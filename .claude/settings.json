@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e ' *)",
+      "Bash(file /home/valentin/projects/binch-mobile/assets/search/*)",
+      "Bash(npm start *)",
+      "Bash(ps -p 18005 -o pid,ppid,cmd)",
+      "Bash(npx expo *)",
+      "Bash(CI=1 EXPO_NO_INTERACTIVE=1 npx expo start --non-interactive)",
+      "Bash(tee /tmp/expo-start.log)",
+      "Bash(pkill -f \"expo start\")",
+      "Bash(tee /tmp/expo-debug.log)",
+      "Bash(mkdir -p /tmp/img-resize)",
+      "Bash(npm init *)",
+      "Bash(rm -rf /tmp/img-resize)",
+      "Bash(node resize.js)",
+      "Bash(node resize2.js)",
+      "Bash(git -C /home/valentin/projects/binch-mobile status assets/search/)",
+      "Bash(git -C /home/valentin/projects/binch-mobile ls-files -s assets/search/)",
+      "Read(//home/valentin/.local/share/Trash/**)",
+      "Read(//mnt/c/Users/**)",
+      "Bash(node -e \"const fs=require\\('fs'\\); const buf=fs.readFileSync\\('/mnt/c/Users/Valentin/Desktop/buses.png'\\); console.log\\('w/h:', buf.readUInt32BE\\(16\\), buf.readUInt32BE\\(20\\), 'size:', buf.length\\)\")",
+      "Bash(echo \"---exit: $?\")",
+      "Bash(node -e \"const r = require\\('react-native-reanimated'\\); console.log\\(Object.keys\\(r\\).filter\\(k => /Slide/.test\\(k\\)\\)\\);\")",
+      "Bash(npm uninstall *)",
+      "Bash(sudo apt *)",
+      "WebFetch(domain:api.anthropic.com)",
+      "Bash(curl -sI \"https://api.anthropic.com/v1/design/h/cDOo8RqJNZY8yomw2LXvTQ\")",
+      "Bash(curl -s \"https://api.anthropic.com/v1/design/h/cDOo8RqJNZY8yomw2LXvTQ\")",
+      "Bash(echo \"exit=$?\")",
+      "Bash(echo \"server-exit=$?\")",
+      "Bash(docker exec *)",
+      "Bash(curl -s \"http://localhost:3000/api/locations?q=berlin&mode=ALL\")",
+      "Bash(curl -s \"http://localhost:3000/api/locations?q=hannover&mode=TRAIN\")",
+      "Bash(curl -s \"http://localhost:3000/api/locations?q=hannover&mode=BUS\")",
+      "Bash(curl -s \"http://localhost:3000/api/locations?q=hann&mode=FLIGHT\")"
+    ],
+    "additionalDirectories": [
+      "/tmp/img-backup",
+      "/home/valentin/projects/binch-mobile/app/search"
+    ]
+  }
+}

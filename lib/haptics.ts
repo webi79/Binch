@@ -1,0 +1,30 @@
+import { Platform, Vibration } from "react-native";
+import * as Haptics from "expo-haptics";
+import { useSearchStore } from "@/stores/searchStore";
+
+export type HapticKind = "button" | "important" | "error";
+
+/**
+ * Trigger a haptic pulse. Respects the user's `hapticsEnabled` setting —
+ * silently no-ops when haptics are disabled in settings.
+ *
+ * "button" uses platform-specific minimal feedback:
+ *   - iOS: selectionAsync() (the softest system tick)
+ *   - Android: 8 ms Vibration (Android haptics are not differentiated by
+ *     style, so we cap the duration directly to keep the tap subtle)
+ */
+export function haptic(kind: HapticKind = "button"): void {
+  if (!useSearchStore.getState().hapticsEnabled) return;
+  switch (kind) {
+    case "button":
+      if (Platform.OS === "android") Vibration.vibrate(8);
+      else void Haptics.selectionAsync();
+      return;
+    case "important":
+      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      return;
+    case "error":
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      return;
+  }
+}

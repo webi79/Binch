@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: binch
+      POSTGRES_PASSWORD: binch
+      POSTGRES_DB: binch
+    ports:
+      - "5432:5432"
+    volumes:
+      - binch-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U binch -d binch"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Self-hosted db-rest — kostenloser HAFAS-Wrapper für DB-Bahnverkehr.
+  # Source: https://github.com/derhuerst/db-rest
+  # Endpoints: /stations, /journeys, /locations, /stops/...
+  # Kein API-Key, kein Auth, kein Quota.
+  dbrest:
+    image: derhuerst/db-rest:6
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      PORT: "3000"
+
+volumes:
+  binch-db:
