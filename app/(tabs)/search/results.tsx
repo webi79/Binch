@@ -1,15 +1,17 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AppState } from "react-native";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   View,
   Text,
   Pressable,
-  FlatList,
   ActivityIndicator,
   RefreshControl,
   StyleSheet,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useLocalSearchParams, useRouter } from "expo-router";
+import { CommonActions, useNavigation } from "@react-navigation/native";
 import {
   Plane,
   Train,
@@ -23,6 +25,7 @@ import {
 } from "lucide-react-native";
 import { useQuery } from "@tanstack/react-query";
 import Animated, {
+  LinearTransition,
   useAnimatedStyle,
   useSharedValue,
   withRepeat,
@@ -94,8 +97,28 @@ function displayCode(code: string): string {
 
 export default function ResultsScreen() {
   const router = useRouter();
+  const navigation = useNavigation();
   const t = useT();
   const [sort, setSort] = useState<SortKey>("cheapest");
+
+  // Stack auf [results] reduzieren — vor dem Push aus dem Home-Tab landet
+  // expo-router temporär bei `[index, results]` (index ist die Initial-Route
+  // des Search-Stacks). Ohne Reset würde der Back-Swipe von results in den
+  // SearchHero (index) pop'pen statt aus dem Search-Stack rauszugehen.
+  // Mit dem Reset auf nur `[results]` exitet der Back-Swipe direkt zum
+  // (tabs)-Parent → Landing-Page.
+  useEffect(() => {
+    const state = navigation.getState();
+    if (!state || state.routes.length <= 1) return;
+    const current = state.routes[state.index];
+    if (!current) return;
+    navigation.dispatch(
+      CommonActions.reset({
+        index: 0,
+        routes: [{ name: current.name, params: current.params as object | undefined }],
+      }),
+    );
+  }, [navigation]);
 
   const p = useLocalSearchParams<{
     mode: string;
@@ -108,6 +131,7 @@ export default function ResultsScreen() {
     tripType?: string;
     passengers?: string;
     currency?: string;
+    travelClass?: string;
   }>();
 
   const mode = (p.mode ?? "FLIGHT") as TravelMode;
@@ -119,26 +143,179 @@ export default function ResultsScreen() {
   const returnDate = p.returnDate ?? "";
   const passengers = Number(p.passengers ?? "1");
   const currency = p.currency ?? "EUR";
+  const travelClass = p.travelClass ?? "";
+
+  // Flag dass die NÄCHSTE queryFn-Ausführung den Server-Cache umgeht.
+  // Initial-Load nutzt Cache (schnell + spart Provider-Anfrage), Refresh per
+  // Pull-Down / Refresh-Button nutzt nocache=1 (frische Preise).
+  const forceFreshRef = useRef(false);
 
   const { data, isLoading, isError, error, refetch, isRefetching } = useQuery<SearchResponse>({
-    queryKey: ["search", mode, origin, destination, departDate, returnDate, passengers, currency],
-    queryFn: () =>
-      searchByMode({
-        mode,
-        origin,
-        destination,
-        originLabel,
-        destLabel,
-        departDate,
-        returnDate: returnDate || undefined,
-        passengers,
-        currency,
-      }),
+    queryKey: ["search", mode, origin, destination, departDate, returnDate, passengers, currency, travelClass],
+    queryFn: () => {
+      const opt = forceFreshRef.current ? { nocache: true } : undefined;
+      forceFreshRef.current = false;
+      return searchByMode(
+        {
+          mode,
+          origin,
+          destination,
+          originLabel,
+          destLabel,
+          departDate,
+          returnDate: returnDate || undefined,
+          passengers,
+          currency,
+          travelClass: travelClass || undefined,
+        },
+        opt,
+      );
+    },
     enabled: Boolean(origin && destination && departDate),
     retry: 1,
+    staleTime: 10 * 60 * 1000,
+    gcTime: 30 * 60 * 1000,
+    refetchOnMount: false,
+    refetchOnWindowFocus: false,
   });
 
-  const sorted = useMemo(() => sortResults(data?.results ?? [], sort), [data, sort]);
+  const refreshFresh = () => {
+    forceFreshRef.current = true;
+    return refetch();
+  };
+
+  // Silent Background-Refresh: alle 5 Min frische Preise vom SERVER-Cache
+  // holen — ohne `nocache`. Das ist clever weil:
+  //   1. Server hat eh schon SWR-Logik: bei >50% TTL läuft ein Refresh im
+  //      Hintergrund → Cache wird automatisch frisch gehalten
+  //   2. Client-Poll triggert eigene Provider-Calls NICHT → ein User der den
+  //      Screen lange offen lässt verbraucht KEINE Provider-Quota
+  //   3. Mehrere User auf derselben Route teilen sich den Server-Cache → eine
+  //      Provider-Anfrage pro Route pro TTL-Window, völlig unabhängig von Usern
+  //
+  // Effekt: Preise sind nie älter als TTL/2 (≈ Flight 5min, Bus 15min, Train 2h)
+  // OHNE dass die User-Anzahl die Kosten skaliert.
+  const queryClient = useQueryClient();
+  const queryKey = useMemo(
+    () => ["search", mode, origin, destination, departDate, returnDate, passengers, currency, travelClass],
+    [mode, origin, destination, departDate, returnDate, passengers, currency, travelClass],
+  );
+
+  useEffect(() => {
+    if (!origin || !destination || !departDate) return;
+    const intervalMs = 5 * 60 * 1000; // 5 Min
+
+    const doSilentRefresh = async () => {
+      if (AppState.currentState !== "active") return;
+      try {
+        // OHNE nocache — wir holen vom Server-Cache, der via SWR
+        // automatisch frisch gehalten wird.
+        const fresh = await searchByMode({
+          mode,
+          origin,
+          destination,
+          originLabel,
+          destLabel,
+          departDate,
+          returnDate: returnDate || undefined,
+          passengers,
+          currency,
+          travelClass: travelClass || undefined,
+        });
+        queryClient.setQueryData(queryKey, fresh);
+      } catch {
+        // Refresh fehlgeschlagen → bestehende Daten bleiben.
+      }
+    };
+
+    const id = setInterval(doSilentRefresh, intervalMs);
+    // Auch beim Foreground-Switch refreshen (User hatte App im Hintergrund).
+    const sub = AppState.addEventListener("change", (s) => {
+      if (s === "active") void doSilentRefresh();
+    });
+    return () => {
+      clearInterval(id);
+      sub.remove();
+    };
+  }, [mode, origin, destination, originLabel, destLabel, departDate, returnDate, passengers, currency, travelClass, queryKey, queryClient]);
+
+  // Hin- oder Rückreise-Ansicht. Nur für Train/Bus relevant — Flüge bekommen
+  // keine separaten Rück-Treffer (SerpAPI/Google Flights pre-bundled die schon
+  // serverseitig). Default: Hinreise.
+  const [direction, setDirection] = useState<"OUTBOUND" | "RETURN">("OUTBOUND");
+
+  // „Später"-Pagination (nur TRAIN): zusätzliche Verbindungen die per HAFAS-
+  // laterRef nachgeladen wurden, plus der aktuelle Token für den nächsten
+  // Klick. Reset bei jedem Such-Wechsel — geknüpft an `data?.fetchedAt` damit
+  // ein frischer Server-Refresh den lokalen Pagination-State leert.
+  const [extraResults, setExtraResults] = useState<SearchResult[]>([]);
+  const [paginationToken, setPaginationToken] = useState<string | undefined>(undefined);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const dataFetchedAt = data?.fetchedAt;
+  useEffect(() => {
+    setExtraResults([]);
+    setPaginationToken(data?.paginationToken);
+  }, [dataFetchedAt, data?.paginationToken]);
+
+  const loadMore = async () => {
+    if (!paginationToken || isLoadingMore) return;
+    setIsLoadingMore(true);
+    haptic("button");
+    try {
+      const next = await searchByMode(
+        {
+          mode,
+          origin,
+          destination,
+          originLabel,
+          destLabel,
+          departDate,
+          returnDate: returnDate || undefined,
+          passengers,
+          currency,
+          travelClass: travelClass || undefined,
+        },
+        { paginationToken },
+      );
+      setExtraResults((prev) => [...prev, ...next.results]);
+      setPaginationToken(next.paginationToken);
+    } catch {
+      // Bei Fehler den Token behalten — User kann erneut auf „Später" tippen.
+    } finally {
+      setIsLoadingMore(false);
+    }
+  };
+
+  const allResults = [...(data?.results ?? []), ...extraResults];
+  const hasReturnLeg = allResults.some((r) => r.direction === "RETURN");
+  const showDirectionToggle =
+    Boolean(returnDate) && hasReturnLeg && (mode === "TRAIN" || mode === "BUS");
+
+  const sorted = useMemo(() => {
+    // Defensive Dedupe auf id — falls der Server mal doppelte IDs liefert
+    // (z.B. alter Cache vor Server-Restart), schützt das vor FlatList-Crash
+    // mit "two children with the same key".
+    const dedupeById = (list: SearchResult[]): SearchResult[] => {
+      const seen = new Set<string>();
+      const out: SearchResult[] = [];
+      for (const r of list) {
+        const key = `${r.direction ?? "OUTBOUND"}-${r.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(r);
+      }
+      return out;
+    };
+
+    if (!showDirectionToggle) {
+      const onlyOutbound = allResults.filter((r) => r.direction !== "RETURN");
+      return sortResults(dedupeById(onlyOutbound), sort);
+    }
+    const filtered = allResults.filter((r) =>
+      direction === "RETURN" ? r.direction === "RETURN" : r.direction !== "RETURN",
+    );
+    return sortResults(dedupeById(filtered), sort);
+  }, [allResults, sort, direction, showDirectionToggle]);
 
   const tabs: { key: SortKey; labelKey: string }[] = [
     { key: "cheapest", labelKey: "results.sort.cheapest" },
@@ -185,6 +362,30 @@ export default function ResultsScreen() {
         </View>
       </View>
 
+      {showDirectionToggle ? (
+        <View style={styles.dirToggleWrap}>
+          <View style={styles.dirToggle}>
+            {(["OUTBOUND", "RETURN"] as const).map((id) => {
+              const active = direction === id;
+              return (
+                <Pressable
+                  key={id}
+                  onPress={() => {
+                    haptic("button");
+                    setDirection(id);
+                  }}
+                  style={[styles.dirSeg, active && styles.dirSegActive]}
+                >
+                  <Text style={active ? styles.dirSegTextActive : styles.dirSegText}>
+                    {t(id === "OUTBOUND" ? "results.direction.outbound" : "results.direction.return")}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        </View>
+      ) : null}
+
       <View style={styles.tabsRow}>
         {tabs.map((tab) => {
           const active = sort === tab.key;
@@ -195,6 +396,10 @@ export default function ResultsScreen() {
                 haptic("button");
                 setSort(tab.key);
               }}
+              // Hitbox vergrößern, ohne die visuellen Buttons aufzublasen.
+              // top/bottom großzügig (vertikaler Platz ist da), left/right
+              // moderat (sonst überlappen die Hitboxen den 22px-Gap).
+              hitSlop={{ top: 14, bottom: 14, left: 10, right: 10 }}
               style={styles.tabBtn}
             >
               <Text style={[styles.tabText, active && styles.tabTextActive]}>
@@ -229,7 +434,7 @@ export default function ResultsScreen() {
           <RippleTouch
             onPress={() => {
               haptic("button");
-              refetch();
+              refreshFresh();
             }}
             style={styles.retryBtn}
           >
@@ -239,18 +444,34 @@ export default function ResultsScreen() {
           </RippleTouch>
         </View>
       ) : (
-        <FlatList
+        <Animated.FlatList
+          // Bei Direction-Wechsel (Hin/Rück) UND bei neuen Suchergebnissen
+          // komplett remounten — `data?.fetchedAt` ändert sich pro Server-
+          // Response, damit feuert die `itemLayoutAnimation` nicht für die
+          // initialen 8 Cards einer frischen Suche (sonst sliden die Cards
+          // ins Layout, und während der User auf "Auswählen" klickt kämpfen
+          // diese Layout-Animationen mit dem DetailsOverlay-Slide).
+          // Innerhalb derselben Daten + Direction läuft der Sort-Reorder
+          // weiter smooth.
+          key={`${direction}-${data?.fetchedAt ?? ""}`}
           data={sorted}
-          keyExtractor={(r) => r.id}
+          // Defensiv mit Direction-Prefix: garantiert eindeutig auch wenn
+          // Outbound- und Return-Backend-IDs jemals kollidieren sollten.
+          keyExtractor={(r) => `${r.direction ?? "OUTBOUND"}-${r.id}`}
           renderItem={({ item }) => <ResultCard result={item} passengers={passengers} />}
           ItemSeparatorComponent={() => <View style={{ height: 12 }} />}
           contentContainerStyle={styles.listContent}
+          // Sliding-Reorder beim Sort-Wechsel (Cheapest/Fastest/Direct):
+          // Reanimated trackt jede Ticket-Card per `keyExtractor` und animiert
+          // sie smooth von alter zu neuer Position. Dauer passend zu den
+          // anderen App-Animationen (Home-Slide, Details-Slide).
+          itemLayoutAnimation={LinearTransition.duration(320)}
           refreshControl={
             <RefreshControl
               refreshing={isRefetching}
               onRefresh={() => {
                 haptic("button");
-                refetch();
+                refreshFresh();
               }}
               tintColor={C.lime}
               colors={[C.lime]}
@@ -262,7 +483,7 @@ export default function ResultsScreen() {
               <RippleTouch
                 onPress={() => {
                   haptic("button");
-                  refetch();
+                  refreshFresh();
                 }}
                 style={styles.retryBtn}
               >
@@ -271,6 +492,22 @@ export default function ResultsScreen() {
                 <Text style={styles.retryBtnText}>{t("results.retry")}</Text>
               </RippleTouch>
             </View>
+          }
+          ListFooterComponent={
+            mode === "TRAIN" && paginationToken && sorted.length > 0 ? (
+              <View style={styles.laterWrap}>
+                <RippleTouch
+                  onPress={loadMore}
+                  disabled={isLoadingMore}
+                  style={({ pressed }) => [styles.laterBtn, pressed && { opacity: 0.85 }]}
+                >
+                  <GradientFill />
+                  <Text style={styles.laterBtnText}>
+                    {isLoadingMore ? t("results.loading") : t("results.later")}
+                  </Text>
+                </RippleTouch>
+              </View>
+            ) : null
           }
         />
       )}
@@ -441,6 +678,26 @@ const styles = StyleSheet.create({
   dotsRow: { flexDirection: "row", gap: 3, marginLeft: 4 },
   smallDot: { width: 4, height: 4, borderRadius: 2, backgroundColor: C.lime },
 
+  // Hin/Rück-Toggle — visuell wie im Saved-Tab (Reise/Tickets-Segment):
+  // dunkler Pill-Container, aktive Pille mit Lime-Background.
+  dirToggleWrap: { paddingHorizontal: 16, paddingTop: 12 },
+  dirToggle: {
+    flexDirection: "row",
+    backgroundColor: "#242425",
+    borderRadius: 16,
+    padding: 4,
+  },
+  dirSeg: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  dirSegActive: { backgroundColor: C.lime },
+  dirSegText: { color: "#8A8A90", fontSize: 13, fontWeight: "500" },
+  dirSegTextActive: { color: "#000000", fontSize: 13, fontWeight: "700" },
+
   tabsRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -508,4 +765,16 @@ const styles = StyleSheet.create({
   retryBtnText: { color: C.black, fontWeight: "700", fontSize: 14 },
   emptyWrap: { paddingVertical: 60, alignItems: "center", gap: 14 },
   emptyText: { color: C.sub },
+
+  /* „Später"-Pagination-Button am Listenende */
+  laterWrap: { paddingTop: 16, paddingBottom: 8, alignItems: "center" },
+  laterBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 28,
+    paddingVertical: 12,
+    borderRadius: 9999,
+    overflow: "hidden",
+  },
+  laterBtnText: { color: C.black, fontWeight: "800", fontSize: 14, letterSpacing: -0.1 },
 });

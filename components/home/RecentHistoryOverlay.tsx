@@ -93,6 +93,7 @@ function RecentHistorySheet() {
           onPress: () => {
             haptic("important");
             clearRecentSearches();
+            close();
           },
         },
       ]

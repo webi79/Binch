@@ -26,6 +26,7 @@ import {
   MessageSquare,
   ChevronDown,
   LogOut,
+  LogIn,
   Pencil,
 } from "lucide-react-native";
 import { useSearchStore, Locale } from "@/stores/searchStore";
@@ -93,6 +94,7 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
   const isAuthed = useSearchStore((s) => s.authUser !== null);
   const token = useSearchStore((s) => s.authToken);
   const clearAuth = useSearchStore((s) => s.clearAuth);
+  const openAuth = useSearchStore((s) => s.openAuthOverlay);
 
   const tiles: { id: Exclude<SubScreen, null>; titleKey: string; descKey: string; illu: ReactNode }[] = [
     { id: "details", titleKey: "settings.tile.details", descKey: "settings.tile.details.desc", illu: <IlluDetails /> },
@@ -146,18 +148,27 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
         ))}
       </View>
 
+      <View style={styles.divider} />
       {isAuthed ? (
-        <>
-          <View style={styles.divider} />
-          <RippleTouch
-            onPress={onSignOut}
-            style={({ pressed }) => [styles.signOut, pressed && { opacity: 0.7 }]}
-          >
-            <LogOut size={18} color={C.red} strokeWidth={2} />
-            <Text style={styles.signOutText}>{t("settings.signout")}</Text>
-          </RippleTouch>
-        </>
-      ) : null}
+        <RippleTouch
+          onPress={onSignOut}
+          style={({ pressed }) => [styles.signOut, pressed && { opacity: 0.7 }]}
+        >
+          <LogOut size={18} color={C.red} strokeWidth={2} />
+          <Text style={styles.signOutText}>{t("settings.signout")}</Text>
+        </RippleTouch>
+      ) : (
+        <RippleTouch
+          onPress={() => {
+            haptic("button");
+            openAuth();
+          }}
+          style={({ pressed }) => [styles.signIn, pressed && { opacity: 0.7 }]}
+        >
+          <LogIn size={18} color={C.green} strokeWidth={2} />
+          <Text style={styles.signInText}>{t("auth.guest.cta")}</Text>
+        </RippleTouch>
+      )}
 
       <Text style={styles.versionText}>{t("settings.app.version")}</Text>
     </View>
@@ -196,16 +207,13 @@ function ProfileCard() {
               <Text style={styles.profileEmail}>{user.email}</Text>
             </>
           ) : (
-            <>
-              <Text style={styles.profileName}>{t("auth.guest.title")}</Text>
-              <Pressable onPress={onAvatarPress} hitSlop={6}>
-                <Text style={styles.profileGuestCta}>{t("auth.guest.cta")}</Text>
-              </Pressable>
-            </>
+            <Text style={styles.profileName}>{t("auth.guest.title")}</Text>
           )}
         </View>
         <Pressable onPress={onAvatarPress} disabled={isAuthed} style={styles.avatarWrap}>
-          {isAuthed ? (
+          {isAuthed && user.avatarDataUrl ? (
+            <Image source={{ uri: user.avatarDataUrl }} style={styles.avatar} />
+          ) : isAuthed ? (
             <LinearGradient
               colors={[C.green, C.greenDark]}
               start={{ x: 0, y: 0 }}
@@ -964,13 +972,6 @@ const styles = StyleSheet.create({
     lineHeight: 31,
   },
   profileEmail: { fontSize: 12, color: C.g2, marginTop: 8 },
-  profileGuestCta: {
-    fontSize: 13,
-    color: C.green,
-    fontWeight: "700",
-    marginTop: 8,
-    textDecorationLine: "underline",
-  },
 
   avatarWrap: { width: 58, height: 58 },
   avatar: {
@@ -1049,6 +1050,18 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   signOutText: { fontSize: 15, fontWeight: "600", color: C.red },
+  signIn: {
+    marginHorizontal: 16,
+    marginTop: 12,
+    backgroundColor: "rgba(127,234,77,0.05)",
+    borderRadius: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  signInText: { fontSize: 15, fontWeight: "600", color: C.green },
   versionText: {
     textAlign: "center",
     fontSize: 11,

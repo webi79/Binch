@@ -9,9 +9,21 @@ const querySchema = z.object({
   originLabel: z.string().optional(),
   destLabel: z.string().optional(),
   departDate: z.string().min(1),
+  /** Optional ISO-UTC-Zeitstempel — Surroundings-Tap setzt das, normale Suche
+   *  lässt's weg. Wird vom dbVendo-Provider als Suchfenster-Start verwendet. */
+  departTime: z.string().optional(),
   returnDate: z.string().optional(),
   passengers: z.coerce.number().int().min(1).max(9).default(1),
   currency: z.string().default("EUR"),
+  /** i18n-Key (z.B. "search.class.business"). Provider entscheiden selbst,
+   *  ob/wie sie das umsetzen — wir reichen den Wert nur durch. */
+  travelClass: z.string().optional(),
+  /** ?nocache=1 erzwingt frische Provider-Anfrage, sonst greift der 2h-Cache. */
+  nocache: z.coerce.boolean().optional(),
+  /** „Später"-Pagination: opaques Token aus der vorherigen Suche
+   *  (HAFAS laterRef). Wird nur von TRAIN-Provider unterstützt; bei
+   *  anderen Modes ignoriert. */
+  paginationToken: z.string().optional(),
 });
 
 const MODE_PATHS: Array<{ path: string; mode: TravelMode }> = [

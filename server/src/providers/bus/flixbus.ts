@@ -39,6 +39,20 @@ export class FlixbusApiError extends Error {
   }
 }
 
+/** Erkennt Stop-IDs aus ÖPNV-Quellen (HAFAS, GTFS, db-rest, StaDa), für die
+ *  FlixBus garantiert keine passenden Trips hat. Solche Searches früh skippen
+ *  spart einen Autocomplete-Roundtrip + verhindert Phantom-Matches gegen
+ *  zufällige FlixBus-Stationen in der Nähe. */
+function looksLikeTransitStopId(code: string | undefined): boolean {
+  if (!code) return false;
+  // Reine numerische HAFAS-EVA (6-9 Stellen, z.B. 615123 für Bus-Stop,
+  // 8011102 für Bahnhof). FlixBus-IDs sind UUIDs, nicht numerisch.
+  if (/^\d{6,9}$/.test(code)) return true;
+  // Präfixierte ÖPNV-Quellen aus unserer locations-Tabelle.
+  if (/^(gtfs|dbrest|sta|airport):/.test(code)) return true;
+  return false;
+}
+
 /**
  * Ruft FlixBus-Autocomplete für eine Suchanfrage auf. Liefert die Roh-Liste
  * (Stations + Cities) sortiert nach Bus-Vorrang und Importance.
@@ -136,6 +150,21 @@ export const flixbusProvider: SearchProvider = {
       return { results: [], raw: { skipped: "no rapidapi key" }, statusCode: 0, durationMs: 0 };
     }
 
+    // Self-Filter: HAFAS-/GTFS-Stop-IDs sind keine FlixBus-Stationen. Wenn
+    // Origin oder Destination wie eine ÖPNV-Stop-ID aussieht (numerische
+    // HAFAS-EVA oder gtfs:/dbrest:/sta:-Präfix), würde resolveFlixId via
+    // Autocomplete höchstens einen ZUFÄLLIGEN FlixBus-Halt in der Nähe
+    // matchen und falsche Trips zurückliefern. Lieber sofort skippen — spart
+    // einen RapidAPI-Call pro Anfrage und ist semantisch ehrlicher.
+    if (looksLikeTransitStopId(input.origin) || looksLikeTransitStopId(input.destination)) {
+      return {
+        results: [],
+        raw: { skipped: "transit_stop_id", origin: input.origin, destination: input.destination },
+        statusCode: 0,
+        durationMs: Date.now() - start,
+      };
+    }
+
     let fromId: string | null;
     let toId: string | null;
     try {
@@ -165,35 +194,71 @@ export const flixbusProvider: SearchProvider = {
       };
     }
 
-    const url = new URL(`https://${config.FLIXBUS_RAPIDAPI_HOST}/trips`);
-    url.searchParams.set("from_id", fromId);
-    url.searchParams.set("to_id", toId);
-    url.searchParams.set("date", isoToDmy(input.departDate));
-    url.searchParams.set("time", "00:00");
-    url.searchParams.set("adult", String(input.passengers));
-    url.searchParams.set("search_by", "cities");
-    url.searchParams.set("currency", input.currency);
+    // FlixBus /trips ist One-Way. Bei returnDate parallel ein zweites Mal in
+    // Gegenrichtung suchen und Rück-Treffer mit `direction: "RETURN"` markieren.
+    // Client trennt sie über den Hinreise/Rückreise-Toggle.
+    const outboundPromise = fetchFlixTrips(fromId, toId, input.departDate, input, signal);
+    const returnPromise = input.returnDate
+      ? fetchFlixTrips(toId, fromId, input.returnDate, input, signal)
+      : Promise.resolve(null);
 
-    const res = await fetch(url, {
-      headers: rapidHeaders(),
-      signal,
-    });
-    const statusCode = res.status;
-    const raw = (await res.json().catch(() => null)) as unknown;
+    const [outbound, returnLeg] = await Promise.all([outboundPromise, returnPromise]);
     const durationMs = Date.now() - start;
 
-    if (!res.ok || !raw) {
-      return { results: [], raw, statusCode, durationMs };
+    if (!outbound.ok) {
+      return { results: [], raw: outbound.raw, statusCode: outbound.statusCode, durationMs };
+    }
+
+    const outboundResults: NormalizedResult[] = parseFlixJourneys(outbound.raw, input).map(
+      (r) => ({ ...r, direction: "OUTBOUND" as const }),
+    );
+
+    let returnResults: NormalizedResult[] = [];
+    if (returnLeg?.ok) {
+      returnResults = parseFlixJourneys(returnLeg.raw, {
+        ...input,
+        origin: input.destination,
+        destination: input.origin,
+        originLabel: input.destLabel,
+        destLabel: input.originLabel,
+      }).map((r) => ({ ...r, direction: "RETURN" as const }));
     }
 
     return {
-      results: parseFlixJourneys(raw, input),
-      raw,
-      statusCode,
+      results: [...outboundResults, ...returnResults],
+      raw: returnLeg ? { outbound: outbound.raw, return: returnLeg.raw } : outbound.raw,
+      statusCode: outbound.statusCode,
       durationMs,
     };
   },
 };
+
+interface FlixFetch {
+  ok: boolean;
+  raw: unknown;
+  statusCode: number;
+}
+
+async function fetchFlixTrips(
+  fromId: string,
+  toId: string,
+  isoDate: string,
+  input: ProviderSearchInput,
+  signal?: AbortSignal,
+): Promise<FlixFetch> {
+  const url = new URL(`https://${config.FLIXBUS_RAPIDAPI_HOST}/trips`);
+  url.searchParams.set("from_id", fromId);
+  url.searchParams.set("to_id", toId);
+  url.searchParams.set("date", isoToDmy(isoDate));
+  url.searchParams.set("time", "00:00");
+  url.searchParams.set("adult", String(input.passengers));
+  url.searchParams.set("search_by", "cities");
+  url.searchParams.set("currency", input.currency);
+
+  const res = await fetch(url, { headers: rapidHeaders(), signal });
+  const raw = (await res.json().catch(() => null)) as unknown;
+  return { ok: res.ok && raw !== null, raw, statusCode: res.status };
+}
 
 function rapidHeaders(): Record<string, string> {
   return {

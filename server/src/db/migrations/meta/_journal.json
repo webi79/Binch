@@ -36,6 +36,55 @@
       "when": 1778192609378,
       "tag": "0004_lazy_riptide",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1778674919871,
+      "tag": "0005_tough_punisher",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1778864531259,
+      "tag": "0006_brainy_lifeguard",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1778872470483,
+      "tag": "0007_far_enchantress",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1778887078955,
+      "tag": "0008_romantic_darwin",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1778890070042,
+      "tag": "0009_cultured_wolfsbane",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1778952324358,
+      "tag": "0010_stale_vampiro",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1779039402302,
+      "tag": "0011_gray_phalanx",
+      "breakpoints": true
     }
   ]
 }

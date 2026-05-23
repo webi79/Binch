@@ -1,0 +1,185 @@
+import { memo, useMemo } from "react";
+import { GeoJSONSource, Layer } from "@maplibre/maplibre-react-native";
+import type { RouteWaypoint, RouteLegGeometry } from "@/stores/searchStore";
+
+/**
+ * Zeichnet eine Route auf der Karte: Polyline durch alle Waypoints + farbige
+ * Marker je Waypoint (Origin / Transfer / Destination).
+ *
+ * Drei Layer-Quellen:
+ *   1. route-line-src → LineString durch die Waypoint-Coords
+ *   2. route-waypoints-src → Punkte für Origin/Transfer/Destination
+ * Layer:
+ *   - line-shadow (dunkle dickere Linie hinter der Hauptlinie)
+ *   - line-main (lime, ggf. gestrichelt für Flug/Cruise)
+ *   - wp-bg-circle (großer farbiger Kreis pro Waypoint)
+ *   - wp-stroke-circle (heller Ring außen für Sichtbarkeit auf dunklem Map-BG)
+ *   - wp-label (Text mit Stop-Name)
+ */
+
+const LIME = "#7FEA4D";
+const ORIGIN_COLOR = "#7FEA4D";
+const TRANSFER_COLOR = "#FFD60A";
+const DEST_COLOR = "#FF3B5C";
+
+interface Props {
+  waypoints: RouteWaypoint[];
+  /** Pro Leg ein Geometry-Block — kann echte Polyline-Coords enthalten. */
+  legs: RouteLegGeometry[];
+  /** Modus bestimmt den Linien-Style (gestrichelt für Flug/Cruise = Luft/Wasser). */
+  mode: "FLIGHT" | "TRAIN" | "BUS" | "CRUISE";
+}
+
+const LINE_SRC = "route-line-src";
+const WP_SRC = "route-waypoints-src";
+const LINE_SHADOW_ID = "route-line-shadow";
+const LINE_MAIN_ID = "route-line-main";
+const WP_RING_ID = "route-wp-ring";
+const WP_BG_ID = "route-wp-bg";
+const WP_LABEL_ID = "route-wp-label";
+
+export const RouteLayer = memo(function RouteLayer({ waypoints, legs, mode }: Props) {
+  // Pro Leg ein LineString: entweder echte Polyline (Schienen-Geometrie) wenn
+  // bereits gefetched, oder Fallback auf gerade Linie zwischen den Waypoints.
+  const lineGeoJson = useMemo(
+    () => ({
+      type: "FeatureCollection" as const,
+      features: legs.map((leg) => {
+        const coords = leg.coords && leg.coords.length > 1
+          ? leg.coords
+          : ([
+              [waypoints[leg.fromIndex].longitude, waypoints[leg.fromIndex].latitude],
+              [waypoints[leg.toIndex].longitude, waypoints[leg.toIndex].latitude],
+            ] as [number, number][]);
+        return {
+          type: "Feature" as const,
+          geometry: { type: "LineString" as const, coordinates: coords },
+          properties: { hasPolyline: Boolean(leg.coords) },
+        };
+      }),
+    }),
+    [legs, waypoints],
+  );
+
+  const waypointGeoJson = useMemo(
+    () => ({
+      type: "FeatureCollection" as const,
+      features: waypoints.map((w, i) => ({
+        type: "Feature" as const,
+        geometry: {
+          type: "Point" as const,
+          coordinates: [w.longitude, w.latitude] as [number, number],
+        },
+        properties: {
+          label: w.label,
+          role: w.role,
+          index: i,
+        },
+      })),
+    }),
+    [waypoints],
+  );
+
+  // Cruise bleibt gestrichelt (Schifffahrt = Wasser, kein fest gezogener Weg).
+  // Flug ist seit der Großkreis-Arc-Berechnung als durchgängige Kurve
+  // dargestellt — die Bogenform reicht visuell um Luftverkehr zu signalisieren,
+  // gestrichelt wäre redundant + macht die Kurve auf der Karte schlechter
+  // ablesbar.
+  const dashed = mode === "CRUISE";
+
+  return (
+    <>
+      <GeoJSONSource id={LINE_SRC} data={lineGeoJson} />
+      <GeoJSONSource id={WP_SRC} data={waypointGeoJson} />
+
+      {/* Dunkle „Shadow"-Linie unter der Hauptlinie für Lesbarkeit */}
+      <Layer
+        id={LINE_SHADOW_ID}
+        type="line"
+        source={LINE_SRC}
+        layout={{ "line-cap": "round", "line-join": "round" }}
+        paint={{
+          "line-color": "#14181A",
+          "line-width": 8,
+          "line-opacity": 0.7,
+        }}
+      />
+      <Layer
+        id={LINE_MAIN_ID}
+        type="line"
+        source={LINE_SRC}
+        layout={{ "line-cap": "round", "line-join": "round" }}
+        paint={{
+          "line-color": LIME,
+          "line-width": 4,
+          ...(dashed ? { "line-dasharray": [2, 2] } : {}),
+        }}
+      />
+
+      {/* Waypoint-Ring (heller Kontrast außen) */}
+      <Layer
+        id={WP_RING_ID}
+        type="circle"
+        source={WP_SRC}
+        paint={{
+          "circle-radius": [
+            "match",
+            ["get", "role"],
+            "origin",
+            12,
+            "destination",
+            12,
+            8, // transfer
+          ],
+          "circle-color": "#FFFFFF",
+          "circle-stroke-color": "#14181A",
+          "circle-stroke-width": 2,
+        }}
+      />
+      <Layer
+        id={WP_BG_ID}
+        type="circle"
+        source={WP_SRC}
+        paint={{
+          "circle-radius": [
+            "match",
+            ["get", "role"],
+            "origin",
+            8,
+            "destination",
+            8,
+            5, // transfer
+          ],
+          "circle-color": [
+            "match",
+            ["get", "role"],
+            "origin",
+            ORIGIN_COLOR,
+            "destination",
+            DEST_COLOR,
+            TRANSFER_COLOR,
+          ],
+        }}
+      />
+      <Layer
+        id={WP_LABEL_ID}
+        type="symbol"
+        source={WP_SRC}
+        layout={{
+          "text-field": ["get", "label"],
+          "text-font": ["Noto Sans Bold"],
+          "text-size": 11,
+          "text-offset": [0, 1.4],
+          "text-anchor": "top",
+          "text-allow-overlap": false,
+          "text-optional": true,
+        }}
+        paint={{
+          "text-color": "#FFFFFF",
+          "text-halo-color": "#14181A",
+          "text-halo-width": 1.5,
+        }}
+      />
+    </>
+  );
+});

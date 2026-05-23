@@ -7,7 +7,13 @@ import { locationsRoutes } from "./routes/locations.js";
 import { redirectRoutes } from "./routes/redirect.js";
 import { ticketsRoutes } from "./routes/tickets.js";
 import { authRoutes } from "./routes/auth.js";
+import { surroundingsRoutes } from "./routes/surroundings.js";
+import { stopsRoutes } from "./routes/stops.js";
+import { tripsRoutes } from "./routes/trips.js";
+import { flightBookingOptionsRoutes } from "./routes/flightBookingOptions.js";
 import { pool } from "./db/client.js";
+import { startStopBoardPreCache, stopStopBoardPreCache } from "./services/stopBoardPreCache.js";
+import { startDbVendoQueue, stopDbVendoQueue } from "./services/dbVendoQueue.js";
 
 const app = Fastify({
   logger: {
@@ -29,9 +35,24 @@ await app.register(locationsRoutes);
 await app.register(redirectRoutes);
 await app.register(ticketsRoutes);
 await app.register(authRoutes);
+await app.register(surroundingsRoutes);
+await app.register(stopsRoutes);
+await app.register(tripsRoutes);
+await app.register(flightBookingOptionsRoutes);
+
+// db-vendo Background-Queue starten — Worker tickt alle 1.5s und arbeitet
+// SWR/History-Refreshes ab. Muss VOR dem Pre-Cache laufen, weil der Pre-Cache
+// optional über die Queue gehen könnte (aktuell nutzt er getStopBoard direkt).
+startDbVendoQueue();
+
+// Background-Job startet sich selbst — alle 50s refresht er die Top-10 Stops
+// damit User-Taps auf populäre Stationen Cache-Hits werden.
+startStopBoardPreCache();
 
 const shutdown = async (signal: string) => {
   app.log.info({ signal }, "Shutting down");
+  stopStopBoardPreCache();
+  stopDbVendoQueue();
   await app.close();
   await pool.end();
   process.exit(0);

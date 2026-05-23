@@ -1,0 +1,26 @@
+# Build-Kontext schlank halten — alles was nicht ins Image muss.
+# `docker compose build` würde sonst das ganze Verzeichnis (inkl. node_modules
+# und dist) hochladen, was Builds drastisch verlangsamt.
+
+node_modules
+dist
+logs
+*.log
+
+# Secrets — gehören nicht ins Image
+.env
+.env.*
+!.env.example
+
+# Build- / Tooling-Artifakte die im Container nicht gebraucht werden
+.git
+.gitignore
+.github
+.vscode
+.idea
+*.md
+README*
+Dockerfile
+docker-compose.yml
+.dockerignore
+ecosystem.config.cjs

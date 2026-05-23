@@ -31,7 +31,14 @@ export const googleFlightsProvider: SearchProvider = {
     if (input.returnDate) url.searchParams.set("return_date", input.returnDate);
     url.searchParams.set("adults", String(input.passengers));
     url.searchParams.set("currency", input.currency);
-    url.searchParams.set("travel_class", "ECONOMY");
+    // Travel-Class aus dem Client mappen — Default Economy.
+    //   search.class.economy  → ECONOMY
+    //   search.class.business → BUSINESS
+    //   search.class.first    → FIRST
+    let flightClass = "ECONOMY";
+    if (input.travelClass === "search.class.business") flightClass = "BUSINESS";
+    else if (input.travelClass === "search.class.first") flightClass = "FIRST";
+    url.searchParams.set("travel_class", flightClass);
     url.searchParams.set("type", input.returnDate ? "1" : "2");
 
     const res = await fetch(url, {
@@ -61,11 +68,23 @@ export const googleFlightsProvider: SearchProvider = {
 };
 
 interface GfAirport {
+  // Echte Felder der google-flights2 API: airport_name + airport_code.
+  // Die alten Felder `id`/`name` waren ein Mismatch und liefen leer durch.
+  airport_name?: string;
+  airport_code?: string;
+  time?: string;
+  // Legacy-Compat: ältere Wrapper-Versionen hatten id/name. Wir lesen sie
+  // als Fallback damit ein Provider-Update uns nicht stillschweigend bricht.
   id?: string;
   name?: string;
-  time?: string;
   airport?: string;
-  airport_code?: string;
+}
+
+function airportCode(a?: GfAirport): string {
+  return a?.airport_code ?? a?.id ?? "";
+}
+function airportName(a?: GfAirport): string | undefined {
+  return a?.airport_name ?? a?.name ?? a?.airport;
 }
 
 interface GfFlight {
@@ -115,9 +134,8 @@ function parseGoogleFlights(raw: unknown, input: ProviderSearchInput): Normalize
     const last = flights[flights.length - 1];
     if (!first || !last) continue;
 
-    const depart =
-      first.departure_airport?.time ?? first.departure_airport?.id ? toIso(first.departure_airport?.time) : null;
-    const arrive = last.arrival_airport?.time ? toIso(last.arrival_airport?.time) : null;
+    const depart = first.departure_airport?.time ? toIso(first.departure_airport.time) : null;
+    const arrive = last.arrival_airport?.time ? toIso(last.arrival_airport.time) : null;
     if (!depart || !arrive) continue;
 
     const durationMinutes =
@@ -139,10 +157,10 @@ function parseGoogleFlights(raw: unknown, input: ProviderSearchInput): Normalize
           ? f.duration
           : Math.max(1, Math.round((Date.parse(fArr) - Date.parse(fDep)) / 60000));
       legs.push({
-        origin: f.departure_airport?.id ?? "",
-        destination: f.arrival_airport?.id ?? "",
-        originLabel: f.departure_airport?.name,
-        destLabel: f.arrival_airport?.name,
+        origin: airportCode(f.departure_airport),
+        destination: airportCode(f.arrival_airport),
+        originLabel: airportName(f.departure_airport),
+        destLabel: airportName(f.arrival_airport),
         departTime: fDep,
         arriveTime: fArr,
         durationMinutes: fDuration,
@@ -159,23 +177,29 @@ function parseGoogleFlights(raw: unknown, input: ProviderSearchInput): Normalize
         : typeof it.price === "string"
           ? Number(it.price.replace(/[^\d.]/g, ""))
           : Number.NaN;
-    if (!Number.isFinite(priceNum) || priceNum <= 0) continue;
+    // Itineraries ohne Preis NICHT mehr droppen — wir zeigen sie mit Preis=0
+    // an, ResultCard rendert dann „Tarif beim Anbieter" statt einer Zahl.
+    // Google Flights liefert auf manchen Strecken ein paar Flüge ohne Preis
+    // (z.B. Codeshares wo SerpAPI keinen Live-Preis ziehen konnte). Bevor
+    // wir die abwerfen, lieber dem User zeigen + Click führt zur Buchungs-
+    // seite wo er den Echt-Preis sieht.
+    const safePrice = Number.isFinite(priceNum) && priceNum > 0 ? priceNum : 0;
 
     const token = it.booking_token ?? it.departure_token ?? `${i}`;
 
     out.push({
       externalId: `gflights:${token}`,
-      origin: first.departure_airport?.id ?? input.origin,
-      destination: last.arrival_airport?.id ?? input.destination,
-      originLabel: first.departure_airport?.name ?? input.originLabel,
-      destLabel: last.arrival_airport?.name ?? input.destLabel,
+      origin: airportCode(first.departure_airport) || input.origin,
+      destination: airportCode(last.arrival_airport) || input.destination,
+      originLabel: airportName(first.departure_airport) ?? input.originLabel,
+      destLabel: airportName(last.arrival_airport) ?? input.destLabel,
       departTime: depart,
       arriveTime: arrive,
       durationMinutes,
       stops: Math.max(0, flights.length - 1),
       stopLabels,
       legs: legs.length > 0 ? legs : undefined,
-      price: priceNum,
+      price: safePrice,
       currency: input.currency,
       deepLink: buildDeepLink(token, input, depart, first.flight_number),
       bookingToken: it.booking_token ?? undefined,

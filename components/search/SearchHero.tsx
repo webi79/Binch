@@ -1,4 +1,10 @@
 import { useMemo, useState } from "react";
+import Animated, {
+  Easing,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from "react-native-reanimated";
 import {
   View,
   Text,
@@ -8,7 +14,6 @@ import {
   StyleSheet,
   Platform,
 } from "react-native";
-import { showAlert } from "@/lib/alert";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { LinearGradient } from "expo-linear-gradient";
@@ -46,7 +51,10 @@ const C = {
   gray1: "#C8C8CC",
   gray2: "#8A8A90",
   gray3: "#56565C",
+  red: "#FF3B5C",
 };
+
+type ErrorField = "origin" | "destination" | "depart" | "return";
 
 const DATE_LOCALES: Record<string, DateLocale> = {
   en: enUS,
@@ -123,6 +131,16 @@ export function SearchHero({ mode }: Props) {
   const [extraOpt, setExtraOpt] = useState(0);
   const [pickerField, setPickerField] = useState<"from" | "to" | null>(null);
   const [dateField, setDateField] = useState<"depart" | "return" | null>(null);
+  // Welche Felder beim letzten Submit fehlerhaft waren → rote Border. Wird
+  // sobald der User das jeweilige Feld ausfüllt automatisch geleert.
+  const [errors, setErrors] = useState<Set<ErrorField>>(() => new Set());
+  const clearError = (field: ErrorField) =>
+    setErrors((prev) => {
+      if (!prev.has(field)) return prev;
+      const next = new Set(prev);
+      next.delete(field);
+      return next;
+    });
 
   const Icon = MODE_ICON[mode];
   const tripTypes = useMemo(() => tripTypesFor(mode), [mode]);
@@ -138,42 +156,79 @@ export function SearchHero({ mode }: Props) {
   const extraLabel = t(`search.extraLabel.${modeKey}`);
   const heroTitle = t(`search.title.${modeKey}`);
 
+  // Visuelles Feedback beim Tausch: das Icon rotiert um 180° pro Klick.
+  // Kumulativ (180, 360, 540...), damit jeder Tap eine sichtbare halbe Drehung
+  // liefert, statt immer auf 180° zu springen.
+  const swapRotation = useSharedValue(0);
+  const swapIconStyle = useAnimatedStyle(() => ({
+    transform: [{ rotate: `${swapRotation.value}deg` }],
+  }));
   function handleSwap() {
     haptic("button");
     setOrigin(destination);
     setDestination(origin);
+    swapRotation.value = withTiming(swapRotation.value + 180, {
+      duration: 320,
+      easing: Easing.out(Easing.cubic),
+    });
   }
 
   function onPickerSelect(loc: Location) {
-    if (pickerField === "from") setOrigin(loc);
-    else if (pickerField === "to") setDestination(loc);
+    if (pickerField === "from") {
+      setOrigin(loc);
+      clearError("origin");
+    } else if (pickerField === "to") {
+      setDestination(loc);
+      clearError("destination");
+    }
   }
 
   function onDateChange(_: DateTimePickerEvent, picked?: Date) {
     if (Platform.OS === "android") setDateField(null);
     if (!picked) return;
-    if (dateField === "depart") setDepartDate(picked);
-    else if (dateField === "return") setReturnDate(picked);
+    if (dateField === "depart") {
+      setDepartDate(picked);
+      clearError("depart");
+      // Rückreise vor neuem Hin-Datum → invalid, also reset. User muss bewusst
+      // neu wählen, damit die Pille nicht heimlich auf einen Tag wandert den
+      // er nicht gemeint hat.
+      if (returnDate && returnDate < picked) setReturnDate(null);
+    } else if (dateField === "return") {
+      setReturnDate(picked);
+      clearError("return");
+    }
   }
 
   function handleSubmit() {
-    if (!origin || !destination || !departDate) {
+    // Fehlende/ungültige Felder einsammeln und rot umrandet markieren.
+    const missing = new Set<ErrorField>();
+    if (!origin) missing.add("origin");
+    if (!destination) missing.add("destination");
+    if (!departDate) missing.add("depart");
+    if (isRoundtrip && !returnDate) missing.add("return");
+    if (missing.size > 0 || !origin || !destination || !departDate) {
+      // Visuelles Feedback via roter Border auf den fehlenden Feldern reicht —
+      // ein zusätzlicher Alert würde den User unnötig unterbrechen.
+      setErrors(missing);
       haptic("error");
-      showAlert(t("search.missingdata.title"), t("search.missingdata.body"));
       return;
     }
+    setErrors(new Set());
     haptic("important");
     const departIso = format(departDate, "yyyy-MM-dd");
+    const returnIso = isRoundtrip && returnDate ? format(returnDate, "yyyy-MM-dd") : "";
     addRecentSearch({
       mode,
       origin: { code: origin.code, label: origin.label },
       destination: { code: destination.code, label: destination.label },
       departDate: departIso,
+      returnDate: returnIso || undefined,
+      tripType,
       passengers: pax,
       currency,
     });
     closeSearchOverlay();
-    const returnIso = isRoundtrip && returnDate ? format(returnDate, "yyyy-MM-dd") : "";
+    const travelClass = extraOpts[extraOpt] ?? "";
     router.push({
       pathname: "/search/results",
       params: {
@@ -187,6 +242,7 @@ export function SearchHero({ mode }: Props) {
         tripType,
         passengers: String(pax),
         currency,
+        travelClass,
       },
     });
   }
@@ -207,7 +263,7 @@ export function SearchHero({ mode }: Props) {
           pointerEvents="none"
         />
 
-        <View style={[styles.logoWrap, { top: insets.top + 10 }]} pointerEvents="none">
+        <View style={[styles.logoWrap, { top: insets.top + 16 }]} pointerEvents="none">
           <Text style={styles.logo}>
             B<Text style={styles.logoAccent}>i</Text>nch
           </Text>
@@ -262,7 +318,7 @@ export function SearchHero({ mode }: Props) {
 
         <View style={styles.fromToRow}>
           <RippleTouch
-            style={[styles.fieldBox, styles.flex1]}
+            style={[styles.fieldBox, styles.flex1, errors.has("origin") && styles.fieldBoxError]}
             onPress={() => {
               haptic("button");
               setPickerField("from");
@@ -275,12 +331,14 @@ export function SearchHero({ mode }: Props) {
             <Text style={styles.fieldMeta}>{fromPlaceholder}</Text>
           </RippleTouch>
 
-          <RippleTouch onPress={handleSwap} borderless style={styles.swapBtn}>
-            <ArrowLeftRight size={20} color={C.green} />
+          <RippleTouch onPress={handleSwap} style={styles.swapBtn}>
+            <Animated.View style={swapIconStyle}>
+              <ArrowLeftRight size={20} color={C.green} />
+            </Animated.View>
           </RippleTouch>
 
           <RippleTouch
-            style={[styles.fieldBox, styles.flex1]}
+            style={[styles.fieldBox, styles.flex1, errors.has("destination") && styles.fieldBoxError]}
             onPress={() => {
               haptic("button");
               setPickerField("to");
@@ -296,7 +354,7 @@ export function SearchHero({ mode }: Props) {
 
         <View style={styles.dateRow}>
           <RippleTouch
-            style={[styles.fieldBox, styles.flex1]}
+            style={[styles.fieldBox, styles.flex1, errors.has("depart") && styles.fieldBoxError]}
             onPress={() => {
               haptic("button");
               setDateField("depart");
@@ -310,7 +368,7 @@ export function SearchHero({ mode }: Props) {
 
           {isRoundtrip ? (
             <RippleTouch
-              style={[styles.fieldBox, styles.flex1]}
+              style={[styles.fieldBox, styles.flex1, errors.has("return") && styles.fieldBoxError]}
               onPress={() => {
                 haptic("button");
                 setDateField("return");
@@ -397,10 +455,15 @@ export function SearchHero({ mode }: Props) {
 
       {dateField !== null ? (
         <DateTimePicker
-          value={(dateField === "depart" ? departDate : returnDate) ?? new Date()}
+          value={(dateField === "depart" ? departDate : returnDate) ?? departDate ?? new Date()}
           mode="date"
           display={Platform.OS === "ios" ? "inline" : "default"}
-          minimumDate={new Date()}
+          // Rückreise-Picker: nicht vor Hin-Datum erlauben. Tage davor grayed out.
+          minimumDate={
+            dateField === "return" && departDate
+              ? departDate
+              : new Date()
+          }
           onChange={onDateChange}
           themeVariant="dark"
         />
@@ -416,8 +479,13 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: C.bg },
 
   hero: { height: 310, justifyContent: "flex-end" },
-  logoWrap: { position: "absolute", left: 20, zIndex: 2 },
-  logo: { fontSize: 26, fontWeight: "800", letterSpacing: -0.8, color: C.white },
+  // Position + Typo identisch zur Header-Logo in app/(tabs)/index.tsx:
+  // left=22, fontWeight=900 (Fett), letterSpacing=-0.6. Top wird via
+  // insets.top + 16 inline gesetzt damit die Position auch ohne SafeAreaView
+  // korrekt unter der StatusBar sitzt — identisch zur Landingpage
+  // (scroll-paddingTop = insets.top + 8, plus Header-paddingTop = 8).
+  logoWrap: { position: "absolute", left: 22, zIndex: 2 },
+  logo: { fontSize: 26, fontWeight: "900", letterSpacing: -0.6, color: C.white },
   logoAccent: { color: "#7FEA4D" },
   heroBottom: { paddingHorizontal: 20, paddingBottom: 20 },
   titleRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
@@ -459,7 +527,16 @@ const styles = StyleSheet.create({
     alignSelf: "center",
   },
 
-  fieldBox: { backgroundColor: C.surface1, borderRadius: 16, padding: 14 },
+  fieldBox: {
+    backgroundColor: C.surface1,
+    borderRadius: 16,
+    padding: 14,
+    // Default-Border transparent damit der rote Error-State keinen Layout-
+    // Shift verursacht (Box behält identische Größe).
+    borderWidth: 1,
+    borderColor: "transparent",
+  },
+  fieldBoxError: { borderColor: C.red },
   flex1: { flex: 1 },
   fieldLabel: {
     fontSize: 11,

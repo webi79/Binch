@@ -16,17 +16,90 @@ services:
       timeout: 3s
       retries: 10
 
-  # Self-hosted db-rest — kostenloser HAFAS-Wrapper für DB-Bahnverkehr.
-  # Source: https://github.com/derhuerst/db-rest
-  # Endpoints: /stations, /journeys, /locations, /stops/...
-  # Kein API-Key, kein Auth, kein Quota.
+  # Self-hosted db-vendo-client — Nachfolger von derhuerst/db-rest.
+  # DB hat 2025/26 die alte HAFAS-API (app.vendo.noncd.db.de) abgeschaltet, der
+  # db-vendo-client redet stattdessen mit dem neuen "vendo/movas"-Backend von
+  # bahn.de / DB Navigator. Gleiche hafas-rest-api-Foundation → REST-Routen
+  # (/stops/:id/departures, /locations/nearby) sind drop-in kompatibel.
+  # Source: https://github.com/public-transport/db-vendo-client
+  # Quota: 60 req/min pro IPv4 (dbnav-Profil) — unser 60s-Cache + Coalescing
+  # in stopInfoService halten uns weit drunter.
   dbrest:
-    image: derhuerst/db-rest:6
+    image: ghcr.io/public-transport/db-vendo-client:latest
     restart: unless-stopped
     ports:
       - "3001:3000"
     environment:
       PORT: "3000"
+      DB_PROFILE: "dbnav"
+      USER_AGENT: "binch-mobile/0.1"
+
+  # Backend-Server selbst als Container — vereint Restart-Logik (Docker
+  # `restart: unless-stopped`) mit dem Rest des Stacks. Crash → Docker
+  # startet automatisch neu. Reboot → Docker-Daemon startet beim Boot,
+  # zieht alle Container hoch.
+  binch-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      dbrest:
+        condition: service_started
+    # `.env` enthält alle Standard-Secrets (RAPIDAPI_KEY, JWT_SECRET, ...).
+    # Hostnamen-spezifische Werte werden unten in `environment:` überschrieben,
+    # da die in-Container-Hostnamen nicht localhost sind sondern die Service-
+    # Namen aus dem Docker-Network.
+    env_file: .env
+    environment:
+      # DB ist im Docker-Network unter dem Hostname `db` erreichbar — NICHT
+      # localhost (das wäre der Container selbst).
+      DATABASE_URL: postgres://binch:binch@db:5432/binch
+      # db-vendo läuft intern auf Port 3000 (nicht 3001 wie extern gemapped).
+      DBREST_BASE_URL: http://dbrest:3000
+      NODE_ENV: production
+      HOST: "0.0.0.0"
+    # Memory-Cap als Schutz vor schleichenden Leaks. Wenn der Server
+    # diese Grenze überschreitet, killt Docker den Container → `restart:
+    # unless-stopped` startet ihn neu. `mem_limit` ist die Standalone-
+    # Compose-Syntax (`deploy.resources.limits` wäre Swarm-only).
+    mem_limit: 1g
+
+  # Periodischer GTFS-Schedule-Refresh — re-importiert alle Feeds aus
+  # `scripts/gtfs-feeds.conf` (NL/BE/CZ/GB, FR ist aktuell auf inactive).
+  # Läuft als Sidecar im selben Image wie `binch-server` (hat tsx + scripts
+  # + curl/unzip dabei). Endlos-Loop mit `sleep 604800` = 1 Woche.
+  #
+  # Wenn der Loop crashed (z.B. ein einzelner Feed-Download 500's), restart-
+  # unless-stopped bringt's wieder hoch. import-gtfs-feed.sh purged pro
+  # feed_id und re-inserts atomar — DB wächst nicht mit jeder Iteration.
+  # VACUUM ANALYZE läuft am Ende jedes Refresh-Zyklus → kein Bloat.
+  gtfs-refresh:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://binch:binch@db:5432/binch
+      NODE_ENV: production
+    # ./scripts ist im Image gebaked, aber wir cd'en explizit damit die
+    # Pfade relativ stimmen. `|| true` damit ein einzelner Failure nicht
+    # die ganze Loop kippt.
+    command: ["sh", "-c", "cd /app && while true; do ./scripts/refresh-all-feeds.sh || true; echo 'Next refresh in 7 days…'; sleep 604800; done"]
+    # Memory-Limit höher als binch-server weil GTFS-Imports mehrere Millionen
+    # Rows in Batches laden — Node-Heap kann temporär 1-2 GB ziehen.
+    mem_limit: 2g
 
 volumes:
-  binch-db:
+  # `{}` = leeres Volume-Objekt mit Docker-Defaults (driver: local). Funktional
+  # identisch zum bloßen `binch-db:` ohne Wert, aber strikte YAML-Schema-Linter
+  # bemängeln den null-Wert. Mit explizitem `{}` ist die Warnung weg.
+  binch-db: {}

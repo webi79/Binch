@@ -1,4 +1,7 @@
+import { eq, sql } from "drizzle-orm";
 import { config } from "../../config.js";
+import { db } from "../../db/client.js";
+import { locations } from "../../db/schema.js";
 import type {
   SearchProvider,
   ProviderSearchInput,
@@ -28,6 +31,7 @@ interface DbStation {
 interface DbStop {
   id?: string;
   name?: string;
+  location?: { latitude?: number; longitude?: number };
 }
 
 interface DbLine {
@@ -118,31 +122,153 @@ export const dbVendoProvider: SearchProvider = {
       };
     }
 
-    const url = new URL(`${config.DBREST_BASE_URL}/journeys`);
-    url.searchParams.set("from", fromId);
-    url.searchParams.set("to", toId);
-    url.searchParams.set("departure", `${input.departDate}T08:00`);
-    url.searchParams.set("results", "8");
-    url.searchParams.set("language", "de");
-    url.searchParams.set("stopovers", "true");
+    // Hin- und (falls returnDate gesetzt) Rückfahrt parallel suchen.
+    // db-rest hat keinen Round-Trip-Endpoint — wir machen zwei /journeys-
+    // Calls und liefern beide Listen mit `direction`-Marker an den Client
+    // zurück. Pairing-Logik (cheapest/fastest/direct) macht der Client je
+    // nach aktivem Sort-Tab — nicht der Server, der das Sort-Kriterium nicht
+    // kennt.
+    // Pagination („Später"): wenn ein Token vom Client mitkommt, geht's an
+    // den Provider statt der Standard-Initial-Zeit. Hin-Pagination ONLY —
+    // Rückfahrt bleibt der gleiche initial Call (kein Pagination-State
+    // dafür gerechtfertigt, Rückfahrten zeigt der Client meist nur 1-2x).
+    // `departTime` (vom Surroundings-Departure-Tap) verschiebt das Suchfenster
+    // auf den konkreten Ziel-Zeitpunkt — ohne das würde HAFAS bei einem Klick
+    // auf einen Zug 4h in der Zukunft womöglich nur Verbindungen ab "jetzt"
+    // liefern (10er-Limit), und der Ziel-Zug wäre nicht in den Results.
+    const outboundPromise = fetchJourneys(
+      fromId,
+      toId,
+      input.departDate,
+      signal,
+      input.paginationToken,
+      input.departTime,
+    );
+    const returnPromise = input.returnDate
+      ? fetchJourneys(toId, fromId, input.returnDate, signal)
+      : Promise.resolve(null);
 
-    const res = await fetch(url, { headers: { Accept: "application/json" }, signal });
-    const statusCode = res.status;
-    const raw = (await res.json().catch(() => null)) as unknown;
+    const [outbound, returnLeg] = await Promise.all([outboundPromise, returnPromise]);
     const durationMs = Date.now() - start;
 
-    if (!res.ok || !raw) {
-      return { results: [], raw, statusCode, durationMs };
+    if (!outbound.ok) {
+      return {
+        results: [],
+        raw: outbound.raw,
+        statusCode: outbound.statusCode,
+        durationMs,
+      };
     }
 
+    const outboundResults: NormalizedResult[] = parseJourneys(outbound.raw, input).map(
+      (r) => ({ ...r, direction: "OUTBOUND" as const }),
+    );
+
+    let returnResults: NormalizedResult[] = [];
+    if (returnLeg?.ok) {
+      returnResults = parseJourneys(returnLeg.raw, {
+        ...input,
+        origin: input.destination,
+        destination: input.origin,
+        originLabel: input.destLabel,
+        destLabel: input.originLabel,
+      }).map((r) => ({ ...r, direction: "RETURN" as const }));
+    }
+
+    // HAFAS-laterRef aus der OUTBOUND-Antwort rausziehen — den brauchen wir
+    // für den „Später"-Knopf im Result-Screen. Bei Round-Trips nutzen wir
+    // weiterhin den Outbound-laterRef (Pagination immer auf Hinrichtung).
+    const outboundRaw = outbound.raw as { laterRef?: string } | null;
+    const paginationToken = outboundRaw?.laterRef;
+
     return {
-      results: parseJourneys(raw, input),
-      raw,
-      statusCode,
+      results: [...outboundResults, ...returnResults],
+      raw: returnLeg
+        ? { outbound: outbound.raw, return: returnLeg.raw }
+        : outbound.raw,
+      statusCode: outbound.statusCode,
       durationMs,
+      paginationToken,
     };
   },
 };
+
+interface JourneyFetch {
+  ok: boolean;
+  raw: unknown;
+  statusCode: number;
+}
+
+/** Heutiges Datum (Europe/Berlin) im ISO-Format `YYYY-MM-DD`. */
+function todayInBerlin(): string {
+  return new Intl.DateTimeFormat("sv-SE", { timeZone: "Europe/Berlin" }).format(new Date());
+}
+
+/** Aktuelle Berlin-Zeit auf die nächst-untere 5-Min-Marke abgerundet (z.B.
+ *  15:36 → "15:35", 15:34 → "15:30"). Damit kriegt der User auf seine „jetzt
+ *  los"-Such auch Verbindungen die wenige Minuten in der Vergangenheit
+ *  losgefahren sind (nützlich am Bahnsteig). */
+function nowFloor5MinBerlin(): string {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Berlin",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+  const h = parts.find((p) => p.type === "hour")?.value ?? "08";
+  const m = Number(parts.find((p) => p.type === "minute")?.value ?? "0");
+  const floored = Math.floor(m / 5) * 5;
+  return `${h}:${String(floored).padStart(2, "0")}`;
+}
+
+/** Wählt die Start-Uhrzeit für die initiale Such-Anfrage. Bei „heute" snappen
+ *  wir auf den aktuellen 5-Min-Floor — damit fängt der User auf eine ad-hoc-
+ *  Anfrage die nächsten echten Verbindungen ab. An zukünftigen Tagen starten
+ *  wir bei 05:00, was die frühen Pendlerzüge mitnimmt. */
+function initialDepartureTime(date: string): string {
+  return date === todayInBerlin() ? nowFloor5MinBerlin() : "05:00";
+}
+
+async function fetchJourneys(
+  fromId: string,
+  toId: string,
+  date: string,
+  signal?: AbortSignal,
+  laterRef?: string,
+  targetDepartTime?: string,
+): Promise<JourneyFetch> {
+  // EIN Call — entweder neue Suche ab Zeit-Floor, oder Folge-Seite per
+  // HAFAS-`laterThan`. Pagination („gesamter Tag") explizit user-getriggered
+  // via separatem Endpoint (search.ts route) — kein eager loop hier, sonst
+  // würde ein einzelner Such-Klick 5 User-Slots verbrennen.
+  const url = new URL(`${config.DBREST_BASE_URL}/journeys`);
+  url.searchParams.set("from", fromId);
+  url.searchParams.set("to", toId);
+  if (laterRef) {
+    url.searchParams.set("laterThan", laterRef);
+  } else if (targetDepartTime) {
+    // Ziel-Zeit-Targeting: HAFAS wünscht das `departure`-Feld als ISO. Wir
+    // setzen es leicht VOR die Ziel-Zeit (-5 Min Floor), damit der Ziel-Zug
+    // mit höherer Wahrscheinlichkeit IN den 10 Result-Slots landet. Ohne
+    // diesen Offset hätten wir bei punktgenauer Zeit das Risiko, dass HAFAS
+    // den Zug knapp davor noch reinpackt und unseren rauskickt.
+    const targetMs = Date.parse(targetDepartTime);
+    if (Number.isFinite(targetMs)) {
+      url.searchParams.set("departure", new Date(targetMs - 5 * 60_000).toISOString());
+    } else {
+      url.searchParams.set("departure", `${date}T${initialDepartureTime(date)}`);
+    }
+  } else {
+    url.searchParams.set("departure", `${date}T${initialDepartureTime(date)}`);
+  }
+  url.searchParams.set("results", "10");
+  url.searchParams.set("language", "de");
+  url.searchParams.set("stopovers", "true");
+
+  const res = await fetch(url, { headers: { Accept: "application/json" }, signal });
+  const raw = (await res.json().catch(() => null)) as unknown;
+  return { ok: res.ok && raw !== null, raw, statusCode: res.status };
+}
 
 async function resolveStationId(
   code: string,
@@ -156,22 +282,83 @@ async function resolveStationId(
   const dbrestMatch = code.match(/^dbrest:(\d+)$/);
   if (dbrestMatch && dbrestMatch[1]) return dbrestMatch[1];
 
+  // StaDa-Import speichert direkt die UIC (= HAFAS-ID) im Code: "sta:8011160"
+  // → kein Live-Lookup nötig, einfach Suffix verwenden.
+  const stadaMatch = code.match(/^sta:(\d{7})$/);
+  if (stadaMatch && stadaMatch[1]) return stadaMatch[1];
+
+  // GTFS-Import: einige Stop-IDs sind direkt UIC-konform (7-stellig).
+  // Manche haben aber Hyphen-Format wie "de:01:5100:1:1" — in dem Fall haben
+  // wir hafas_id beim Import in der DB gespeichert. DB-Lookup statt Live-Call.
+  if (code.startsWith("gtfs:")) {
+    const dbHit = await db
+      .select({ hafasId: locations.hafasId })
+      .from(locations)
+      .where(eq(locations.code, code))
+      .limit(1);
+    if (dbHit[0]?.hafasId) return dbHit[0].hafasId;
+    // Kein hafas_id beim Import → fällt durch zum Live-Lookup via Name.
+  }
+
+  // OSM-Stop: hat selber keine hafas_id, aber wir finden eine via Coord-Match
+  // auf einen nahgelegenen StaDa-Stop. Damit kennt HAFAS den Ort und Routing
+  // klappt. Verhindert dass „Wien Hauptbahnhof (OSM)" auf einen entfernten
+  // Stop wie „Inzersdorf Wien Blumental" gemapped wird via Label-Lookup.
+  if (code.startsWith("osm:")) {
+    const dbHit = await db
+      .select({
+        latitude: locations.latitude,
+        longitude: locations.longitude,
+      })
+      .from(locations)
+      .where(eq(locations.code, code))
+      .limit(1);
+    const row = dbHit[0];
+    if (row?.latitude && row?.longitude) {
+      const lat = Number(row.latitude);
+      const lon = Number(row.longitude);
+      // Bbox-Filter ~200m, dann sortieren nach Distanz und nächsten StaDa-Stop
+      // mit hafas_id nehmen.
+      const dLat = 0.0018;
+      const dLon = 0.0018 / Math.cos((lat * Math.PI) / 180);
+      const nearest = await db.execute(sql`
+        SELECT hafas_id FROM locations
+        WHERE hafas_id IS NOT NULL
+          AND latitude::float BETWEEN ${lat - dLat} AND ${lat + dLat}
+          AND longitude::float BETWEEN ${lon - dLon} AND ${lon + dLon}
+        ORDER BY (latitude::float - ${lat}) * (latitude::float - ${lat})
+               + (longitude::float - ${lon}) * (longitude::float - ${lon})
+        LIMIT 1
+      `);
+      const rows = (nearest as unknown as { rows: Array<{ hafas_id: string }> }).rows ?? [];
+      if (rows[0]?.hafas_id) return rows[0].hafas_id;
+    }
+  }
+
   const candidates = [label, code].filter((x): x is string => typeof x === "string" && x.length > 0);
   for (const candidate of candidates) {
     const key = candidate.toLowerCase();
     const cached = stationCache.get(key);
     if (cached) return cached;
 
-    const url = new URL(`${config.DBREST_BASE_URL}/stations`);
+    // /locations (HAFAS) statt /stations (nur DE-Stationsdaten) — auf diese Art
+    // werden auch internationale Bahnhöfe wie Amsterdam Centraal, Paris Gare
+    // du Nord, Wien Hbf etc. gefunden.
+    const url = new URL(`${config.DBREST_BASE_URL}/locations`);
     url.searchParams.set("query", candidate);
-    url.searchParams.set("limit", "5");
+    url.searchParams.set("results", "5");
+    url.searchParams.set("stops", "true");
+    url.searchParams.set("addresses", "false");
+    url.searchParams.set("poi", "false");
 
     const res = await fetch(url, { headers: { Accept: "application/json" }, signal });
     if (!res.ok) continue;
     const data = (await res.json().catch(() => null)) as Record<string, DbStation> | DbStation[] | null;
     if (!data) continue;
     const list: DbStation[] = Array.isArray(data) ? data : Object.values(data);
-    const first = list[0];
+    // Nur echte Bahnhöfe — 7-stellige UIC-ID (z.B. 8000584). HAFAS liefert
+    // sonst auch Bushaltestellen (6-stellig, z.B. 821676 „Anrath Bahnhof").
+    const first = list.find((s) => typeof s?.id === "string" && /^\d{7}$/.test(s.id));
     if (first?.id) {
       stationCache.set(key, first.id);
       return first.id;
@@ -239,6 +426,10 @@ function parseJourneys(raw: unknown, input: ProviderSearchInput): NormalizedResu
         destination: seg.destination?.id ?? "",
         originLabel: seg.origin?.name,
         destLabel: seg.destination?.name,
+        originLat: seg.origin?.location?.latitude,
+        originLng: seg.origin?.location?.longitude,
+        destLat: seg.destination?.location?.latitude,
+        destLng: seg.destination?.location?.longitude,
         departTime: segDep,
         arriveTime: segArr,
         durationMinutes: segDuration,
@@ -250,6 +441,7 @@ function parseJourneys(raw: unknown, input: ProviderSearchInput): NormalizedResu
         direction: seg.direction,
         stops: stopovers.length,
         stopovers: stopovers.length > 0 ? stopovers : undefined,
+        tripId: seg.tripId,
       });
     }
 
@@ -257,7 +449,12 @@ function parseJourneys(raw: unknown, input: ProviderSearchInput): NormalizedResu
     // (VRR/VRS/MVV usw. werden nicht über DB-Tarif gebucht). Wir zeigen sie
     // trotzdem mit price=0 — UI rendert dann "Tarif beim Anbieter".
     const rawPrice = journey.price?.amount;
-    const priceNum = typeof rawPrice === "number" && rawPrice > 0 ? rawPrice : 0;
+    const perPaxPrice = typeof rawPrice === "number" && rawPrice > 0 ? rawPrice : 0;
+    // db-rest /journeys liefert den Preis pro Person — HAFAS hat keinen
+    // passengers-Param, der die Suche selbst beeinflusst. Damit `passengers`
+    // im UI nicht ignoriert wirkt, skalieren wir den Gesamtpreis hier.
+    const pax = Math.max(1, input.passengers ?? 1);
+    const priceNum = perPaxPrice > 0 ? Math.round(perPaxPrice * pax * 100) / 100 : 0;
 
     const operatedBy =
       first.line?.operator?.name ??
@@ -291,6 +488,7 @@ function parseJourneys(raw: unknown, input: ProviderSearchInput): NormalizedResu
         // weitergeben — UTC-ISO würde die Stunden um den DST-Offset
         // verschieben und bahn.de auf die falsche Zeit scrollen lassen.
         first.plannedDeparture ?? first.departure ?? departIso,
+        input.passengers,
       ),
       flightNumber: first.line?.fahrtNr ?? first.line?.name,
       operatedBy,
@@ -342,6 +540,7 @@ function buildBahnDeeplink(
   toId: string | undefined,
   toName: string | undefined,
   departureLocal: string,
+  passengers: number,
 ): string {
   const soid =
     fromId && fromName
@@ -353,6 +552,11 @@ function buildBahnDeeplink(
       : encodeURIComponent(toName ?? "");
   const m = departureLocal.match(/(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})/);
   const hd = m ? `${m[1]}T${m[2]}:${m[3]}:00` : `${departureLocal.slice(0, 10)}T08:00:00`;
-  const fragment = `soid=${soid}&zoid=${zoid}&hd=${hd}&kl=2`;
+  // bahn.de Reisende-Format: `r=<ageFrom>:<ageTo>:KLASSENLOS:<count>` für N
+  // Erwachsene ohne Bahncard. Mehrere Reisende werden über mehrere `r=`-
+  // Parameter ausgedrückt — eines pro Person (so verhält sich bahn.de selbst).
+  const pax = Math.max(1, Math.min(9, passengers));
+  const r = Array.from({ length: pax }, () => `r=13:16:KLASSENLOS:1`).join("&");
+  const fragment = `soid=${soid}&zoid=${zoid}&hd=${hd}&kl=2&${r}`;
   return `https://www.bahn.de/buchung/fahrplan/suche#${fragment}`;
 }

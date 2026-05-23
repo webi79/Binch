@@ -1,0 +1,1 @@
+ALTER TABLE "locations" ADD COLUMN "subtype" varchar(16);

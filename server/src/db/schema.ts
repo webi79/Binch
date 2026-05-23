@@ -90,6 +90,10 @@ export const searchResults = pgTable(
     price: numeric("price", { precision: 12, scale: 2 }).notNull(),
     currency: varchar("currency", { length: 8 }).notNull(),
     deepLink: text("deep_link").notNull(),
+    /** Provider-spezifischer Booking-Token (z.B. SerpAPI google_flights
+     *  `booking_token`) — wird beim Direct-Purchase-Flow benötigt. Persistieren
+     *  damit auch Cache-Hits den vollen Buchungs-Flow ermöglichen. */
+    bookingToken: text("booking_token"),
     flightNumber: varchar("flight_number", { length: 16 }),
     operatedBy: text("operated_by"),
     isRefundable: boolean("is_refundable"),
@@ -177,14 +181,239 @@ export const sessions = pgTable(
 export const locations = pgTable(
   "locations",
   {
-    code: varchar("code", { length: 16 }).primaryKey(),
+    /** Eindeutiger Code. Format hängt von der Quelle ab:
+     *  - IATA-Code (3 Buchstaben) für Flughäfen
+     *  - "PORT-XXX" für Häfen
+     *  - "sta:<uic>" für StaDa-Bahnhöfe (UIC 7-stellig = HAFAS-ID)
+     *  - "gtfs:<stop_id>" für GTFS-DE-Stops
+     *  Länge auf 64 hochgesetzt, da GTFS-IDs lang sein können (z.B. "de:01:5100:1:1"). */
+    code: varchar("code", { length: 64 }).primaryKey(),
     label: text("label").notNull(),
     city: text("city"),
     country: text("country"),
     type: varchar("type", { length: 16 }).notNull().$type<LocationType>(),
+    /** GPS-Koordinaten. Numeric mit Präzision 9 → ~1 m Genauigkeit. */
+    latitude: numeric("latitude", { precision: 9, scale: 6 }),
+    longitude: numeric("longitude", { precision: 9, scale: 6 }),
+    /** HAFAS-Station-ID (UIC 7-stellig). Wenn gesetzt → kann direkt für
+     *  /journeys-Trip-Search genutzt werden, keine Live-ID-Auflösung nötig.
+     *  Bei StaDa-Stationen aus dem DB-Netz immer gesetzt; bei GTFS-Stops nur,
+     *  wenn der GTFS-Stop-ID UIC-konform ist. */
+    hafasId: varchar("hafas_id", { length: 16 }),
+    /** Dominante Verkehrsart (häufigste Subtype-Kategorie an dem Stop),
+     *  abgeleitet aus GTFS route_type:
+     *    LONG_DISTANCE — Fernverkehr (ICE/IC/EC, TGV, AVE…)
+     *    REGIONAL      — Regionalbahn (RB/RE/IRE)
+     *    SUBURBAN      — S-Bahn / Commuter Rail
+     *    SUBWAY        — U-Bahn / Metro
+     *    TRAM          — Straßenbahn / Light Rail
+     *    BUS           — Stadtbus
+     *    COACH         — Fernbus
+     *    FERRY         — Fähre
+     *  Wird im Frontend für Sortier-Priorität benutzt. Für die Anzeige
+     *  selber zählt `kinds` (s.u.). Null bei Airports/Ports — die haben
+     *  einen eigenen Marker-Type. */
+    subtype: varchar("subtype", { length: 16 }),
+    /** Alle Modi die an diesem Stop verkehren (Kategorien). z.B. an
+     *  „Dortmund Barop Parkhaus" hält U-Bahn UND Bus → kinds=["subway","bus"].
+     *  Wird vom Frontend genutzt um eine Multi-Mode-Pille (mehrere Icons in
+     *  einer Box) zu rendern statt nur das dominante Icon. Sortiert nach
+     *  Häufigkeit absteigend. Werte:
+     *    train (= rail-like: long-distance/regional/suburban)
+     *    subway, tram, bus (= bus + coach), ferry */
+    kinds: text("kinds").array(),
+    /** Datenquelle — für Updates und Debugging. "stada", "gtfs", "iata", "port", "local". */
+    source: varchar("source", { length: 16 }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     type: index("idx_locations_type").on(t.type),
+    hafasIdIdx: index("idx_locations_hafas_id").on(t.hafasId),
+    // Beschleunigt ILIKE-Prefix-Suchen über Label und City beim Autocomplete.
+    labelIdx: index("idx_locations_label").on(t.label),
+    cityIdx: index("idx_locations_city").on(t.city),
+    // Composite-Index für Bounding-Box-Queries im Surroundings-Endpoint.
+    // Ohne diesen Index macht Postgres bei zoom 9-12 (80km Radius) einen
+    // Seq-Scan über ~400k Rows — der Surroundings-Call dauert dann mehrere
+    // Sekunden, Map-Marker flackern weil der Client mit Cache-Daten arbeitet.
+    geoIdx: index("idx_locations_geo").on(t.latitude, t.longitude),
+  }),
+);
+
+/**
+ * Städte aus GeoNames cities5000. Wird genutzt um Stops administrativ einer
+ * Stadt zuzuordnen (z.B. „Anrath Bahnhof" → city = „Willich"), damit der
+ * Autocomplete via ILIKE-Suche auf `locations.city` Stops auch über den
+ * Gemeindenamen findet.
+ */
+export const cities = pgTable(
+  "cities",
+  {
+    geonameId: integer("geoname_id").primaryKey(),
+    name: text("name").notNull(),
+    asciiName: text("ascii_name"),
+    country: text("country"),
+    latitude: numeric("latitude", { precision: 9, scale: 6 }).notNull(),
+    longitude: numeric("longitude", { precision: 9, scale: 6 }).notNull(),
+    population: integer("population"),
+    /** GeoNames feature_code (PPL, PPLA, PPLA2, PPLA3, PPLA4, PPLX, …).
+     *  - PPL    = populated place (generisch)
+     *  - PPLA*  = seat of an administrative division (PPLA = Landeshauptstadt,
+     *             PPLA2/3/4 = Hauptort des admin2/3/4-Gebiets, also Kreis-/
+     *             Gemeindesitz)
+     *  - PPLX   = Ortsteil (Section of populated place)
+     *  Wird genutzt um Ortsteile (PPLX) ihrer übergeordneten Gemeinde
+     *  (PPLA3/PPLA4 mit gleichem admin4-Code) zuzuordnen. */
+    featureCode: varchar("feature_code", { length: 16 }),
+    /** Hierarchische Admin-Codes (GeoNames):
+     *    admin1 = Bundesland/Region (z.B. NW für NRW)
+     *    admin2 = Regierungsbezirk
+     *    admin3 = Kreis
+     *    admin4 = Gemeinde/Kommune (Amtlicher Gemeindeschlüssel-Suffix)
+     *  Anrath (PPLX) und Willich (PPLA4) teilen denselben admin4 — darüber
+     *  ordnen wir den Ortsteil seiner Gemeinde zu. */
+    admin1: varchar("admin1", { length: 16 }),
+    admin2: varchar("admin2", { length: 32 }),
+    admin3: varchar("admin3", { length: 32 }),
+    admin4: varchar("admin4", { length: 32 }),
+  },
+  (t) => ({
+    nameIdx: index("idx_cities_name").on(t.name),
+    countryIdx: index("idx_cities_country").on(t.country),
+    // Schnelles Lookup „welche Stadt ist Hauptort des admin4-Gebiets X?"
+    adminIdx: index("idx_cities_admin").on(t.admin1, t.admin2, t.admin3, t.admin4),
+  }),
+);
+
+/**
+ * GTFS-Schedule-Tabellen — speichern planmäßige Fahrpläne pro Land/Feed.
+ *
+ * Wozu? Für Länder ohne funktionierendes HAFAS-Profile (NL/FR/IT/ES/CZ/etc.)
+ * können wir Live-Departures nicht über hafas-client holen. Stattdessen
+ * importieren wir die offiziellen GTFS-Schedule-Feeds (open data, kein Login)
+ * in diese Tabellen und beantworten Departure-Anfragen per SQL-JOIN.
+ *
+ * `feed_id` ist ein Diskriminator (z.B. "nl-ovapi", "fr-transport") damit
+ * mehrere Länder nebeneinander koexistieren ohne Konflikt. Re-Import eines
+ * Feeds soll alle alten Rows mit demselben feed_id löschen und neu schreiben.
+ *
+ * stop_id in den GTFS-Tabellen ist DER GTFS-ORIGINAL-STOP-ID (z.B.
+ * "stoparea:525388"), nicht unser `locations.code` mit `gtfs:nl:` Präfix.
+ * Beim Departure-Lookup wird das Präfix vom Code abgezogen.
+ */
+export const gtfsCalendar = pgTable(
+  "gtfs_calendar",
+  {
+    feedId: varchar("feed_id", { length: 32 }).notNull(),
+    serviceId: varchar("service_id", { length: 128 }).notNull(),
+    monday: boolean("monday").notNull().default(false),
+    tuesday: boolean("tuesday").notNull().default(false),
+    wednesday: boolean("wednesday").notNull().default(false),
+    thursday: boolean("thursday").notNull().default(false),
+    friday: boolean("friday").notNull().default(false),
+    saturday: boolean("saturday").notNull().default(false),
+    sunday: boolean("sunday").notNull().default(false),
+    startDate: date("start_date").notNull(),
+    endDate: date("end_date").notNull(),
+  },
+  (t) => ({
+    pk: index("gtfs_calendar_pk").on(t.feedId, t.serviceId),
+  }),
+);
+
+export const gtfsCalendarDates = pgTable(
+  "gtfs_calendar_dates",
+  {
+    feedId: varchar("feed_id", { length: 32 }).notNull(),
+    serviceId: varchar("service_id", { length: 128 }).notNull(),
+    date: date("date").notNull(),
+    /** 1 = service added on this date, 2 = service removed on this date. */
+    exceptionType: integer("exception_type").notNull(),
+  },
+  (t) => ({
+    lookup: index("gtfs_calendar_dates_lookup").on(t.feedId, t.serviceId, t.date),
+    byDate: index("gtfs_calendar_dates_date").on(t.feedId, t.date),
+  }),
+);
+
+export const gtfsRoutes = pgTable(
+  "gtfs_routes",
+  {
+    feedId: varchar("feed_id", { length: 32 }).notNull(),
+    routeId: varchar("route_id", { length: 128 }).notNull(),
+    agencyId: varchar("agency_id", { length: 64 }),
+    shortName: text("short_name"),
+    longName: text("long_name"),
+    /** GTFS route_type — 0=tram, 1=subway, 2=rail, 3=bus, 4=ferry, etc. */
+    type: integer("type").notNull().default(3),
+    color: varchar("color", { length: 8 }),
+    textColor: varchar("text_color", { length: 8 }),
+  },
+  (t) => ({
+    pk: index("gtfs_routes_pk").on(t.feedId, t.routeId),
+  }),
+);
+
+export const gtfsTrips = pgTable(
+  "gtfs_trips",
+  {
+    feedId: varchar("feed_id", { length: 32 }).notNull(),
+    tripId: varchar("trip_id", { length: 192 }).notNull(),
+    routeId: varchar("route_id", { length: 128 }).notNull(),
+    serviceId: varchar("service_id", { length: 128 }).notNull(),
+    headsign: text("headsign"),
+    directionId: integer("direction_id"),
+  },
+  (t) => ({
+    pk: index("gtfs_trips_pk").on(t.feedId, t.tripId),
+    byService: index("gtfs_trips_service").on(t.feedId, t.serviceId),
+    byRoute: index("gtfs_trips_route").on(t.feedId, t.routeId),
+  }),
+);
+
+/** GTFS-Stops — brauchen wir um Platform-IDs (in stop_times) auf
+ *  Parent-Stoparea-IDs (in unserer locations.code) zu mappen. NL z.B. nutzt
+ *  `stoparea:513745` als Gruppierungs-Code in locations, aber `3151931`/`3152315`
+ *  als einzelne Platform-IDs in stop_times. Eine Departure-Anfrage für die
+ *  Stoparea muss ALLE Platform-IDs mit-abdecken. */
+export const gtfsStops = pgTable(
+  "gtfs_stops",
+  {
+    feedId: varchar("feed_id", { length: 32 }).notNull(),
+    stopId: varchar("stop_id", { length: 128 }).notNull(),
+    parentStation: varchar("parent_station", { length: 128 }),
+    name: text("name"),
+    /** 0 = stop/platform, 1 = station, 2 = entrance/exit, ... */
+    locationType: integer("location_type").default(0),
+    /** Lat/Lon — brauchen wir um OSM-Stops (`osm:1234`) via Coord auf den
+     *  nächsten GTFS-Stop mappen zu können. Ohne Coords kein OSM-Fallback. */
+    latitude: numeric("latitude"),
+    longitude: numeric("longitude"),
+  },
+  (t) => ({
+    pk: index("gtfs_stops_pk").on(t.feedId, t.stopId),
+    byParent: index("gtfs_stops_parent").on(t.feedId, t.parentStation),
+    byGeo: index("gtfs_stops_geo").on(t.feedId, t.latitude, t.longitude),
+  }),
+);
+
+export const gtfsStopTimes = pgTable(
+  "gtfs_stop_times",
+  {
+    feedId: varchar("feed_id", { length: 32 }).notNull(),
+    tripId: varchar("trip_id", { length: 192 }).notNull(),
+    stopSequence: integer("stop_sequence").notNull(),
+    stopId: varchar("stop_id", { length: 128 }).notNull(),
+    /** Sekunden seit Mitternacht (kann >86400 sein für Trips nach 24:00). */
+    arrivalSeconds: integer("arrival_seconds").notNull(),
+    departureSeconds: integer("departure_seconds").notNull(),
+    /** 0=regular, 1=none, 2=must phone, 3=coordinate with driver. */
+    pickupType: integer("pickup_type").default(0),
+    dropOffType: integer("drop_off_type").default(0),
+  },
+  (t) => ({
+    pk: index("gtfs_stop_times_pk").on(t.feedId, t.tripId, t.stopSequence),
+    // Haupt-Index für Departure-Lookups: pro Stop + Zeit-Range scannen.
+    byStop: index("gtfs_stop_times_stop").on(t.feedId, t.stopId, t.departureSeconds),
   }),
 );

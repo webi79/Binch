@@ -35,14 +35,21 @@ const CARRIER_DOMAINS: Record<string, string> = {
   "cathay pacific": "cathaypacific.com",
 };
 
+// Logo-URLs gehen über wsrv.nl als Image-Proxy: Wikimedia blockt direkte
+// Hotlinks auf ihre Thumbnail-URLs (HTTP 400 ohne Referer-Header), und
+// React-Native Image rendert keine SVGs nativ. wsrv.nl löst beides — es
+// fetcht die Quelle mit korrekten Headern und liefert eine PNG-Konversion
+// in der gewünschten Größe. Stabiler Free-Service, dafür entworfen.
+// Clearbit Logo-API ist 2024 abgeschaltet worden → fliegt raus.
 const DB_LOGO_URLS = [
-  "https://upload.wikimedia.org/wikipedia/commons/thumb/2/24/Deutsche_Bahn_AG-Logo.svg/200px-Deutsche_Bahn_AG-Logo.svg.png",
-  "https://logo.clearbit.com/bahn.de",
+  "https://wsrv.nl/?url=upload.wikimedia.org%2Fwikipedia%2Fcommons%2Fd%2Fd5%2FDeutsche_Bahn_AG-Logo.svg&output=png&w=200",
+  "https://icons.duckduckgo.com/ip3/bahn.de.ico",
   "https://www.google.com/s2/favicons?domain=bahn.de&sz=128",
 ];
 
 const FLIXBUS_LOGO_URLS = [
-  "https://logo.clearbit.com/flixbus.com",
+  "https://wsrv.nl/?url=upload.wikimedia.org%2Fwikipedia%2Fcommons%2F7%2F79%2FFlixBus_Logo.png&output=png&w=200",
+  "https://icons.duckduckgo.com/ip3/flixbus.com.ico",
   "https://www.google.com/s2/favicons?domain=flixbus.com&sz=128",
 ];
 
@@ -57,9 +64,14 @@ export function airlineCode(flightNumber?: string): string | null {
 }
 
 export function logoUrls(result: SearchResult, carrier: string): string[] {
-  if (result.providerLogo) return [result.providerLogo];
+  // TRAIN/BUS: feste Brand-Logo-Liste hat Vorrang vor `providerLogo`. Der
+  // db-vendo-Provider setzt z.B. eine kleine Bahn-Favicon als providerLogo —
+  // die wäre auf der Card kaum sichtbar. DB_LOGO_URLS zieht stattdessen das
+  // hochauflösende Wikipedia-DB-Logo als ersten Kandidaten, gefolgt von
+  // Clearbit + Google-Favicons als Fallback wenn die erste URL down ist.
   if (result.mode === "TRAIN") return DB_LOGO_URLS;
   if (result.mode === "BUS") return FLIXBUS_LOGO_URLS;
+  if (result.providerLogo) return [result.providerLogo];
   if (result.mode === "FLIGHT") {
     const urls: string[] = [];
     const code = airlineCode(result.flightNumber);

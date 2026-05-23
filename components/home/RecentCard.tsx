@@ -70,6 +70,10 @@ export function RecentCard({ search, bordered = false }: { search: RecentSearch;
         originLabel: search.origin.label,
         destLabel: search.destination.label,
         departDate: search.departDate,
+        // Round-Trip-Kontext aus der History wieder mitnehmen — sonst fehlt
+        // im Results-Screen der Hin/Rück-Toggle.
+        ...(search.returnDate ? { returnDate: search.returnDate } : {}),
+        ...(search.tripType ? { tripType: search.tripType } : {}),
         passengers: String(search.passengers),
         currency: search.currency,
       },

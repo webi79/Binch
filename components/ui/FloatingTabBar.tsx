@@ -48,18 +48,51 @@ export function FloatingTabBar() {
   const activeIndex = TAB_ROUTES.findIndex((r) => r.key === activeTab);
 
   const slotWidth = screenWidth / TAB_ROUTES.length;
-  const circleX = useSharedValue(activeIndex * slotWidth + (slotWidth - CIRCLE_SIZE) / 2);
+  const targetX = (idx: number) => idx * slotWidth + (slotWidth - CIRCLE_SIZE) / 2;
 
+  // Kein Slide zwischen Tabs mehr — der Kreis "springt" sofort an die neue
+  // Position (translateX) und macht dort eine Pop-in-Animation: klein, von
+  // unten rein, mit kleinem Bounce am Ende.
+  const circleX = useSharedValue(targetX(activeIndex));
+  const entrance = useSharedValue(1); // 0 = klein & unten, 1 = at-rest
+
+  // Spring mit etwas Overshoot → das ist der kleine Bounce. Langsamer +
+  // weicher gedämpft als vorher: damping↑ reduziert das Spring-Hüpfen,
+  // stiffness↓ + mass↑ lassen den Pop-in gemächlicher ablaufen.
+  const ENTRANCE_SPRING = { damping: 16, stiffness: 95, mass: 0.7 } as const;
+
+  // Ref verhindert dass Press-Handler + useEffect-Sync zweimal feuern.
+  const animatedIndexRef = useRef<number>(activeIndex);
+
+  const playEntrance = (idx: number) => {
+    "worklet";
+    circleX.value = targetX(idx);
+    entrance.value = 0;
+    entrance.value = withSpring(1, ENTRANCE_SPRING);
+  };
+
+  // Sync-Pfad für externe Navigation (Deep-Link, Toast-Ansehen etc.).
   useEffect(() => {
-    circleX.value = withSpring(
-      activeIndex * slotWidth + (slotWidth - CIRCLE_SIZE) / 2,
-      { damping: 18, stiffness: 180, mass: 0.6 }
-    );
-  }, [activeIndex, slotWidth, circleX]);
+    if (animatedIndexRef.current === activeIndex) return;
+    animatedIndexRef.current = activeIndex;
+    playEntrance(activeIndex);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeIndex, slotWidth]);
 
-  const circleStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: circleX.value }],
-  }));
+  const circleStyle = useAnimatedStyle(() => {
+    // entrance kann durch Spring-Overshoot kurz über 1 gehen → genau der
+    // gewünschte kleine Bounce. translateY geht von 24 → 0 (mit kurzem
+    // Über-Schwung leicht ins Negative), scale von 0.3 → 1.
+    const e = entrance.value;
+    return {
+      opacity: e,
+      transform: [
+        { translateX: circleX.value },
+        { translateY: (1 - e) * 24 },
+        { scale: 0.3 + e * 0.7 },
+      ],
+    };
+  });
 
   return (
     <View pointerEvents="box-none" style={styles.wrap}>
@@ -76,6 +109,13 @@ export function FloatingTabBar() {
             <Pressable
               key={key}
               onPress={() => {
+                if (idx === animatedIndexRef.current) return;
+                // Pop-in läuft auf der UI-Thread via Reanimated `withSpring` —
+                // ist unabhängig vom JS-Thread und braucht KEIN raf-Defer.
+                // Navigation sofort feuern, sonst spürt der User die zusätzliche
+                // ~16 ms Latenz pro Tab-Wechsel ohne dass es der Animation hilft.
+                animatedIndexRef.current = idx;
+                playEntrance(idx);
                 haptic("button");
                 closeSearchOverlay();
                 router.navigate(path as never);

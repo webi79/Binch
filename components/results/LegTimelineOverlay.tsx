@@ -23,11 +23,14 @@ import Animated, {
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { format, parseISO } from "date-fns";
 import { de, enGB, es, fr } from "date-fns/locale";
-import { ChevronDown, ChevronUp, Footprints } from "lucide-react-native";
+import { ChevronDown, Footprints, Clock, CircleDot } from "lucide-react-native";
 import { useSearchStore } from "@/stores/searchStore";
 import { useT } from "@/lib/i18n/useT";
 import { LegInfo, SearchResult } from "@/types/search";
 
+// Farbpalette aus dem App-Theme — die hellere Lime aus dem Mockup ist bewusst
+// auf unsere Brand-Lime gedimmt (#7FEA4D), Card/Surface-Stufen matchen
+// DetailsOverlay damit die beiden Slides visuell zusammen wirken.
 const C = {
   bg: "#1A1A1A",
   sheet: "#1F1F20",
@@ -44,6 +47,13 @@ const C = {
 };
 
 const DATE_LOCALES = { en: enGB, de, fr, es } as const;
+
+// Timeline-Geometrie — alle Werte müssen synchron zueinander stimmen damit
+// die Rail-Linie exakt unter den Dot-Mitten liegt.
+const TIME_COL_W = 56;
+const DOT = 14;
+const GAP = 14;
+const SIDE_PAD = 20;
 
 function formatDuration(min: number): string {
   const h = Math.floor(min / 60);
@@ -130,7 +140,12 @@ function buildFallbackLegs(result: SearchResult): SyntheticLeg[] {
 
 export function LegTimelineOverlay() {
   const open = useSearchStore((s) => s.legTimelineOverlayOpen);
-  const result = useSearchStore((s) => s.selectedResult);
+  const selectedResult = useSearchStore((s) => s.selectedResult);
+  const directTripResult = useSearchStore((s) => s.directTripResult);
+  // Direct-Trip-Flow (Bus-Tap aus dem Stop-Sheet) hat Vorrang vor
+  // selectedResult — sonst würde der vorher gewählte Trip aus der Such-
+  // Liste die Timeline füllen statt der gerade getappten Bus-Abfahrt.
+  const result = directTripResult ?? selectedResult;
   if (!open || !result) return null;
   return <LegTimelineSheet result={result} />;
 }
@@ -175,9 +190,17 @@ function LegTimelineSheet({ result }: { result: SearchResult }) {
   const dateLocale = DATE_LOCALES[locale] ?? enGB;
   const legs = result.legs && result.legs.length > 0 ? result.legs : buildFallbackLegs(result);
 
-  const dateStr = (() => {
+  // Kompakter Stat-Format „Do, 21. Mai" — Wochentags-Abkürzung + Tag + Monat.
+  const summaryDateStr = (() => {
     try {
-      return format(parseISO(result.departTime), "EEEE, d MMMM", { locale: dateLocale });
+      return format(parseISO(result.departTime), "EEE, d. MMM", { locale: dateLocale });
+    } catch {
+      return "";
+    }
+  })();
+  const departTime = (() => {
+    try {
+      return format(parseISO(result.departTime), "HH:mm");
     } catch {
       return "";
     }
@@ -189,9 +212,10 @@ function LegTimelineSheet({ result }: { result: SearchResult }) {
       : result.stops === 1
       ? t("details.stop.one")
       : t("details.stop.many").replace("{count}", String(result.stops));
+  const stopsAccent = result.stops === 0 ? C.lime : C.amber;
 
   return (
-    <View style={StyleSheet.absoluteFillObject}>
+    <View style={[StyleSheet.absoluteFillObject, { zIndex: 300, elevation: 32 }]}>
       <Animated.View
         entering={FadeIn.duration(220)}
         exiting={FadeOut.duration(180)}
@@ -210,54 +234,107 @@ function LegTimelineSheet({ result }: { result: SearchResult }) {
           </View>
         </GestureDetector>
 
-        <View style={styles.headerRow}>
-          <View style={styles.dateBadge}>
-            <Text style={styles.dateBadgeText}>{dateStr}</Text>
-          </View>
-          <Text style={styles.headerMeta}>
-            {formatDuration(result.durationMinutes)}
-            {"  ·  "}
-            <Text style={result.stops === 0 ? { color: C.lime } : { color: C.amber }}>
-              {stopLabel}
-            </Text>
-          </Text>
+        {/* Stat-Box (Date | Departure | Stops). Symmetrische Anordnung:
+            Date linksbündig, Uhrzeit zentriert, Stops rechtsbündig — gleicher
+            Abstand vom linken wie vom rechten Rand. Keine Trenner-Dots, weil
+            sie die Symmetrie optisch brechen würden. */}
+        <View style={styles.summaryBox}>
+          <SummaryStat
+            label={t("details.summary.date")}
+            value={summaryDateStr}
+            align="start"
+          />
+          <SummaryStat
+            icon={<Clock size={14} color={C.text} strokeWidth={2} />}
+            label={t("details.summary.departure")}
+            value={departTime}
+            align="center"
+          />
+          <SummaryStat
+            icon={<CircleDot size={14} color={stopsAccent} strokeWidth={2} />}
+            label={t("details.summary.stops")}
+            value={stopLabel}
+            accentColor={stopsAccent}
+            align="end"
+          />
         </View>
 
         <ScrollView
           contentContainerStyle={styles.scrollContent}
           showsVerticalScrollIndicator={false}
         >
-          {legs.map((leg, idx) => {
-            const next = legs[idx + 1];
-            const isLast = idx === legs.length - 1;
-            const transferMin = next
-              ? Math.max(
-                  0,
-                  Math.round(
-                    (Date.parse(next.departTime) - Date.parse(leg.arriveTime)) / 60000,
-                  ),
-                )
-              : 0;
-            return (
-              <View key={`${leg.origin}-${idx}`}>
-                <StationRow
-                  time={timeOf(leg.departTime)}
-                  name={leg.originLabel ?? leg.origin}
-                  platform={leg.departPlatform}
-                />
-                <LegBodyRow leg={leg} />
-                <StationRow
-                  time={timeOf(leg.arriveTime)}
-                  name={leg.destLabel ?? leg.destination}
-                  platform={leg.arrivePlatform}
-                  hideTrailingLine={isLast}
-                />
-                {next ? <TransferBlock minutes={transferMin} /> : null}
-              </View>
-            );
-          })}
+          <View style={styles.timeline}>
+            {/* Vertical lime rail behind all dots — abs-positioned, exakt
+                ausgerichtet auf die Dot-Mitten via SIDE_PAD + TIME_COL_W + GAP + DOT/2 */}
+            <View style={styles.timeRail} pointerEvents="none" />
+
+            {legs.map((leg, idx) => {
+              const next = legs[idx + 1];
+              const isFirstLeg = idx === 0;
+              const isLastLeg = idx === legs.length - 1;
+              const transferMin = next
+                ? Math.max(
+                    0,
+                    Math.round(
+                      (Date.parse(next.departTime) - Date.parse(leg.arriveTime)) / 60000,
+                    ),
+                  )
+                : 0;
+              return (
+                <View key={`${leg.origin}-${idx}`}>
+                  <StationRow
+                    time={timeOf(leg.departTime)}
+                    name={leg.originLabel ?? leg.origin}
+                    platform={leg.departPlatform}
+                    terminal={isFirstLeg}
+                  />
+                  <TransportSegment leg={leg} />
+                  <StationRow
+                    time={timeOf(leg.arriveTime)}
+                    name={leg.destLabel ?? leg.destination}
+                    platform={leg.arrivePlatform}
+                    terminal={isLastLeg}
+                  />
+                  {next ? <TransferSegment minutes={transferMin} /> : null}
+                </View>
+              );
+            })}
+          </View>
         </ScrollView>
       </Animated.View>
+    </View>
+  );
+}
+
+function SummaryStat({
+  icon,
+  value,
+  label,
+  accentColor,
+  align,
+}: {
+  icon?: React.ReactNode;
+  value: string;
+  label: string;
+  accentColor?: string;
+  align: "start" | "center" | "end";
+}) {
+  const alignItems =
+    align === "start" ? "flex-start" : align === "end" ? "flex-end" : "center";
+  return (
+    <View style={[styles.summaryStat, { alignItems }]}>
+      <View style={styles.summaryValueRow}>
+        {icon}
+        <Text
+          style={[styles.summaryValue, accentColor ? { color: accentColor } : null]}
+          numberOfLines={1}
+        >
+          {value}
+        </Text>
+      </View>
+      <Text style={styles.summaryLabel} numberOfLines={1}>
+        {label}
+      </Text>
     </View>
   );
 }
@@ -266,140 +343,135 @@ function StationRow({
   time,
   name,
   platform,
-  hideTrailingLine,
+  terminal,
 }: {
   time: string;
   name: string;
   platform?: string;
-  hideTrailingLine?: boolean;
+  terminal?: boolean;
 }) {
   return (
-    <View style={styles.stationRow}>
-      <View style={styles.leftCol}>
-        <Text style={styles.stationTime}>{time}</Text>
-      </View>
-      <View style={styles.rail}>
-        <View style={styles.dot} />
-        {hideTrailingLine ? null : <View style={styles.railLineShort} />}
-      </View>
-      <View style={styles.stationHeader}>
+    <View style={styles.row}>
+      <Text style={styles.timeLabel}>{time}</Text>
+      <View style={[styles.dot, terminal && styles.dotTerminal]} />
+      <View style={styles.stationBody}>
         <Text style={styles.stationName} numberOfLines={1}>
           {name}
         </Text>
-        {platform ? (
-          <View style={styles.platformBadge}>
-            <Text style={styles.platformText}>Pl. {platform}</Text>
-          </View>
-        ) : null}
+        {platform ? <PlatformChip value={platform} /> : null}
       </View>
     </View>
   );
 }
 
-function LegBodyRow({ leg }: { leg: SyntheticLeg }) {
+function PlatformChip({ value }: { value: string }) {
   const t = useT();
-  const [expanded, setExpanded] = useState(false);
-  const lineLabel = leg.line ?? productLabel(leg.product) ?? "";
-  const lineBg = productColor(leg.product);
-  const stopsCount = leg.stops ?? 0;
-
   return (
-    <View style={styles.legBodyRow}>
-      <View style={styles.leftColCenter}>
-        <Text style={styles.leftColText} numberOfLines={1}>
-          {formatDuration(leg.durationMinutes)}
-        </Text>
-      </View>
-      <View style={styles.rail}>
-        <View style={styles.railLine} />
-      </View>
-      <View style={styles.legBody}>
-        {lineLabel ? (
-          <View style={styles.lineRow}>
-            <View style={[styles.lineBadge, { backgroundColor: lineBg }]}>
-              <Text style={styles.lineBadgeText}>{lineLabel}</Text>
-            </View>
-            {leg.fahrtNr && leg.fahrtNr !== leg.line ? (
-              <Text style={styles.fahrtNr}>({leg.fahrtNr})</Text>
-            ) : null}
-          </View>
-        ) : null}
-        {leg.direction ? (
-          <Text style={styles.direction}>
-            {t("details.direction")} {leg.direction}
-          </Text>
-        ) : null}
+    <View style={styles.platformChip}>
+      <Text style={styles.platformChipText}>{t("details.platform")} {value}</Text>
+    </View>
+  );
+}
 
-        {stopsCount > 0 ? (
-          <View>
-            <Pressable
-              onPress={() => setExpanded((v) => !v)}
-              style={styles.stopsToggle}
-              hitSlop={6}
-            >
-              {expanded ? (
-                <ChevronUp size={14} color={C.lime} strokeWidth={2.5} />
-              ) : (
-                <ChevronDown size={14} color={C.lime} strokeWidth={2.5} />
-              )}
-              <Text style={styles.stopsToggleText}>
-                {stopsCount === 1
-                  ? t("details.stop.one")
-                  : t("details.stop.many").replace("{count}", String(stopsCount))}
-              </Text>
-            </Pressable>
-            {expanded && leg.stopovers && leg.stopovers.length > 0 ? (
-              <View style={styles.stopoverList}>
-                {leg.stopovers.map((s, i) => {
-                  const stopTime = s.arrival
-                    ? timeOf(s.arrival)
-                    : s.departure
-                    ? timeOf(s.departure)
-                    : "";
-                  return (
-                    <View key={`${s.name}-${i}`} style={styles.stopoverRow}>
-                      <View style={styles.stopoverDot} />
-                      <Text style={styles.stopoverTime}>{stopTime}</Text>
-                      <Text style={styles.stopoverName} numberOfLines={1}>
-                        {s.name}
-                      </Text>
-                      {s.platform ? (
-                        <Text style={styles.stopoverPlatform}>Pl. {s.platform}</Text>
-                      ) : null}
-                    </View>
-                  );
-                })}
+function TransportSegment({ leg }: { leg: SyntheticLeg }) {
+  const t = useT();
+  const [open, setOpen] = useState(false);
+  const lineLabel = leg.line ?? productLabel(leg.product) ?? "";
+  const lineColor = productColor(leg.product);
+  const stops = leg.stops ?? 0;
+  const stopovers = leg.stopovers ?? [];
+  const destinationLabel = leg.direction ?? leg.destLabel ?? leg.destination;
+  return (
+    <View style={styles.segment}>
+      <View style={styles.timeCol}>
+        <Text style={styles.durationLabel}>{formatDuration(leg.durationMinutes)}</Text>
+      </View>
+      <View style={styles.dotSpacer} />
+      <View style={styles.segmentBody}>
+        <View style={styles.transportCard}>
+          <View style={styles.transportHeader}>
+            {lineLabel ? (
+              <View style={[styles.linePill, { backgroundColor: lineColor }]}>
+                <Text style={styles.linePillText}>{lineLabel}</Text>
               </View>
             ) : null}
+            {leg.fahrtNr && leg.fahrtNr !== leg.line ? (
+              <Text style={styles.codeText}>({leg.fahrtNr})</Text>
+            ) : null}
           </View>
-        ) : null}
-      </View>
-    </View>
-  );
-}
-
-function TransferBlock({ minutes }: { minutes: number }) {
-  const t = useT();
-  return (
-    <View style={styles.transferRow}>
-      <View style={styles.leftCol} />
-      <View style={styles.rail}>
-        <View style={styles.railDottedWrap}>
-          {Array.from({ length: 14 }).map((_, i) => (
-            <View key={i} style={styles.railDot} />
-          ))}
+          {destinationLabel ? (
+            <Text style={styles.destinationText}>
+              <Text style={{ color: C.sub }}>{t("details.toward")} </Text>
+              {destinationLabel}
+            </Text>
+          ) : null}
+          {stops > 0 ? (
+            <Pressable onPress={() => setOpen((v) => !v)} style={styles.stopsToggle} hitSlop={6}>
+              <View style={{ transform: [{ rotate: open ? "180deg" : "0deg" }] }}>
+                <ChevronDown size={13} color={C.lime} strokeWidth={2.5} />
+              </View>
+              <Text style={styles.stopsToggleText}>
+                {stops === 1
+                  ? t("details.stop.one")
+                  : t("details.stop.many").replace("{count}", String(stops))}
+              </Text>
+            </Pressable>
+          ) : null}
+          {open && stopovers.length > 0 ? (
+            <View style={styles.stopList}>
+              {stopovers.map((s, i) => (
+                <View key={`${s.name}-${i}`} style={styles.stopItem}>
+                  <View style={styles.stopBullet} />
+                  <Text style={styles.stopItemText} numberOfLines={1}>
+                    {s.name}
+                  </Text>
+                </View>
+              ))}
+            </View>
+          ) : null}
         </View>
       </View>
-      <View style={styles.transferContent}>
-        <Text style={styles.transferLabel}>{t("details.transfer")}</Text>
-        <Text style={styles.transferMin}>{formatDuration(minutes)}</Text>
-        <Footprints size={16} color={C.lime} strokeWidth={2.2} />
+    </View>
+  );
+}
+
+function TransferSegment({ minutes }: { minutes: number }) {
+  const t = useT();
+  return (
+    <View style={styles.segment}>
+      <View style={styles.timeCol} />
+      <View style={styles.dotSpacer}>
+        <DottedLine />
+      </View>
+      <View style={styles.segmentBody}>
+        <View style={styles.transferCard}>
+          <View style={styles.walkBadge}>
+            <Footprints size={16} color={C.lime} strokeWidth={2.2} />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.transferTitle}>{t("details.transfer")}</Text>
+            <Text style={styles.transferMeta}>
+              {formatDuration(minutes)} {t("details.transferwalk")}
+            </Text>
+          </View>
+        </View>
       </View>
     </View>
   );
 }
 
-const RAIL_WIDTH = 22;
+// Gepunktete vertikale Linie für den Transfer-Spacer — emuliert via gestapelte
+// 4px-Striche, weil borderStyle:dashed bei Container-Heights variabel rendert.
+function DottedLine() {
+  const dashes = Array.from({ length: 8 });
+  return (
+    <View style={styles.dottedLineWrap}>
+      {dashes.map((_, i) => (
+        <View key={i} style={styles.dottedLineDash} />
+      ))}
+    </View>
+  );
+}
 
 const styles = StyleSheet.create({
   backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.6)" },
@@ -416,141 +488,172 @@ const styles = StyleSheet.create({
   handleWrap: { alignItems: "center", paddingTop: 12, paddingBottom: 14 },
   handle: { width: 40, height: 4, borderRadius: 9999, backgroundColor: C.text },
 
-  headerRow: {
+  /* Stat-Box: Date | Departure | Stops */
+  summaryBox: {
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 14,
-    marginBottom: 16,
-    gap: 10,
-  },
-  dateBadge: {
-    backgroundColor: C.limeSoft,
-    borderRadius: 9999,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-  },
-  dateBadgeText: { color: C.lime, fontSize: 12, fontWeight: "700", letterSpacing: 0.2 },
-  headerMeta: { color: C.text, fontSize: 13, fontWeight: "700" },
-
-  scrollContent: { paddingHorizontal: 14, paddingBottom: 32 },
-
-  leftCol: { width: 64, alignItems: "flex-end", paddingRight: 6 },
-  leftColCenter: { width: 64, alignItems: "flex-end", justifyContent: "center", paddingRight: 6 },
-  leftColText: { color: C.sub, fontSize: 11, fontWeight: "700", letterSpacing: 0.2 },
-
-  stationRow: { flexDirection: "row", gap: 10, alignItems: "stretch" },
-  legBodyRow: { flexDirection: "row", gap: 10, paddingVertical: 4 },
-  rail: { width: RAIL_WIDTH, alignItems: "center" },
-  dot: {
-    width: 14,
-    height: 14,
-    borderRadius: 7,
-    borderWidth: 3,
-    borderColor: C.border,
-    backgroundColor: C.sheet,
-  },
-  railLine: {
-    flex: 1,
-    width: 2,
-    backgroundColor: C.border,
-  },
-  railLineShort: {
-    flex: 1,
-    width: 2,
-    backgroundColor: C.border,
-    marginTop: 2,
-  },
-
-  stationHeader: {
-    flex: 1,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    minHeight: 14,
-    marginTop: -3,
-  },
-  stationTime: { color: C.text, fontSize: 16, fontWeight: "800", letterSpacing: -0.3 },
-  stationName: { color: C.text, fontSize: 16, fontWeight: "700", flex: 1 },
-  platformBadge: {
-    backgroundColor: C.limeSoft,
-    paddingHorizontal: 9,
-    paddingVertical: 3,
-    borderRadius: 9999,
-  },
-  platformText: { color: C.lime, fontSize: 11, fontWeight: "700", letterSpacing: 0.3 },
-
-  legBody: {
-    flex: 1,
     backgroundColor: C.card,
-    borderRadius: 16,
-    padding: 12,
-    gap: 10,
-    marginVertical: 8,
+    borderRadius: 18,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    marginHorizontal: 14,
+    marginBottom: 16,
   },
-  lineRow: { flexDirection: "row", alignItems: "center", gap: 8 },
-  lineBadge: {
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 6,
+  summaryStat: { flex: 1, flexDirection: "column", gap: 2, minWidth: 0 },
+  summaryValueRow: { flexDirection: "row", alignItems: "center", gap: 5 },
+  summaryValue: { fontSize: 14, fontWeight: "700", color: C.text, letterSpacing: -0.15 },
+  summaryLabel: {
+    fontSize: 10,
+    color: C.sub,
+    fontWeight: "500",
+    textTransform: "uppercase",
+    letterSpacing: 0.8,
   },
-  lineBadgeText: { color: "#FFFFFF", fontSize: 13, fontWeight: "800", letterSpacing: 0.3 },
-  fahrtNr: { color: C.sub, fontSize: 13, fontWeight: "600" },
-  direction: { color: C.sub, fontSize: 13, fontWeight: "500" },
 
+  scrollContent: { paddingBottom: 32 },
+
+  /* Timeline scaffolding */
+  timeline: { position: "relative", paddingTop: 4 },
+  timeRail: {
+    position: "absolute",
+    top: 24,
+    bottom: 24,
+    left: SIDE_PAD + TIME_COL_W + GAP + DOT / 2 - 1.25,
+    width: 2.5,
+    backgroundColor: C.lime,
+    opacity: 0.35,
+    borderRadius: 2,
+  },
+
+  /* Station row */
+  row: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: GAP,
+    paddingHorizontal: SIDE_PAD,
+    paddingVertical: 14,
+    minHeight: 44,
+  },
+  timeLabel: {
+    width: TIME_COL_W,
+    fontSize: 17,
+    fontWeight: "700",
+    color: C.text,
+    letterSpacing: -0.4,
+  },
+  dot: {
+    width: DOT,
+    height: DOT,
+    borderRadius: DOT / 2,
+    backgroundColor: C.bg,
+    borderWidth: 2.5,
+    borderColor: C.lime,
+    zIndex: 1,
+  },
+  dotTerminal: { backgroundColor: C.lime },
+  stationBody: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+  },
+  stationName: {
+    flex: 1,
+    fontSize: 16,
+    fontWeight: "700",
+    color: C.text,
+    letterSpacing: -0.3,
+  },
+  platformChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    backgroundColor: C.limeSoft,
+    borderRadius: 9999,
+    borderWidth: 1,
+    borderColor: "rgba(127,234,77,0.3)",
+  },
+  platformChipText: { fontSize: 11, fontWeight: "700", color: C.lime },
+
+  /* Segment (shared by transport + transfer) */
+  segment: {
+    flexDirection: "row",
+    gap: GAP,
+    paddingHorizontal: SIDE_PAD,
+    paddingBottom: 8,
+  },
+  timeCol: { width: TIME_COL_W, paddingTop: 4 },
+  durationLabel: { fontSize: 12, color: C.sub, fontWeight: "600" },
+  dotSpacer: { width: DOT, position: "relative" },
+  segmentBody: { flex: 1 },
+
+  /* Transport card */
+  transportCard: {
+    backgroundColor: C.card,
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: 20,
+    padding: 14,
+    gap: 10,
+  },
+  transportHeader: { flexDirection: "row", alignItems: "center", gap: 10 },
+  linePill: { paddingHorizontal: 11, paddingVertical: 6, borderRadius: 10 },
+  linePillText: { fontSize: 12, fontWeight: "800", color: C.text, letterSpacing: -0.2 },
+  codeText: { fontSize: 13, color: C.sub, fontWeight: "600" },
+  destinationText: { fontSize: 13, color: C.text, fontWeight: "500" },
   stopsToggle: {
+    alignSelf: "flex-start",
     flexDirection: "row",
     alignItems: "center",
     gap: 6,
-    alignSelf: "flex-start",
-    backgroundColor: C.cardSoft,
     paddingHorizontal: 12,
     paddingVertical: 7,
+    backgroundColor: C.cardSoft,
     borderRadius: 9999,
   },
-  stopsToggleText: { color: C.text, fontSize: 12, fontWeight: "700" },
-
-  stopoverList: {
-    marginTop: 4,
-    gap: 6,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    backgroundColor: C.cardSoft,
-    borderRadius: 12,
+  stopsToggleText: { color: C.lime, fontSize: 12, fontWeight: "700" },
+  stopList: {
+    marginTop: 2,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: C.border,
+    gap: 7,
   },
-  stopoverRow: {
+  stopItem: { flexDirection: "row", alignItems: "center", gap: 9 },
+  stopBullet: { width: 5, height: 5, borderRadius: 5, backgroundColor: C.subDim },
+  stopItemText: { fontSize: 13, color: C.sub, flex: 1 },
+
+  /* Transfer card */
+  transferCard: {
     flexDirection: "row",
     alignItems: "center",
     gap: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderStyle: "dashed",
+    borderColor: C.border,
+    borderRadius: 16,
   },
-  stopoverDot: {
-    width: 5,
-    height: 5,
-    borderRadius: 3,
-    backgroundColor: C.lime,
-  },
-  stopoverTime: { color: C.sub, fontSize: 12, fontWeight: "700", minWidth: 38 },
-  stopoverName: { color: C.text, fontSize: 13, fontWeight: "500", flex: 1 },
-  stopoverPlatform: { color: C.lime, fontSize: 11, fontWeight: "700" },
-
-  transferRow: { flexDirection: "row", gap: 10, paddingVertical: 4 },
-  railDottedWrap: {
-    flex: 1,
+  walkBadge: {
+    width: 30,
+    height: 30,
+    borderRadius: 10,
+    backgroundColor: C.limeSoft,
     alignItems: "center",
     justifyContent: "center",
-    gap: 4,
   },
-  railDot: { width: 2, height: 2, borderRadius: 1, backgroundColor: C.sub },
-  transferContent: {
-    flex: 1,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    backgroundColor: C.card,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    borderRadius: 16,
-    marginVertical: 8,
+  transferTitle: { fontSize: 13, fontWeight: "700", color: C.text },
+  transferMeta: { fontSize: 11, color: C.sub, fontWeight: "500" },
+
+  /* Dotted spacer line zwischen Transfer-Stationen */
+  dottedLineWrap: {
+    position: "absolute",
+    left: DOT / 2 - 1,
+    top: 4,
+    bottom: 4,
+    width: 2,
+    justifyContent: "space-between",
   },
-  transferLabel: { color: C.text, fontSize: 13, fontWeight: "800", letterSpacing: 0.2 },
-  transferMin: { color: C.sub, fontSize: 13, fontWeight: "700" },
+  dottedLineDash: { width: 2, height: 4, backgroundColor: C.sub, borderRadius: 1 },
 });

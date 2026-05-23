@@ -1,0 +1,1136 @@
+import { useEffect, useState } from "react";
+import {
+  View,
+  Text,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Image,
+  Linking,
+  Share,
+  BackHandler,
+  Platform,
+  useWindowDimensions,
+} from "react-native";
+import Animated, {
+  Easing,
+  runOnJS,
+  useAnimatedStyle,
+  useSharedValue,
+  withRepeat,
+  withTiming,
+} from "react-native-reanimated";
+import { SafeAreaView } from "react-native-safe-area-context";
+import {
+  ArrowLeft,
+  ArrowRight,
+  Heart,
+  Share2,
+  ChevronRight,
+  Plane,
+  Train,
+  Bus,
+  Ship,
+  AlertTriangle,
+  Award,
+  Check,
+  X as XIcon,
+  Briefcase,
+  Luggage,
+  Info,
+  type LucideIcon,
+} from "lucide-react-native";
+import { format, parseISO } from "date-fns";
+import { de, enGB, es, fr } from "date-fns/locale";
+import { useT } from "@/lib/i18n/useT";
+import { useSearchStore } from "@/stores/searchStore";
+import { haptic } from "@/lib/haptics";
+import {
+  redirectUrl,
+  fetchFlightBookingOptions,
+  flightBookingUrl,
+  type FlightBookingOption,
+} from "@/lib/api/client";
+import { useQuery } from "@tanstack/react-query";
+import { RippleTouch } from "@/components/ui/RippleTouch";
+import { GradientFill } from "@/components/ui/GradientFill";
+import { displayCode, displayProvider, logoUrls } from "@/lib/results/logos";
+import { tripSignature } from "@/lib/results/signature";
+import { TravelMode } from "@/types/search";
+
+/**
+ * Details-Slide als globales Overlay (Pattern wie SearchHeroOverlay).
+ * Statt eine Route via router.push("/details") zu pushen — was eine native
+ * Stack-Operation triggert mit React-Navigation-State-Reducer, Bridge-Roundtrip
+ * und Screen-Container-Mount — wird hier nur ein Zustand-Store-Flag gesetzt.
+ * Das macht den Slide-In spürbar smoother, weil der UI-Thread beim Animations-
+ * Start nicht mit Navigation-Mount-Arbeit beschäftigt ist.
+ */
+
+// Brand-Palette (App-Colors statt der neonigen Mockup-Lime).
+const C = {
+  bg: "#1A1A1A",
+  card: "#242425",
+  surface: "#1F1F20",
+  surface3: "#2A2A2C",
+  border: "#2E2E30",
+  borderSoft: "rgba(255,255,255,0.06)",
+  text: "#FFFFFF",
+  sub: "#8A8A90",
+  subDim: "#56565C",
+  lime: "#7FEA4D",
+  limePressed: "#6DCC3F",
+  limeSoft: "rgba(127,234,77,0.14)",
+  black: "#0A0A0A",
+  red: "#FF3B5C",
+  alert: "#FF7A59",
+  alertSoft: "rgba(255,122,89,0.14)",
+};
+
+const MODE_ICON: Record<TravelMode, LucideIcon> = {
+  FLIGHT: Plane,
+  TRAIN: Train,
+  BUS: Bus,
+  CRUISE: Ship,
+};
+
+const DATE_LOCALES = { en: enGB, de, fr, es } as const;
+
+function formatDuration(min: number): string {
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  if (h === 0) return `${m}m`;
+  if (m === 0) return `${h}h`;
+  return `${h}h ${m}m`;
+}
+
+/** Splittet "Berlin Hbf" → ["Berlin", "Hbf"] für visuelle Akzentuierung des
+ *  Haupt-Stadt-Namens. Nur das letzte Token wird gedämpft, wenn es ein klar
+ *  station-typisches Suffix ist — sonst bleibt der gesamte Name in weiß
+ *  (vermeidet falsches Dämpfen bei z.B. "Paris Nord" wo "Nord" Teil des
+ *  Hauptnamens ist). */
+const STATION_SUFFIXES = new Set([
+  "Hbf",
+  "Hauptbahnhof",
+  "Bahnhof",
+  "Bf",
+  "Bf.",
+  "Centraal",
+  "Centre",
+  "Central",
+  "Centrale",
+  "Airport",
+  "Flughafen",
+  "Stazione",
+  "Estación",
+  "Gare",
+]);
+
+function splitCity(name: string): { head: string; tail: string | null } {
+  const trimmed = name.trim();
+  const lastSpace = trimmed.lastIndexOf(" ");
+  if (lastSpace < 0) return { head: trimmed, tail: null };
+  const tail = trimmed.slice(lastSpace + 1);
+  const head = trimmed.slice(0, lastSpace);
+  if (STATION_SUFFIXES.has(tail)) return { head, tail };
+  return { head: trimmed, tail: null };
+}
+
+export function DetailsOverlay() {
+  const result = useSearchStore((s) => s.selectedResult);
+  const passengers = useSearchStore((s) => s.selectedPassengers);
+  const clearSelectedResult = useSearchStore((s) => s.clearSelectedResult);
+  const pending = useSearchStore((s) => s.selectedResultPending);
+  const locale = useSearchStore((s) => s.locale);
+  const savedTrips = useSearchStore((s) => s.savedTrips);
+  const toggleSavedTrip = useSearchStore((s) => s.toggleSavedTrip);
+  const showSavedToast = useSearchStore((s) => s.showSavedToast);
+  const openLegTimelineOverlay = useSearchStore((s) => s.openLegTimelineOverlay);
+  // Direct-Trip-Flow vom Stop-Sheet (Bus-Tap): umgeht den Booking-Overlay
+  // komplett — wir rendern dann nichts, LegTimelineOverlay übernimmt direkt.
+  const directTripResult = useSearchStore((s) => s.directTripResult);
+
+  if (!result || directTripResult) return null;
+
+  return (
+    <DetailsContent
+      result={result}
+      passengers={passengers}
+      pending={pending}
+      clearSelectedResult={clearSelectedResult}
+      locale={locale}
+      savedTrips={savedTrips}
+      toggleSavedTrip={toggleSavedTrip}
+      showSavedToast={showSavedToast}
+      openLegTimelineOverlay={openLegTimelineOverlay}
+    />
+  );
+}
+
+interface ContentProps {
+  result: NonNullable<ReturnType<typeof useSearchStore.getState>["selectedResult"]>;
+  passengers: number;
+  /** True solange das Result noch ein Stub aus einer Surroundings-Departure
+   *  ist und die echte Search-API noch läuft. In dem Zustand zeigen wir
+   *  Skeletons in der Provider-Sektion. */
+  pending: boolean;
+  clearSelectedResult: () => void;
+  locale: "en" | "de" | "fr" | "es";
+  savedTrips: ReturnType<typeof useSearchStore.getState>["savedTrips"];
+  toggleSavedTrip: ReturnType<typeof useSearchStore.getState>["toggleSavedTrip"];
+  showSavedToast: ReturnType<typeof useSearchStore.getState>["showSavedToast"];
+  openLegTimelineOverlay: () => void;
+}
+
+function DetailsContent({
+  result,
+  passengers,
+  pending,
+  clearSelectedResult,
+  locale,
+  savedTrips,
+  toggleSavedTrip,
+  showSavedToast,
+  openLegTimelineOverlay,
+}: ContentProps) {
+  const t = useT();
+  const screenWidth = useWindowDimensions().width;
+
+  const translateX = useSharedValue(screenWidth);
+  const slideStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: translateX.value }],
+  }));
+  useEffect(() => {
+    translateX.value = withTiming(0, {
+      duration: 260,
+      easing: Easing.out(Easing.cubic),
+    });
+  }, [translateX]);
+
+  const [closing, setClosing] = useState(false);
+  const animateClose = () => {
+    if (closing) return;
+    setClosing(true);
+    translateX.value = withTiming(
+      screenWidth,
+      { duration: 260, easing: Easing.in(Easing.cubic) },
+      (finished) => {
+        if (finished) runOnJS(clearSelectedResult)();
+      },
+    );
+  };
+
+  useEffect(() => {
+    if (Platform.OS !== "android") return;
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      animateClose();
+      return true;
+    });
+    return () => sub.remove();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Zwei-Phasen-Render gegen Mount-Lag während des Slide-In.
+  const [contentReady, setContentReady] = useState(false);
+  useEffect(() => {
+    const id = setTimeout(() => setContentReady(true), 320);
+    return () => clearTimeout(id);
+  }, []);
+
+  const dateLocale = DATE_LOCALES[locale] ?? enGB;
+  const carrier = displayProvider(result);
+  const urls = logoUrls(result, carrier);
+  const [logoIdx, setLogoIdx] = useState(0);
+  const ModeIcon = MODE_ICON[result.mode] ?? Plane;
+  const resultSig = tripSignature(result);
+  const favored = savedTrips.some((trip) => tripSignature(trip) === resultSig);
+  const isDirect = result.stops === 0;
+  const stopVia = !isDirect && result.stopLabels?.length ? result.stopLabels[0] : null;
+  const stopLabel =
+    result.stops === 0
+      ? t("details.stop.zero")
+      : result.stops === 1
+      ? t("details.stop.one")
+      : t("details.stop.many").replace("{count}", String(result.stops));
+  const dateStr = (() => {
+    try {
+      return format(parseISO(result.departTime), "d. MMM", { locale: dateLocale });
+    } catch {
+      return "";
+    }
+  })();
+  const departTime = (() => {
+    try {
+      return format(parseISO(result.departTime), "HH:mm");
+    } catch {
+      return "";
+    }
+  })();
+  const arriveTime = (() => {
+    try {
+      return format(parseISO(result.arriveTime), "HH:mm");
+    } catch {
+      return "";
+    }
+  })();
+
+  const originName = result.originLabel?.split(",")[0]?.trim() || displayCode(result.origin) || result.origin;
+  const destName = result.destLabel?.split(",")[0]?.trim() || displayCode(result.destination) || result.destination;
+
+  const paxKey = passengers === 1 ? "details.passenger.one" : "details.passenger.many";
+  const paxLabel = t(paxKey).replace("{count}", String(passengers));
+  const classLabel = result.mode === "FLIGHT" ? t("search.class.economy") : t("search.class.second");
+
+  // Multi-Provider-Liste für Flüge: Google Flights liefert pro Itinerary
+  // mehrere Buchungs-Optionen (Airline-direct, Expedia, Kiwi, trip.com, …).
+  // Wir holen die On-Demand wenn das Sheet öffnet — Search-Time wäre teurer
+  // (1 Call pro Result = 10-20× mehr API-Hits) und meistens unnötig (User
+  // schaut nur ein paar Details an).
+  const isFlight = result.mode === "FLIGHT";
+  const bookingToken = result.bookingToken;
+  const optionsQuery = useQuery({
+    queryKey: ["flightBookingOptions", bookingToken, result.currency, passengers],
+    queryFn: () =>
+      fetchFlightBookingOptions({
+        token: bookingToken!,
+        origin: result.origin,
+        destination: result.destination,
+        departDate: result.departTime.slice(0, 10),
+        passengers,
+        currency: result.currency.toUpperCase(),
+      }),
+    // Bewusst NICHT auf contentReady gated — der Network-Call läuft auf
+    // dem JS-/Background-Thread und konkurriert nicht mit der Slide-In-
+    // Spring-Animation (Reanimated, UI-Thread). Wir feuern SOFORT beim
+    // Mount, sodass die ~1-3s RapidAPI-Latenz parallel zur 260ms Slide-In
+    // läuft. Effekt: bei normalen Verbindungen ist die Provider-Liste
+    // schon da wenn der Section-Container sichtbar wird.
+    enabled: isFlight && !!bookingToken,
+    staleTime: 5 * 60_000,
+    retry: 1,
+  });
+  const remoteOptions = optionsQuery.data?.options ?? [];
+
+  const bookUrl = result.redirectToken
+    ? redirectUrl(result.redirectToken)
+    : result.deepLink || "";
+
+  // Anbieter-Liste für die UI. Bei Flügen mit echten Daten zeigen wir die
+  // remote-Optionen mit Sort + Recommended-Markierung; sonst fallen wir auf
+  // den Single-Provider aus dem Search-Result zurück (Bahn/Bus/Cruise haben
+  // aktuell nur einen Anbieter — DB/FlixBus/etc.). Die „Empfohlen"-Pille
+  // wird nur gesetzt wenn >1 Provider existiert (sonst ist sie redundant).
+  const providerList: ProviderRow[] = (() => {
+    if (isFlight && remoteOptions.length > 0) {
+      const rows = remoteOptions.map(toProviderRow);
+      rows.sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity));
+      if (rows.length > 1 && rows[0]!.price !== undefined) rows[0]!.recommended = true;
+      return rows;
+    }
+    // Single-Provider-Fallback (Bahn/Bus/Cruise): füllen mit den passenden
+    // Defaults pro Mode damit die neue Card-Anzeige (24/7-Service, Gepäck,
+    // Logo) trotzdem voll genutzt wird.
+    return [
+      {
+        name: carrier,
+        url: bookUrl,
+        price: result.price,
+        currency: result.currency,
+        // Erstes URL aus der logoUrls()-Kandidatenliste — z.B. DB-Logo für
+        // Train, FlixBus-Logo für Bus, Cruise-Provider-Favicon wo vorhanden.
+        logo: urls[0],
+        isAirline: result.mode === "FLIGHT",
+        // 24/7-Hotline: DB Service-Nummer, FlixBus-Chat, Reederei-Hotlines.
+        // Bei Airline-Direct (Edge-Case ohne Booking-Options-Antwort) auch true.
+        support: true,
+        // Bahn/Bus/Cruise haben keine harte Gepäck-Beschränkung — beide aktiv.
+        // Bei Flug-Fallback (sollte selten passieren — z.B. wenn Token expired)
+        // konservativ: nur Handgepäck inkludiert.
+        carryOn: true,
+        checked: result.mode !== "FLIGHT",
+      },
+    ];
+  })();
+
+  const providerCount = providerList.length;
+  const providerCountLabel =
+    providerCount === 1
+      ? t("details.providers.count.one")
+      : t("details.providers.count.many").replace("{count}", String(providerCount));
+  const pricesLabel = t("details.providers.prices").replace("{currency}", result.currency.toUpperCase());
+
+  async function onShare() {
+    haptic("button");
+    try {
+      await Share.share({
+        title: `${result.originLabel} → ${result.destLabel}`,
+        message: `${carrier} · ${result.currency} ${result.price.toFixed(0)} — ${bookUrl}`,
+        url: bookUrl,
+      });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function onClose() {
+    haptic("button");
+    animateClose();
+  }
+
+  function onToggleFav() {
+    haptic("button");
+    const justSaved = !favored;
+    toggleSavedTrip(result, passengers);
+    if (justSaved) showSavedToast(result);
+  }
+
+  const currentLogoUrl = urls[logoIdx];
+
+  const origin = splitCity(originName);
+  const destination = splitCity(destName);
+
+  return (
+    <Animated.View
+      style={[
+        StyleSheet.absoluteFill,
+        // Höher als StopDetailSheet (zIndex 100, elevation 16) damit der
+        // Overlay GANZ VORNE liegt, wenn er via Departure-Tap aus dem
+        // Surroundings-Sheet geöffnet wird.
+        { zIndex: 200, elevation: 24 },
+        slideStyle,
+      ]}
+    >
+      <SafeAreaView style={styles.root} edges={["top"]}>
+        {/* Header: runde 40×40-Icon-Buttons, Heart wird beim Save komplett
+            lime mit schwarzem Icon (kräftigeres Visual als nur Heart-Fill). */}
+        <View style={styles.header}>
+          <View style={styles.headerLeft}>
+            <RippleTouch onPress={onClose} hitSlop={6} style={styles.roundBtn}>
+              <ArrowLeft color={C.text} size={20} strokeWidth={2} />
+            </RippleTouch>
+            <Text style={styles.title} numberOfLines={1}>
+              {t("details.title")}
+            </Text>
+          </View>
+          <View style={styles.headerRight}>
+            <RippleTouch onPress={onShare} hitSlop={6} style={styles.roundBtn}>
+              <Share2 color={C.text} size={18} strokeWidth={2} />
+            </RippleTouch>
+            <RippleTouch
+              onPress={onToggleFav}
+              hitSlop={6}
+              style={styles.roundBtn}
+            >
+              <Heart
+                color={favored ? C.red : C.text}
+                fill={favored ? C.red : "transparent"}
+                size={18}
+                strokeWidth={2}
+              />
+            </RippleTouch>
+          </View>
+        </View>
+
+        <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+          {/* Route-Card */}
+          <View style={styles.routeCard}>
+            <View style={{ gap: 10 }}>
+              <CityRow head={origin.head} tail={origin.tail} />
+              <View style={styles.dividerSoft} />
+              <CityRow head={destination.head} tail={destination.tail} />
+            </View>
+
+            <View style={styles.metaRow}>
+              <Text style={[styles.metaText, styles.metaTextStrong]}>{dateStr}</Text>
+              <MetaDot />
+              <Text style={styles.metaText}>{paxLabel}</Text>
+              <MetaDot />
+              <Text style={styles.metaText}>{t("details.oneway")}</Text>
+              <MetaDot />
+              <Text style={styles.metaText}>{classLabel}</Text>
+            </View>
+
+            <View style={styles.dividerSoft} />
+
+            {/* Transport-Row: Lime-Badge mit Mode-Icon (oder Provider-Logo) +
+                Abfahrt → Ankunft + via + Stops/Duration rechts. */}
+            <View style={styles.trainRow}>
+              <View style={styles.trainBadge}>
+                {currentLogoUrl ? (
+                  <Image
+                    key={currentLogoUrl}
+                    source={{ uri: currentLogoUrl }}
+                    style={styles.trainBadgeLogo}
+                    resizeMode="contain"
+                    onError={() => setLogoIdx((i) => i + 1)}
+                  />
+                ) : (
+                  <ModeIcon color={C.text} size={28} strokeWidth={1.8} />
+                )}
+              </View>
+              <View style={{ flex: 1, minWidth: 0 }}>
+                {/* Pending = Stub-Result von Surroundings-Departure-Tap: depart
+                    und arrive sind beide dieselbe Planzeit, würde sonst
+                    "16:15 → 16:15" anzeigen. Stattdessen Em-Dash bis das echte
+                    Result da ist. */}
+                <Text style={styles.trainTime} numberOfLines={1}>
+                  {departTime} <Text style={styles.trainTimeDash}>→</Text>{" "}
+                  {pending ? "—" : arriveTime}
+                </Text>
+                {stopVia ? (
+                  <Text style={styles.trainVia} numberOfLines={1}>
+                    via {stopVia}
+                  </Text>
+                ) : (
+                  <Text style={styles.trainVia} numberOfLines={1}>
+                    {carrier}
+                  </Text>
+                )}
+              </View>
+              <View style={{ alignItems: "flex-end" }}>
+                {/* Stops + Duration sind im Pending-Stub beide 0 / "Direkt" —
+                    auch hier Em-Dash bis die echten Daten da sind. */}
+                <Text style={isDirect ? styles.stopsTextDirect : styles.stopsText}>
+                  {pending ? "—" : stopLabel}
+                </Text>
+                <Text style={styles.durationText}>
+                  {pending ? "—" : formatDuration(result.durationMinutes)}
+                </Text>
+              </View>
+            </View>
+
+            {/* Details-anzeigen Ghost-Button — im Pending-State versteckt
+                weil noch keine Legs/Stopovers da sind, der LegTimelineOverlay
+                hätte nichts zum Anzeigen. */}
+            {!pending ? (
+              <RippleTouch
+                onPress={() => {
+                  haptic("button");
+                  openLegTimelineOverlay();
+                }}
+                style={styles.detailsBtn}
+              >
+                <Text style={styles.detailsBtnLabel}>{t("details.viewdetails")}</Text>
+                <ArrowRight size={15} color={C.lime} strokeWidth={2.5} />
+              </RippleTouch>
+            ) : null}
+          </View>
+
+          {contentReady ? (
+            <>
+              {!isDirect && !pending ? (
+                <>
+                  <SectionHeader title={t("details.goodtoknow")} />
+                  <View style={styles.sectionContent}>
+                    <View style={styles.infoRow}>
+                      <View style={styles.infoBadge}>
+                        <AlertTriangle color={C.alert} size={16} strokeWidth={2.4} />
+                      </View>
+                      <View style={{ flex: 1, minWidth: 0 }}>
+                        <Text style={styles.infoTitle}>{t("details.selftransfer.title")}</Text>
+                        <Text style={styles.infoSubtitle} numberOfLines={2}>
+                          {t("details.selftransfer.sub")}
+                        </Text>
+                      </View>
+                      <ChevronRight size={18} color={C.sub} strokeWidth={2} />
+                    </View>
+                  </View>
+                </>
+              ) : null}
+
+              <SectionHeader
+                title={t("details.bookticket")}
+                caption={`${providerCountLabel} · ${pricesLabel}`}
+              />
+              <View style={styles.sectionContent}>
+                {/* Pending-State: nur Skeletons. Wir wissen noch gar nichts
+                    über Provider/Preise weil die Search-API noch läuft. Sobald
+                    `pending` false wird, switcht's auf die echten Cards. */}
+                {pending ? (
+                  <>
+                    <ProviderCardSkeleton />
+                    <ProviderCardSkeleton />
+                    <ProviderCardSkeleton />
+                  </>
+                ) : (
+                  <>
+                    {providerList.map((p, i) => (
+                      <ProviderCard key={`${p.name}-${i}`} provider={p} t={t} />
+                    ))}
+                    {/* Skeletons zusätzlich für Flug-Multi-Provider-Liste,
+                        solange `getBookingDetails` lädt — wir zeigen den
+                        Airline-Fallback aus dem Search-Result + 3 Skeletons
+                        für die weiteren OTAs die gleich nachkommen. */}
+                    {isFlight && optionsQuery.isLoading && remoteOptions.length === 0 ? (
+                      <>
+                        <ProviderCardSkeleton />
+                        <ProviderCardSkeleton />
+                        <ProviderCardSkeleton />
+                      </>
+                    ) : null}
+                  </>
+                )}
+              </View>
+            </>
+          ) : null}
+        </ScrollView>
+      </SafeAreaView>
+    </Animated.View>
+  );
+}
+
+interface ProviderRow {
+  name: string;
+  /** URL die direkt mit Linking.openURL geöffnet wird. Bei Flight-Optionen
+   *  zeigt sie auf unseren Redirect-Endpoint der den Provider-Token
+   *  auflöst und zum Anbieter weiterleitet. */
+  url: string;
+  price?: number;
+  currency?: string;
+  /** Logo-URL. Bei Flight-Optionen ableiten wir's aus der Anbieter-Domain
+   *  via Google's S2-Favicon-Service — kein RapidAPI-Call nötig. */
+  logo?: string;
+  /** True bei direkter Airline-Buchung (Eurowings, Lufthansa, …), False
+   *  bei OTA (Expedia, Kiwi, Booking, …). Steuert Heuristiken für
+   *  Service/Gepäck wenn keine echten Daten vorliegen. */
+  isAirline?: boolean;
+  /** Wird auf den günstigsten Provider automatisch gesetzt. */
+  recommended?: boolean;
+  /** 24/7 Kundenservice? Per Heuristik wenn keine echten Daten da. */
+  support?: boolean;
+  /** Handgepäck im Tarif inkludiert. */
+  carryOn?: boolean;
+  /** Aufgegebenes Gepäck im Tarif inkludiert. */
+  checked?: boolean;
+}
+
+/** Bekannte OTAs mit 24/7 Kundenservice — Heuristik solange wir keine
+ *  echten Service-Daten vom Provider haben. */
+const SUPPORT_24_7_OTAS = new Set([
+  "expedia",
+  "booking",
+  "booking.com",
+  "kiwi",
+  "kiwi.com",
+  "trip.com",
+  "edreams",
+  "opodo",
+  "bravofly",
+  "priceline",
+  "cheaptickets",
+  "lastminute.com",
+  "fluege.de",
+  "kayak",
+]);
+
+function hasSupport24_7(providerName: string): boolean {
+  const key = providerName.toLowerCase().replace(/\s+/g, "");
+  for (const k of SUPPORT_24_7_OTAS) {
+    if (key.includes(k.replace(/\s+/g, ""))) return true;
+  }
+  return false;
+}
+
+function toProviderRow(o: FlightBookingOption): ProviderRow {
+  return {
+    name: o.name,
+    url: flightBookingUrl(o.providerToken),
+    price: o.price,
+    currency: o.currency,
+    logo: o.website ? `https://www.google.com/s2/favicons?sz=64&domain=${o.website}` : undefined,
+    isAirline: o.isAirline,
+    // Airline-Direct-Buchungen haben i.d.R. Carry-On & Service inkludiert,
+    // OTA-Cheap-Fares oft nur Carry-On, kein Aufgegebenes.
+    support: o.isAirline ? true : hasSupport24_7(o.name),
+    carryOn: true,
+    checked: o.isAirline === true,
+  };
+}
+
+/** 2-Letter-Code für die Provider-Logo-Box wenn kein echtes Logo verfügbar ist. */
+function providerCode(name: string): string {
+  const cleaned = name.replace(/[^a-zA-Z0-9]+/g, " ").trim();
+  if (!cleaned) return "?";
+  const parts = cleaned.split(/\s+/);
+  if (parts.length === 1) return parts[0]!.slice(0, 2).toUpperCase();
+  return (parts[0]![0]! + parts[1]![0]!).toUpperCase();
+}
+
+/** Heuristische BG-Farbe pro Provider — DB-Rot für Bahn, Lime für Standard,
+ *  bunt für die geläufigen OTAs. Damit hat jede Card visuell Wiedererkennung. */
+function providerColor(name: string): string {
+  const n = name.toLowerCase();
+  if (n.includes("expedia")) return "#FFC107";
+  if (n.includes("kiwi")) return "#00A991";
+  if (n.includes("trip.com") || n.includes("trip ")) return "#287DFA";
+  if (n.includes("booking")) return "#003580";
+  if (n.includes("opodo")) return "#FF6900";
+  if (n.includes("kayak")) return "#FF690F";
+  if (n.includes("flix")) return "#73D700"; // FlixBus-Grün
+  if (n.includes("bahn") || n.includes("db ") || n === "db") return "#E0394A"; // DB-Rot
+  return "#7FEA4D";
+}
+
+function CityRow({ head, tail }: { head: string; tail: string | null }) {
+  return (
+    <Text style={styles.cityText} numberOfLines={1}>
+      {head}
+      {tail ? <Text style={styles.cityTail}> {tail}</Text> : null}
+    </Text>
+  );
+}
+
+function MetaDot() {
+  return <View style={styles.metaDot} />;
+}
+
+function ProviderCard({
+  provider,
+  t,
+}: {
+  provider: ProviderRow;
+  t: (key: string) => string;
+}) {
+  // Wenn das Logo-Bild fehlerhaft lädt, fallen wir nach dem onError auf
+  // den 2-Letter-Code-Fallback zurück. Verhindert dass die Provider-Card
+  // mit einer leeren transparenten Logo-Box endet.
+  const [logoErrored, setLogoErrored] = useState(false);
+  async function onBook() {
+    if (!provider.url) return;
+    haptic("important");
+    try {
+      const ok = await Linking.canOpenURL(provider.url);
+      if (ok) Linking.openURL(provider.url);
+    } catch {
+      /* ignore */
+    }
+  }
+  // Wenn ein Logo vorhanden ist: transparent rendern, damit die Favicon-PNG
+  // (oft mit eigenem Hintergrund) ohne farbigen Rahmen daherkommt. Nur beim
+  // Fallback ohne Logo nutzen wir die brand-getönte Box mit 2-Letter-Code.
+  const hasLogo = !!provider.logo && !logoErrored;
+  const bgColor = hasLogo ? "transparent" : providerColor(provider.name);
+  const usesDarkText = bgColor === "#FFC107" || bgColor === "#7FEA4D";
+  const isRec = provider.recommended === true;
+  const showSupport = provider.support === true;
+  const showBaggage = provider.carryOn !== undefined || provider.checked !== undefined;
+  return (
+    <View style={[styles.providerCard, isRec && styles.providerCardRecommended]}>
+      {/* Empfohlener-Anbieter-Pille oben — nur beim günstigsten Provider. */}
+      {isRec ? (
+        <View style={styles.recommendedRow}>
+          <View style={styles.recommendedBadge}>
+            <Award size={13} color={C.black} strokeWidth={2.4} />
+            <Text style={styles.recommendedText}>{t("details.recommended")}</Text>
+            <Info size={12} color="rgba(0,0,0,0.55)" strokeWidth={2} />
+          </View>
+        </View>
+      ) : null}
+
+      <View style={styles.providerHeader}>
+        <View style={styles.providerLeft}>
+          <View style={[styles.providerLogo, { backgroundColor: bgColor }]}>
+            {hasLogo ? (
+              <Image
+                source={{ uri: provider.logo! }}
+                style={styles.providerLogoImg}
+                resizeMode="contain"
+                onError={() => setLogoErrored(true)}
+              />
+            ) : (
+              <Text
+                style={[styles.providerLogoText, usesDarkText ? styles.providerLogoTextDark : null]}
+              >
+                {providerCode(provider.name)}
+              </Text>
+            )}
+          </View>
+          <View style={{ minWidth: 0, flex: 1 }}>
+            <Text style={styles.providerName} numberOfLines={1}>
+              {provider.name}
+            </Text>
+            <Text style={styles.providerNote} numberOfLines={1}>
+              {provider.isAirline ? t("details.providernote.airline") : t("details.providernote")}
+            </Text>
+          </View>
+        </View>
+        <View style={{ alignItems: "flex-end" }}>
+          <Text style={styles.priceLabel}>{t("details.priceprefix")}</Text>
+          <Text style={styles.priceValue}>
+            {provider.price !== undefined && provider.price > 0
+              ? `${provider.price.toFixed(0)} ${(provider.currency ?? "EUR").toUpperCase()}`
+              : "—"}
+          </Text>
+        </View>
+      </View>
+
+      {/* 24/7-Service Pille — nur wenn der Anbieter dafür bekannt ist. */}
+      {showSupport ? (
+        <View style={styles.serviceRow}>
+          <View style={styles.serviceCheck}>
+            <Check size={11} color={C.lime} strokeWidth={3.2} />
+          </View>
+          <Text style={styles.serviceText}>{t("details.support247")}</Text>
+        </View>
+      ) : null}
+
+      {/* Footer: Gepäck (links) + Tarif-Details-Link + CTA (rechts) */}
+      <View style={styles.footerRow}>
+        {showBaggage ? (
+          <View style={styles.baggageRow}>
+            <BaggageCell active={!!provider.carryOn} icon="carryOn" />
+            <BaggageCell active={!!provider.checked} icon="checked" />
+          </View>
+        ) : (
+          <View />
+        )}
+        <View style={styles.footerActions}>
+          <Pressable
+            onPress={onBook}
+            hitSlop={8}
+            style={({ pressed }) => [{ opacity: pressed ? 0.6 : 1 }]}
+          >
+            <Text style={styles.fareDetails}>{t("details.faredetails")}</Text>
+          </Pressable>
+          <RippleTouch
+            onPress={onBook}
+            rippleColor="rgba(0,0,0,0.18)"
+            style={({ pressed }) => [
+              styles.providerCta,
+              // Pressed-State über Opacity statt Background-Swap, weil das
+              // Gradient absolut darunter liegt und Background-Color am
+              // RippleTouch nicht durchschlägt.
+              pressed && { opacity: 0.92 },
+            ]}
+          >
+            <GradientFill />
+            <Text style={styles.providerCtaText}>{t("details.gotosite")}</Text>
+            <ArrowRight size={16} color={C.black} strokeWidth={2.5} />
+          </RippleTouch>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+/** Gepäck-Indikator: Briefcase (Handgepäck) oder Luggage (Aufgegebenes). Aktiv
+ *  = farbig + lime Check-Badge, inaktiv = ausgegraut + rotes X-Badge. */
+function BaggageCell({ active, icon }: { active: boolean; icon: "carryOn" | "checked" }) {
+  const Icon = icon === "carryOn" ? Briefcase : Luggage;
+  return (
+    <View style={styles.baggageCell}>
+      <Icon size={22} color={active ? C.text : C.subDim} strokeWidth={1.8} />
+      <View style={[styles.baggageBadge, { backgroundColor: active ? C.lime : C.surface3 }]}>
+        {active ? (
+          <Check size={8} color={C.black} strokeWidth={3.5} />
+        ) : (
+          <XIcon size={8} color={C.sub} strokeWidth={3.5} />
+        )}
+      </View>
+    </View>
+  );
+}
+
+/**
+ * Skeleton-Variante einer ProviderCard — gleiche Box-Geometrie, leere graue
+ * Platzhalter mit dezenter Pulse-Animation (0.5 ↔ 0.9 opacity, 900 ms). Während
+ * die Booking-Options-Query läuft zeigen wir 3 davon unter der Single-Carrier-
+ * Card, sodass User sehen „mehr Anbieter werden gerade geladen".
+ */
+function ProviderCardSkeleton() {
+  const pulse = useSharedValue(0.5);
+  useEffect(() => {
+    pulse.value = withRepeat(withTiming(0.9, { duration: 900 }), -1, true);
+  }, [pulse]);
+  const pulseStyle = useAnimatedStyle(() => ({ opacity: pulse.value }));
+  return (
+    <View style={styles.providerCard}>
+      <View style={styles.providerHeader}>
+        <View style={styles.providerLeft}>
+          <Animated.View style={[styles.skeletonLogo, pulseStyle]} />
+          <View style={{ flex: 1, gap: 6 }}>
+            <Animated.View style={[styles.skeletonLineLg, pulseStyle]} />
+            <Animated.View style={[styles.skeletonLineSm, pulseStyle]} />
+          </View>
+        </View>
+        <View style={{ alignItems: "flex-end", gap: 6 }}>
+          <Animated.View style={[styles.skeletonLabel, pulseStyle]} />
+          <Animated.View style={[styles.skeletonPrice, pulseStyle]} />
+        </View>
+      </View>
+      <Animated.View style={[styles.skeletonCta, pulseStyle]} />
+    </View>
+  );
+}
+
+function SectionHeader({ title, caption }: { title: string; caption?: string }) {
+  return (
+    <View style={styles.sectionHeader}>
+      <Text style={styles.sectionTitle}>{title}</Text>
+      {caption ? <Text style={styles.sectionCaption}>{caption}</Text> : null}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  root: { flex: 1, backgroundColor: C.bg },
+
+  /* Header */
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 20,
+    paddingTop: 6,
+    paddingBottom: 12,
+  },
+  headerLeft: { flexDirection: "row", alignItems: "center", gap: 12, flex: 1, minWidth: 0 },
+  headerRight: { flexDirection: "row", gap: 8 },
+  roundBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 9999,
+    backgroundColor: C.card,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  title: { fontSize: 19, fontWeight: "700", color: C.text, letterSpacing: -0.4 },
+
+  scrollContent: { paddingHorizontal: 20, paddingBottom: 32 },
+
+  /* Route card */
+  routeCard: {
+    backgroundColor: C.card,
+    borderRadius: 24,
+    padding: 20,
+    gap: 14,
+  },
+  dividerSoft: { height: 1, backgroundColor: C.borderSoft },
+  cityText: {
+    fontSize: 28,
+    fontWeight: "700",
+    color: C.text,
+    letterSpacing: -0.7,
+    lineHeight: 30,
+  },
+  cityTail: { color: C.sub, fontWeight: "600" },
+
+  metaRow: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8 },
+  metaText: { fontSize: 13, color: C.sub, fontWeight: "500" },
+  metaTextStrong: { color: C.text, fontWeight: "600" },
+  metaDot: { width: 3, height: 3, borderRadius: 1.5, backgroundColor: C.subDim },
+
+  /* Train row */
+  trainRow: { flexDirection: "row", alignItems: "center", gap: 14 },
+  trainBadge: {
+    width: 56,
+    height: 56,
+    borderRadius: 18,
+    // Transparent — Airline-Favicons haben i.d.R. eigene Hintergründe und
+    // sehen ohne brand-getönte Box natürlicher aus. Beim Fallback ohne
+    // Logo (Carrier unbekannt) zeigen wir den Lucide-Mode-Icon in
+    // white, der auch ohne BG gut sichtbar bleibt.
+    backgroundColor: "transparent",
+    alignItems: "center",
+    justifyContent: "center",
+    overflow: "hidden",
+  },
+  trainBadgeLogo: { width: 48, height: 48 },
+  trainTime: {
+    fontSize: 22,
+    fontWeight: "700",
+    color: C.text,
+    letterSpacing: -0.5,
+    lineHeight: 24,
+  },
+  trainTimeDash: { color: C.sub },
+  trainVia: { fontSize: 13, color: C.sub, marginTop: 3, fontWeight: "500" },
+  stopsText: { fontSize: 13, fontWeight: "700", color: C.alert },
+  stopsTextDirect: { fontSize: 13, fontWeight: "700", color: C.lime },
+  durationText: { fontSize: 13, color: C.sub, marginTop: 3, fontWeight: "500" },
+
+  /* Details ghost button */
+  detailsBtn: {
+    marginTop: 4,
+    paddingVertical: 12,
+    borderRadius: 9999,
+    borderWidth: 1,
+    borderColor: C.border,
+    backgroundColor: "transparent",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+  },
+  detailsBtnLabel: { color: C.lime, fontSize: 14, fontWeight: "700", letterSpacing: -0.15 },
+
+  /* Section */
+  sectionHeader: { paddingTop: 24, paddingBottom: 12 },
+  sectionTitle: { fontSize: 22, fontWeight: "700", color: C.text, letterSpacing: -0.5 },
+  sectionCaption: { fontSize: 12, color: C.sub, fontWeight: "500", marginTop: 4 },
+  sectionContent: { gap: 8 },
+
+  /* Info row */
+  infoRow: {
+    backgroundColor: C.card,
+    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  infoBadge: {
+    width: 36,
+    height: 36,
+    borderRadius: 12,
+    backgroundColor: C.alertSoft,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  infoTitle: { fontSize: 15, fontWeight: "700", color: C.text, letterSpacing: -0.15 },
+  infoSubtitle: { fontSize: 12, color: C.sub, marginTop: 2, fontWeight: "500" },
+
+  /* Provider card */
+  providerCard: {
+    backgroundColor: C.card,
+    borderRadius: 24,
+    padding: 16,
+    gap: 14,
+  },
+  providerCardRecommended: {
+    borderWidth: 1.5,
+    borderColor: C.lime,
+  },
+
+  /* „Empfohlener Anbieter" Badge oben */
+  recommendedRow: { flexDirection: "row" },
+  recommendedBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: C.lime,
+    borderRadius: 9999,
+    paddingVertical: 5,
+    paddingHorizontal: 10,
+    gap: 6,
+  },
+  recommendedText: {
+    color: C.black,
+    fontSize: 11,
+    fontWeight: "800",
+    letterSpacing: -0.1,
+  },
+
+  /* 24/7-Service Pille — füllt die ganze Card-Breite (kein alignSelf:
+     flex-start). Padding der Card bleibt davor, sodass die Box auf beiden
+     Seiten denselben Abstand zum Card-Rand hat. */
+  serviceRow: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    backgroundColor: C.surface3,
+    borderRadius: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  serviceCheck: {
+    width: 18,
+    height: 18,
+    borderRadius: 999,
+    backgroundColor: C.limeSoft,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  serviceText: { fontSize: 12.5, color: C.sub, fontWeight: "500" },
+
+  /* Footer (Gepäck + CTA) */
+  footerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+  },
+  baggageRow: { flexDirection: "row", alignItems: "center", gap: 14 },
+  footerActions: { flexDirection: "row", alignItems: "center", gap: 12 },
+  fareDetails: {
+    color: C.text,
+    fontSize: 12.5,
+    fontWeight: "600",
+    textDecorationLine: "underline",
+  },
+  baggageCell: {
+    width: 26,
+    height: 26,
+    position: "relative",
+    alignItems: "flex-start",
+    justifyContent: "flex-start",
+  },
+  baggageBadge: {
+    position: "absolute",
+    bottom: -3,
+    right: -2,
+    width: 12,
+    height: 12,
+    borderRadius: 999,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 2,
+    borderColor: C.card,
+  },
+  providerHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  providerLeft: { flexDirection: "row", alignItems: "center", gap: 12, flex: 1, minWidth: 0 },
+  providerLogo: {
+    width: 44,
+    height: 44,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  providerLogoText: {
+    fontSize: 13,
+    fontWeight: "900",
+    color: C.text,
+    letterSpacing: -0.3,
+  },
+  providerLogoTextDark: { color: C.black },
+  providerLogoImg: { width: 36, height: 36 },
+
+  /* Skeleton-Variante: matched die ProviderCard-Box-Geometrie damit beim
+     Übergang zur echten Card kein Layout-Sprung passiert. Pulse-Animation
+     wird per Animated.View + useSharedValue auf opacity gefahren. */
+  skeletonLogo: { width: 44, height: 44, borderRadius: 14, backgroundColor: C.surface3 },
+  skeletonLineLg: { height: 12, borderRadius: 6, backgroundColor: C.surface3, width: "60%" },
+  skeletonLineSm: { height: 9, borderRadius: 5, backgroundColor: C.surface3, width: "35%" },
+  skeletonLabel: { height: 8, borderRadius: 4, backgroundColor: C.surface3, width: 28 },
+  skeletonPrice: { height: 18, borderRadius: 5, backgroundColor: C.surface3, width: 70 },
+  skeletonCta: { height: 46, borderRadius: 9999, backgroundColor: C.surface3 },
+  providerName: { fontSize: 15, fontWeight: "700", color: C.text, letterSpacing: -0.15 },
+  providerNote: { fontSize: 12, color: C.sub, marginTop: 2, fontWeight: "500" },
+  priceLabel: {
+    fontSize: 10,
+    color: C.sub,
+    fontWeight: "600",
+    letterSpacing: 0.8,
+    textTransform: "uppercase",
+  },
+  priceValue: { fontSize: 22, fontWeight: "800", color: C.lime, letterSpacing: -0.5, marginTop: 2 },
+  providerCta: {
+    // Kein backgroundColor — der GradientFill rendert als Absolute-Fill-Child
+    // den Hintergrund. `overflow: hidden` clipped den Gradient an der
+    // borderRadius-Pille.
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 9999,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    overflow: "hidden",
+  },
+  providerCtaText: { color: C.black, fontSize: 13, fontWeight: "800", letterSpacing: -0.1 },
+});

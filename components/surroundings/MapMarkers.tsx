@@ -1,0 +1,189 @@
+import { memo } from "react";
+import { View, Text, StyleSheet } from "react-native";
+import { Marker as MapLibreMarker } from "@maplibre/maplibre-react-native";
+import {
+  Train,
+  Bus,
+  TramFront,
+  Plane,
+  Ship,
+  type LucideIcon,
+  Trees,
+  ShoppingBag,
+  UtensilsCrossed,
+} from "lucide-react-native";
+import { MapMarker, MarkerKind, POI, USER_LOC, type Coord } from "@/lib/surroundings/mockData";
+
+const LIME = "#7FEA4D";
+const LIME_HALO = "rgba(127,234,77,0.35)";
+
+const MARKER_ICON: Record<MarkerKind, LucideIcon> = {
+  train: Train,
+  subway: Train, // U-Bahn nutzt dasselbe Icon wie Train, Unterscheidung über Farbe
+  bus: Bus,
+  tram: TramFront,
+  airport: Plane,
+  cruise: Ship,
+};
+
+function markerColors(type: MarkerKind): { bg: string; fg: string } {
+  if (type === "train" || type === "airport") return { bg: LIME, fg: "#000" };
+  if (type === "subway") return { bg: "#1F3A8A", fg: "#FFFFFF" }; // Dunkelblau
+  if (type === "tram") return { bg: "#2A2A2C", fg: "#FFFFFF" };
+  if (type === "cruise") return { bg: "#6B95B5", fg: "#FFFFFF" };
+  return { bg: "#FFFFFF", fg: "#1A1A1A" };
+}
+
+/** MapLibre erwartet Koordinaten als [longitude, latitude] (GeoJSON-Order). */
+function lngLat(c: Coord): [number, number] {
+  return [c.longitude, c.latitude];
+}
+
+export const Marker = memo(function Marker({ m }: { m: MapMarker }) {
+  const { bg, fg } = markerColors(m.type);
+  const Icon = MARKER_ICON[m.type];
+  const size = m.big ? 36 : 28;
+  const round = false;
+
+  return (
+    <MapLibreMarker id={m.id} lngLat={lngLat(m.coord)} anchor="bottom">
+      <View style={styles.markerWrap}>
+        {m.selected && (
+          <View style={[styles.halo, { borderRadius: round ? size : 16 }]} />
+        )}
+        <View
+          style={[
+            styles.pin,
+            {
+              width: size,
+              height: size,
+              borderRadius: round ? size / 2 : 10,
+              backgroundColor: bg,
+              borderColor: m.selected ? LIME : "rgba(0,0,0,0.45)",
+            },
+          ]}
+        >
+          <Icon color={fg} size={m.big ? 17 : 14} strokeWidth={2.2} />
+          {m.label && (
+            <View style={styles.label}>
+              <Text style={styles.labelText}>{m.label}</Text>
+            </View>
+          )}
+        </View>
+        <View style={[styles.tail, { borderTopColor: bg }]} />
+      </View>
+    </MapLibreMarker>
+  );
+});
+
+const POI_COLORS: Record<POI["kind"], { bg: string; fg: string; Icon: LucideIcon }> = {
+  park: { bg: "#2A4A30", fg: "#7ACC8A", Icon: Trees },
+  shop: { bg: "#3A2A4A", fg: "#B388E6", Icon: ShoppingBag },
+  food: { bg: "#4A3A2A", fg: "#E6A04A", Icon: UtensilsCrossed },
+};
+
+export function POIMarker({ p, id }: { p: POI; id: string }) {
+  const { bg, fg, Icon } = POI_COLORS[p.kind];
+  return (
+    <MapLibreMarker id={id} lngLat={lngLat(p.coord)} anchor="center">
+      <View style={[styles.poi, { backgroundColor: bg }]}>
+        <Icon color={fg} size={11} strokeWidth={2.4} />
+      </View>
+    </MapLibreMarker>
+  );
+}
+
+export function UserPin({ coord = USER_LOC }: { coord?: Coord }) {
+  return (
+    <MapLibreMarker id="user-pin" lngLat={lngLat(coord)} anchor="center">
+      <View style={styles.userPin}>
+        <View style={styles.userHalo} />
+        <View style={styles.userDot} />
+      </View>
+    </MapLibreMarker>
+  );
+}
+
+const styles = StyleSheet.create({
+  markerWrap: {
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  halo: {
+    position: "absolute",
+    left: -10,
+    top: -10,
+    right: -10,
+    bottom: -2,
+    borderWidth: 3,
+    borderColor: LIME_HALO,
+  },
+  pin: {
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 2,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.5,
+    shadowRadius: 8,
+    elevation: 6,
+  },
+  label: {
+    position: "absolute",
+    top: -6,
+    right: -6,
+    backgroundColor: "#1A1A1A",
+    borderColor: LIME,
+    borderWidth: 1.5,
+    paddingHorizontal: 4,
+    paddingVertical: 1,
+    borderRadius: 7,
+    minWidth: 14,
+  },
+  labelText: {
+    color: LIME,
+    fontSize: 9,
+    fontWeight: "800",
+    textAlign: "center",
+  },
+  tail: {
+    width: 0,
+    height: 0,
+    borderLeftWidth: 4,
+    borderRightWidth: 4,
+    borderTopWidth: 7,
+    borderLeftColor: "transparent",
+    borderRightColor: "transparent",
+    marginTop: -2,
+  },
+  poi: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1.5,
+    borderColor: "rgba(0,0,0,0.5)",
+  },
+  userPin: {
+    width: 52,
+    height: 52,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  userHalo: {
+    position: "absolute",
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    backgroundColor: "rgba(127,234,77,0.18)",
+  },
+  userDot: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: LIME,
+    borderWidth: 3,
+    borderColor: "#1A1A1A",
+  },
+});

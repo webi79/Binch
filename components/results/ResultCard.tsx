@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import { View, Text, Share, Image, StyleSheet } from "react-native";
-import { useRouter } from "expo-router";
-import { Heart, Share2, Plane, Train, Bus, Ship, ChevronRight } from "lucide-react-native";
+import { useRouter, usePathname, useLocalSearchParams } from "expo-router";
+import { Heart, Share2, Plane, Train, Bus, Ship, ChevronRight, Route as RouteIcon } from "lucide-react-native";
 import Animated, {
   useAnimatedStyle,
   useSharedValue,
@@ -13,12 +13,14 @@ import { SearchResult, TravelMode } from "@/types/search";
 import { useSearchStore } from "@/stores/searchStore";
 import { useT } from "@/lib/i18n/useT";
 import { formatTimeInZone, formatDateInZone } from "@/lib/time-format";
-import { redirectUrl } from "@/lib/api/client";
+import { redirectUrl, fetchTripPolylines, fetchFlightBookingOptions } from "@/lib/api/client";
+import { useQueryClient } from "@tanstack/react-query";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { displayCode, displayProvider, logoUrls } from "@/lib/results/logos";
 import { tripSignature } from "@/lib/results/signature";
+import { buildRoutePlan } from "@/lib/routing/buildRoute";
 
 interface Props {
   result: SearchResult;
@@ -37,6 +39,15 @@ const C = {
 
 const MODE_ICON = { FLIGHT: Plane, TRAIN: Train, BUS: Bus, CRUISE: Ship };
 
+// Mode-Farben übernommen aus dem Surroundings-Map (MarkerLayer): einheitliche
+// visuelle Sprache zwischen Karten-Markern und Result-Card-Badges.
+const MODE_COLOR: Record<TravelMode, { bg: string; fg: string }> = {
+  FLIGHT: { bg: "#7FEA4D", fg: "#000000" },
+  TRAIN: { bg: "#FFD60A", fg: "#000000" },
+  BUS: { bg: "#9D5FE0", fg: "#FFFFFF" },
+  CRUISE: { bg: "#6B95B5", fg: "#FFFFFF" },
+};
+
 function formatDuration(minutes: number): string {
   const h = Math.floor(minutes / 60);
   const m = minutes % 60;
@@ -49,13 +60,18 @@ function currencyCode(code: string): string {
   return code.toUpperCase();
 }
 
-export function ResultCard({ result, passengers = 1 }: Props) {
+function ResultCardInner({ result, passengers = 1 }: Props) {
   const t = useT();
   const router = useRouter();
+  const pathname = usePathname();
+  const currentParams = useLocalSearchParams();
   const savedTrips = useSearchStore((s) => s.savedTrips);
   const toggleSavedTrip = useSearchStore((s) => s.toggleSavedTrip);
   const selectResult = useSearchStore((s) => s.selectResult);
   const showSavedToast = useSearchStore((s) => s.showSavedToast);
+  const setRoute = useSearchStore((s) => s.setRoute);
+  const setRoutePolylines = useSearchStore((s) => s.setRoutePolylines);
+  const queryClient = useQueryClient();
   const resultSig = tripSignature(result);
   const favored = savedTrips.some((trip) => tripSignature(trip) === resultSig);
 
@@ -76,10 +92,36 @@ export function ResultCard({ result, passengers = 1 }: Props) {
     }
   }
 
+  // Doppel-Tap-Guard ist nicht mehr nötig: das Details-Overlay reagiert
+  // idempotent auf wiederholtes selectResult (gleiche Daten ⇒ kein
+  // Re-Mount, kein doppelter Slide).
   function onSelect() {
-    haptic("important");
+    // Overlay-Pattern: nur den Store füllen — DetailsOverlay im _layout
+    // hört auf `selectedResult` und slidet rein. Kein router.push mehr,
+    // also keine Navigation-Stack-Mount-Arbeit die den Slide-Start verzögert.
     selectResult(result, passengers);
-    router.push("/details");
+    haptic("important");
+
+    // Prefetch: schon beim Card-Tap die Buchungs-Optionen für diesen Flug
+    // anfordern. Bis das Overlay durch die 260ms Slide-In durch ist, ist
+    // die RapidAPI-Antwort meistens schon da → Provider-Liste erscheint
+    // ohne sichtbaren Spinner. Reine Network-Last, kein UI-Konflikt mit
+    // der Slide-Animation (die läuft auf der UI-Thread via Reanimated).
+    if (result.mode === "FLIGHT" && result.bookingToken) {
+      queryClient.prefetchQuery({
+        queryKey: ["flightBookingOptions", result.bookingToken, result.currency, passengers],
+        queryFn: () =>
+          fetchFlightBookingOptions({
+            token: result.bookingToken!,
+            origin: result.origin,
+            destination: result.destination,
+            departDate: result.departTime.slice(0, 10),
+            passengers,
+            currency: result.currency.toUpperCase(),
+          }),
+        staleTime: 5 * 60_000,
+      });
+    }
   }
 
   const scale = useSharedValue(1);
@@ -100,7 +142,34 @@ export function ResultCard({ result, passengers = 1 }: Props) {
     }
   }
 
+  function onShowRoute() {
+    haptic("button");
+    const plan = buildRoutePlan(result);
+    if (!plan) return;
+    // pathname + Query-Params merken damit der Back-Arrow in Surroundings
+    // exakt zum Screen zurück springt — INKLUSIVE origin/destination/dates,
+    // sonst hat der Results-Screen keine Such-Parameter und zeigt leer an.
+    const params: Record<string, string> = {};
+    for (const [k, v] of Object.entries(currentParams)) {
+      if (typeof v === "string") params[k] = v;
+      else if (Array.isArray(v) && typeof v[0] === "string") params[k] = v[0];
+    }
+    setRoute({
+      ...plan,
+      previousHref: { pathname, params: Object.keys(params).length > 0 ? params : undefined },
+    });
+    router.navigate("/(tabs)/surroundings");
+
+    const tripIds = plan.legs.map((l) => l.tripId).filter((id): id is string => Boolean(id));
+    if (tripIds.length > 0) {
+      fetchTripPolylines(tripIds)
+        .then((r) => setRoutePolylines(r.polylines))
+        .catch(() => {});
+    }
+  }
+
   const ModeIcon = MODE_ICON[result.mode] ?? Plane;
+  const modeColor = MODE_COLOR[result.mode] ?? MODE_COLOR.FLIGHT;
   const carrierName = displayProvider(result);
   const urls = logoUrls(result, carrierName);
   const [logoIdx, setLogoIdx] = useState(0);
@@ -120,7 +189,17 @@ export function ResultCard({ result, passengers = 1 }: Props) {
     <Animated.View style={[styles.card, cardAnim]}>
       <View style={styles.headerRow}>
         <View style={styles.providerWrap}>
-          <View style={styles.providerLogo}>
+          {/* Logo-Box: bei vorhandenem Carrier-Logo transparent, damit das
+              echte Logo (Eurowings, DB, FlixBus, …) ohne brand-getönte Box
+              dargestellt wird. Beim Fallback ohne Logo behalten wir die
+              mode-Farbbox + Lucide-Icon damit die Card visuell strukturiert
+              bleibt und der Mode auf einen Blick erkennbar ist. */}
+          <View
+            style={[
+              styles.providerLogo,
+              { backgroundColor: currentLogoUrl ? "transparent" : modeColor.bg },
+            ]}
+          >
             {currentLogoUrl ? (
               <Image
                 key={currentLogoUrl}
@@ -130,22 +209,19 @@ export function ResultCard({ result, passengers = 1 }: Props) {
                 onError={() => setLogoIdx((i) => i + 1)}
               />
             ) : (
-              <ModeIcon color={C.black} size={16} />
+              <ModeIcon color={modeColor.fg} size={16} />
             )}
           </View>
-          <Text style={styles.providerName} numberOfLines={1}>
-            {carrierName}
-          </Text>
           {flightCode ? (
-            <>
-              <Text style={styles.providerSep}>·</Text>
-              <Text style={styles.providerCode}>{flightCode}</Text>
-            </>
+            <Text style={styles.providerCode}>{flightCode}</Text>
           ) : null}
         </View>
         <View style={styles.headerActions}>
           <RippleTouch onPress={onShare} hitSlop={8} borderless style={styles.iconBtn}>
             <Share2 color={C.text} size={18} />
+          </RippleTouch>
+          <RippleTouch onPress={onShowRoute} hitSlop={8} borderless style={styles.iconBtn}>
+            <RouteIcon color={C.text} size={18} />
           </RippleTouch>
           <RippleTouch onPress={onToggleFav} hitSlop={8} borderless style={styles.iconBtn}>
             <Heart
@@ -236,6 +312,17 @@ export function ResultCard({ result, passengers = 1 }: Props) {
   );
 }
 
+// Memoization-Wrapper: verhindert dass jede FlatList-Re-Render alle Cards
+// re-rendert. Verglichen wird über `result.id` + passengers — gleiche ID =
+// gleiche Card, kein Re-Render. Wichtig wenn der Store wegen anderer Felder
+// (selectedResult etc.) updated, oder die FlatList neue Prop-Refs vergibt
+// nach einem Daten-Refresh.
+export const ResultCard = memo(
+  ResultCardInner,
+  (prev, next) =>
+    prev.result.id === next.result.id && prev.passengers === next.passengers,
+);
+
 const styles = StyleSheet.create({
   card: {
     backgroundColor: C.card,
@@ -267,8 +354,6 @@ const styles = StyleSheet.create({
     overflow: "hidden",
   },
   providerLogoImg: { width: 24, height: 24 },
-  providerName: { color: C.text, fontSize: 14, fontWeight: "700", letterSpacing: -0.1 },
-  providerSep: { color: C.subDim, fontSize: 13 },
   providerCode: { color: C.sub, fontSize: 12, fontWeight: "600" },
   headerActions: { flexDirection: "row", alignItems: "center", gap: 12 },
   iconBtn: { padding: 2 },

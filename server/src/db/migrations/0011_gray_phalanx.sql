@@ -1,0 +1,1 @@
+CREATE INDEX IF NOT EXISTS "idx_locations_geo" ON "locations" USING btree ("latitude","longitude");

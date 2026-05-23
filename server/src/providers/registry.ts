@@ -12,7 +12,11 @@ import { cruisedirectProvider } from "./cruise/cruisedirect.js";
 const REGISTRY: Record<TravelMode, SearchProvider[]> = {
   FLIGHT: [googleFlightsProvider, skyscannerProvider, amadeusProvider],
   TRAIN: [trainlineProvider, dbVendoProvider],
-  BUS: [flixbusProvider, busbudProvider],
+  // dbVendo (HAFAS) ist intermodal und liefert auch Bus-Verbindungen — vor
+  // allem für regionale/Verbund-Strecken die FlixBus/Busbud gar nicht im
+  // Angebot haben. Reihenfolge: erst dbVendo (lokale ÖPNV-Strecken), dann
+  // FlixBus/Busbud (internationale/Fernbusse).
+  BUS: [dbVendoProvider, flixbusProvider, busbudProvider],
   CRUISE: [cruisedirectProvider],
 };
 

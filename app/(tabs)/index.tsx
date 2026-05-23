@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -26,6 +26,8 @@ import Animated, {
   FadeInDown,
   FadeOutUp,
   LinearTransition,
+  SlideInLeft,
+  SlideInRight,
   useAnimatedStyle,
   useSharedValue,
   withSequence,
@@ -78,51 +80,172 @@ interface Destination {
   country: string;
   priceFrom: number;
   currency: string;
-  imageUrl: string;
+  // String = Remote-URL (Unsplash etc.), number = lokales require()-Asset.
+  imageUrl: string | number;
   popular?: boolean;
   mode: TravelMode;
 }
 
-const DESTINATIONS: Destination[] = [
-  {
-    id: "ny",
-    city: "New York",
-    country: "USA",
-    priceFrom: 456,
-    currency: "USD",
-    imageUrl: "https://images.unsplash.com/photo-1496442226666-8d4d0e62e6e9?w=900&q=80",
-    popular: true,
-    mode: "FLIGHT",
-  },
-  {
-    id: "tenerife",
-    city: "Teneriffa",
-    country: "Spanien",
-    priceFrom: 89,
-    currency: "EUR",
-    imageUrl: "https://images.unsplash.com/photo-1552832230-c0197dd311b5?w=900&q=80",
-    popular: true,
-    mode: "FLIGHT",
-  },
-  {
-    id: "bangkok",
-    city: "Bangkok",
-    country: "Thailand",
-    priceFrom: 598,
-    currency: "EUR",
-    imageUrl: "https://images.unsplash.com/photo-1508009603885-50cf7c579365?w=900&q=80",
-    mode: "FLIGHT",
-  },
-  {
-    id: "berlin",
-    city: "Berlin",
-    country: "Deutschland",
-    priceFrom: 29,
-    currency: "EUR",
-    imageUrl: "https://images.unsplash.com/photo-1587330979470-3016b6702d89?w=900&q=80",
-    mode: "TRAIN",
-  },
-];
+// Stock-Daten pro Kategorie. Echte Backend-Anbindung folgt — diese Listen
+// dienen erstmal nur dazu, das visuelle Verhalten (Slide-Animation,
+// Kategorie-Switch) zu simulieren.
+const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
+  ocean: [
+    {
+      id: "tenerife",
+      city: "Teneriffa",
+      country: "Spanien",
+      priceFrom: 89,
+      currency: "EUR",
+      imageUrl: "https://images.unsplash.com/photo-1593693397690-362cb9666fc2?w=900&q=80",
+      popular: true,
+      mode: "FLIGHT",
+    },
+    {
+      id: "bali",
+      city: "Bali",
+      country: "Indonesien",
+      priceFrom: 612,
+      currency: "EUR",
+      imageUrl: "https://images.unsplash.com/photo-1537996194471-e657df975ab4?w=900&q=80",
+      mode: "FLIGHT",
+    },
+    {
+      id: "mykonos",
+      city: "Mykonos",
+      country: "Griechenland",
+      priceFrom: 219,
+      currency: "EUR",
+      imageUrl: "https://images.unsplash.com/photo-1601581875309-fafbf2d3ed3a?w=900&q=80",
+      mode: "FLIGHT",
+    },
+    {
+      id: "maldives",
+      city: "Malediven",
+      country: "Indischer Ozean",
+      priceFrom: 749,
+      currency: "EUR",
+      imageUrl: "https://images.unsplash.com/photo-1514282401047-d79a71a590e8?w=900&q=80",
+      mode: "FLIGHT",
+    },
+  ],
+  mountain: [
+    {
+      id: "zermatt",
+      city: "Zermatt",
+      country: "Schweiz",
+      priceFrom: 119,
+      currency: "EUR",
+      imageUrl: "https://images.unsplash.com/photo-1530122037265-a5f1f91d3b99?w=900&q=80",
+      popular: true,
+      mode: "TRAIN",
+    },
+    {
+      id: "innsbruck",
+      city: "Innsbruck",
+      country: "Österreich",
+      priceFrom: 69,
+      currency: "EUR",
+      imageUrl: require("@/assets/destinations/innsbruck.jpg"),
+      mode: "TRAIN",
+    },
+    {
+      id: "chamonix",
+      city: "Chamonix",
+      country: "Frankreich",
+      priceFrom: 99,
+      currency: "EUR",
+      imageUrl: "https://images.unsplash.com/photo-1551524559-8af4e6624178?w=900&q=80",
+      mode: "TRAIN",
+    },
+    {
+      id: "banff",
+      city: "Banff",
+      country: "Kanada",
+      priceFrom: 689,
+      currency: "EUR",
+      imageUrl: "https://images.unsplash.com/photo-1561134643-668f9057cce4?w=900&q=80",
+      mode: "FLIGHT",
+    },
+  ],
+  forest: [
+    {
+      id: "blackforest",
+      city: "Schwarzwald",
+      country: "Deutschland",
+      priceFrom: 49,
+      currency: "EUR",
+      imageUrl: "https://images.unsplash.com/photo-1469474968028-56623f02e42e?w=900&q=80",
+      mode: "TRAIN",
+    },
+    {
+      id: "patagonia",
+      city: "Patagonien",
+      country: "Argentinien",
+      priceFrom: 899,
+      currency: "EUR",
+      imageUrl: "https://images.unsplash.com/photo-1483683804023-6ccdb62f86ef?w=900&q=80",
+      mode: "FLIGHT",
+    },
+    {
+      id: "lapland",
+      city: "Lappland",
+      country: "Finnland",
+      priceFrom: 329,
+      currency: "EUR",
+      imageUrl: "https://images.unsplash.com/photo-1483347756197-71ef80e95f73?w=900&q=80",
+      mode: "FLIGHT",
+    },
+    {
+      id: "costarica",
+      city: "Costa Rica",
+      country: "Mittelamerika",
+      priceFrom: 599,
+      currency: "EUR",
+      imageUrl: "https://images.unsplash.com/photo-1518182170546-07661fd94144?w=900&q=80",
+      mode: "FLIGHT",
+    },
+  ],
+  city: [
+    {
+      id: "ny",
+      city: "New York",
+      country: "USA",
+      priceFrom: 456,
+      currency: "USD",
+      imageUrl: "https://images.unsplash.com/photo-1496442226666-8d4d0e62e6e9?w=900&q=80",
+      popular: true,
+      mode: "FLIGHT",
+    },
+    {
+      id: "tokyo",
+      city: "Tokio",
+      country: "Japan",
+      priceFrom: 689,
+      currency: "EUR",
+      imageUrl: "https://images.unsplash.com/photo-1540959733332-eab4deabeeaf?w=900&q=80",
+      mode: "FLIGHT",
+    },
+    {
+      id: "berlin",
+      city: "Berlin",
+      country: "Deutschland",
+      priceFrom: 29,
+      currency: "EUR",
+      imageUrl: "https://images.unsplash.com/photo-1560969184-10fe8719e047?w=900&q=80",
+      mode: "TRAIN",
+    },
+    {
+      id: "bangkok",
+      city: "Bangkok",
+      country: "Thailand",
+      priceFrom: 598,
+      currency: "EUR",
+      imageUrl: "https://images.unsplash.com/photo-1508009603885-50cf7c579365?w=900&q=80",
+      mode: "FLIGHT",
+    },
+  ],
+};
 
 // === Subcomponents ============================================================
 
@@ -272,14 +395,13 @@ function DestinationCard({ d }: { d: Destination }) {
         }}
       >
         <ImageBackground
-          source={{ uri: d.imageUrl }}
+          source={typeof d.imageUrl === "number" ? d.imageUrl : { uri: d.imageUrl }}
           style={styles.cardBg}
-          imageStyle={{ borderRadius: 28 }}
         >
           <LinearGradient
             colors={["rgba(0,0,0,0.05)", "rgba(0,0,0,0.15)", "rgba(0,0,0,0.85)"]}
             locations={[0, 0.45, 1]}
-            style={[StyleSheet.absoluteFill, { borderRadius: 28 }]}
+            style={StyleSheet.absoluteFill}
           />
           <RippleTouch
             borderless
@@ -337,6 +459,16 @@ export default function HomeScreen() {
   const openRecentHistoryOverlay = useSearchStore((s) => s.openRecentHistoryOverlay);
   const [recentExpanded, setRecentExpanded] = useState(false);
   const [category, setCategory] = useState<CategoryId>("ocean");
+  // Vorherige Kategorie merken → für die Slide-Richtung. Wechsel nach rechts
+  // (höherer Chip-Index) → neue Cards kommen von rechts, sonst von links.
+  const prevCategoryRef = useRef<CategoryId>(category);
+  const currentCatIdx = CATEGORIES.findIndex((c) => c.id === category);
+  const prevCatIdx = CATEGORIES.findIndex((c) => c.id === prevCategoryRef.current);
+  const slideFromRight = currentCatIdx >= prevCatIdx;
+  useEffect(() => {
+    prevCategoryRef.current = category;
+  }, [category]);
+  const destinations = DESTINATIONS_BY_CATEGORY[category];
   const visibleRecents = recentSearches.slice(
     0,
     recentExpanded ? RECENT_EXPANDED : RECENT_COLLAPSED
@@ -409,9 +541,16 @@ export default function HomeScreen() {
             </View>
             <CategoryChips value={category} onChange={setCategory} />
             <View style={{ height: 14 }} />
-            {DESTINATIONS.map((d) => (
-              <DestinationCard key={d.id} d={d} />
-            ))}
+            {/* Keyed wrapper → bei jedem Kategorie-Wechsel remountet die Liste
+                und Reanimated spielt die Slide-Animation in passender Richtung. */}
+            <Animated.View
+              key={category}
+              entering={(slideFromRight ? SlideInRight : SlideInLeft).duration(320)}
+            >
+              {destinations.map((d) => (
+                <DestinationCard key={d.id} d={d} />
+              ))}
+            </Animated.View>
           </Animated.View>
       </ScrollView>
     </View>

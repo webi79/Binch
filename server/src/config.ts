@@ -23,6 +23,10 @@ const schema = z.object({
   FLIXBUS_AFFILIATE_ID: z.string().optional(),
   BUSBUD_API_KEY: z.string().optional(),
   CRUISEDIRECT_API_KEY: z.string().optional(),
+
+  // AeroDataBox via RapidAPI — Flughafen-Departures/Arrivals.
+  AERODATABOX_KEY: z.string().optional(),
+  AERODATABOX_RAPIDAPI_HOST: z.string().default("aerodatabox.p.rapidapi.com"),
 });
 
 export type Config = z.infer<typeof schema>;
