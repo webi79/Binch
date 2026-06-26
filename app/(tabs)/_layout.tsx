@@ -1,45 +1,118 @@
-import { Tabs } from "expo-router";
+import { withLayoutContext } from "expo-router";
+import {
+  createNativeBottomTabNavigator,
+  type NativeBottomTabNavigationOptions,
+  type NativeBottomTabNavigationEventMap,
+} from "@bottom-tabs/react-navigation";
+import type {
+  ParamListBase,
+  TabNavigationState,
+} from "@react-navigation/native";
 import { View } from "react-native";
 import { useT } from "@/lib/i18n/useT";
+import { useSearchStore } from "@/stores/searchStore";
+import { useAccent } from "@/lib/theme/accent";
+
+const NativeBottomTabs = createNativeBottomTabNavigator();
+const Tabs = withLayoutContext<
+  NativeBottomTabNavigationOptions,
+  typeof NativeBottomTabs.Navigator,
+  TabNavigationState<ParamListBase>,
+  NativeBottomTabNavigationEventMap
+>(NativeBottomTabs.Navigator);
+
+const COLORS = {
+  bar: "#242425",
+  active: "#FFFFFF",
+  inactive: "#8A8A90",
+};
+
+const NAVBAR_TRIM = 16;
 
 export default function TabsLayout() {
   const t = useT();
+  const closeSearchOverlay = useSearchStore((s) => s.closeSearchOverlay);
+  // Akzent reaktiv lesen: wenn der User in Settings auf Mint switcht, kriegt
+  // der Tab-Bar-Pill (activeIndicatorColor) sofort die neue Farbe. Vorher
+  // war es hartcoded grün → ignorierte die Mint-Wahl.
+  const accent = useAccent();
 
   return (
-    <View style={{ flex: 1, backgroundColor: "#1A1A1A" }}>
+    // Wrapper mit marginBottom: -7 schiebt die TabView 7px unter den Screen-
+    // Rand. Effektiv: die unteren 7px der nativen Tab-Bar liegen außerhalb
+    // des sichtbaren Bereichs → Bar erscheint 7px schlanker. Material 3
+    // BottomNavigationView hat 56dp Mindesthöhe, dieser Trick macht's
+    // optisch näher an unsere alte FloatingTabBar.
+    <View style={{ flex: 1, marginBottom: -NAVBAR_TRIM }}>
       <Tabs
-        // detachInactiveScreens ist eine Navigator-Level-Prop (kein screenOption).
-        // Default in react-native-screens v3+ ist `true` — der native View-
-        // Container des inaktiven Tabs wird beim Verlassen vom Tree abgehängt,
-        // beim Zurück-Wechseln wieder angehängt → 1-2 Frame Latenz pro Switch.
-        // Mit `false` bleiben alle Tabs durchgehend im native View-Tree
-        // (nur visibility wechselt) → Switch ist effektiv nur ein Toggle.
-        detachInactiveScreens={false}
-        screenOptions={{
-          headerShown: false,
-          tabBarStyle: { display: "none" },
-          sceneStyle: { backgroundColor: "#1A1A1A" },
-          // Tab-Wechsel ohne Crossfade/Shift — der grüne Kreis im
-          // FloatingTabBar liefert genug visuelles Feedback. So fühlt
-          // sich der Tab-Wechsel sofort an statt mit Verzögerung.
-          animation: "none",
-          // Alle Tabs eager mounten (statt lazy beim ersten Besuch). Trade-
-          // off: App-Start dauert ~200-400 ms länger (Surroundings mit
-          // MapLibre + Saved-SectionList werden vorbereitet), dafür ist
-          // jeder Tab-Switch danach instant ohne Mount-Stutter.
-          lazy: false,
-          // Render-Loop auf inaktiven Tabs NICHT einfrieren. Default ist
-          // bereits `false`, aber explizit weil's für unsere App wichtig
-          // ist (z.B. damit der MapLibre-Container im Surroundings-Tab
-          // beim Zurück-Wechseln nicht erst wieder hochfahren muss).
-          freezeOnBlur: false,
+        // tabPress feuert wenn der User auf irgendein Tab-Icon tippt.
+        // Wir schließen den SearchHero-Overlay damit er nicht weiter offen
+        // bleibt während der Tab im Hintergrund wechselt.
+        screenListeners={{
+          tabPress: () => closeSearchOverlay(),
         }}
+        tabBarActiveTintColor={COLORS.active}
+        tabBarInactiveTintColor={COLORS.inactive}
+        tabBarStyle={{ backgroundColor: COLORS.bar }}
+        // accent.border ist die rgba-Variante (~30% Opacity) des aktiven
+        // Akzents — gibt den dezent translucenten Pill-Hintergrund, der zum
+        // Rest der App-Akzente passt (gleiche Border-Farbe wie z.B. der
+        // FAB-Highlight).
+        activeIndicatorColor={accent.border}
+        rippleColor="transparent"
+        // labeled=TRUE (statt false): Android Material 3 positioniert dann
+        // das Icon im OBEREN Teil des Slots (mit reserviertem Label-Bereich
+        // darunter). Wir machen die Label aber unsichtbar via fontSize=0
+        // → Icon erscheint visuell höher in der Bar, ohne dass Text
+        // sichtbar ist. Der zusätzliche Label-Slot-Höhe wird durch unseren
+        // NAVBAR_TRIM-Crop unten wieder kompensiert.
+        labeled={true}
+        tabLabelStyle={{ fontSize: 0 }}
+        hapticFeedbackEnabled
+        disablePageAnimations
+        translucent={false}
+        scrollEdgeAppearance="opaque"
       >
-        <Tabs.Screen name="index" options={{ title: t("bottomnav.booking") }} />
-        <Tabs.Screen name="surroundings" options={{ title: t("bottomnav.surroundings") }} />
-        <Tabs.Screen name="saved" options={{ title: t("bottomnav.saved") }} />
-        <Tabs.Screen name="settings" options={{ title: t("bottomnav.settings") }} />
-        <Tabs.Screen name="search" options={{ href: null }} />
+        {/* freezeOnBlur=true ist die ROOT-FIX gegen den App-weiten Lag der
+            nach jedem ersten Saved-/Surroundings-/Settings-Besuch auftrat:
+            react-native-bottom-tabs hat per Default `freezeOnBlur=false`,
+            d.h. unfocussierte Tabs bleiben AKTIV rendernd im Hintergrund
+            (Reanimated-Subscriptions, useEffects, Store-Subscriber laufen
+            alle weiter). Jeder einmal besuchte Tab fügt permanent JS- und
+            UI-Thread-Last hinzu. Mit Freeze stoppt React das Rendering der
+            unfocussierten Tabs via Suspense → Landing bleibt smooth. */}
+        <Tabs.Screen
+          name="index"
+          options={{
+            title: t("bottomnav.booking"),
+            tabBarIcon: () => require("@/assets/tabs/home.png"),
+            freezeOnBlur: true,
+          }}
+        />
+        <Tabs.Screen
+          name="surroundings"
+          options={{
+            title: t("bottomnav.surroundings"),
+            tabBarIcon: () => require("@/assets/tabs/tag.png"),
+            freezeOnBlur: true,
+          }}
+        />
+        <Tabs.Screen
+          name="saved"
+          options={{
+            title: t("bottomnav.saved"),
+            tabBarIcon: () => require("@/assets/tabs/calendar.png"),
+            freezeOnBlur: true,
+          }}
+        />
+        <Tabs.Screen
+          name="settings"
+          options={{
+            title: t("bottomnav.settings"),
+            tabBarIcon: () => require("@/assets/tabs/user.png"),
+            freezeOnBlur: true,
+          }}
+        />
       </Tabs>
     </View>
   );

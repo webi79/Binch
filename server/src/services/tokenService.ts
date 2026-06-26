@@ -12,6 +12,12 @@ export interface BookingContext {
   returnDate?: string;
   passengers?: number;
   currency?: string;
+  /** App-Sprache (de/en/fr/es) — für die Sprach-Lokalisierung der aufgelösten
+   *  Anbieter-Deeplinks. */
+  lang?: string;
+  /** Suchpreis (it.price = Card-Preis) — Detail snappt den günstigsten
+   *  geschätzten Anbieter darauf, damit Card- und Detail-Preis übereinstimmen. */
+  searchPrice?: number;
 }
 
 export interface IssueOptions {

@@ -140,6 +140,27 @@ async function main() {
   const seenCode = new Set<string>();
   let fromUic = 0;
   let fromCarrier = 0;
+  // Substrings die auf eine "Sub-Bahnhof"-Variante hinweisen (Bahnsteig,
+  // Eingang, Tief-Niveau, Autoreisezug-Anlage). Diese Einträge bringen
+  // KEINEN Mehrwert für die User-Suche (der canonical Hbf reicht), tragen
+  // aber das Risiko von Sub-Code-Kollisionen mit HAFAS-IDs anderer Länder
+  // (z.B. „Matzleinsdorf Wien Hbf (Bahnsteige 1-2)" → ID 8101590 → mapped
+  // auf NL-Bus-Stop in HAFAS). Daher: nicht importieren.
+  const SUB_ENTRY_PATTERNS = [
+    /\(Bahnsteige?\b/i,
+    /\(Eingang\b/i,
+    /\(Tief\)?/i,
+    /\(tief\)/,
+    /\(Gleis\b/i,
+    /\(Autoreisezug/i,
+    /\(Washingtonplatz\)/i,
+    /\(Europaplatz\)/i,
+    /\(Kaiserstraße\)/i,
+    /\(Kirchenallee\)/i,
+    /\(Nelson-Mandela/i,
+    /\bGl\.?\s*\d+/i, // "Gl. 27" / "Gl 27" / "Gleis 5-10"
+  ];
+
   for (const r of rows) {
     // Filter: nur suggestable-Stationen + Coords.
     if (r["is_suggestable"] !== "t") continue;
@@ -148,6 +169,8 @@ async function main() {
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
     const name = r["name"]?.trim();
     if (!name) continue;
+    // Sub-Bahnhof-Einträge skippen.
+    if (SUB_ENTRY_PATTERNS.some((re) => re.test(name))) continue;
 
     const countryCode = r["country"]?.trim() ?? "";
     const uic = r["uic"]?.trim();
@@ -219,6 +242,32 @@ async function main() {
   }
 
   console.log("[stada] done.");
+
+  // Post-Import-Audit: StaDa importiert hauptsächlich DE/AT/CH-Bahnhöfe und
+  // verwendet UIC bzw. carrier-spezifische IDs. Letztere können trotzdem auf
+  // HAFAS-LU/NL-Bus-Stops mappen (Berlin Hbf 8065969 mapped auf Bertrange in
+  // LU). Wir prüfen daher Hbfs (label-basiert, ~3 Min) UND alle Verdachts-
+  // Präfixe (~13 Min) gegen HAFAS und löschen klare Kollisionen automatisch.
+  console.log("[stada] running post-import audits…");
+  const { spawnSync } = await import("node:child_process");
+  const scriptDir = new URL("./", import.meta.url).pathname;
+  const hbfAudit = spawnSync(
+    "npx",
+    ["tsx", `${scriptDir}audit-hbf-hafas-ids.ts`, "--auto-clean"],
+    { stdio: "inherit" },
+  );
+  if (hbfAudit.status !== 0) {
+    console.warn(`[stada] post-import hbf-audit failed (status=${hbfAudit.status})`);
+  }
+  const suspectAudit = spawnSync(
+    "npx",
+    ["tsx", `${scriptDir}audit-suspect-hafas-ids.ts`, "--auto-clean"],
+    { stdio: "inherit" },
+  );
+  if (suspectAudit.status !== 0) {
+    console.warn(`[stada] post-import suspect-audit failed (status=${suspectAudit.status})`);
+  }
+
   process.exit(0);
 }
 

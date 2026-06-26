@@ -16,14 +16,18 @@ export interface ParsedTicket {
   flightNumber?: string;
   fromCode?: string;
   fromCity?: string;
+  fromStation?: string;
   toCode?: string;
   toCity?: string;
+  toStation?: string;
   departTime?: string; // ISO yyyy-mm-ddThh:mm:00 (no tz)
   arriveTime?: string;
   durationMinutes?: number;
   passenger?: string;
   seat?: string;
+  wagon?: string;
   travelClass?: string;
+  bookingRef?: string;
 }
 
 // === carriers ====================================================
@@ -79,9 +83,32 @@ const RX_DATE_DOT = /\b(\d{1,2})\.\s?(\d{1,2})\.\s?(\d{2,4})\b/;
 const RX_DATE_MONTHNAME =
   /\b(\d{1,2})\s+(Jan|Feb|Mar|Mär|Apr|May|Mai|Jun|Jul|Aug|Sep|Sept|Oct|Okt|Nov|Dec|Dez)[a-zäöü.]*\s+(\d{2,4})\b/i;
 
-const RX_PASSENGER = /(?:Passagier|Passenger|Pasajero|Passager|Name|PAX)\s*[:.]?\s*([A-ZÄÖÜ][\p{L}'.\- ]+(?:\s+[A-ZÄÖÜ][\p{L}'.\- ]+){0,3})/u;
-const RX_SEAT = /(?:Sitz(?:platz)?|Seat|Place|Asiento|Posto)\s*[:.]?\s*(\d{1,3}\s?[A-Z]?)\b/i;
-const RX_CLASS = /\b(Economy|Eco|Premium Economy|Business|First|2\.?\s?Klasse|1\.?\s?Klasse|Standard|Comfort)\b/i;
+const RX_PASSENGER = /(?:Passagier|Passenger|Pasajero|Passager|Holder|PAX)\s*[:.]?\s*([A-ZÄÖÜ][\p{L}'.\- ]+(?:\s+[\p{L}'.\- ]+){0,3})/u;
+// "Jona Skrubel Auftragsnummer:" — der Passagier-Name steht in DB-Tickets
+// DIREKT vor dem "Auftragsnummer:" Label. Höchste Priorität für DB.
+const RX_PASS_BEFORE_AUFTRAG = /\b([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){1,2})\s+Auftragsnummer/u;
+const RX_SEAT = /(?:Sitz(?:platz)?|Platz|Seat|Place|Asiento|Posto)\s*[:.]?\s*(\d{1,3}\s?[A-Z]?)\b/i;
+const RX_WAGON = /(?:Wagen|Wg\.?|Coach|Car|Voiture|Carro|Carrozza|Vagón|Vagon)\s*[:.]?\s*(\d{1,3}[A-Z]?)\b/i;
+const RX_CLASS = /\b(Economy|Eco|Premium Economy|Business|First|2\.?\s?Klasse|1\.?\s?Klasse|Standard|Comfort|1ère|2ème|1st|2nd)\b/i;
+const RX_BOOKING_REF = /(?:Auftragsnummer|Buchungscode|Buchungsnummer|Buchungsref|Bestellnummer|Booking(?:\s*(?:code|number|reference|ref))?|Reference|Réservation|PNR|Ticket\s*(?:no|nr|number|#))\s*[:.#]?\s*([A-Z0-9][A-Z0-9-]{4,15})\b/i;
+// DB-spezifisch: "Einfache Fahrt: Kölleda → Erfurt Hbf" — höchste Priorität,
+// da das Pattern eindeutig die Reise-Route markiert. Stops bei common breakers
+// (Via:, Klasse, Reisender, etc.) damit nicht greedy in andere Sektionen
+// reingelaufen wird.
+const RX_DB_ROUTE = /Einfache\s+Fahrt[:\s]+([\p{L}\-' ]{2,40}?)\s*(?:→|—|–|->|\bnach\b)\s*([\p{L}\-' ]{2,40}?)(?=\s+(?:Via|Klasse|Reisender|Eine|Gesamtpreis|Auftrags|Datum|Halt)\b|\s*$|[.,;:])/iu;
+// "Hin-/Rückfahrt" Variante für DB:
+const RX_DB_HINFAHRT = /(?:Hin|Rück)fahrt[:\s]+([\p{L}\-' ]{2,40}?)\s*(?:→|—|–|->|\bnach\b)\s*([\p{L}\-' ]{2,40}?)(?=\s+(?:Via|Klasse|Reisender|Eine|Gesamtpreis|Auftrags|Datum|Halt)\b|\s*$|[.,;:])/iu;
+// Stations mit Suffix — KEINE Parens/Dots/Digits im Prefix (sonst greedy
+// über Tabellen-Inhalt). Stops am Suffix-Wort.
+const RX_STATION_KEYWORDS = /\b([A-ZÄÖÜ][\p{L}\-' ]{1,28}?)\s+(Hbf\.?|Hauptbahnhof|Hauptbf\.?|Główny|Centrale|Termini|Centraal|Bahnhof|Stazione|Station|Flughafen|Airport)\b/gu;
+// Arrow-separierte Routen (generisch, niedrige Priorität) — gleiches Pattern
+// wie zuvor aber mit common-breaker-Lookahead damit's nicht in benachbarte
+// Sektionen läuft. Keine Parens, keine Dots im City-Match.
+const RX_ROUTE_ARROW = /\b([A-ZÄÖÜ][\p{L}\-' ]{1,30}?)\s*(?:→|—|–|->|\bnach\b|\bvers\b|\bto\b)\s+([A-ZÄÖÜ][\p{L}\-' ]{1,30}?)(?=\s+(?:Via|Klasse|Reisender|Datum|Halt|Auftrags)\b|\s*$|[.,;])/iu;
+// DB-Zeiten in der Reise-Tabelle: "ab HH:MM" (Abfahrt) / "an HH:MM" (Ankunft).
+// Generisch erste freie HH:MM nur als Fallback wenn keine ab/an Pattern matchen.
+const RX_DEPART_AB = /\bab\s+(\d{1,2}):(\d{2})\b/g;
+const RX_ARRIVE_AN = /\ban\s+(\d{1,2}):(\d{2})\b/g;
 
 const MONTH_MAP: Record<string, number> = {
   jan: 1, feb: 2, mar: 3, mär: 3, apr: 4, may: 5, mai: 5, jun: 6,
@@ -188,22 +215,114 @@ export function parseTicketText(text: string): ParsedTicket {
     if (fn) out.flightNumber = `${fn[1]} ${fn[2]}`;
   }
 
-  // Route
-  const { from, to } = findIataPair(collapsed);
-  if (from) {
-    out.fromCode = from;
-    const ap = AIRPORT_BY_IATA.get(from);
-    if (ap) out.fromCity = ap.city;
+  // Route — Versuch 1: DB-spezifisches "Einfache Fahrt: X → Y" (höchste
+  // Priorität, eindeutig die Reise-Route, nicht irgendein Text-Fragment).
+  const dbRoute = RX_DB_ROUTE.exec(collapsed) ?? RX_DB_HINFAHRT.exec(collapsed);
+  if (dbRoute) {
+    out.fromCity = dbRoute[1]!.trim();
+    out.toCity = dbRoute[2]!.trim();
   }
-  if (to) {
-    out.toCode = to;
-    const ap = AIRPORT_BY_IATA.get(to);
-    if (ap) out.toCity = ap.city;
+
+  // Route — Versuch 2: IATA-Airport-Codes (für Flug-Tickets)
+  if (!out.fromCity || !out.toCity) {
+    const { from, to } = findIataPair(collapsed);
+    if (from) {
+      if (!out.fromCode) out.fromCode = from;
+      const ap = AIRPORT_BY_IATA.get(from);
+      if (ap && !out.fromCity) out.fromCity = ap.city;
+    }
+    if (to) {
+      if (!out.toCode) out.toCode = to;
+      const ap = AIRPORT_BY_IATA.get(to);
+      if (ap && !out.toCity) out.toCity = ap.city;
+    }
+  }
+
+  // Route — Versuch 3: Stations-Keywords (für Zug/Bus-Tickets ohne IATA-Codes
+  // und ohne explizites "Einfache Fahrt"-Label). Sammelt alle Strings die auf
+  // Bahnhof-Suffixe enden.
+  if (!out.fromStation || !out.toStation || !out.fromCity || !out.toCity) {
+    const stations: string[] = [];
+    let sm: RegExpExecArray | null;
+    RX_STATION_KEYWORDS.lastIndex = 0;
+    while ((sm = RX_STATION_KEYWORDS.exec(collapsed)) !== null && stations.length < 4) {
+      const full = `${sm[1]!.trim()} ${sm[2]!.trim()}`;
+      if (!stations.includes(full)) stations.push(full);
+    }
+    if (stations.length >= 2) {
+      if (!out.fromStation) out.fromStation = stations[0];
+      if (!out.toStation) out.toStation = stations[1];
+      const cityFromStation = (s: string) =>
+        s.replace(/\s+(Hbf\.?|Hauptbahnhof|Hauptbf\.?|Główny|Centrale|Termini|Centraal|Bahnhof|Stazione|Station|Flughafen|Airport)\s*$/u, "").trim();
+      if (!out.fromCity) out.fromCity = cityFromStation(stations[0]!);
+      if (!out.toCity) out.toCity = cityFromStation(stations[1]!);
+    }
+  }
+
+  // Route — Versuch 4: Generic Arrow-Route ("X → Y" ohne DB-Prefix).
+  if (!out.fromCity || !out.toCity) {
+    const arrow = RX_ROUTE_ARROW.exec(collapsed);
+    if (arrow) {
+      if (!out.fromCity) out.fromCity = arrow[1]!.trim();
+      if (!out.toCity) out.toCity = arrow[2]!.trim();
+    }
+  }
+
+  // Post-Processing: wenn fromCity/toCity einen Station-Suffix enthält
+  // (z.B. "Erfurt Hbf" aus dem DB-Route-Match), trennen wir City + Station
+  // damit die UI-Titel-Zeile sauber "Erfurt" zeigt und die Subtitle-Zeile
+  // "Erfurt Hbf". Stationen die schon eigenständig erkannt wurden behalten
+  // wir.
+  const stripStationSuffix = (s: string): { city: string; station?: string } => {
+    const m = s.match(/^(.+?)\s+(Hbf\.?|Hauptbahnhof|Hauptbf\.?|Główny|Centrale|Termini|Centraal|Bahnhof|Stazione|Station|Flughafen|Airport)\s*$/u);
+    if (m) return { city: m[1]!.trim(), station: s.trim() };
+    return { city: s.trim() };
+  };
+  if (out.fromCity) {
+    const split = stripStationSuffix(out.fromCity);
+    out.fromCity = split.city;
+    if (split.station && !out.fromStation) out.fromStation = split.station;
+  }
+  if (out.toCity) {
+    const split = stripStationSuffix(out.toCity);
+    out.toCity = split.city;
+    if (split.station && !out.toStation) out.toStation = split.station;
   }
 
   // Date + times
   const date = parseFirstDate(collapsed);
-  const { t1, t2 } = findFirstTwoTimes(collapsed);
+
+  // Times — Versuch 1: DB-Tabellen-Pattern "ab HH:MM" / "an HH:MM" (echte
+  // Reise-Zeiten, NICHT die Gültigkeits-Periode "Gültigkeit: ... 00:00 ...
+  // bis ... 03:00 ..."). Erste "ab" = echte Abfahrt, LETZTE "an" = finale
+  // Ankunft (bei Multi-Leg-Trips: z.B. Kölleda ab 11:16 → Sömmerda an 11:25
+  // → Sömmerda ab 11:31 → Erfurt an 11:51 = wir wollen 11:16/11:51).
+  const abMatches: string[] = [];
+  let am: RegExpExecArray | null;
+  RX_DEPART_AB.lastIndex = 0;
+  while ((am = RX_DEPART_AB.exec(collapsed)) !== null) {
+    abMatches.push(`${am[1]!.padStart(2, "0")}:${am[2]}`);
+  }
+  const anMatches: string[] = [];
+  let nm: RegExpExecArray | null;
+  RX_ARRIVE_AN.lastIndex = 0;
+  while ((nm = RX_ARRIVE_AN.exec(collapsed)) !== null) {
+    anMatches.push(`${nm[1]!.padStart(2, "0")}:${nm[2]}`);
+  }
+
+  let t1: string | undefined;
+  let t2: string | undefined;
+  if (abMatches.length > 0 && anMatches.length > 0) {
+    t1 = abMatches[0];
+    t2 = anMatches[anMatches.length - 1];
+  } else {
+    // Times — Versuch 2 (Fallback): erste zwei HH:MM im Text (Flug-Tickets
+    // haben kein "ab"/"an"-Prefix, sondern z.B. "07:25 STR → 09:35 BER").
+    const found = findFirstTwoTimes(collapsed);
+    t1 = found.t1;
+    t2 = found.t2;
+  }
+
   if (date && t1) out.departTime = isoDateTime(date, t1);
   if (date && t2) {
     let arr = isoDateTime(date, t2);
@@ -222,15 +341,29 @@ export function parseTicketText(text: string): ParsedTicket {
     out.arriveTime = arr;
   }
 
-  // Passenger / seat / class
-  const pax = RX_PASSENGER.exec(collapsed);
-  if (pax) out.passenger = pax[1]!.trim();
+  // Passenger — Versuch 1: DB-Pattern "Vorname Nachname Auftragsnummer:"
+  // (der echte Name steht direkt vor dem Auftragsnummer-Label).
+  const paxBeforeAuftrag = RX_PASS_BEFORE_AUFTRAG.exec(collapsed);
+  if (paxBeforeAuftrag) out.passenger = paxBeforeAuftrag[1]!.trim();
+
+  // Passenger — Versuch 2: explizite "Passenger:" / "Pasajero:" Labels.
+  // Bewusst ohne "Name|Reisender" weil das auch "1 Person" matchen würde.
+  if (!out.passenger) {
+    const pax = RX_PASSENGER.exec(collapsed);
+    if (pax) out.passenger = pax[1]!.trim();
+  }
 
   const seat = RX_SEAT.exec(collapsed);
   if (seat) out.seat = seat[1]!.replace(/\s+/g, "").toUpperCase();
 
+  const wagon = RX_WAGON.exec(collapsed);
+  if (wagon) out.wagon = wagon[1]!.toUpperCase();
+
   const cls = RX_CLASS.exec(collapsed);
   if (cls) out.travelClass = cls[1]!.trim();
+
+  const ref = RX_BOOKING_REF.exec(collapsed);
+  if (ref) out.bookingRef = ref[1]!.trim();
 
   return out;
 }

@@ -32,6 +32,11 @@ async function loadStopRow(code: string) {
     .select({
       hafasId: locations.hafasId,
       label: locations.label,
+      type: locations.type,
+      // kinds = welche Verkehrsmittel an diesem Stop wirklich halten
+      // (Frontend-Kategorien wie "tram"/"bus"/"subway"/"train"/"ferry").
+      // Wird genutzt um Departures strikt nach Stop-Profile zu filtern.
+      kinds: locations.kinds,
       latitude: locations.latitude,
       longitude: locations.longitude,
       country: locations.country,
@@ -40,6 +45,29 @@ async function loadStopRow(code: string) {
     .where(eq(locations.code, code))
     .limit(1);
   return rows[0] ?? null;
+}
+
+/** Mappt ein HAFAS-Product (z.B. „regional", „tram", „bus", „suburban") auf
+ *  unsere Frontend-Kind-Kategorie. Wenn das Product nicht erkannt wird (z.B.
+ *  ""/null/unbekannter String): null → wir lassen's durch, lieber zu inklusiv
+ *  als verloren. */
+function productToKind(product: string): string | null {
+  const p = product.toLowerCase();
+  if (p === "tram") return "tram";
+  if (p === "subway" || p === "metro" || p === "underground") return "subway";
+  if (p === "bus") return "bus";
+  if (p === "ferry") return "ferry";
+  if (
+    p === "nationalexpress" ||
+    p === "national" ||
+    p === "regionalexpress" ||
+    p === "regional" ||
+    p === "regionalbahn" ||
+    p === "suburban" ||
+    p === "express"
+  )
+    return "train";
+  return null;
 }
 
 /** Liefert die HAFAS-ID für einen Stop. Wenn unser DB-Eintrag schon eine hat
@@ -53,13 +81,20 @@ async function loadStopRow(code: string) {
  *  gespeicherte hafasId und resolven IMMER per coord/name auf die Profile-
  *  interne ID — sonst kriegen wir "LOCATION: location/stop not found". */
 async function resolveStopHafasId(
-  stop: { hafasId: string | null; label: string; latitude: string | null; longitude: string | null },
+  stop: { hafasId: string | null; label: string; type?: string | null; latitude: string | null; longitude: string | null },
   profile: HafasProfileKey,
 ): Promise<string | null> {
   const skipCachedId = isAtRegionalProfile(profile);
   if (!skipCachedId && stop.hafasId) return stop.hafasId;
   if (!stop.latitude || !stop.longitude) return stop.hafasId; // wenigstens das probieren wenn keine coords da sind
-  return resolveHafasByCoord(Number(stop.latitude), Number(stop.longitude), stop.label, profile);
+  // expectedType durchreichen damit der Resolver Bus-Stops nicht an
+  // benachbarte Bahnhöfe mappt (Westtünnen-Bug: Bus-Stop 30m vom Bahnhof
+  // hatte Zug-Departures im Stop-Board, weil Coord-Resolver die Train-Station
+  // gefunden hatte).
+  const expectedType = stop.type === "BUS" || stop.type === "TRAIN" || stop.type === "ALL"
+    ? stop.type
+    : null;
+  return resolveHafasByCoord(Number(stop.latitude), Number(stop.longitude), stop.label, profile, expectedType);
 }
 
 function emptyResponse(label: string, code: string): StopBoardApiResponse {
@@ -93,11 +128,29 @@ export async function stopsRoutes(app: FastifyInstance) {
     if (!parsed.success) return reply.code(400).send({ error: "Bad request" });
 
     // Airport-Codes: direkter AeroDataBox-Lookup, kein DB-Row nötig.
+    // (Pattern: `airport:IATA` — Legacy-Format aus dem alten Airport-Suchindex.)
     const flight = await tryFlightBoard(parsed.data.code, board);
     if (flight) return flight;
 
     const stop = await loadStopRow(parsed.data.code);
     if (!stop) return reply.code(404).send({ error: "Stop not found" });
+
+    // FLIGHT-Typ-Locations sind Airports in der DB mit reinem IATA-Code
+    // (z.B. „AMS", „BER", „CDG") — kein `airport:`-Prefix. tryFlightBoard
+    // hat den nicht erkannt, jetzt wo wir den Stop-Typ kennen können wir
+    // direkt die Flight-API aufrufen. Code IST der IATA.
+    if (stop.type === "FLIGHT") {
+      try {
+        const data = await getFlightBoard(parsed.data.code, board);
+        return {
+          ...data,
+          stop: { code: parsed.data.code, label: stop.label, hafasId: null },
+        } satisfies StopBoardApiResponse;
+      } catch (err) {
+        req.log.warn({ err, code: parsed.data.code }, `flight ${board} upstream failed`);
+        return emptyResponse(stop.label, parsed.data.code);
+      }
+    }
 
     // GTFS-Schedule-Fallback ZUERST: für Länder ohne HAFAS-Profile (NL/FR/IT/
     // ES/CZ/BE/HU/SK/UK/PT) haben wir den offiziellen GTFS-Feed lokal in der
@@ -142,8 +195,38 @@ export async function stopsRoutes(app: FastifyInstance) {
     }
     try {
       const data = await getStopBoard(resolvedId, board, profile);
+      // Product-Filter passend zum Stop-Typ.
+      // HAFAS-Stops aggregieren oft mehrere Verkehrsmittel pro ID — z.B. der
+      // Bus-Stop „Westtünnen Bahnhof" liefert RB89-Train-Departures vom
+      // benachbarten Bahnhof mit. Bus-Stop → nur Bus/Taxi/Ferry zeigen.
+      // Train-Stop → keine reinen Bus-Lines (die kommen vom Bus-Stop nebenan).
+      // ALL/Unbekannt → unverändert.
+      // Filter auf Basis von stop.kinds. HAFAS-IDs aggregieren oft mehrere
+      // nahegelegene Stops (Tram-Haltestelle + 50m daneben Bus-Stop bekommen
+      // manchmal dieselbe Stop-ID). Wir wollen aber NUR die Departures
+      // zeigen die zu DIESEM Stop-Eintrag passen — bei einer reinen Tram-
+      // Station (kinds=["tram"]) keine Busse.
+      let results = data.results;
+      const stopKinds = (stop.kinds ?? []) as string[];
+      if (stopKinds.length > 0) {
+        results = results.filter((r) => {
+          const k = productToKind(r.product ?? "");
+          // Unbekanntes Product (taxi, leer, exotisches HAFAS-Produkt):
+          // durchlassen — lieber zu inklusiv als sichtbare Lücken.
+          if (k === null) return true;
+          return stopKinds.includes(k);
+        });
+      } else if (stop.type === "TRAIN") {
+        // Fallback für DB-Rows ohne kinds-Info (Legacy/StaDa-only): TRAIN-
+        // Stops haben sicher keine Bus/Taxi-Lines.
+        results = results.filter((r) => {
+          const p = (r.product ?? "").toLowerCase();
+          return p !== "bus" && p !== "taxi";
+        });
+      }
       return {
         ...data,
+        results,
         stop: { code: parsed.data.code, label: stop.label, hafasId: resolvedId },
       } satisfies StopBoardApiResponse;
     } catch (err) {

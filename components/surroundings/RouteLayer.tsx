@@ -1,6 +1,7 @@
 import { memo, useMemo } from "react";
 import { GeoJSONSource, Layer } from "@maplibre/maplibre-react-native";
 import type { RouteWaypoint, RouteLegGeometry } from "@/stores/searchStore";
+import { useAccent } from "@/lib/theme/accent";
 
 /**
  * Zeichnet eine Route auf der Karte: Polyline durch alle Waypoints + farbige
@@ -17,10 +18,28 @@ import type { RouteWaypoint, RouteLegGeometry } from "@/stores/searchStore";
  *   - wp-label (Text mit Stop-Name)
  */
 
-const LIME = "#7FEA4D";
-const ORIGIN_COLOR = "#7FEA4D";
+// LIME/ORIGIN_COLOR entfernt — werden zur Laufzeit aus useAccent() bezogen
+// (siehe RouteLayer-Body). Transfer/Dest sind feste informative Farben.
 const TRANSFER_COLOR = "#FFD60A";
 const DEST_COLOR = "#FF3B5C";
+
+// Maximales Verhältnis Polyline-Länge / Luftlinie, ab dem wir die echte
+// Polyline als implausibel verwerfen. Normale Linienbusse/-bahnen folgen den
+// Straßen/Schienen mit ~1.2-2.5× Luftlinie. Rufbusse (Bedarfsverkehr ohne feste
+// Route) liefern bei HAFAS eine zickzackende „Polyline" quer durch den Ort →
+// Vielfaches der Luftlinie → wir zeichnen stattdessen eine saubere Gerade.
+const MAX_POLY_RATIO = 5;
+
+function segLen(a: [number, number], b: [number, number]): number {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  return Math.sqrt(dx * dx + dy * dy);
+}
+function pathLen(coords: [number, number][]): number {
+  let len = 0;
+  for (let i = 1; i < coords.length; i++) len += segLen(coords[i - 1]!, coords[i]!);
+  return len;
+}
 
 interface Props {
   waypoints: RouteWaypoint[];
@@ -39,22 +58,33 @@ const WP_BG_ID = "route-wp-bg";
 const WP_LABEL_ID = "route-wp-label";
 
 export const RouteLayer = memo(function RouteLayer({ waypoints, legs, mode }: Props) {
+  // Line-Color + Origin-Waypoint nutzen den User-Akzent (live).
+  const accent = useAccent();
+  const LIME = accent.solid;
+  const ORIGIN_COLOR = accent.solid;
   // Pro Leg ein LineString: entweder echte Polyline (Schienen-Geometrie) wenn
   // bereits gefetched, oder Fallback auf gerade Linie zwischen den Waypoints.
   const lineGeoJson = useMemo(
     () => ({
       type: "FeatureCollection" as const,
       features: legs.map((leg) => {
-        const coords = leg.coords && leg.coords.length > 1
-          ? leg.coords
-          : ([
-              [waypoints[leg.fromIndex].longitude, waypoints[leg.fromIndex].latitude],
-              [waypoints[leg.toIndex].longitude, waypoints[leg.toIndex].latitude],
-            ] as [number, number][]);
+        const straight = [
+          [waypoints[leg.fromIndex].longitude, waypoints[leg.fromIndex].latitude],
+          [waypoints[leg.toIndex].longitude, waypoints[leg.toIndex].latitude],
+        ] as [number, number][];
+        // Echte Polyline nur nutzen, wenn sie plausibel ist (nicht absurd länger
+        // als die Luftlinie). Sonst (Rufbus-Zickzack o.ä.) → saubere Gerade.
+        let coords = straight;
+        if (leg.coords && leg.coords.length > 1) {
+          const direct = segLen(straight[0]!, straight[1]!);
+          if (direct === 0 || pathLen(leg.coords) / direct <= MAX_POLY_RATIO) {
+            coords = leg.coords;
+          }
+        }
         return {
           type: "Feature" as const,
           geometry: { type: "LineString" as const, coordinates: coords },
-          properties: { hasPolyline: Boolean(leg.coords) },
+          properties: { hasPolyline: coords !== straight },
         };
       }),
     }),

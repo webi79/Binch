@@ -19,6 +19,7 @@ import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useQuery } from "@tanstack/react-query";
 import { Star, Train, Bus, TramFront, Plane, Ship, type LucideIcon } from "lucide-react-native";
+import Svg, { Circle, Path } from "react-native-svg";
 import {
   fetchStopArrivals,
   fetchStopDepartures,
@@ -34,8 +35,9 @@ import type { MarkerKind } from "@/lib/surroundings/mockData";
 import { registerStopSheetAnimation } from "./stopSheetAnimation";
 import { stopToLocation } from "@/lib/surroundings/savedStation";
 import { haptic } from "@/lib/haptics";
-import { showAlert } from "@/lib/alert";
+import { showConnectionNotFound } from "@/lib/connectionNotFoundAlert";
 import type { SearchResult, TravelMode } from "@/types/search";
+import { useAccent } from "@/lib/theme/accent";
 
 const SAVED_GOLD = "#FFC107";
 
@@ -53,15 +55,23 @@ const SAVED_GOLD = "#FFC107";
  *     knapp unter dem Top-Inset)
  */
 
+// Surface-Stack: bg → surface2 (Cards) → surface3 (Pressed-State). border
+// rahmt Hero-Card subtil ein. Gleiche Werte wie in ClearSearchHistoryAlert
+// + RecentHistoryOverlay damit das Material konsistent ist.
 const C = {
   bg: "#1F1F20",
+  surface2: "#242425",
+  surface3: "#2A2A2C",
   border: "#2E2E30",
   white: "#FFFFFF",
   g1: "#C4C4C8",
   g2: "#8A8A90",
   g3: "#56565C",
 };
-const LIME = "#7FEA4D"; // Brand-Grün — gleiches Akzent wie aktive Tabs im SurroundingsSheet
+// Akzent-Tokens kommen jetzt aus useAccent() — die Hard-Coded LIME-/SUBTLE-/
+// BORDER-Werte sind raus damit die Slide automatisch die User-Wahl
+// (Lime/Mint/Iris) erbt. Components die im StyleSheet noch statisch waren,
+// nutzen jetzt inline-style mit accent.* statt diesen Konstanten.
 const TRAIN_YELLOW = "#FFD60A";
 const TRAIN_YELLOW_BG = "rgba(255,214,10,0.18)";
 const BUS_PURPLE = "#9D5FE0";
@@ -94,9 +104,39 @@ function formatDistance(m: number | undefined, t: (k: string) => string): string
   return `${(m / 1000).toFixed(1)} ${t("stop.distance.km_away")}`;
 }
 
+// Transit-Zeiten zeigen wir IMMER im 24h-Format (17:33) statt 12h mit AM/PM.
+// Das gilt unabhängig von der Device-Locale — bei englischer System-Sprache
+// würde toLocaleTimeString sonst „5:33 PM" liefern was im Bahn-Kontext
+// unüblich ist und einen visuellen Layout-Sprung bringt (4 Stellen vs 7).
+// `hourCycle: "h23"` zwingt 24h und 2-Ziffer-Stunde (00-23).
+const TIME_FORMAT_OPTS: Intl.DateTimeFormatOptions = {
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+  hourCycle: "h23",
+};
+
 function formatTime(iso: string): string {
   const d = new Date(iso);
-  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  return d.toLocaleTimeString("de-DE", TIME_FORMAT_OPTS);
+}
+
+/** ISO-Zeit + Delay-Minuten → tatsächliche Abfahrtszeit als „HH:MM"-String.
+ *  Wird unter der durchgestrichenen Planzeit angezeigt wenn die Abfahrt
+ *  verspätet ist. */
+function addDelayToTime(iso: string, delayMin: number): string {
+  const d = new Date(iso);
+  d.setMinutes(d.getMinutes() + delayMin);
+  return d.toLocaleTimeString("de-DE", TIME_FORMAT_OPTS);
+}
+
+/** Minuten bis zur Abfahrt. Inklusive Delay damit der Hero-Ring auch
+ *  korrekt schrumpft wenn der Zug 4 Min Verspätung hat. Negative Werte
+ *  (Abfahrt liegt in der Vergangenheit) klemmen wir auf 0 fest. */
+function minutesUntil(iso: string, delayMin: number): number {
+  const target = Date.parse(iso) + delayMin * 60_000;
+  const now = Date.now();
+  return Math.max(0, Math.round((target - now) / 60_000));
 }
 
 const ACCENT_DELAY = "#F26565";
@@ -130,6 +170,21 @@ function productToSearchMode(product: string | null): TravelMode | null {
 function isDeStop(code: string): boolean {
   if (/^gtfs:de:/i.test(code)) return true;
   return /^(?:sta:|dbrest:)?80\d{5,7}$/i.test(code);
+}
+
+/** Lokaler ÖPNV (U-Bahn/S-Bahn/Tram) hat KEINE individuelle Online-Buchung —
+ *  läuft im Verbund-Tarif. Diese Trips gehören durch den Trip-Detail-Flow
+ *  (LegTimeline mit allen Stops) statt durch die Booking-Suche.
+ *
+ *  HAFAS-Product-Tags die hier matchen:
+ *    - subway, metro, u-bahn  → U-Bahn
+ *    - suburban, s-bahn       → S-Bahn (Verbund-Tarif)
+ *    - tram, light_rail       → Tram/Stadtbahn
+ *  Nicht hier: national/regional/express → echte Fernzüge mit DB-Buchung */
+function isLocalTransitProduct(product: string | null): boolean {
+  if (!product) return false;
+  const p = product.toLowerCase();
+  return /(subway|metro|u-?bahn|tram|stadtbahn|light.?rail|s-?bahn|suburban)/.test(p);
 }
 
 /** Normalisiert eine Linien-Kennung für den Vergleich: „RB 59" und „RB59"
@@ -218,17 +273,45 @@ function tripDetailToSearchResult(detail: TripDetailResponse): SearchResult {
  *       der Provider die Linie aus irgendeinem Grund anders benennt, die
  *       Abfahrt aber unverkennbar dieselbe ist.
  *  Sonst: undefined → Caller zeigt Alert. */
-// Beide Toleranzen STRIKT (3 Min). Wenn HAFAS uns nicht GENAU den Zug zurück-
-// gibt den der User getappt hat (innerhalb von 3 Min), lehnen wir ab. Ohne
-// das hatten wir den Bug: User tappt RB98 13:28, Booking-Screen zeigt RB98
-// 13:32 — verwirrend. Lieber „nicht gefunden" als falsche Zeit anzeigen.
-const LINE_MATCH_TIME_TOLERANCE_MS = 3 * 60_000;
+// Gestaffelte Toleranzen je nach Match-Stärke. Stärkeres Signal = mehr
+// Spielraum bei der Zeit. Begründung:
+//  - Line+Direction-Match (15 Min): U5 nach Laimer Platz um 20:45 vs HAFAS
+//    20:47 ist ziemlich sicher derselbe Zug — kein anderer U5 nach Laimer
+//    Platz fährt 2 Min später (Takt ist 5-10 Min).
+//  - Line-only-Match (5 Min): Linie matched aber Richtung unbekannt. Etwas
+//    strenger weil bei dichten Takten (RB98 alle 30min) Verwechslung möglich.
+//  - Time-only (3 Min): schwächstes Signal, sehr strikt.
+const LINE_AND_DIR_MATCH_TOLERANCE_MS = 15 * 60_000;
+const LINE_MATCH_TIME_TOLERANCE_MS = 5 * 60_000;
 const TIME_FALLBACK_TOLERANCE_MS = 3 * 60_000;
+
+/** Normalisiert Richtung-Strings für Vergleich. „München Laimer Platz" und
+ *  „Laimer Platz" sollen matchen — wir vergleichen via Substring-Inklusion
+ *  nach Normalisierung. */
+function normalizeDirection(s: string | null | undefined): string {
+  return (s ?? "").toLowerCase().replace(/[(),.]/g, "").trim();
+}
+
+function directionMatches(itemDir: string, resultDir: string | null | undefined): boolean {
+  const a = normalizeDirection(itemDir);
+  const b = normalizeDirection(resultDir);
+  if (!a || !b) return false;
+  // Substring beidseitig — „Laimer Platz" matched „Laimer Platz, München".
+  return a === b || a.includes(b) || b.includes(a);
+}
 
 function findBestMatch(results: SearchResult[], item: StopBoardItem): SearchResult | undefined {
   if (results.length === 0) return undefined;
   const targetMs = Date.parse(item.plannedTime);
   const itemLine = normalizeLine(item.line);
+  const itemDir = item.direction ?? "";
+  // 3 Buckets nach Match-Stärke:
+  //   1. Linie + Richtung + Zeit  → stärkstes Signal (z.B. U5 nach Laimer Platz
+  //      um 20:45 — kann nicht versehentlich mit U5 nach Neuperlach matchen)
+  //   2. Linie + Zeit              → falls Direction-Field unzuverlässig ist
+  //   3. Zeit only                  → letzter Fallback
+  let bestWithLineAndDir: SearchResult | undefined;
+  let bestWithLineAndDirDiff = Infinity;
   let bestWithLine: SearchResult | undefined;
   let bestWithLineDiff = Infinity;
   let bestAny: SearchResult | undefined;
@@ -243,17 +326,67 @@ function findBestMatch(results: SearchResult[], item: StopBoardItem): SearchResu
       const lineMatch = resultLineCandidates(r).some(
         (cand) => normalizeLine(cand) === itemLine,
       );
-      if (lineMatch && diff < bestWithLineDiff) {
-        bestWithLine = r;
-        bestWithLineDiff = diff;
+      if (lineMatch) {
+        if (diff < bestWithLineDiff) {
+          bestWithLine = r;
+          bestWithLineDiff = diff;
+        }
+        // Richtungs-Check: r.legs[0].direction ist die Headsign-Endstation
+        // des ersten Train-Legs. Falls keine legs vorhanden, fallback auf
+        // destLabel des Results.
+        const resultDir = r.legs?.[0]?.direction ?? r.destLabel ?? null;
+        if (itemDir && directionMatches(itemDir, resultDir) && diff < bestWithLineAndDirDiff) {
+          bestWithLineAndDir = r;
+          bestWithLineAndDirDiff = diff;
+        }
       }
     }
   }
+  if (bestWithLineAndDir && bestWithLineAndDirDiff <= LINE_AND_DIR_MATCH_TOLERANCE_MS) return bestWithLineAndDir;
   if (bestWithLine && bestWithLineDiff <= LINE_MATCH_TIME_TOLERANCE_MS) return bestWithLine;
   if (bestAny && bestAnyDiff <= TIME_FALLBACK_TOLERANCE_MS) return bestAny;
   return undefined;
 }
 
+/** Kleines Walk-Männchen für die Subtitle-Zeile (Distanz zum Stop).
+ *  Lucide hat kein Walking-Person-Icon, daher inline-SVG. Form orientiert sich
+ *  an der WerlAbfahrten-Vorlage: kleiner Kopf-Kreis, Körper als Strich-Pfade
+ *  für Beine/Arme. strokeLinecap=round damit das Männchen bei 14px-Größe
+ *  weich aussieht und nicht pixelig. */
+function WalkIcon({ size = 14, color }: { size?: number; color: string }) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Circle cx={13} cy={4.5} r={1.6} fill={color} />
+      <Path
+        d="M11 9l-2.5 2 1 4M11 9l3 1 1.5 3M11 9l-1 5-2 5M12.5 18l1.5 3"
+        stroke={color}
+        strokeWidth={1.9}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </Svg>
+  );
+}
+
+/** Pro Departure das passende Mode-Icon im Line-Badge. Greift HAFAS-Produkte
+ *  ab — alles was nicht Bus/Tram/Flight/Ferry ist landet auf Train (Default
+ *  für regional/national/suburban/subway/…). */
+function iconForProduct(product: string | null): LucideIcon {
+  if (!product) return Train;
+  const p = product.toLowerCase();
+  if (/bus|coach/.test(p)) return Bus;
+  if (/tram|stadtbahn/.test(p)) return TramFront;
+  if (/flight|air/.test(p)) return Plane;
+  if (/ferry|ship/.test(p)) return Ship;
+  return Train;
+}
+
+/** Card-Row im neuen Hero-Design — eine Departure pro Card.
+ *  Layout: Zeit-Block links (Plan + ggf. Real durchgestrichen), Lime-Line-
+ *  Badge in der Mitte, Direction + Platform rechts. Anti-Patterns die ich
+ *  vermieden habe: keine Border (sonst wirkt's bei vielen Cards untereinander
+ *  unruhig), keine Underline auf Time damit das Strikethrough für Delay
+ *  eindeutig ist. */
 function StopBoardRow({
   item,
   platformPrefix,
@@ -265,10 +398,9 @@ function StopBoardRow({
   loading: boolean;
   onPress: () => void;
 }) {
+  const accent = useAccent();
   const delay = item.delayMinutes ?? 0;
-  const delayColor = delay > 0 ? ACCENT_DELAY : delay < 0 ? LIME : C.g2;
-  // Pressable mit FUNCTION-style (`({pressed}) => [...]`) hat die Box-Styles
-  // bei manchen RN-Versionen verschluckt — wir nutzen state-based opacity.
+  const ModeIcon = iconForProduct(item.product);
   const [pressed, setPressed] = useState(false);
   return (
     <Pressable
@@ -276,33 +408,179 @@ function StopBoardRow({
       disabled={loading}
       onPressIn={() => setPressed(true)}
       onPressOut={() => setPressed(false)}
-      style={[styles.row, pressed ? { opacity: 0.7 } : null]}
+      style={[styles.cardRow, pressed ? styles.cardRowPressed : null]}
     >
-      <View style={styles.rowTime}>
-        <Text style={styles.timeText}>{formatTime(item.plannedTime)}</Text>
-        {delay !== 0 && (
-          <Text style={[styles.delayText, { color: delayColor }]}>
-            {delay > 0 ? `+${delay}` : `${delay}`}
+      {/* Zeit-Block: Planzeit oben, bei Delay durchgestrichen + Real-Zeit
+          in Delay-Farbe darunter. Pünktlich → nur Planzeit, kein zweiter
+          Eintrag (vermeidet redundantes Doppel-Time). */}
+      <View style={styles.cardTime}>
+        <Text
+          style={[
+            styles.cardTimeText,
+            delay > 0 ? styles.cardTimeStrike : null,
+          ]}
+        >
+          {formatTime(item.plannedTime)}
+        </Text>
+        {delay > 0 && (
+          <Text style={styles.cardTimeReal}>
+            {addDelayToTime(item.plannedTime, delay)}
           </Text>
         )}
       </View>
-      <View style={styles.rowMain}>
-        <View style={styles.lineRow}>
-          <Text style={styles.lineText} numberOfLines={1}>
-            {item.line}
-          </Text>
-          {item.platform && (
-            <Text style={styles.platformText} numberOfLines={1}>
-              {platformPrefix} {item.platform}
-            </Text>
-          )}
-        </View>
-        <Text style={styles.directionText} numberOfLines={1}>
-          {item.direction || "—"}
+
+      {/* Accent-tinted Line-Badge mit Mode-Icon (Train/Bus/Tram etc.) */}
+      <View style={[styles.cardLineBadge, { backgroundColor: accent.subtle, borderColor: accent.border }]}>
+        <ModeIcon size={14} color={accent.solid} strokeWidth={2.2} />
+        <Text style={[styles.cardLineBadgeText, { color: accent.solid }]} numberOfLines={1}>
+          {item.line}
         </Text>
       </View>
+
+      <View style={styles.cardRight}>
+        <Text style={styles.cardDirection} numberOfLines={1}>
+          {item.direction || "—"}
+        </Text>
+        {item.platform ? (
+          <Text style={styles.cardPlatform} numberOfLines={1}>
+            {platformPrefix} {item.platform}
+          </Text>
+        ) : null}
+      </View>
+
       {loading ? (
-        <ActivityIndicator color={C.g1} size="small" style={{ marginLeft: 8 }} />
+        <ActivityIndicator color={C.g1} size="small" style={{ marginLeft: 6 }} />
+      ) : null}
+    </Pressable>
+  );
+}
+
+/** Hero-Card für die NÄCHSTE Abfahrt. Hat einen Countdown-Ring links der
+ *  proportional zu den verbleibenden Minuten füllt (15 Min = voller Ring,
+ *  0 Min = leerer Ring). Rechts: Line-Badge, „NÄCHSTE"-Label, Destination,
+ *  Real-Zeit + Platform.
+ *
+ *  Warum 15 Min als Ring-Skala? Default-View-Zeitspanne ist meistens ~30-60
+ *  Min; 15 Min als Maximum gibt einen visuell deutlichen Drop wenn der nächste
+ *  Bus in 12 Min kommt vs 5 Min. Größer würde der Ring meist ~voll wirken. */
+function NextHero({
+  item,
+  fetchedAt,
+  platformPrefix,
+  nextLabel,
+  ontimeLabel,
+  loading,
+  onPress,
+}: {
+  item: StopBoardItem;
+  fetchedAt: string | undefined;
+  platformPrefix: string;
+  nextLabel: string;
+  ontimeLabel: string;
+  loading: boolean;
+  onPress: () => void;
+}) {
+  const accent = useAccent();
+  const delay = item.delayMinutes ?? 0;
+  const ModeIcon = iconForProduct(item.product);
+
+  // Live-Ticker: alle 1 s neu rendern damit Ring sekundengenau wandert.
+  // Nur aktiv wenn das Sheet WIRKLICH offen ist (selectedStop != null) —
+  // sonst tick't das Interval auch nach Slide-Out weiter (displayStop hält
+  // den Stop für die Animation noch fest → NextHero bleibt gemountet) und
+  // erzeugt 1 Re-Render pro Sekunde im Hintergrund.
+  const sheetOpen = useSearchStore((s) => s.selectedStop !== null);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!sheetOpen) return;
+    const id = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(id);
+  }, [sheetOpen]);
+
+  const expectedMs = Date.parse(item.plannedTime) + delay * 60_000;
+  // Display-Minuten mit ceil damit „in 5 sec" noch als 1 Min angezeigt wird
+  // (nicht „0 Min" obwohl er noch fährt).
+  const mins = Math.max(0, Math.ceil((expectedMs - now) / 60_000));
+
+  // Baseline = Server-fetchedAt-Zeitpunkt (NICHT „erste Sicht im Sheet").
+  // Begründung: User-Mental-Model ist „Zug kommt in 40 Min, ich warte 20,
+  // also Ring bei 50%" — die 40 Min sind die Restzeit zum Zeitpunkt als die
+  // Daten geholt wurden. Wenn der User die Slide erst nach 20 Min öffnet,
+  // ist der Ring schon entsprechend gefüllt statt bei 0 zu starten.
+  // Fallback auf `now` wenn fetchedAt fehlt/unparsbar → Ring startet bei 0,
+  // gleiches Verhalten wie vorher.
+  const baselineMs = fetchedAt ? Date.parse(fetchedAt) : Number.NaN;
+  const baseline = Number.isFinite(baselineMs) ? baselineMs : now;
+  // max(1000, …) verhindert /0 wenn die Daten gerade erst geholt wurden
+  // und expectedMs <= baseline. Ring zeigt dann direkt sinnvolle Fraktion.
+  const totalMs = Math.max(1_000, expectedMs - baseline);
+  const elapsedMs = now - baseline;
+
+  const RING_R = 34;
+  const CIRC = 2 * Math.PI * RING_R;
+  // Ring-Fill: bei Daten-Fetch=0%, bei Abfahrt=100%. Linear über die echte
+  // Wartezeit. Per-Sekunde-Update über `now` → sichtbare Bewegung.
+  const frac = Math.min(1, Math.max(0, elapsedMs / totalMs));
+  const realTime = delay > 0 ? addDelayToTime(item.plannedTime, delay) : formatTime(item.plannedTime);
+  const subText = delay > 0
+    ? `${realTime} · +${delay} Min${item.platform ? ` · ${platformPrefix} ${item.platform}` : ""}`
+    : `${realTime} · ${ontimeLabel}${item.platform ? ` · ${platformPrefix} ${item.platform}` : ""}`;
+  const [pressed, setPressed] = useState(false);
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={loading}
+      onPressIn={() => setPressed(true)}
+      onPressOut={() => setPressed(false)}
+      style={[styles.hero, pressed ? styles.heroPressed : null]}
+    >
+      <View style={styles.heroRing}>
+        <Svg width={84} height={84} viewBox="0 0 84 84">
+          <Circle cx={42} cy={42} r={RING_R} fill="none" stroke={C.border} strokeWidth={6} />
+          <Circle
+            cx={42}
+            cy={42}
+            r={RING_R}
+            fill="none"
+            stroke={accent.solid}
+            strokeWidth={6}
+            strokeLinecap="round"
+            strokeDasharray={CIRC}
+            strokeDashoffset={CIRC * (1 - frac)}
+            // -90deg-Rotation um den Center damit der Ring oben (12 Uhr) startet
+            // statt rechts (3 Uhr — SVG-Default).
+            transform={`rotate(-90 42 42)`}
+          />
+        </Svg>
+        <View style={styles.heroRingCenter} pointerEvents="none">
+          <Text style={styles.heroRingMin}>{mins}</Text>
+          <Text style={styles.heroRingLabel}>Min</Text>
+        </View>
+      </View>
+
+      <View style={styles.heroBody}>
+        <View style={styles.heroBadgeRow}>
+          <View style={[styles.cardLineBadge, { backgroundColor: accent.subtle, borderColor: accent.border }]}>
+            <ModeIcon size={14} color={accent.solid} strokeWidth={2.2} />
+            <Text style={[styles.cardLineBadgeText, { color: accent.solid }]} numberOfLines={1}>
+              {item.line}
+            </Text>
+          </View>
+          <Text style={styles.heroNextLabel}>{nextLabel}</Text>
+        </View>
+        <Text style={styles.heroDest} numberOfLines={1}>
+          {item.direction || "—"}
+        </Text>
+        <Text
+          style={[styles.heroSub, delay > 0 ? { color: ACCENT_DELAY } : null]}
+          numberOfLines={1}
+        >
+          {subText}
+        </Text>
+      </View>
+
+      {loading ? (
+        <ActivityIndicator color={C.g1} size="small" style={{ marginLeft: 4 }} />
       ) : null}
     </Pressable>
   );
@@ -324,6 +602,7 @@ function StopDetailSheetInner() {
   const t = useT();
   const insets = useSafeAreaInsets();
   const { height: screenHeight } = useWindowDimensions();
+  const accent = useAccent();
 
   const selectedStop = useSearchStore((s) => s.selectedStop);
   const clearSelectedStop = useSearchStore((s) => s.clearSelectedStop);
@@ -402,7 +681,16 @@ function StopDetailSheetInner() {
     //     mit dem richtigen HAFAS-Profil (oebb/pkp/cfl/rejseplanen)
     // Nur DE-Zug bleibt im klassischen Booking-Flow weil's da den DB-Navigator-
     // Deeplink gibt.
-    const useDirectTripFlow = mode === "BUS" || !isDeStop(stop.code);
+    // Trip-Detail-Flow statt Booking-Flow für:
+    //   - BUS (alle Stadtbusse — ÖPNV ohne Online-Buchung)
+    //   - U-Bahn/S-Bahn/Tram (gleiche Logik — Verbund-Tarif)
+    //   - Nicht-DE Stops (unsere Booking-Suche kann die nicht handhaben)
+    // Übrig bleibt: DE National/Regional Trains → Booking-Flow mit
+    // DB-Navigator-Deeplink-Support.
+    const useDirectTripFlow =
+      mode === "BUS" ||
+      isLocalTransitProduct(item.product) ||
+      !isDeStop(stop.code);
     if (useDirectTripFlow) {
       // hafasId aus der Board-Antwort: damit der Server den Trip auf den
       // User-Halt slicen kann (volle Linie A→Z vs. User steigt erst in der
@@ -414,14 +702,26 @@ function StopDetailSheetInner() {
       setLoadingDepartureId(item.id);
       void (async () => {
         try {
-          const detail = await fetchTripDetail(item.id, { fromStopId, stopCode: stop.code });
+          const detail = await fetchTripDetail(item.id, {
+            fromStopId,
+            // Label als Fallback, falls die ID nicht in den Trip-Stopovers
+            // matched (BVG/VBB-Bus-Stops haben oft uneindeutige IDs zwischen
+            // unserem Resolver und HAFAS-Trip-Body).
+            fromStopLabel: stop.label,
+            stopCode: stop.code,
+            // Board-Direction mitgeben damit das Trip-Detail dieselbe
+            // Destination zeigt wie die Card die der User getappt hat.
+            // HAFAS' trip.direction weicht manchmal vom Board-Direction
+            // ab (M21 Berlin: Board zeigt „Charlottenburg, Goerdelersteg",
+            // trip.direction ist „S+U Jungfernheide").
+            direction: item.direction,
+          });
           const result = tripDetailToSearchResult(detail);
           openDirectTrip(result);
         } catch {
-          showAlert(
-            t("stop.departure.notfound.title"),
-            t("stop.departure.notfound.body"),
-          );
+          // Mode mitschicken (BUS in diesem Branch) damit „Zur Suche" direkt
+          // den Bus-Tab öffnet, nicht irgendeine Suche.
+          showConnectionNotFound({ mode });
         } finally {
           setLoadingDepartureId(null);
         }
@@ -509,10 +809,10 @@ function StopDetailSheetInner() {
       // Liste und kann's nochmal versuchen oder normal suchen.
       clearSelectedResult();
       if (!failed) {
-        // BUS-Mode kommt hier nicht an (wird oben kurzgeschlossen), also nur
-        // der generische „nicht gefunden"-Text — TRAIN/FLIGHT-Fehlschlag heißt
-        // meist „Suche hat zu wenig Treffer geliefert".
-        showAlert(t("stop.departure.notfound.title"), t("stop.departure.notfound.body"));
+        // BUS-Mode kommt hier nicht an (wird oben kurzgeschlossen), also
+        // TRAIN/FLIGHT. Mode mitschicken damit „Zur Suche" direkt den
+        // jeweiligen Tab öffnet.
+        showConnectionNotFound({ mode });
       }
     })();
   };
@@ -666,18 +966,29 @@ function StopDetailSheetInner() {
               </View>
             </GestureDetector>
 
-            {/* Header: Name, Distanz, Favoriten-Stern. Schließen per Drag-Down
-                oder Tap auf den Backdrop. */}
+            {/* Header: Name, Distanz + Venue-Typ, Favoriten-Stern.
+                Subtitle-Format: „163 m entfernt · Bahnhof" — Venue-Typ kommt
+                aus den `kinds` (erstes Element = Primary-Kind, sortiert nach
+                Häufigkeit am Server). Wenn distance fehlt, zeigen wir nur
+                den Venue-Typ. */}
             <View style={styles.header}>
               <View style={styles.headerText}>
                 <Text style={styles.headerTitle} numberOfLines={1}>
                   {stop.label}
                 </Text>
-                {stop.distanceMeters !== undefined && (
-                  <Text style={styles.headerSubtitle}>
-                    {formatDistance(stop.distanceMeters, t)}
-                  </Text>
-                )}
+                {(() => {
+                  const primaryKind = kinds[0];
+                  const venue = primaryKind ? t(`stop.venue.${primaryKind}`) : "";
+                  const dist = stop.distanceMeters !== undefined ? formatDistance(stop.distanceMeters, t) : "";
+                  const sub = [dist, venue].filter(Boolean).join(" · ");
+                  if (!sub) return null;
+                  return (
+                    <View style={styles.headerSubtitleRow}>
+                      <WalkIcon size={14} color={C.g1} />
+                      <Text style={styles.headerSubtitle}>{sub}</Text>
+                    </View>
+                  );
+                })()}
               </View>
               {(() => {
                 // Hier brauchen wir die normalisierte Code-Form (siehe
@@ -709,12 +1020,16 @@ function StopDetailSheetInner() {
               })()}
             </View>
 
-            {/* Mode-Pillen (nur bei multi-modalen Stops sichtbar). */}
+            {/* Mode-Pillen (nur bei multi-modalen Stops sichtbar). Flat-Style:
+                Aktiv = Lime-Bg + schwarzer Text, Inaktiv = transparent + weißer
+                Text + grauer Border. Kein Color-Coding pro Mode mehr — das war
+                visuell zu viel im engen Sheet-Header. */}
             {bodyReady && kinds.length >= 2 && (
               <View style={styles.pillsRow}>
                 {kinds.map((k) => {
                   const style = KIND_STYLE[k];
                   const Icon = KIND_ICON[k];
+                  if (!Icon || !style) return null;
                   const active = activeKind === k;
                   return (
                     <Pressable
@@ -722,14 +1037,16 @@ function StopDetailSheetInner() {
                       onPress={() => setActiveKind(k)}
                       style={[
                         styles.pill,
-                        {
-                          backgroundColor: active ? style.bg : "transparent",
-                          borderColor: style.bg,
-                        },
+                        active
+                          ? [styles.pillActive, { backgroundColor: accent.solid, borderColor: accent.solid }]
+                          : styles.pillInactive,
                       ]}
                     >
-                      <Icon size={14} color={active ? style.fg : C.g1} strokeWidth={2.2} />
-                      <Text style={[styles.pillText, { color: active ? style.fg : C.g1 }]}>
+                      <Icon size={17} color={active ? accent.textOnSolid : C.white} strokeWidth={2.2} />
+                      <Text style={[
+                        styles.pillText,
+                        active ? [styles.pillTextActive, { color: accent.textOnSolid }] : styles.pillTextInactive,
+                      ]}>
                         {t(style.tKey)}
                       </Text>
                     </Pressable>
@@ -751,7 +1068,7 @@ function StopDetailSheetInner() {
                       <Text style={[styles.tabText, active ? styles.tabActive : styles.tabInactive]}>
                         {t(b === "departures" ? "stop.tab.departures" : "stop.tab.arrivals")}
                       </Text>
-                      {active && <View style={styles.tabUnderline} />}
+                      {active && <View style={[styles.tabUnderline, { backgroundColor: accent.solid }]} />}
                     </Pressable>
                   );
                 })}
@@ -783,7 +1100,22 @@ function StopDetailSheetInner() {
                   contentContainerStyle={styles.list}
                   showsVerticalScrollIndicator
                 >
-                  {items.slice(0, 6).map((it, i) => (
+                  {/* Hero = nächste Abfahrt mit Countdown-Ring. „Danach"-Label
+                      nur rendern wenn es noch weitere Items gibt, sonst wirkt
+                      die Section-Headline einsam. */}
+                  <NextHero
+                    item={items[0]!}
+                    fetchedAt={data?.fetchedAt}
+                    platformPrefix={t("stop.platform.prefix")}
+                    nextLabel={t("stop.section.next")}
+                    ontimeLabel={t("stop.section.ontime")}
+                    loading={loadingDepartureId === items[0]!.id}
+                    onPress={() => onSelectDeparture(items[0]!)}
+                  />
+                  {items.length > 1 && (
+                    <Text style={styles.danachLabel}>{t("stop.section.later")}</Text>
+                  )}
+                  {items.slice(1, 6).map((it, i) => (
                     <StopBoardRow
                       key={`${it.id}-${i}`}
                       item={it}
@@ -861,7 +1193,10 @@ const styles = StyleSheet.create({
   },
   headerText: { flex: 1 },
   headerTitle: { color: C.white, fontSize: 20, fontWeight: "700" },
-  headerSubtitle: { color: C.g1, fontSize: 14, marginTop: 4 },
+  // Row mit Walk-Icon + Text. marginTop fängt den Abstand zum Title; das Icon
+  // sitzt vertikal zentriert zum 14pt-Text durch alignItems:"center".
+  headerSubtitleRow: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 6 },
+  headerSubtitle: { color: C.g1, fontSize: 14, fontWeight: "500" },
   headerFav: { paddingTop: 4 },
 
   pillsRow: {
@@ -875,12 +1210,17 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    gap: 6,
-    paddingVertical: 7,
+    gap: 9,
+    paddingVertical: 12,
     borderRadius: 9999,
-    borderWidth: 1,
+    borderWidth: 1.5,
   },
-  pillText: { fontSize: 13, fontWeight: "600" },
+  // backgroundColor/borderColor werden inline mit accent.solid gesetzt.
+  pillActive: {},
+  pillInactive: { backgroundColor: "transparent", borderColor: C.border },
+  pillText: { fontSize: 15, fontWeight: "700", letterSpacing: -0.15 },
+  pillTextActive: { color: "#000" },
+  pillTextInactive: { color: C.white },
 
   tabsRow: {
     flexDirection: "row",
@@ -892,13 +1232,13 @@ const styles = StyleSheet.create({
   tabActive: { color: C.white },
   tabInactive: { color: C.g3 },
   // Active-Tab-Underline: Brand-Grün (vorher rot).
+  // backgroundColor inline mit accent.solid gesetzt.
   tabUnderline: {
     position: "absolute",
     left: 0,
     right: 0,
     bottom: 0,
     height: 3,
-    backgroundColor: LIME,
     borderRadius: 2,
   },
 
@@ -907,24 +1247,123 @@ const styles = StyleSheet.create({
   emptyTitle: { color: C.white, fontSize: 18, fontWeight: "700", textAlign: "center" },
   emptyBody: { color: C.g1, fontSize: 15, marginTop: 6, textAlign: "center", lineHeight: 22 },
 
-  list: { gap: 12, paddingBottom: 12 },
-  row: {
+  // Liste: Hero hat eigenen Margin-Bottom (16), CardRows haben 10 marginBottom
+  // → daher kein gap auf Container-Ebene.
+  list: { paddingBottom: 24 },
+
+  // === Hero-Card (nächste Abfahrt mit Ring-Countdown) ===
+  hero: {
+    marginBottom: 18,
+    backgroundColor: C.surface2,
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: 24,
+    paddingVertical: 18,
+    paddingHorizontal: 20,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 16,
+  },
+  heroPressed: { backgroundColor: C.surface3, opacity: 0.92 },
+  heroRing: { width: 84, height: 84, position: "relative" },
+  heroRingCenter: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  heroRingMin: {
+    color: C.white,
+    fontSize: 26,
+    fontWeight: "800",
+    letterSpacing: -0.6,
+    lineHeight: 28,
+  },
+  heroRingLabel: { color: C.g2, fontSize: 10, fontWeight: "600" },
+  heroBody: { flex: 1, minWidth: 0 },
+  heroBadgeRow: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 6 },
+  heroNextLabel: {
+    color: C.g2,
+    fontSize: 9,
+    fontWeight: "700",
+    letterSpacing: 1.4,
+  },
+  heroDest: {
+    color: C.white,
+    fontSize: 20,
+    fontWeight: "700",
+    letterSpacing: -0.4,
+    marginBottom: 4,
+  },
+  heroSub: { color: C.g2, fontSize: 13, fontWeight: "500" },
+
+  // === „Danach"-Section-Header ===
+  danachLabel: {
+    color: C.g2,
+    fontSize: 12,
+    fontWeight: "700",
+    letterSpacing: 1.4,
+    marginBottom: 10,
+    marginTop: 4,
+  },
+
+  // === Card-Row für die weiteren Abfahrten ===
+  cardRow: {
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    backgroundColor: "rgba(255,255,255,0.04)",
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: C.border,
+    backgroundColor: C.surface2,
+    borderRadius: 20,
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+    marginBottom: 10,
   },
-  rowTime: { width: 64 },
-  timeText: { color: C.white, fontSize: 16, fontWeight: "700" },
-  delayText: { fontSize: 13, fontWeight: "600", marginTop: 2 },
-  rowMain: { flex: 1, gap: 2 },
-  lineRow: { flexDirection: "row", alignItems: "center", gap: 8 },
-  lineText: { color: C.white, fontSize: 15, fontWeight: "600" },
-  platformText: { color: C.g2, fontSize: 12, fontWeight: "500" },
-  directionText: { color: C.g1, fontSize: 14 },
+  cardRowPressed: { backgroundColor: C.surface3, opacity: 0.92 },
+  cardTime: { width: 58, flexShrink: 0 },
+  cardTimeText: {
+    color: C.white,
+    fontSize: 18,
+    fontWeight: "700",
+    letterSpacing: -0.3,
+  },
+  cardTimeStrike: {
+    color: C.g2,
+    textDecorationLine: "line-through",
+    textDecorationColor: C.g3,
+  },
+  cardTimeReal: {
+    color: ACCENT_DELAY,
+    fontSize: 13,
+    fontWeight: "700",
+    marginTop: 2,
+  },
+  // Lime-Tinted Badge mit Mode-Icon — gleicher Look in Hero und Cards
+  // (DRY: Badge-Style ist shared zwischen NextHero + StopBoardRow).
+  // backgroundColor/borderColor inline mit accent.subtle / accent.border.
+  cardLineBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    flexShrink: 0,
+  },
+  // color inline mit accent.solid.
+  cardLineBadgeText: {
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  cardRight: { flex: 1, minWidth: 0 },
+  cardDirection: {
+    color: C.white,
+    fontSize: 15,
+    fontWeight: "600",
+    letterSpacing: -0.2,
+  },
+  cardPlatform: { color: C.g2, fontSize: 12, fontWeight: "500", marginTop: 3 },
 });

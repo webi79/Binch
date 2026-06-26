@@ -1,218 +1,215 @@
-import { useMemo, useState } from "react";
-import { View, Text, Pressable, Image, Modal, ScrollView } from "react-native";
+/**
+ * Übersichts-Karte für ein gespeichertes Ticket (Bordkarten-Design).
+ * Oberer Teil = `TicketHead` (geteilt mit dem Detail-Slide), darunter
+ * Perforation + Countdown bis Abfahrt. Tap öffnet den Detail-Slide via
+ * Store-Action `openTicketDetail`.
+ */
+import { memo, useMemo } from "react";
+import { View, Text, StyleSheet } from "react-native";
+import { format, parseISO } from "date-fns";
+import { de, enGB, es, fr } from "date-fns/locale";
 import { showAlert } from "@/lib/alert";
-import { Plane, TrainFront, Bus, Ship, Trash2, X } from "lucide-react-native";
 import { Ticket } from "@/types/saved";
-import { TravelMode } from "@/types/search";
 import { useT } from "@/lib/i18n/useT";
 import { useSearchStore } from "@/stores/searchStore";
-import { intlLocale } from "@/lib/i18n/intl";
-import { formatTimeInZone, formatDateInZone } from "@/lib/time-format";
+import { useAccent } from "@/lib/theme/accent";
+import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import {
+  TicketHead,
+  Perforation,
+  ProgressBar,
+  useDepartureCountdown,
+  bookingRefFor,
+} from "./TicketParts";
 
-interface Props {
-  ticket: Ticket;
-}
-
-const ICON: Record<TravelMode, typeof Plane> = {
-  FLIGHT: Plane,
-  TRAIN: TrainFront,
-  BUS: Bus,
-  CRUISE: Ship,
+const C = {
+  bg: "#1A1A1A",
+  surface: "#242425",
+  white: "#FFFFFF",
+  gray300: "#8A8A90",
+  gray400: "#56565C",
 };
 
-const ACCENT_COLOR: Record<TravelMode, string> = {
-  FLIGHT: "#2979FF",
-  TRAIN: "#FF6D00",
-  BUS: "#7B1FA2",
-  CRUISE: "#0288D1",
-};
+const DATE_LOCALES = { en: enGB, de, fr, es } as const;
 
-function formatDuration(minutes: number | undefined): string {
-  if (!minutes) return "—";
-  const h = Math.floor(minutes / 60);
-  const m = minutes % 60;
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
-}
-
-export function TicketCard({ ticket }: Props) {
+function TicketCardInner({ ticket }: { ticket: Ticket }) {
   const t = useT();
+  const accent = useAccent();
   const locale = useSearchStore((s) => s.locale);
+  const openTicketDetail = useSearchStore((s) => s.openTicketDetail);
   const removeTicket = useSearchStore((s) => s.removeTicket);
-  const [zoom, setZoom] = useState(false);
 
-  const Icon = ICON[ticket.mode];
-  const accentColor = ACCENT_COLOR[ticket.mode];
+  const dateLocale = DATE_LOCALES[locale] ?? enGB;
 
-  const departStr = useMemo(
-    () => (ticket.departTime ? formatTimeInZone(ticket.departTime, ticket.originTz, intlLocale(locale)) : "—"),
-    [ticket.departTime, ticket.originTz, locale]
-  );
-  const arriveStr = useMemo(
-    () => (ticket.arriveTime ? formatTimeInZone(ticket.arriveTime, ticket.destinationTz, intlLocale(locale)) : "—"),
-    [ticket.arriveTime, ticket.destinationTz, locale]
-  );
-  const dateStr = useMemo(
-    () => (ticket.departTime ? formatDateInZone(ticket.departTime, ticket.originTz, intlLocale(locale)) : ""),
-    [ticket.departTime, ticket.originTz, locale]
-  );
+  // Header-Datum + Abfahrtszeit ("22. Aug · 07:25").
+  const headerLine = useMemo(() => {
+    if (!ticket.departTime) return "";
+    try {
+      const d = parseISO(ticket.departTime);
+      const date = format(d, "d. MMM", { locale: dateLocale });
+      const time = format(d, "HH:mm");
+      return `${date} · ${time}`;
+    } catch {
+      return "";
+    }
+  }, [ticket.departTime, dateLocale]);
 
-  const stopsLabel =
-    ticket.stops === 0
-      ? t("saved.ticket.nonstop")
-      : `${ticket.stops} ${ticket.stops === 1 ? t("results.stop") : t("results.stops")}`;
+  // Titel: "FromCity — ToCity" (em-dash mit Spaces, matched das Template-
+  // Design). Fallback auf Codes wenn keine Cities geparst wurden.
+  const title = useMemo(() => {
+    const from = ticket.fromCity ?? ticket.fromCode ?? "—";
+    const to = ticket.toCity ?? ticket.toCode ?? "—";
+    return `${from} — ${to}`;
+  }, [ticket.fromCity, ticket.fromCode, ticket.toCity, ticket.toCode]);
 
-  const carrierLabel = ticket.flightNumber
-    ? `${ticket.carrier ?? ""} ${ticket.flightNumber}`.trim()
-    : ticket.carrier ?? ticket.originalName ?? t("saved.modal.title");
+  const countdown = useDepartureCountdown(ticket.departTime);
 
-  const confirmDelete = () => {
+  const departAtLine = useMemo(() => {
+    if (!ticket.departTime) return "";
+    try {
+      const d = parseISO(ticket.departTime);
+      return t("saved.ticket.depart.at").replace("{time}", format(d, "HH:mm"));
+    } catch {
+      return "";
+    }
+  }, [ticket.departTime, t]);
+
+  const onPress = () => {
+    haptic("button");
+    openTicketDetail(ticket);
+  };
+
+  const onLongPress = () => {
+    haptic("important");
+    const label =
+      ticket.carrier ?? ticket.originalName ?? bookingRefFor(ticket) ?? "ticket";
     showAlert(
       t("saved.ticket.delete.title"),
-      t("saved.ticket.delete.body").replace("{label}", carrierLabel),
+      t("saved.ticket.delete.body").replace("{label}", label),
       [
         { text: t("common.cancel"), style: "cancel" },
-        { text: t("common.delete"), style: "destructive", onPress: () => removeTicket(ticket.id) },
-      ]
+        {
+          text: t("common.delete"),
+          style: "destructive",
+          onPress: () => removeTicket(ticket.id),
+        },
+      ],
     );
   };
 
-  const ratio = ticket.pageImageRatio && ticket.pageImageRatio > 0 ? ticket.pageImageRatio : 1.4;
-
   return (
-    <View className="bg-[#1F1F20] rounded-2xl border border-[#2A2A2C] mx-4 mb-3 overflow-hidden">
-      <View className="flex-row items-center justify-between px-4 py-3 border-b border-[#2E2E30]">
-        <View className="flex-row items-center gap-2 flex-1">
-          <View className="w-7 h-7 rounded-lg items-center justify-center bg-[#242425]">
-            <Icon size={16} color={accentColor} strokeWidth={1.8} />
-          </View>
-          <Text className="text-[13px] font-bold text-white tracking-wide flex-1" numberOfLines={1}>
-            {ticket.carrier ?? ticket.originalName ?? t("saved.modal.title")}
-          </Text>
-        </View>
-        {ticket.flightNumber ? (
-          <View className="px-2.5 py-0.5 rounded-full bg-[#242425] ml-2">
-            <Text className="text-[11px] font-bold text-white">{ticket.flightNumber}</Text>
-          </View>
-        ) : null}
+    <View style={styles.wrap}>
+      <View style={styles.headerRow}>
+        {headerLine ? <Text style={styles.date}>{headerLine}</Text> : null}
+        <Text style={styles.title} numberOfLines={1}>
+          {title}
+        </Text>
       </View>
 
-      {ticket.fromCode && ticket.toCode ? (
-        <>
-          <View className="flex-row items-center px-4 pt-3.5">
-            <View className="flex-1">
-              <Text className="text-[26px] font-extrabold text-white tracking-tight">{ticket.fromCode}</Text>
-              {ticket.fromCity ? (
-                <Text className="text-[11px] text-[#8A8A90] mt-0.5">{ticket.fromCity}</Text>
-              ) : null}
-            </View>
-            <View className="flex-[2] items-center px-2 gap-1">
-              <Text className="text-[11px] text-[#8A8A90]">{formatDuration(ticket.durationMinutes)}</Text>
-              <View className="w-full h-px bg-[#2E2E30] relative">
-                <View className="absolute -top-[3.5px] left-0 w-2 h-2 rounded-full bg-[#2E2E30]" />
-                <View
-                  className="absolute -top-[3.5px] right-0 w-2 h-2 rounded-full"
-                  style={{ backgroundColor: accentColor }}
-                />
-              </View>
-              <Text
-                className="text-[10px] font-semibold"
-                style={{ color: ticket.stops === 0 ? "#7FEA4D" : "#56565C" }}
-              >
-                {stopsLabel}
-              </Text>
-            </View>
-            <View className="flex-1 items-end">
-              <Text className="text-[26px] font-extrabold text-white tracking-tight">{ticket.toCode}</Text>
-              {ticket.toCity ? (
-                <Text className="text-[11px] text-[#8A8A90] mt-0.5">{ticket.toCity}</Text>
-              ) : null}
-            </View>
-          </View>
-
-          {ticket.departTime || ticket.arriveTime ? (
-            <View className="flex-row justify-between px-4 pt-1 pb-1">
-              <Text className="text-[13px] font-semibold text-[#C8C8CC]">{departStr}</Text>
-              <Text className="text-[13px] font-semibold text-[#C8C8CC]">{arriveStr}</Text>
-            </View>
-          ) : null}
-        </>
-      ) : null}
-
-      <View className="mx-4 my-3 border-t border-dashed border-[#2E2E30]" />
-
+      {/* RippleTouch mit transparentem Ripple — der Card-Style bleibt 100%
+          erhalten (TouchableNativeFeedback wrapper auf Android, plus
+          overflow:hidden Clip am inner View). Visueller Ripple ist aus
+          (transparent) damit's bei LongPress nicht als Welle stehen bleibt. */}
       <RippleTouch
-        onPress={() => setZoom(true)}
-        className="mx-4 mb-3 rounded-xl overflow-hidden bg-[#1A1A1A]"
+        onPress={onPress}
+        onLongPress={onLongPress}
+        style={styles.card}
+        rippleColor="transparent"
       >
-        <Image
-          source={{ uri: ticket.pageImage }}
-          style={{ width: "100%", aspectRatio: 1 / ratio }}
-          resizeMode="contain"
-        />
+        <TicketHead ticket={ticket} />
+
+        {/* Perforation als DIREKTER Child der Card — damit die left:-9/right:-9
+            Notch-Kreise von card.overflow:hidden sauber an den Card-Rändern
+            geclippt werden (halbe Kreise die wie ausgestanzt aussehen). Mit
+            einem Padding-Wrapper wäre der Clip-Anker falsch positioniert. */}
+        <Perforation notchColor={C.bg} />
+
+        <View style={styles.countdown}>
+          <View style={styles.countdownTop}>
+            <Text style={styles.now}>{t("saved.ticket.now")}</Text>
+            <Text style={styles.endsAt}>{departAtLine}</Text>
+          </View>
+          <View style={styles.countdownMain}>
+            <Text style={styles.checkIn}>
+              {countdown.isDeparted
+                ? t("saved.ticket.departed")
+                : t("saved.ticket.depart.in")}
+            </Text>
+            {!countdown.isDeparted ? (
+              <Text style={[styles.checkInValue, { color: accent.solid }]}>
+                {countdown.label}
+              </Text>
+            ) : null}
+          </View>
+          <ProgressBar value={countdown.progress} />
+        </View>
       </RippleTouch>
 
-      <View className="flex-row items-center justify-between px-4 pb-4">
-        <View className="flex-1 pr-3">
-          {ticket.passenger ? (
-            <>
-              <Text className="text-[11px] font-semibold text-[#56565C] tracking-wider uppercase mb-1">
-                {t("saved.ticket.passenger")}
-              </Text>
-              <Text className="text-sm font-semibold text-white" numberOfLines={1}>
-                {ticket.passenger}
-              </Text>
-            </>
-          ) : null}
-          {dateStr ? (
-            <Text className="text-xs text-[#8A8A90] mt-0.5">{dateStr}</Text>
-          ) : null}
-          {ticket.seat || ticket.travelClass ? (
-            <Text className="text-xs text-[#8A8A90] mt-0.5">
-              {[
-                ticket.seat ? `${t("saved.ticket.seat")} ${ticket.seat}` : null,
-                ticket.travelClass,
-              ]
-                .filter(Boolean)
-                .join(" · ")}
-            </Text>
-          ) : null}
-        </View>
-        <RippleTouch
-          onPress={confirmDelete}
-          hitSlop={8}
-          className="w-10 h-10 rounded-xl items-center justify-center"
-          borderless
-          style={{ backgroundColor: "rgba(255,59,48,0.1)" }}
-        >
-          <Trash2 size={18} color="#FF3B30" />
-        </RippleTouch>
-      </View>
-
-      <Modal visible={zoom} animationType="fade" transparent onRequestClose={() => setZoom(false)}>
-        <View className="flex-1 bg-black">
-          <RippleTouch
-            onPress={() => setZoom(false)}
-            hitSlop={12}
-            className="absolute top-14 right-5 z-10 w-10 h-10 rounded-full bg-[#1F1F20] items-center justify-center"
-            borderless
-          >
-            <X size={20} color="#FFFFFF" />
-          </RippleTouch>
-          <ScrollView
-            maximumZoomScale={4}
-            minimumZoomScale={1}
-            contentContainerStyle={{ flexGrow: 1, justifyContent: "center" }}
-            showsVerticalScrollIndicator={false}
-          >
-            <Image
-              source={{ uri: ticket.pageImage }}
-              style={{ width: "100%", aspectRatio: 1 / ratio }}
-              resizeMode="contain"
-            />
-          </ScrollView>
-        </View>
-      </Modal>
+      <Text style={styles.hint}>{t("saved.ticket.openHint")}</Text>
     </View>
   );
 }
+
+const styles = StyleSheet.create({
+  wrap: { marginHorizontal: 16, marginBottom: 8 },
+  headerRow: {
+    paddingHorizontal: 8,
+    paddingTop: 6,
+    paddingBottom: 8,
+  },
+  date: { fontSize: 13, color: C.gray300, fontWeight: "500" },
+  title: {
+    fontSize: 22,
+    fontWeight: "800",
+    color: C.white,
+    letterSpacing: -0.5,
+    marginTop: 2,
+  },
+
+  card: {
+    backgroundColor: C.surface,
+    borderRadius: 24,
+    overflow: "hidden",
+  },
+
+  countdown: { paddingHorizontal: 18, paddingTop: 20, paddingBottom: 18 },
+  countdownTop: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "baseline",
+  },
+  now: { fontSize: 13, color: C.gray300, fontWeight: "600" },
+  endsAt: { fontSize: 12, color: C.gray300 },
+  countdownMain: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-end",
+    marginTop: 5,
+  },
+  checkIn: {
+    fontSize: 22,
+    fontWeight: "800",
+    color: C.white,
+    letterSpacing: -0.6,
+    flexShrink: 1,
+  },
+  checkInValue: {
+    fontSize: 26,
+    fontWeight: "800",
+    letterSpacing: -0.8,
+  },
+
+  hint: {
+    textAlign: "center",
+    fontSize: 12,
+    color: C.gray400,
+    fontWeight: "500",
+    paddingVertical: 12,
+  },
+});
+
+// Memo-Wrapper: bei einer Liste von Tickets verhindert das, dass alle Cards
+// bei jedem Re-Render der Saved-Screen neu zeichnen. Nur die geänderte Card
+// re-rendert (z.B. wenn Ticket gelöscht wird).
+export const TicketCard = memo(TicketCardInner);

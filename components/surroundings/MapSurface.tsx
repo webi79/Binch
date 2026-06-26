@@ -71,6 +71,10 @@ interface Props {
   showsTraffic?: boolean;
   /** Callback wenn der User aufhört zu pannen/zoomen — gibt die neue Region. */
   onRegionChange?: (region: RegionInfo) => void;
+  /** Wird einmal aufgerufen wenn die initialen Tiles tatsächlich gerendert
+   *  sind. Vor diesem Event zeigt die Surface ggf. nur leere Tiles —
+   *  Parent kann ein Skelett darüber halten bis das echte Bild da ist. */
+  onMapRendered?: () => void;
 }
 
 /**
@@ -79,10 +83,11 @@ interface Props {
  * (siehe `mapStyle.ts`).
  */
 const MapSurfaceInner = forwardRef<MapSurfaceHandle, Props>(function MapSurface(
-  { children, onRegionChange },
+  { children, onRegionChange, onMapRendered },
   ref,
 ) {
   const cameraRef = useRef<CameraRef>(null);
+  const renderedFiredRef = useRef(false);
 
   useImperativeHandle(
     ref,
@@ -124,6 +129,14 @@ const MapSurfaceInner = forwardRef<MapSurfaceHandle, Props>(function MapSurface(
           bounds: v.bounds,
           zoom: v.zoom,
         });
+      }}
+      onDidFinishRenderingMapFully={() => {
+        // Feuert wenn alle sichtbaren Tiles geladen + die Karte einmal
+        // vollständig gepaintet ist. Nur einmal aufrufen — danach feuert
+        // das Event bei jedem Pan/Zoom erneut.
+        if (renderedFiredRef.current) return;
+        renderedFiredRef.current = true;
+        onMapRendered?.();
       }}
     >
       <Camera

@@ -163,8 +163,48 @@ export async function getScheduledStopBoard(args: {
 
   // Wege um den Stop in den GTFS-Tabellen zu finden:
   //   A) `gtfs:<country>:<id>` — Code-Präfix → direkter ID-Mapping
-  //   B) `osm:<id>` — OSM-Marker → Coord-Lookup nächster GTFS-Stop
-  //   C) `sta:<uic>` o.ä. — wenn auch keine Coords, kein Treffer
+  //   B) `osm:<id>` / `sta:<uic>` — Coord-Lookup nächster GTFS-Stop
+  //
+  // Beide Pfade landen am Ende mit derselben Coord-Fallback-Logik wenn die
+  // direkte ID-Suche keine echten Children findet (kommt in NL/FR vor wo
+  // manche stoparea-Parents keine parent_station-Pointer von ihren Platforms
+  // bekommen → SELECT findet nur die Parent-Row aber stop_times referenzieren
+  // nur Platforms → leere Antwort obwohl Daten da wären).
+  async function coordLookup(lat: number, lon: number): Promise<string[]> {
+    // Großzügiger als beim OSM-Marker (~250m) weil StaDa-Coords manchmal
+    // 100-200m vom GTFS-stoparea-Zentrum abweichen (StaDa zeigt aufs
+    // Bahnhofs-Gebäude, GTFS auf den Bahnsteig-Mitte).
+    const radiusM = 250;
+    const dLat = radiusM / 111_000;
+    const dLon = dLat / Math.cos((lat * Math.PI) / 180);
+    const nearbyRows = (await db.execute(sql`
+      SELECT stop_id, parent_station, location_type
+      FROM gtfs_stops
+      WHERE feed_id = ${feedId}
+        AND latitude BETWEEN ${lat - dLat} AND ${lat + dLat}
+        AND longitude BETWEEN ${lon - dLon} AND ${lon + dLon}
+      ORDER BY
+        -- Bevorzuge location_type=1 (Stations) vor 0 (Platforms) — die
+        -- Station ist meist im Zentrum und hat alle Plattformen als Kinder.
+        CASE WHEN location_type = 1 THEN 0 ELSE 1 END,
+        (latitude - ${lat}) * (latitude - ${lat}) + (longitude - ${lon}) * (longitude - ${lon})
+      LIMIT 10
+    `)) as unknown as {
+      rows: Array<{ stop_id: string; parent_station: string | null; location_type: number | null }>;
+    };
+    const list = nearbyRows.rows ?? [];
+    if (list.length === 0) return [];
+    const first = list[0]!;
+    const parentOrSelf = first.parent_station ?? first.stop_id;
+    const idsRows = (await db.execute(sql`
+      SELECT stop_id FROM gtfs_stops
+      WHERE feed_id = ${feedId} AND (stop_id = ${parentOrSelf} OR parent_station = ${parentOrSelf})
+    `)) as unknown as { rows: Array<{ stop_id: string }> };
+    const ids = (idsRows.rows ?? []).map((r) => r.stop_id);
+    if (ids.length > 0) return ids;
+    return [first.stop_id];
+  }
+
   let allStopIds: string[] = [];
   const directStopId = gtfsStopIdFromCode(args.stopCode);
   if (directStopId) {
@@ -174,38 +214,20 @@ export async function getScheduledStopBoard(args: {
       WHERE feed_id = ${feedId} AND (stop_id = ${directStopId} OR parent_station = ${directStopId})
     `)) as unknown as { rows: Array<{ stop_id: string }> };
     allStopIds = (stopIdRows.rows ?? []).map((r) => r.stop_id);
+
+    // Edge-Case: nur die Parent-Row gefunden, keine Children. Heißt: das
+    // Feed listet zwar die stoparea als gtfs_stops-Eintrag, aber die
+    // Plattformen darunter haben kein parent_station gesetzt das auf uns
+    // zeigt. Dann findet auch das stop_times-Query nichts (stop_times
+    // referenziert nur Plattformen, nicht Stopareas). → Coord-Fallback.
+    const onlyParent = allStopIds.length === 1 && allStopIds[0] === directStopId;
+    if ((allStopIds.length === 0 || onlyParent) && args.latitude != null && args.longitude != null) {
+      const fallback = await coordLookup(args.latitude, args.longitude);
+      if (fallback.length > 0) allStopIds = fallback;
+    }
     if (allStopIds.length === 0) allStopIds.push(directStopId);
   } else if (args.latitude != null && args.longitude != null) {
-    // OSM-Stop oder anderer Coord-only-Path: nächstgelegenen gtfs-Stop binnen
-    // ~80m suchen. Box-Filter zuerst (Index-Hit), dann Distanz-Approximation
-    // (cos für lon-Skalierung). 0.001° ≈ 100m bei 50°N — eng genug damit's
-    // nicht den Stop auf der anderen Straßenseite oder einen entfernten Bus-
-    // halt verwechselt.
-    const lat = args.latitude;
-    const lon = args.longitude;
-    const dLat = 0.0009; // ~100m
-    const dLon = 0.0009 / Math.cos((lat * Math.PI) / 180);
-    const nearbyRows = (await db.execute(sql`
-      SELECT stop_id, parent_station, latitude, longitude
-      FROM gtfs_stops
-      WHERE feed_id = ${feedId}
-        AND latitude BETWEEN ${lat - dLat} AND ${lat + dLat}
-        AND longitude BETWEEN ${lon - dLon} AND ${lon + dLon}
-      ORDER BY (latitude - ${lat}) * (latitude - ${lat}) + (longitude - ${lon}) * (longitude - ${lon})
-      LIMIT 5
-    `)) as unknown as { rows: Array<{ stop_id: string; parent_station: string | null }> };
-    if ((nearbyRows.rows ?? []).length === 0) return emptyResponse();
-    // Wenn der nächste Stop ein Child ist (parent_station gesetzt), nimm
-    // ALLE Stops mit demselben parent — sonst nur den selbst plus mögliche
-    // Children unter dem Stop selbst.
-    const first = nearbyRows.rows[0]!;
-    const parentOrSelf = first.parent_station ?? first.stop_id;
-    const idsRows = (await db.execute(sql`
-      SELECT stop_id FROM gtfs_stops
-      WHERE feed_id = ${feedId} AND (stop_id = ${parentOrSelf} OR parent_station = ${parentOrSelf})
-    `)) as unknown as { rows: Array<{ stop_id: string }> };
-    allStopIds = (idsRows.rows ?? []).map((r) => r.stop_id);
-    if (allStopIds.length === 0) allStopIds.push(first.stop_id);
+    allStopIds = await coordLookup(args.latitude, args.longitude);
   } else {
     return null;
   }
@@ -322,4 +344,115 @@ function emptyResponse(): StopBoardResponse {
     fetchedAt: now.toISOString(),
     validUntil: new Date(now.getTime() + 60_000).toISOString(),
   };
+}
+
+export interface ScheduledTripStop {
+  stopId: string;
+  name: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  arrival: string;
+  departure: string;
+  sequence: number;
+}
+
+/**
+ * Holt ALLE Halte eines GTFS-Trips (für Trip-Detail in der Schedule-Search).
+ *
+ * Wir wissen den `tripId` aus dem Stop-Board und den User-Origin (`originTime`
+ * + `originStopCode`). Daraus leiten wir die base-midnight ab (statt mit
+ * Server-Now zu raten — der Trip könnte auch ein Yesterday-Trip sein der
+ * über Mitternacht hinausläuft).
+ *
+ * Liefert ALLE Stops ab Origin (= Slice, nicht der volle Verlauf von der
+ * Endstation an). Damit kriegt die UI eine bündige „Du steigst hier ein,
+ * Bahn fährt zu A, B, C, Endstation"-Sicht.
+ */
+export async function getScheduledTripStops(args: {
+  country: string;
+  tripId: string;
+  originStopCode: string;
+  originLatitude: number | null;
+  originLongitude: number | null;
+  originTime: string;
+}): Promise<ScheduledTripStop[] | null> {
+  const feedId = FEED_ID_BY_COUNTRY[args.country];
+  if (!feedId) return null;
+  if (!(await isFeedImported(feedId))) return null;
+
+  // Alle Stops des Trips holen, chronologisch.
+  const result = (await db.execute(sql`
+    SELECT st.stop_id, st.stop_sequence, st.arrival_seconds, st.departure_seconds,
+           s.name AS stop_name, s.latitude, s.longitude, s.parent_station
+    FROM gtfs_stop_times st
+    LEFT JOIN gtfs_stops s ON s.feed_id = ${feedId} AND s.stop_id = st.stop_id
+    WHERE st.feed_id = ${feedId} AND st.trip_id = ${args.tripId}
+    ORDER BY st.stop_sequence ASC
+  `)) as unknown as {
+    rows: Array<{
+      stop_id: string;
+      stop_sequence: number;
+      arrival_seconds: number;
+      departure_seconds: number;
+      stop_name: string | null;
+      latitude: number | null;
+      longitude: number | null;
+      parent_station: string | null;
+    }>;
+  };
+  const rows = result.rows ?? [];
+  if (rows.length === 0) return null;
+
+  // Origin im Trip finden. 3 Strategien (in Reihenfolge):
+  //   A) Direkter ID-Match — wenn der User-Stop ein GTFS-Code ist
+  //      (gtfs:nl:stoparea:502651), matcht die nackte stop_id.
+  //   B) Parent-Station-Match — manche Trips haben stop_id=platform-Code,
+  //      während unser User-Stop die übergeordnete StopArea ist.
+  //   C) Coord-Match — wenn der User-Stop ein OSM-Stop ist, finden wir den
+  //      nahesten Trip-Stop in ~150m.
+  const directId = gtfsStopIdFromCode(args.originStopCode);
+  let originIdx = -1;
+  if (directId) {
+    originIdx = rows.findIndex((r) => r.stop_id === directId || r.parent_station === directId);
+  }
+  if (originIdx < 0 && args.originLatitude != null && args.originLongitude != null) {
+    const lat = args.originLatitude;
+    const lon = args.originLongitude;
+    const dLat = 0.0014; // ~150m
+    const dLon = 0.0014 / Math.cos((lat * Math.PI) / 180);
+    let bestIdx = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i]!;
+      if (r.latitude == null || r.longitude == null) continue;
+      if (Math.abs(r.latitude - lat) > dLat) continue;
+      if (Math.abs(r.longitude - lon) > dLon) continue;
+      const dist =
+        (r.latitude - lat) * (r.latitude - lat) +
+        (r.longitude - lon) * (r.longitude - lon);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx >= 0) originIdx = bestIdx;
+  }
+  if (originIdx < 0) return null;
+
+  // Base-Midnight aus User-Origin-Time ableiten. Damit haben wir den richtigen
+  // Tag — auch wenn der Trip ein Yesterday-Trip ist der über Mitternacht
+  // hinausläuft (seconds > 86400).
+  const originSec = rows[originIdx]!.departure_seconds;
+  const baseMs = Date.parse(args.originTime) - originSec * 1000;
+  if (!Number.isFinite(baseMs)) return null;
+
+  return rows.slice(originIdx).map((r) => ({
+    stopId: r.stop_id,
+    name: r.stop_name,
+    latitude: r.latitude,
+    longitude: r.longitude,
+    arrival: new Date(baseMs + r.arrival_seconds * 1000).toISOString(),
+    departure: new Date(baseMs + r.departure_seconds * 1000).toISOString(),
+    sequence: r.stop_sequence,
+  }));
 }

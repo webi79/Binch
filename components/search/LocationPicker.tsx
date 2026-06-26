@@ -1,8 +1,24 @@
-import { useEffect, useMemo, useState } from "react";
-import { View, Text, Pressable, Modal, FlatList, ActivityIndicator, StyleSheet } from "react-native";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  BackHandler,
+  Platform,
+  View,
+  Text,
+  Pressable,
+  FlatList,
+  ActivityIndicator,
+  StyleSheet,
+  useWindowDimensions,
+} from "react-native";
 import { useQuery } from "@tanstack/react-query";
 import { X, Navigation, Plane, Train, Bus, Ship, Flag, Star } from "lucide-react-native";
-import Animated, { SlideInDown, SlideOutDown } from "react-native-reanimated";
+import Animated, {
+  cancelAnimation,
+  Easing,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from "react-native-reanimated";
 import { Location, TravelMode } from "@/types/search";
 import { fetchLocations } from "@/lib/api/client";
 import { useT } from "@/lib/i18n/useT";
@@ -10,6 +26,7 @@ import { SearchBar } from "@/components/SearchBar";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useSearchStore } from "@/stores/searchStore";
 import { haptic } from "@/lib/haptics";
+import { useAccent } from "@/lib/theme/accent";
 
 const SAVED_GOLD = "#FFC107";
 
@@ -48,6 +65,7 @@ export function LocationPicker({
   placeholderKey = "search.location.placeholder",
 }: Props) {
   const t = useT();
+  const accent = useAccent();
   const [query, setQuery] = useState("");
   const debounced = useDebounce(query, 200);
   const savedStations = useSearchStore((s) => s.savedStations);
@@ -80,26 +98,120 @@ export function LocationPicker({
 
   const showSearchResults = debounced.trim().length >= 2;
 
-  const handleSelect = (loc: Location) => {
-    onSelect(loc);
-    onClose();
-  };
+  // Slide-Animation via Reanimated.View statt RN Modal. Vorher hat der
+  // Modal-Native-Layer auf Android beim ERSTEN Open eine Dialog-Init
+  // gestartet → spürbares Input-Lag. Jetzt ist der Overlay IMMER mounted
+  // (nur translateY/opacity-getrieben), erster Tap → null Cold-Start.
+  const { height: screenH } = useWindowDimensions();
+  const offset = useSharedValue(screenH);
+  const opacity = useSharedValue(0);
+
+  // Pre-warm: einmaliger no-op withTiming am Mount damit Reanimated v4
+  // die Worklets JIT-kompiliert BEVOR der User zum ersten Mal tippt.
+  useEffect(() => {
+    offset.value = withTiming(screenH, { duration: 1 });
+    opacity.value = withTiming(0, { duration: 1 });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    cancelAnimation(offset);
+    cancelAnimation(opacity);
+    if (visible) {
+      offset.value = withTiming(0, { duration: 280, easing: Easing.out(Easing.cubic) });
+      // Opacity steuert NUR den Backdrop (siehe backdropStyle). Sync mit
+      // offset-Duration damit Backdrop in derselben Zeit ein-/ausfadet wie
+      // der Picker rein-/rausslidet.
+      opacity.value = withTiming(1, { duration: 280 });
+    } else {
+      offset.value = withTiming(screenH, { duration: 280, easing: Easing.in(Easing.cubic) });
+      opacity.value = withTiming(0, { duration: 280 });
+    }
+  }, [visible, offset, opacity, screenH]);
+
+  // Picker selbst NUR translateY, KEINE Opacity — sonst fadet er beim
+  // Slide-Out (160ms) schneller weg als er translatet (280ms) und der
+  // User sieht nur einen Disappear-Effekt statt einem Slide. Mit reinem
+  // translateY ist der Picker während der gesamten 280ms voll sichtbar
+  // bis er off-screen ist.
+  const overlayStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: offset.value }],
+  }));
+
+  // Backdrop-Style — opacity fadet von 0→1 wenn Picker visible.
+  const backdropStyle = useAnimatedStyle(() => ({
+    opacity: opacity.value,
+  }));
+
+  // Inner content (FlatList, SearchBar) wird IMMER gemountet — analog zum
+  // DatePicker. Mit always-mount ist das Inner-Tree bereits zu App-Start
+  // gerendert → Slide-In startet sauber ohne Mount-Konkurrenz.
+  const hasOpened = true;
+
+  // BackHandler: hardware-back/Geste schließt den Picker statt den ganzen
+  // SearchHero zu verlassen. Vorher hat das Modal das automatisch gemacht
+  // via onRequestClose — jetzt müssen wir's manuell intercepten.
+  useEffect(() => {
+    if (!visible) return;
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      onClose();
+      return true; // prevent default
+    });
+    return () => sub.remove();
+  }, [visible, onClose]);
+
+  const handleSelect = useCallback(
+    (loc: Location) => {
+      onSelect(loc);
+      onClose();
+    },
+    [onSelect, onClose],
+  );
+
+  // Stabile renderItem-Referenz für die FlatList. Vorher war die Funktion
+  // inline mit einer weiteren Inline-Arrow für onPress — das erstellt pro
+  // Render-Zyklus neue Function-Refs für alle Items und macht potentielle
+  // memo-Wrapper für LocationRow nutzlos.
+  const renderResultRow = useCallback(
+    ({ item }: { item: Location }) => (
+      <LocationRow loc={item} onPress={() => handleSelect(item)} />
+    ),
+    [handleSelect],
+  );
+  const keyExtractor = useCallback((i: Location) => i.code, []);
 
   return (
-    <Modal
-      visible={visible}
-      animationType="none"
-      transparent
-      statusBarTranslucent
-      navigationBarTranslucent
-      onRequestClose={onClose}
-    >
-      <View style={[StyleSheet.absoluteFillObject, { backgroundColor: "#1A1A1A" }]} />
+    <>
+      {/* Backdrop — abdunkelt SearchHero hinter dem Picker während Slide-In.
+          zIndex 9998 = unter dem Picker, parallel zum DatePicker-Pattern. */}
       <Animated.View
-        entering={SlideInDown.duration(350)}
-        exiting={SlideOutDown.duration(350)}
-        style={[StyleSheet.absoluteFillObject, { backgroundColor: "#1A1A1A" }]}
-      >
+        pointerEvents="none"
+        style={[
+          StyleSheet.absoluteFillObject,
+          { zIndex: 9998, backgroundColor: "rgba(0,0,0,0.75)" },
+          backdropStyle,
+        ]}
+      />
+      {/* Slide-Wrap mit elevation 32 → Android hebt diesen View auf einen
+          eigenen Hardware-Layer. translateY läuft damit GPU-only und der
+          Compositor muss NICHT pro Frame den ganzen Subtree (Searchbar,
+          FlatList, alle Rows) neu rasterisieren. Ohne elevation hatten wir
+          spürbare Frame-Drops während des Slide-Ins. Zusätzlich
+          renderToHardwareTextureAndroid + shouldRasterizeIOS als Belt-and-
+          Suspenders gegen Sub-Pixel-Jitter. */}
+      <Animated.View
+      collapsable={false}
+      renderToHardwareTextureAndroid={Platform.OS === "android"}
+      shouldRasterizeIOS={Platform.OS === "ios"}
+      pointerEvents={visible ? "auto" : "none"}
+      style={[
+        StyleSheet.absoluteFillObject,
+        { backgroundColor: "#1A1A1A", zIndex: 9999, elevation: 32 },
+        overlayStyle,
+      ]}
+    >
+        {hasOpened ? (
+        <>
         <View className="flex-row items-center gap-3 px-5 pt-14 pb-4">
           <RippleTouch
             hitSlop={12}
@@ -126,14 +238,19 @@ export function LocationPicker({
                 : leadingLabel || undefined
             }
             showMic={false}
-            autoFocus
+            // autoFocus togglet mit visible — Overlay ist immer mounted,
+            // aber Keyboard öffnet nur wenn das Overlay sichtbar wird.
+            // Mit autoFocusDelay startet das Keyboard 380ms nach visible→
+            // true, also direkt nach der Slide-In-Animation.
+            autoFocus={visible}
+            autoFocusDelay={380}
           />
         </View>
 
         {showSearchResults ? (
           isLoading ? (
             <View className="py-8 items-center">
-              <ActivityIndicator color="#7FEA4D" />
+              <ActivityIndicator color={accent.solid} />
             </View>
           ) : isError ? (
             <View className="px-5 py-6">
@@ -147,12 +264,16 @@ export function LocationPicker({
           ) : (
             <FlatList
               data={results ?? []}
-              keyExtractor={(i) => i.code}
+              keyExtractor={keyExtractor}
               keyboardShouldPersistTaps="handled"
               contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 32 }}
-              renderItem={({ item }) => (
-                <LocationRow loc={item} onPress={() => handleSelect(item)} />
-              )}
+              renderItem={renderResultRow}
+              // Virtualisierung — bei langen Autocomplete-Listen (z.B. die 25
+              // Treffer für „Berlin") spart das CPU/Memory und macht's smooth.
+              windowSize={5}
+              initialNumToRender={10}
+              maxToRenderPerBatch={8}
+              removeClippedSubviews
               ListEmptyComponent={
                 <Text className="text-sm text-gray-500 mt-6">
                   No matches.
@@ -223,8 +344,10 @@ export function LocationPicker({
             }
           />
         )}
+        </>
+        ) : null}
       </Animated.View>
-    </Modal>
+    </>
   );
 }
 

@@ -1,113 +1,198 @@
-import { useEffect } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
-import Animated, { FadeInDown, FadeInUp, FadeOutDown, FadeOutUp } from "react-native-reanimated";
+/**
+ * SavedToastHost — "Ticket gespeichert" Toast-Popup (Premium-Glide).
+ *
+ *  - Toast gleitet von oben rein (Overshoot-Bezier) wenn savedToast gesetzt
+ *  - Nach Slide-Ende: Glow-Ring pulst einmal, Häkchen zeichnet sich
+ *  - Hold ~2.6s, dann automatisch ausgleiten
+ *  - User kann auf "Ansehen" tippen → Navigation + Cleanup
+ *
+ * Mount/Unmount-Pattern: solange kein Toast aktiv ist, ist nichts gemountet.
+ * Keine Reanimated-Subscriptions, keine GestureDetector-Native-Recognizers
+ * im Leerlauf.
+ */
+
+import { useCallback, useEffect } from "react";
+import { StyleSheet, Text, TouchableOpacity, View } from "react-native";
+import Animated, {
+  cancelAnimation,
+  Easing,
+  Keyframe,
+  useAnimatedProps,
+  useAnimatedStyle,
+  useSharedValue,
+  withDelay,
+  withTiming,
+} from "react-native-reanimated";
+import Svg, { Path } from "react-native-svg";
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { BookmarkCheck } from "lucide-react-native";
 import { useSearchStore } from "@/stores/searchStore";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
+import { useAccent } from "@/lib/theme/accent";
 
-// Farb-Palette: matched die Card-Farben aus ResultCard (`surface2 #242425`,
-// `border #2E2E30`) und die Brand-Lime aus dem Rest der App (`#7FEA4D`).
-// Bewusst NICHT die neonige Lime `#D4FF3F` aus dem Design-Mockup übernommen
-// — die kollidiert mit den Result-Card-Akzenten an anderen Stellen.
-const C = {
-  surface: "#242425",
-  border: "#2E2E30",
-  white: "#FFFFFF",
-  gray300: "#8A8A90",
-  lime: "#7FEA4D",
-  black: "#0A0A0A",
-};
+const AnimatedPath = Animated.createAnimatedComponent(Path);
 
-const AUTO_DISMISS_MS = 3500;
+const HOLD_MS = 2600;
+const SLIDE_DURATION = 380;
+const RING_DURATION = 420;
+const CHECK_DURATION = 280;
+const CHECK_LEN = 26;
+
+const SURFACE = "#2A2A2C";
+const BORDER = "rgba(255,255,255,0.08)";
+const TEXT_PRIMARY = "#FFFFFF";
+const TEXT_TERTIARY = "#8A8A90";
+const ICON_INK = "#123007";
+
+const toastEntering = new Keyframe({
+  0: { opacity: 0, transform: [{ translateY: -200 }] },
+  100: {
+    opacity: 1,
+    transform: [{ translateY: 0 }],
+    easing: Easing.bezier(0.18, 0.9, 0.22, 1.04),
+  },
+}).duration(SLIDE_DURATION);
+
+// KEIN exiting Keyframe — Reanimated hielt sonst die native View 140ms
+// nach dem Unmount fest und das verzögert Tab-Switch + Overlay-Cleanup.
+// Toast verschwindet jetzt instant beim Unmount.
 
 export function SavedToastHost() {
   const toast = useSearchStore((s) => s.savedToast);
-  const position = useSearchStore((s) => s.savedToastPosition);
-
   if (!toast) return null;
-  return <Toast key={toast.key} position={position} />;
+  return <Toast key={toast.key} />;
 }
 
-function Toast({ position }: { position: "top" | "bottom" }) {
-  const toast = useSearchStore((s) => s.savedToast);
+function Toast() {
   const hide = useSearchStore((s) => s.hideSavedToast);
-  const clearSelectedResult = useSearchStore((s) => s.clearSelectedResult);
-  const t = useT();
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const t = useT();
+  const accent = useAccent();
+  // Store-Daten zu Mount-Zeit einlesen, danach nicht mehr subscriben —
+  // die Toast-Lebenszeit ist von außen kontrolliert (HOLD_MS oder Klick).
+  const toastData = useSearchStore.getState().savedToast;
+  const clearSelectedResult = useSearchStore.getState().clearSelectedResult;
+
+  const ring = useSharedValue(0);
+  const check = useSharedValue(0);
 
   useEffect(() => {
-    const timer = setTimeout(hide, AUTO_DISMISS_MS);
-    return () => clearTimeout(timer);
-  }, [hide]);
+    // Innere Animationen erst nach Slide-In starten (UI-Thread via withDelay).
+    ring.value = withDelay(
+      SLIDE_DURATION,
+      withTiming(1, { duration: RING_DURATION, easing: Easing.out(Easing.ease) }),
+    );
+    check.value = withDelay(
+      SLIDE_DURATION,
+      withTiming(1, { duration: CHECK_DURATION, easing: Easing.out(Easing.cubic) }),
+    );
+    const dismiss = setTimeout(hide, HOLD_MS);
+    return () => {
+      clearTimeout(dismiss);
+      cancelAnimation(ring);
+      cancelAnimation(check);
+    };
+  }, [ring, check, hide]);
 
-  if (!toast) return null;
-
-  const onView = () => {
+  const onPressCta = useCallback(() => {
     haptic("button");
+    cancelAnimation(ring);
+    cancelAnimation(check);
+    // Flag setzen damit der results-Screen seine 260ms Slide-Out-Animation
+    // überspringt — sonst läuft die parallel zu Tab-Switch + Overlay-Unmount
+    // = UI-Thread-Spike. Modal pop'pt instant, kein Konflikt.
+    useSearchStore.getState().setBypassResultsSlideOut(true);
     hide();
-    // Navigation ZUERST: Tab-Wechsel + SavedScreen-Mount + FloatingTabBar-
-    // Indicator-Slide bekommen einen ungestörten Render-Commit.
-    router.navigate("/(tabs)/saved");
-    // DetailsOverlay-Clear erst im NÄCHSTEN Frame — sonst kämpft das
-    // DetailsContent-Unmount mit der Tab-Switch-Arbeit im selben Commit
-    // (= Stutter im Indicator + Saved-Screen-Layout-Jitter). 2 RAFs gibt
-    // dem nativen Layout-Pass Zeit zu settlen bevor wir Details rausnehmen.
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => clearSelectedResult());
-    });
-  };
+    // dismissTo statt navigate: dismisst die Modal-Schichten UND switcht
+    // die Tab in EINER atomaren Aktion. Vorher (router.navigate) machte
+    // expo-router das in zwei separaten State-Updates, was dazu führte dass
+    // der User einen Frame lang den Home-Tab sah (= Reanimated unfreeze
+    // + Re-Mount-Churn) BEVOR der Saved-Tab fokussiert wurde.
+    router.dismissTo("/(tabs)/saved");
+    // KEINE direkte clearSelectedResult-Aufrufung mehr! Der DetailsContent-
+    // Subtree ist riesig (useQuery + viele Reanimated-Hooks + ScrollView).
+    // Ein synchrones Unmount während der Tab-Switch + Modal-Pop läuft,
+    // war wahrscheinlich der UI-Thread-Spike der die App permanent laggig
+    // anfühlen ließ. Stattdessen 2s deferred — bis dahin hat der User sich
+    // visuell schon längst auf der Saved-Tab eingelebt, und das Unmount
+    // passiert unsichtbar im Hintergrund.
+    setTimeout(() => clearSelectedResult(), 2000);
+  }, [ring, check, hide, router, clearSelectedResult]);
 
-  const Entering = position === "top" ? FadeInUp : FadeInDown;
-  const Exiting = position === "top" ? FadeOutUp : FadeOutDown;
+  const ringStyle = useAnimatedStyle(() => {
+    const r = ring.value;
+    const scale =
+      r < 0.35 ? 0.7 + (r / 0.35) * 0.3 : 1 + ((r - 0.35) / 0.65) * 0.5;
+    const opacity =
+      r < 0.2 ? (r / 0.2) * 0.9 : 0.9 * (1 - (r - 0.2) / 0.8);
+    return { opacity, transform: [{ scale }] };
+  });
 
-  const containerStyle = [
-    styles.container,
-    position === "top"
-      ? { top: insets.top + 10 }
-      : { bottom: insets.bottom + 96 },
-  ];
+  const checkProps = useAnimatedProps(() => ({
+    strokeDashoffset: CHECK_LEN * (1 - check.value),
+  }));
+
+  if (!toastData) return null;
+
+  const numStr = toastData.price.toFixed(0);
+  const ccy = toastData.currency.toUpperCase();
+  const pre = `${t("results.from").toUpperCase()} `;
+  const post = ` ${ccy}`;
 
   return (
-    <View pointerEvents="box-none" style={[StyleSheet.absoluteFillObject, styles.host]}>
+    <View
+      pointerEvents="box-none"
+      style={[StyleSheet.absoluteFillObject, styles.host]}
+    >
       <Animated.View
-        entering={Entering.duration(280)}
-        exiting={Exiting.duration(220)}
-        style={containerStyle}
+        entering={toastEntering}
+        style={[styles.layer, { top: (insets.top || 0) + 10 }]}
       >
         <View style={styles.toast}>
-          {/* Lime-Badge mit Bookmark+Check-Icon — visuelles Anchor für „etwas
-              wurde abgespeichert". 44×44 wie im Design-Mockup, harmoniert mit
-              dem 28×28 Provider-Logo der Result-Cards (größer weil Toast eine
-              Notification ist, kein In-Content-Element). */}
-          <View style={styles.iconBadge}>
-            <BookmarkCheck size={22} color={C.black} strokeWidth={2.2} />
-          </View>
+            <View style={styles.iconWrap}>
+              <Animated.View
+                style={[
+                  styles.ring,
+                  { borderColor: accent.solid },
+                  ringStyle,
+                ]}
+              />
+              <View
+                style={[styles.iconBox, { backgroundColor: accent.solid }]}
+              >
+                <Svg width={34} height={34} viewBox="0 0 24 24">
+                  <AnimatedPath
+                    d="M6 12.5 l4 4 l8 -8.5"
+                    fill="none"
+                    stroke={ICON_INK}
+                    strokeWidth={4.5}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeDasharray={CHECK_LEN}
+                    animatedProps={checkProps}
+                  />
+                </Svg>
+              </View>
+            </View>
 
-          <View style={styles.textCol}>
-            <Text style={styles.title} numberOfLines={1}>
-              {t("toast.saved.title")}
-            </Text>
-            <Text style={styles.meta} numberOfLines={1}>
-              <Text style={styles.from}>{t("results.from")} </Text>
-              <Text style={styles.price}>
-                {toast.price.toFixed(0)} {toast.currency.toUpperCase()}
+            <View style={styles.body}>
+              <Text style={styles.title} numberOfLines={1}>
+                {t("toast.saved.title")}
               </Text>
-            </Text>
-          </View>
+              <Text style={styles.sub} numberOfLines={1}>
+                {pre}
+                <Text style={[styles.subStrong, { color: accent.solid }]}>
+                  {numStr}
+                </Text>
+                {post}
+              </Text>
+            </View>
 
-          <Pressable
-            onPress={onView}
-            hitSlop={10}
-            style={({ pressed }) => [styles.cta, pressed && { opacity: 0.6 }]}
-            accessibilityRole="button"
-            accessibilityLabel={t("toast.saved.view")}
-          >
-            <Text style={styles.ctaLabel}>{t("toast.saved.view")}</Text>
-          </Pressable>
+            <TouchableOpacity onPress={onPressCta} hitSlop={10}>
+              <Text style={styles.cta}>{t("toast.saved.view")}</Text>
+            </TouchableOpacity>
         </View>
       </Animated.View>
     </View>
@@ -115,60 +200,76 @@ function Toast({ position }: { position: "top" | "bottom" }) {
 }
 
 const styles = StyleSheet.create({
-  host: { zIndex: 1000 },
-  container: {
+  host: {
+    zIndex: 1000,
+    elevation: 32,
+  },
+  layer: {
     position: "absolute",
-    left: 16,
-    right: 16,
+    left: 14,
+    right: 14,
   },
   toast: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: C.surface,
-    borderRadius: 20,
+    gap: 14,
+    backgroundColor: SURFACE,
+    borderColor: BORDER,
     borderWidth: 1,
-    borderColor: C.border,
-    padding: 12,
-    gap: 12,
+    borderRadius: 24,
+    paddingVertical: 14,
+    paddingLeft: 14,
+    paddingRight: 18,
     shadowColor: "#000",
-    shadowOpacity: 0.4,
-    shadowRadius: 18,
-    shadowOffset: { width: 0, height: 8 },
-    elevation: 10,
+    shadowOpacity: 0.55,
+    shadowRadius: 24,
+    shadowOffset: { width: 0, height: 16 },
+    elevation: 32,
   },
-  iconBadge: {
-    width: 44,
-    height: 44,
-    borderRadius: 14,
-    backgroundColor: C.lime,
+  iconWrap: {
+    width: 54,
+    height: 54,
     alignItems: "center",
     justifyContent: "center",
   },
-  textCol: { flex: 1, minWidth: 0 },
+  ring: {
+    position: "absolute",
+    width: 66,
+    height: 66,
+    borderRadius: 22,
+    borderWidth: 2,
+  },
+  iconBox: {
+    width: 54,
+    height: 54,
+    borderRadius: 17,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  body: {
+    flex: 1,
+    minWidth: 0,
+  },
   title: {
-    color: C.white,
+    color: TEXT_PRIMARY,
+    fontSize: 17,
+    fontWeight: "700",
+    letterSpacing: -0.2,
+  },
+  sub: {
+    color: TEXT_TERTIARY,
+    fontSize: 14,
+    fontWeight: "600",
+    marginTop: 2,
+  },
+  subStrong: {
+    fontWeight: "800",
+  },
+  cta: {
+    color: TEXT_PRIMARY,
     fontSize: 15,
     fontWeight: "700",
-    letterSpacing: -0.15,
-    lineHeight: 18,
-  },
-  meta: {
-    color: C.gray300,
-    fontSize: 13,
-    fontWeight: "500",
-    marginTop: 3,
-  },
-  from: { color: C.gray300, fontSize: 13, fontWeight: "500" },
-  price: { color: C.lime, fontSize: 13, fontWeight: "700" },
-  cta: {
-    paddingVertical: 4,
-    paddingHorizontal: 4,
-  },
-  ctaLabel: {
-    color: C.white,
-    fontWeight: "700",
-    fontSize: 14,
-    letterSpacing: -0.14,
     textDecorationLine: "underline",
+    paddingHorizontal: 4,
   },
 });

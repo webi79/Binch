@@ -11,6 +11,7 @@ import { surroundingsRoutes } from "./routes/surroundings.js";
 import { stopsRoutes } from "./routes/stops.js";
 import { tripsRoutes } from "./routes/trips.js";
 import { flightBookingOptionsRoutes } from "./routes/flightBookingOptions.js";
+import { chatRoutes } from "./routes/chat.js";
 import { pool } from "./db/client.js";
 import { startStopBoardPreCache, stopStopBoardPreCache } from "./services/stopBoardPreCache.js";
 import { startDbVendoQueue, stopDbVendoQueue } from "./services/dbVendoQueue.js";
@@ -39,6 +40,7 @@ await app.register(surroundingsRoutes);
 await app.register(stopsRoutes);
 await app.register(tripsRoutes);
 await app.register(flightBookingOptionsRoutes);
+await app.register(chatRoutes);
 
 // db-vendo Background-Queue starten — Worker tickt alle 1.5s und arbeitet
 // SWR/History-Refreshes ab. Muss VOR dem Pre-Cache laufen, weil der Pre-Cache

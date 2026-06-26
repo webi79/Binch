@@ -1,6 +1,6 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { View, StyleSheet } from "react-native";
-import Animated, { FadeIn } from "react-native-reanimated";
+import Animated, { FadeOut } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useQuery } from "@tanstack/react-query";
 import { router } from "expo-router";
@@ -17,6 +17,7 @@ import { openStopSheet } from "@/components/surroundings/stopSheetAnimation";
 import { RouteLayer } from "@/components/surroundings/RouteLayer";
 import { RouteBanner } from "@/components/surroundings/RouteBanner";
 import { MapFabs } from "@/components/surroundings/MapFabs";
+import { MapSkeleton } from "@/components/surroundings/MapSkeleton";
 import { SurroundingsSheet } from "@/components/surroundings/SurroundingsSheet";
 import { SearchBar } from "@/components/SearchBar";
 import { LocationPicker } from "@/components/search/LocationPicker";
@@ -104,22 +105,23 @@ export default function SurroundingsScreen() {
   // Marker-Tap.
   const selectStop = useSearchStore((s) => s.selectStop);
 
-  // MapSurface erst nach dem ersten Focus des Tabs mounten — UND erst
-  // ~280 ms später, damit die Pop-in-Spring der FloatingTabBar
-  // ungestört durchläuft bevor MapLibre mit GL-Init / Tile-Loading
-  // anfängt. Sobald `mapReady = true` ist, bleibt's true (Tab-Wechsel
-  // weg + zurück hat keine Wiederholung der Wartezeit).
-  //
-  // Visueller Effekt: Tab-Switch ist instant, dann fadet die Karte ein
-  // (FadeIn 220 ms) → User sieht zuerst sauber die Surroundings-UI,
-  // danach die Karte „einblenden" statt sie mit Stutter mit-zu-rendern.
+  // MapSurface mountet bereits beim ersten Focus, aber wir behalten das
+  // MapSkeleton SICHTBAR bis MapLibre tatsächlich seine Tiles gerendert
+  // hat (Event `onDidFinishRenderingMapFully`). Vorher wurde nach 80ms hart
+  // gewechselt → User sah leere/blanke Tiles während MapLibre noch lud,
+  // dann ein Flicker zur richtigen Karte.
+  // Jetzt: Skelett bleibt drauf bis die echten Tiles da sind → kein leerer
+  // Zwischenzustand mehr sichtbar.
   const isFocused = useIsFocused();
-  const [mapReady, setMapReady] = useState(false);
+  const [mapMounted, setMapMounted] = useState(false);
+  const [mapTilesRendered, setMapTilesRendered] = useState(false);
   useEffect(() => {
-    if (!isFocused || mapReady) return;
-    const t = setTimeout(() => setMapReady(true), 280);
-    return () => clearTimeout(t);
-  }, [isFocused, mapReady]);
+    if (!isFocused || mapMounted) return;
+    // Ein Frame Defer damit der erste Tab-Commit das Skelett zeichnet
+    // BEVOR wir die schwere MapLibre-Initialisation triggern.
+    const id = requestAnimationFrame(() => setMapMounted(true));
+    return () => cancelAnimationFrame(id);
+  }, [isFocused, mapMounted]);
 
   // Tab-Tap soll sich sofort anfühlen. Marker-Swap (100+ native Views) ist
   // teuer und blockt sonst den Tap. useDeferredValue rendert die Marker
@@ -219,7 +221,7 @@ export default function SurroundingsScreen() {
 
   // Wenn eine Route gesetzt wird → Bounds berechnen und Karte darauf fitten.
   useEffect(() => {
-    if (!routeActive || !mapReady) return;
+    if (!routeActive || !mapMounted) return;
     const pts = pendingRoute!.waypoints;
     let minLat = pts[0].latitude, maxLat = pts[0].latitude;
     let minLng = pts[0].longitude, maxLng = pts[0].longitude;
@@ -230,7 +232,7 @@ export default function SurroundingsScreen() {
       if (p.longitude > maxLng) maxLng = p.longitude;
     }
     mapRef.current?.fitBounds([minLng, minLat], [maxLng, maxLat], 80);
-  }, [routeActive, mapReady, pendingRoute]);
+  }, [routeActive, mapMounted, pendingRoute]);
 
   // Tab-Switch: Zoom anpassen so dass der User die Marker sieht.
   //   - transit: nah ran (Zoom 13, Bushaltestellen-Distanz)
@@ -283,16 +285,16 @@ export default function SurroundingsScreen() {
 
   return (
     <View style={styles.root}>
-      {mapReady && (
-        <Animated.View
-          style={StyleSheet.absoluteFill}
-          entering={FadeIn.duration(220)}
-        >
+      {/* MapSurface mountet darunter, MapSkeleton liegt DARÜBER und fadet
+          erst raus wenn MapLibre seine Tiles tatsächlich gerendert hat.
+          So sieht der User nie blanke Tiles. */}
+      {mapMounted && (
         <MapSurface
           ref={mapRef}
           mapType={mapType}
           showsTraffic={trafficOn}
           onRegionChange={onRegionChange}
+          onMapRendered={() => setMapTilesRendered(true)}
         >
           {/* Route-Modus: nur RouteLayer + UserPin, sonst MarkerLayer + POIs */}
           {routeActive ? (
@@ -325,6 +327,17 @@ export default function SurroundingsScreen() {
           )}
           <UserPin coord={userCoord} />
         </MapSurface>
+      )}
+      {/* Skelett liegt OBEN bis die Tiles wirklich gerendert sind, dann
+          fadet es weg. Vorher sah der User "blanke Tiles" während MapLibre
+          noch lud. */}
+      {!mapTilesRendered && (
+        <Animated.View
+          style={StyleSheet.absoluteFill}
+          exiting={FadeOut.duration(280)}
+          pointerEvents="none"
+        >
+          <MapSkeleton />
         </Animated.View>
       )}
 
@@ -333,20 +346,36 @@ export default function SurroundingsScreen() {
           title={pendingRoute!.title ?? "Route"}
           waypointCount={pendingRoute!.waypoints.length}
           onBack={() => {
-            // 1. Navigation SOFORT auslösen — fühlt sich snappy an.
-            //    Bevorzugt: zurück zum exakten Pfad + Params, von dem aus
-            //    die Route geöffnet wurde (z.B. /search/results mit den
-            //    origin/destination/date-Params, sonst landet man auf einem
-            //    leeren Results-Screen ohne Search-Kontext).
+            // Surroundings-Flow (Direct-Trip ODER Booking ODER nur Stop offen):
+            // wir haben den kompletten Overlay-State in den Stash geparkt
+            // bevor die Route gezeigt wurde. Beim Back restoren wir alles
+            // wieder — Slide + DetailsOverlay + LegTimelineOverlay tauchen
+            // genau im selben Zustand wieder auf. KEINE Navigation, sonst
+            // landet man bei der vorigen Tab (i.d.R. Home/Landing).
+            const stash = useSearchStore.getState().stashedSurroundings;
+            if (stash) {
+              useSearchStore.getState().restoreSurroundings();
+              setTimeout(() => clearRoute(), 400);
+              return;
+            }
+
+            // Search-Flow (User kam aus /search/results, z.B. via Card-Route-
+            // Icon ODER via Details→LegTimeline→Show-on-Map). Navigation
+            // zurück per `router.replace` mit previousHref — der explizite
+            // Pfad ist hier zuverlässiger als `router.back()`, weil expo-
+            // router in Tab-Navigation tab-separate Stacks führt und `back()`
+            // innerhalb des Surroundings-Tabs zurückspringen würde statt zum
+            // Search-Tab. Overlays sind global gemountet in app/_layout.tsx,
+            // ihre Pathname-Wache zeigt sie automatisch wieder an sobald der
+            // Pathname zu `selectedResultContext.pathname` passt.
             const target = pendingRoute!.previousHref;
             if (target) {
               router.replace({ pathname: target.pathname, params: target.params } as never);
             } else if (router.canGoBack()) {
               router.back();
             }
-            // 2. clearRoute DEFERRED — der Map-Reset (Routen-Layer entfernen,
-            //    Marker neu mounten, Zoom zurück) würde sonst gleichzeitig mit
-            //    der Nav-Animation laufen und sichtbar ruckeln.
+            // clearRoute DEFERRED — der Map-Reset würde sonst gleichzeitig mit
+            // der Nav-Animation laufen und sichtbar ruckeln.
             setTimeout(() => clearRoute(), 400);
           }}
           topInset={insets.top}

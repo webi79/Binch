@@ -26,6 +26,14 @@ export default function SearchLayout() {
           animation: "slide_from_bottom",
         }}
       />
+      {/* results: contentStyle transparent damit der Stack-Container kein
+          solides Rechteck über die Landing-Page legt. Der eigentliche
+          Result-Hintergrund kommt aus styles.slideRoot in results.tsx, das
+          via Reanimated von rechts reinslidet — DRÜBER die Landing. */}
+      <Stack.Screen
+        name="results"
+        options={{ contentStyle: { backgroundColor: "transparent" } }}
+      />
     </Stack>
   );
 }

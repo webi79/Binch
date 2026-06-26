@@ -10,6 +10,7 @@ import { fetchLocations } from "@/lib/api/client";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import { useAccent } from "@/lib/theme/accent";
 
 let ExpoSpeechRecognitionModule: any = null;
 let useSpeechRecognitionEvent: (name: string, cb: (e: any) => void) => void = () => {};
@@ -28,6 +29,7 @@ interface Props {
 export function VoiceContent({ onClose }: Props) {
   const router = useRouter();
   const t = useT();
+  const accent = useAccent();
   const locale = useSearchStore((s) => s.locale);
   const currency = useSearchStore((s) => s.currency);
   const closeSearchOverlay = useSearchStore((s) => s.closeSearchOverlay);
@@ -136,9 +138,9 @@ export function VoiceContent({ onClose }: Props) {
         <RippleTouch
           onPress={listening ? stop : start}
           disabled={busy}
-          className="w-24 h-24 rounded-full bg-[#7FEA4D] items-center justify-center shadow-lg"
+          className="w-24 h-24 rounded-full items-center justify-center shadow-lg"
           rippleColor="rgba(0,0,0,0.32)"
-          style={({ pressed }) => ({ opacity: pressed ? 0.85 : 1 })}
+          style={({ pressed }) => ({ backgroundColor: accent.solid, opacity: pressed ? 0.85 : 1 })}
         >
           {busy ? <ActivityIndicator color="#000" /> : <Mic color="#000000" size={40} />}
         </RippleTouch>

@@ -95,6 +95,24 @@ async function createSession(userId: string): Promise<string> {
 }
 
 export async function authRoutes(app: FastifyInstance) {
+  app.post("/api/auth/check-email", async (req, reply) => {
+    // Schmaler Endpoint nur für den BinchAuthScreen — entscheidet ob der
+    // User in Schritt 1 (Email) auf den Login-Pfad (Konto existiert) oder
+    // Register-Pfad (Neukunde) gehen soll. Kein PW, kein Token. Returns
+    // {exists: boolean}.
+    const schema = z.object({ email: z.string().email().toLowerCase() });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "Invalid email" });
+    }
+    const rows = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.email, parsed.data.email))
+      .limit(1);
+    return { exists: rows.length > 0 };
+  });
+
   app.post("/api/auth/register", async (req, reply) => {
     const parsed = registerSchema.safeParse(req.body);
     if (!parsed.success) {

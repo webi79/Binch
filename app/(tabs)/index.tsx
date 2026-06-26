@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -21,6 +21,7 @@ import {
   type LucideIcon,
 } from "lucide-react-native";
 import { SearchBar } from "@/components/SearchBar";
+import { useRouter } from "expo-router";
 import { LinearGradient } from "expo-linear-gradient";
 import Animated, {
   FadeInDown,
@@ -41,6 +42,7 @@ import { GradientFill } from "@/components/ui/GradientFill";
 import { RecentCard } from "@/components/home/RecentCard";
 import { useSearchStore } from "@/stores/searchStore";
 import { TravelMode } from "@/types/search";
+import { useAccent } from "@/lib/theme/accent";
 
 // === Design Tokens ============================================================
 const C = {
@@ -250,10 +252,11 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
 // === Subcomponents ============================================================
 
 function Header() {
+  const accent = useAccent();
   return (
     <View style={styles.headerRow}>
       <Text style={styles.logoHeading}>
-        B<Text style={styles.logoAccent}>i</Text>nch
+        B<Text style={[styles.logoAccent, { color: accent.solid }]}>i</Text>nch
       </Text>
       <RippleTouch
         style={styles.bell}
@@ -310,11 +313,12 @@ function TransportTabs() {
 
 function SectionHeaderSmall({ title, onViewAll }: { title: string; onViewAll?: () => void }) {
   const t = useT();
+  const accent = useAccent();
   return (
     <View style={styles.sectionHeader}>
       <Text style={styles.sectionTitleSmall}>{title}</Text>
       <Pressable hitSlop={8} onPress={onViewAll}>
-        <Text style={styles.actionLink}>{t("home.viewall")}</Text>
+        <Text style={[styles.actionLink, { color: accent.solid }]}>{t("home.viewall")}</Text>
       </Pressable>
     </View>
   );
@@ -360,12 +364,26 @@ function CategoryChips({ value, onChange }: { value: CategoryId; onChange: (id: 
 
 const HEART_RED = "#FF3B5C";
 
-function DestinationCard({ d }: { d: Destination }) {
+// Unsplash-URLs sind mit w=900 hinterlegt — die Karte ist aber nur ~340px breit
+// (×2 für Retina ≈ 700px). RNs Image dekodiert Remote-Bilder in VOLLER Quell-
+// Auflösung (kein Auto-Downsampling), d.h. 900px-JPEGs zu dekodieren kostet beim
+// Scrollen spürbar. Wir verkleinern die angefragte Breite auf 700 → ~40% weniger
+// Pixel zu dekodieren, ohne sichtbaren Schärfeverlust. (Echter Fix wäre expo-image
+// mit Disk-Cache + exaktem Downsampling — separate Dependency.)
+function sizedImageUrl(url: string): string {
+  return url.replace(/([?&]w=)\d+/, "$1700");
+}
+
+const DestinationCard = memo(function DestinationCard({ d }: { d: Destination }) {
   const t = useT();
+  const accent = useAccent();
   const openSearchOverlay = useSearchStore((s) => s.openSearchOverlay);
-  const favoriteIds = useSearchStore((s) => s.favoriteResultIds);
+  // WICHTIG: selektiv abonnieren — sonst löst JEDER Favorite-Toggle einen
+  // Re-Render ALLER DestinationCards aus. Wir interessieren uns nur dafür ob
+  // GENAU DIESE Destination gespeichert ist; Zustand's shallow-compare
+  // verhindert dann den Re-Render wenn sich nur fremde Favoriten ändern.
+  const saved = useSearchStore((s) => s.favoriteResultIds.includes(d.id));
   const toggleFavorite = useSearchStore((s) => s.toggleFavorite);
-  const saved = favoriteIds.includes(d.id);
 
   const scale = useSharedValue(1);
   const cardAnim = useAnimatedStyle(() => ({
@@ -395,7 +413,7 @@ function DestinationCard({ d }: { d: Destination }) {
         }}
       >
         <ImageBackground
-          source={typeof d.imageUrl === "number" ? d.imageUrl : { uri: d.imageUrl }}
+          source={typeof d.imageUrl === "number" ? d.imageUrl : { uri: sizedImageUrl(d.imageUrl) }}
           style={styles.cardBg}
         >
           <LinearGradient
@@ -426,7 +444,7 @@ function DestinationCard({ d }: { d: Destination }) {
               </Text>
               <Text style={styles.priceLine}>
                 {t("home.popular.from")}{" "}
-                <Text style={styles.priceValue}>{d.priceFrom}</Text>{" "}
+                <Text style={[styles.priceValue, { color: accent.solid }]}>{d.priceFrom}</Text>{" "}
                 <Text style={{ color: C.gray1 }}>{d.currency}</Text>
               </Text>
             </View>
@@ -446,14 +464,16 @@ function DestinationCard({ d }: { d: Destination }) {
       </RippleTouch>
     </Animated.View>
   );
-}
+});
 
 const RECENT_COLLAPSED = 3;
 const RECENT_EXPANDED = 8;
 
 // === Screen ===================================================================
 export default function HomeScreen() {
+  const accent = useAccent();
   const t = useT();
+  const router = useRouter();
   const insets = useSafeAreaInsets();
   const recentSearches = useSearchStore((s) => s.recentSearches);
   const openRecentHistoryOverlay = useSearchStore((s) => s.openRecentHistoryOverlay);
@@ -465,8 +485,18 @@ export default function HomeScreen() {
   const currentCatIdx = CATEGORIES.findIndex((c) => c.id === category);
   const prevCatIdx = CATEGORIES.findIndex((c) => c.id === prevCategoryRef.current);
   const slideFromRight = currentCatIdx >= prevCatIdx;
+  // shouldAnimateCategory: nur slide wenn der User WIRKLICH die Kategorie
+  // gewechselt hat — NICHT beim Initial-Mount und NICHT bei Remount nach
+  // freezeOnBlur-Unfreeze (Bottom-Tabs nutzen react-freeze = Suspense-
+  // basiert, beim Refocus mountet die ganze Landing-Tree neu → entering
+  // würde sonst auf jedem Tab-Switch zurück zu Landing für 320ms feuern
+  // und mit dem Scroll auf UI-Thread kollidieren = laggy scroll).
+  const [shouldAnimateCategory, setShouldAnimateCategory] = useState(false);
   useEffect(() => {
-    prevCategoryRef.current = category;
+    if (prevCategoryRef.current !== category) {
+      setShouldAnimateCategory(true);
+      prevCategoryRef.current = category;
+    }
   }, [category]);
   const destinations = DESTINATIONS_BY_CATEGORY[category];
   const visibleRecents = recentSearches.slice(
@@ -484,7 +514,13 @@ export default function HomeScreen() {
         showsVerticalScrollIndicator={false}
       >
           <Header />
-          <SearchBar style={styles.searchBarSpacing} />
+          <SearchBar
+            style={styles.searchBarSpacing}
+            onPress={() => router.navigate("/assistant")}
+            onMicPress={() =>
+              router.navigate({ pathname: "/assistant", params: { autoVoice: "1" } })
+            }
+          />
           <TransportTabs />
 
           {recentSearches.length > 0 && (
@@ -510,48 +546,69 @@ export default function HomeScreen() {
                 )
               )}
               {canExpand && (
-                <Animated.View layout={LinearTransition.duration(220)}>
-                  <RippleTouch
-                    style={styles.recentToggle}
-                    onPress={() => {
-                      haptic("button");
-                      setRecentExpanded((v) => !v);
-                    }}
-                  >
-                    <Text style={styles.recentToggleText}>
-                      {recentExpanded ? t("home.recent.showLess") : t("home.recent.showMore")}
-                    </Text>
-                    {recentExpanded ? (
-                      <ChevronUp size={14} color={C.lime} strokeWidth={2.5} />
-                    ) : (
-                      <ChevronDown size={14} color={C.lime} strokeWidth={2.5} />
-                    )}
-                  </RippleTouch>
-                </Animated.View>
+                // KEIN layout={LinearTransition} mehr — sonst flog der
+                // Button bei jeder neuen Recent-Search von oben rein (weil
+                // sich die List-Höhe ändert und der Button seine Position
+                // animiert). Statisch positioniert: kein Re-Anim wenn man
+                // vom Results zurück zum Landing kommt.
+                <RippleTouch
+                  style={styles.recentToggle}
+                  onPress={() => {
+                    haptic("button");
+                    setRecentExpanded((v) => !v);
+                  }}
+                >
+                  <Text style={[styles.recentToggleText, { color: accent.solid }]}>
+                    {recentExpanded ? t("home.recent.showLess") : t("home.recent.showMore")}
+                  </Text>
+                  {recentExpanded ? (
+                    <ChevronUp size={14} color={accent.solid} strokeWidth={2.5} />
+                  ) : (
+                    <ChevronDown size={14} color={accent.solid} strokeWidth={2.5} />
+                  )}
+                </RippleTouch>
               )}
             </View>
           )}
 
-          <Animated.View layout={LinearTransition.duration(220)}>
+          {/* Plain View statt Animated.View+LinearTransition — die Layout-
+              Animation war zwar selten aktiv (Section-Height ändert sich kaum
+              zwischen Categories), aber Reanimated installiert pro-Frame
+              onLayout-Listener auf jedem layout-Prop, was während Scroll
+              spürbare Frame-Drops im ScrollView verursachte. Ohne
+              LinearTransition snappt die Höhe direkt — kaum sichtbarer
+              Verlust, viel smoother Scroll. */}
+          <View>
             <View style={styles.popularHeader}>
               <Text style={styles.sectionTitle}>{t("home.destinations.title")}</Text>
               <Pressable hitSlop={8}>
-                <Text style={styles.actionLink}>{t("home.viewall")}</Text>
+                <Text style={[styles.actionLink, { color: accent.solid }]}>{t("home.viewall")}</Text>
               </Pressable>
             </View>
             <CategoryChips value={category} onChange={setCategory} />
             <View style={{ height: 14 }} />
-            {/* Keyed wrapper → bei jedem Kategorie-Wechsel remountet die Liste
-                und Reanimated spielt die Slide-Animation in passender Richtung. */}
-            <Animated.View
-              key={category}
-              entering={(slideFromRight ? SlideInRight : SlideInLeft).duration(320)}
-            >
-              {destinations.map((d) => (
-                <DestinationCard key={d.id} d={d} />
-              ))}
-            </Animated.View>
-          </Animated.View>
+            {/* Keyed wrapper → bei jedem ECHTEN Kategorie-Wechsel remountet
+                die Liste und Reanimated spielt die Slide-Animation. Bei
+                Initial-Mount + Remount-nach-Refocus (shouldAnimateCategory=
+                false) rendern wir einen plain View ohne entering → kein
+                320ms Slide der mit dem Scroll-Handler kollidiert. */}
+            {shouldAnimateCategory ? (
+              <Animated.View
+                key={category}
+                entering={(slideFromRight ? SlideInRight : SlideInLeft).duration(320)}
+              >
+                {destinations.map((d) => (
+                  <DestinationCard key={d.id} d={d} />
+                ))}
+              </Animated.View>
+            ) : (
+              <View key={category}>
+                {destinations.map((d) => (
+                  <DestinationCard key={d.id} d={d} />
+                ))}
+              </View>
+            )}
+          </View>
       </ScrollView>
     </View>
   );
@@ -561,7 +618,12 @@ export default function HomeScreen() {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: C.bg },
   scroll: { flex: 1 },
-  scrollContent: { paddingBottom: 130 },
+  // paddingBottom: 0 — die Nav-Bar reserviert ihren eigenen Platz unter der
+  // ScrollView (überlagert sie nicht). Der `card.marginBottom: 16` ist also
+  // direkt der sichtbare Abstand zwischen letzter Card und Nav-Bar. Damit
+  // matchen Inter-Card-Spacing (16dp) und Card-zu-Nav-Bar-Spacing (16dp)
+  // geräteunabhängig.
+  scrollContent: { paddingBottom: 0 },
 
   // Header
   headerRow: {
@@ -573,7 +635,7 @@ const styles = StyleSheet.create({
     paddingBottom: 14,
   },
   logoHeading: { fontSize: 26, fontWeight: "900", letterSpacing: -0.6, color: C.white },
-  logoAccent: { color: C.lime },
+  logoAccent: {},
   bell: {
     width: 44,
     height: 44,
@@ -631,7 +693,7 @@ const styles = StyleSheet.create({
     color: C.white,
     letterSpacing: -0.5,
   },
-  actionLink: { fontSize: 13, fontWeight: FONT.semibold, color: C.lime },
+  actionLink: { fontSize: 13, fontWeight: FONT.semibold },
 
   recentToggle: {
     flexDirection: "row",
@@ -644,7 +706,7 @@ const styles = StyleSheet.create({
     marginBottom: 8,
     borderRadius: 16,
   },
-  recentToggleText: { fontSize: 13, fontWeight: FONT.semibold, color: C.lime },
+  recentToggleText: { fontSize: 13, fontWeight: FONT.semibold },
 
   // Popular header
   popularHeader: {
@@ -735,7 +797,7 @@ const styles = StyleSheet.create({
     textShadowOffset: { width: 0, height: 2 },
   },
   priceLine: { fontSize: 13, color: C.gray1, marginTop: 6 },
-  priceValue: { color: C.lime, fontSize: 16, fontWeight: FONT.extrabold },
+  priceValue: { fontSize: 16, fontWeight: FONT.extrabold },
   cta: {
     borderRadius: 9999,
     paddingVertical: 12,

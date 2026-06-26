@@ -28,6 +28,7 @@ import {
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useT } from "@/lib/i18n/useT";
 import { MarkerKind, SheetMode, StopListItem } from "@/lib/surroundings/mockData";
+import { useAccent } from "@/lib/theme/accent";
 
 const LIME = "#7FEA4D";
 const LIME_SUB = "rgba(127,234,77,0.18)";
@@ -39,7 +40,7 @@ const BUS_PURPLE_SUB = "rgba(157,95,224,0.22)";
 /** Chip-Styling pro Marker-Typ — matched die Map-Marker für visuelle Konsistenz. */
 const KIND_CHIP_STYLE: Record<string, { bg: string; fg: string }> = {
   train: { bg: TRAIN_YELLOW_SUB, fg: TRAIN_YELLOW },
-  airport: { bg: LIME_SUB, fg: LIME },
+  // airport entfernt — wird zur Laufzeit aus accent berechnet (siehe useAccent).
   bus: { bg: BUS_PURPLE_SUB, fg: BUS_PURPLE },
 };
 const C = {
@@ -83,6 +84,7 @@ interface Props {
 
 export function SurroundingsSheet({ mode, setMode, items }: Props) {
   const t = useT();
+  const accent = useAccent();
   const insets = useSafeAreaInsets();
   const { height: screenHeight } = useWindowDimensions();
 
@@ -174,7 +176,7 @@ export function SurroundingsSheet({ mode, setMode, items }: Props) {
               hitSlop={4}
             >
               <View style={styles.tabInner}>
-                <Icon color={active ? LIME : C.g2} size={18} strokeWidth={2} />
+                <Icon color={active ? accent.solid : C.g2} size={18} strokeWidth={2} />
                 <Text
                   style={[
                     styles.tabLabel,
@@ -184,7 +186,7 @@ export function SurroundingsSheet({ mode, setMode, items }: Props) {
                   {t(tKey)}
                 </Text>
               </View>
-              {active && <View style={styles.tabUnderline} />}
+              {active && <View style={[styles.tabUnderline, { backgroundColor: accent.solid }]} />}
             </Pressable>
           );
         })}
@@ -193,8 +195,8 @@ export function SurroundingsSheet({ mode, setMode, items }: Props) {
       <View style={styles.titleRow}>
         <Text style={styles.title}>{title}</Text>
         <RippleTouch style={styles.filterRow} borderless>
-          <Text style={styles.filterText}>{t("surroundings.filter")}</Text>
-          <SlidersHorizontal color={LIME} size={12} strokeWidth={2.2} />
+          <Text style={[styles.filterText, { color: accent.solid }]}>{t("surroundings.filter")}</Text>
+          <SlidersHorizontal color={accent.solid} size={12} strokeWidth={2.2} />
         </RippleTouch>
       </View>
 
@@ -227,13 +229,14 @@ const renderStopRow = ({ item }: ListRenderItemInfo<StopListItem>) => (
 
 const StopRow = memo(function StopRow({ item }: { item: StopListItem }) {
   const t = useT();
+  const accent = useAccent();
   return (
     <RippleTouch style={[styles.row, item.selected && styles.rowSelected]}>
       <View style={{ flex: 1 }}>
         <View style={styles.rowTitleLine}>
           <Text style={styles.rowTitle}>{item.name}</Text>
           {item.selected && (
-            <View style={styles.selectedBadge}>
+            <View style={[styles.selectedBadge, { backgroundColor: accent.solid }]}>
               <Text style={styles.selectedBadgeText}>{t("surroundings.selected")}</Text>
             </View>
           )}
@@ -241,7 +244,16 @@ const StopRow = memo(function StopRow({ item }: { item: StopListItem }) {
         <View style={styles.kindRow}>
           {item.kinds.map((k, i) => {
             const Icon = KIND_ICON[k];
-            const styled = KIND_CHIP_STYLE[k];
+            // Unbekannte Kinds (z.B. „ferry" aus OSM-Imports, leere Strings
+            // aus partiellen Daten) → Chip einfach skippen statt Render-
+            // Crash mit „Cannot read property displayName of undefined".
+            if (!Icon) return null;
+            // Airport-Chip nutzt den User-Akzent, train/bus haben feste
+            // informative Farben (Gelb/Lila) damit die Mode-Erkennung im
+            // Marker erhalten bleibt.
+            const styled = k === "airport"
+              ? { bg: accent.subtle, fg: accent.solid }
+              : KIND_CHIP_STYLE[k];
             const bg = styled?.bg ?? C.s3;
             const fg = styled?.fg ?? C.white;
             return (
@@ -263,7 +275,7 @@ const StopRow = memo(function StopRow({ item }: { item: StopListItem }) {
         </View>
       </View>
       <View style={styles.distanceCol}>
-        <Text style={styles.distance}>{item.distance}</Text>
+        <Text style={[styles.distance, { color: accent.solid }]}>{item.distance}</Text>
         <ChevronRight color={C.g3} size={16} strokeWidth={2.4} />
       </View>
     </RippleTouch>
@@ -327,7 +339,7 @@ const styles = StyleSheet.create({
     left: "15%",
     right: "15%",
     height: 3,
-    backgroundColor: LIME,
+
     borderRadius: 2,
   },
   titleRow: {
@@ -353,7 +365,7 @@ const styles = StyleSheet.create({
   },
   filterText: {
     fontSize: 12,
-    color: LIME,
+
     fontWeight: "600",
   },
   scroll: { flex: 1 },
@@ -380,7 +392,7 @@ const styles = StyleSheet.create({
     letterSpacing: -0.2,
   },
   selectedBadge: {
-    backgroundColor: LIME,
+
     paddingHorizontal: 6,
     paddingVertical: 2,
     borderRadius: 6,
@@ -434,7 +446,7 @@ const styles = StyleSheet.create({
   distance: {
     fontSize: 14,
     fontWeight: "700",
-    color: LIME,
+
     letterSpacing: -0.2,
   },
   footer: {

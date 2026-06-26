@@ -1,8 +1,8 @@
 import { View, StyleSheet } from "react-native";
 import { Layers, Activity, Crosshair } from "lucide-react-native";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import { useAccent } from "@/lib/theme/accent";
 
-const LIME = "#7FEA4D";
 const WHITE = "#FFFFFF";
 
 interface Props {
@@ -22,16 +22,17 @@ export function MapFabs({
   onToggleTraffic,
   onLocate,
 }: Props) {
+  const accent = useAccent();
   return (
     <View style={[styles.col, { top: topInset + 70 }]} pointerEvents="box-none">
-      <Fab active={satelliteOn} onPress={onToggleLayers}>
-        <Layers size={20} color={satelliteOn ? LIME : WHITE} strokeWidth={2} />
+      <Fab active={satelliteOn} onPress={onToggleLayers} activeColor={accent.solid}>
+        <Layers size={20} color={satelliteOn ? accent.solid : WHITE} strokeWidth={2} />
       </Fab>
-      <Fab active={trafficOn} onPress={onToggleTraffic}>
-        <Activity size={20} color={trafficOn ? LIME : WHITE} strokeWidth={2} />
+      <Fab active={trafficOn} onPress={onToggleTraffic} activeColor={accent.solid}>
+        <Activity size={20} color={trafficOn ? accent.solid : WHITE} strokeWidth={2} />
       </Fab>
       <Fab onPress={onLocate}>
-        <Crosshair size={20} color={LIME} strokeWidth={2} />
+        <Crosshair size={20} color={accent.solid} strokeWidth={2} />
       </Fab>
     </View>
   );
@@ -41,14 +42,16 @@ function Fab({
   children,
   onPress,
   active,
+  activeColor,
 }: {
   children: React.ReactNode;
   onPress: () => void;
   active?: boolean;
+  activeColor?: string;
 }) {
   return (
     <RippleTouch
-      style={[styles.fab, active && styles.fabActive]}
+      style={[styles.fab, active && activeColor ? { borderColor: activeColor } : null]}
       borderless
       onPress={onPress}
     >
@@ -79,7 +82,5 @@ const styles = StyleSheet.create({
     shadowRadius: 12,
     elevation: 6,
   },
-  fabActive: {
-    borderColor: LIME,
-  },
+  // fabActive entfernt — borderColor wird inline aus accent.solid gesetzt.
 });

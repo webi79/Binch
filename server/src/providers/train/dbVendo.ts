@@ -282,21 +282,55 @@ async function resolveStationId(
   const dbrestMatch = code.match(/^dbrest:(\d+)$/);
   if (dbrestMatch && dbrestMatch[1]) return dbrestMatch[1];
 
-  // StaDa-Import speichert direkt die UIC (= HAFAS-ID) im Code: "sta:8011160"
-  // → kein Live-Lookup nötig, einfach Suffix verwenden.
+  // StaDa-Import: bei DE-Stationen sind code-Suffix und hafasId identisch und
+  // werden von DB-HAFAS direkt verstanden. Bei AT/CH/BE/NL etc. ist die
+  // gespeicherte hafasId NICHT zwingend die DB-HAFAS-kompatible ID:
+  //   - AT: obb_id ist ÖBB-internal (z.B. Wien Hbf = 8103000), DB-HAFAS
+  //     interpretiert das aber als andere Station (Wien Blumental o.ä.)
+  //   - CH: cff_id ist SBB-internal, gleiches Problem
+  //   - BE: UIC 88xxxxx vs DB-internal 88xxx (siehe Bruxelles-Midi)
+  // Für non-DE: stored hafasId nur als Hint nehmen, aber via Label-Lookup
+  // (mit allWordsMatch-Filter) gegen DB-HAFAS verifizieren/auflösen. Für DE
+  // kürzen wir ab und nehmen die stored ID direkt.
   const stadaMatch = code.match(/^sta:(\d{7})$/);
-  if (stadaMatch && stadaMatch[1]) return stadaMatch[1];
+  if (stadaMatch && stadaMatch[1]) {
+    const dbHit = await db
+      .select({ hafasId: locations.hafasId, country: locations.country })
+      .from(locations)
+      .where(eq(locations.code, code))
+      .limit(1);
+    const storedHafasId = dbHit[0]?.hafasId ?? null;
+    const country = dbHit[0]?.country ?? null;
+    // DE-Stationen: direkt nutzen (UIC = DB-HAFAS-ID).
+    if (country === "Germany" && storedHafasId) {
+      return storedHafasId;
+    }
+    // Non-DE: Label-Lookup fallthrough unten ist robuster. Wir hängen aber
+    // die stored ID als zusätzlichen Candidate dran (falls Label nicht in
+    // HAFAS findbar ist).
+    // Continue past this block → label-based lookup mit candidates [label,
+    // ...] greift.
+  }
+
+  // Steuert, ob beim Label-Lookup unten auch 6-stellige HAFAS-IDs (= Bus-/
+  // Tram-Haltestellen) als Treffer zählen. Standard: NEIN (nur 7-stellige
+  // Bahnhöfe), sonst würde eine Zug-Suche auf eine Bushaltestelle rutschen.
+  // Für BUS-Stops MUSS es aber AN sein — sonst hat „Werl, Markt" (gtfs, type=BUS)
+  // keinen 7-stelligen Treffer und landet beim Bahnhof „Werl" (HAFAS kennt die
+  // Bushaltestelle nur als 6-stellige id 414408 „Markt, Werl").
+  let allowBusStops = false;
 
   // GTFS-Import: einige Stop-IDs sind direkt UIC-konform (7-stellig).
   // Manche haben aber Hyphen-Format wie "de:01:5100:1:1" — in dem Fall haben
   // wir hafas_id beim Import in der DB gespeichert. DB-Lookup statt Live-Call.
   if (code.startsWith("gtfs:")) {
     const dbHit = await db
-      .select({ hafasId: locations.hafasId })
+      .select({ hafasId: locations.hafasId, type: locations.type })
       .from(locations)
       .where(eq(locations.code, code))
       .limit(1);
     if (dbHit[0]?.hafasId) return dbHit[0].hafasId;
+    if (dbHit[0]?.type === "BUS") allowBusStops = true;
     // Kein hafas_id beim Import → fällt durch zum Live-Lookup via Name.
   }
 
@@ -335,7 +369,16 @@ async function resolveStationId(
     }
   }
 
-  const candidates = [label, code].filter((x): x is string => typeof x === "string" && x.length > 0);
+  // Candidate-Reihenfolge ist relevant: zuerst probieren wir die deutsche
+  // Variante des Labels (mit Stadt-Aliasen), dann das Original, dann den Code.
+  // Hintergrund: HAFAS DB ist auf deutsche Bezeichnungen optimiert. Wenn
+  // unsere App das englische Label „Munich Odeonsplatz" schickt, liefert
+  // HAFAS zwar „München Odeonsplatz" mit zurück — aber unser 4-Char-Prefix-
+  // Match („muni" vs „munc") schmeißt das raus. Der Aliasing-Pass davor
+  // baut die Anfrage zu „München Odeonsplatz" um und der Prefix matcht.
+  const localized = label ? applyCityAlias(label) : undefined;
+  const candidates = [localized, label, code]
+    .filter((x, i, arr): x is string => typeof x === "string" && x.length > 0 && arr.indexOf(x) === i);
   for (const candidate of candidates) {
     const key = candidate.toLowerCase();
     const cached = stationCache.get(key);
@@ -356,15 +399,114 @@ async function resolveStationId(
     const data = (await res.json().catch(() => null)) as Record<string, DbStation> | DbStation[] | null;
     if (!data) continue;
     const list: DbStation[] = Array.isArray(data) ? data : Object.values(data);
-    // Nur echte Bahnhöfe — 7-stellige UIC-ID (z.B. 8000584). HAFAS liefert
-    // sonst auch Bushaltestellen (6-stellig, z.B. 821676 „Anrath Bahnhof").
-    const first = list.find((s) => typeof s?.id === "string" && /^\d{7}$/.test(s.id));
+    // Standard: nur echte Bahnhöfe — 7-stellige UIC-ID (z.B. 8000584). HAFAS
+    // liefert sonst auch Bushaltestellen (6-stellig, z.B. 414408 „Markt, Werl").
+    // AUSNAHME: wenn wir gerade einen BUS-Stop auflösen (allowBusStops), zählen
+    // 6-stellige Treffer mit — sonst kann eine echte Bushaltestelle gar nicht
+    // aufgelöst werden.
+    //
+    // Matching: ALLE Wörter aus der Query müssen im HAFAS-Namen vorkommen,
+    // mit Hbf/Hauptbahnhof als Synonyme (sonst matched „Wien Hbf" auf
+    // „Wien Blumental" — beide starten mit „wien", aber Blumental landet
+    // im Result-Set zuerst). Plus: bevorzugt Treffer wo „hbf"/„hauptbahnhof"
+    // vorkommt wenn die Query danach fragt — sonst greift HAFAS bei breiten
+    // Queries („wien") gerne den nächstbesten kleineren Stop ab.
+    const matchAll = (name: string) => allWordsMatch(name, candidate);
+    const idPattern = allowBusStops ? /^\d{6,7}$/ : /^\d{7}$/;
+    const matches = list.filter(
+      (s) =>
+        typeof s?.id === "string" &&
+        idPattern.test(s.id) &&
+        typeof s.name === "string" &&
+        matchAll(s.name),
+    );
+    if (matches.length === 0) continue;
+    // Bei mehreren Treffern: bevorzuge KÜRZESTEN Namen (typischerweise der
+    // Hauptbahnhof selbst, nicht Sub-Stationen wie „Wien Hbf Bahnsteig 7").
+    matches.sort((a, b) => (a.name?.length ?? 999) - (b.name?.length ?? 999));
+    const first = matches[0];
     if (first?.id) {
       stationCache.set(key, first.id);
       return first.id;
     }
   }
   return null;
+}
+
+/** Lowercase + Diakritika-Entfernung für robusten Name-Vergleich.
+ *  z.B. "Köln Hbf" → "koln hbf", "Höfingen" → "hofingen", "Hoefkade" → "hoefkade".
+ *  Diakritika werden via NFD-Zerlegung + Combining-Marks-Strip entfernt. */
+function normalizeForMatch(s: string): string {
+  return s
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+/** Synonyme für Bahnhof-Bezeichnungen — manche HAFAS-Stationen labeln „Hbf",
+ *  andere „Hauptbahnhof"; manche „Westbf", andere „Westbahnhof". Compound-
+ *  Patterns abdecken damit „Wien Westbahnhof" auch „Wien Westbf" findet. */
+const STATION_SYNONYMS: Record<string, string[]> = {
+  hbf: ["hbf", "hauptbahnhof"],
+  hauptbahnhof: ["hbf", "hauptbahnhof"],
+  bf: ["bf", "bahnhof"],
+  bahnhof: ["bf", "bahnhof"],
+  westbahnhof: ["westbahnhof", "westbf"],
+  westbf: ["westbahnhof", "westbf"],
+  ostbahnhof: ["ostbahnhof", "ostbf"],
+  ostbf: ["ostbahnhof", "ostbf"],
+  nordbahnhof: ["nordbahnhof", "nordbf"],
+  nordbf: ["nordbahnhof", "nordbf"],
+  südbahnhof: ["südbahnhof", "südbf"],
+  südbf: ["südbahnhof", "südbf"],
+  sudbahnhof: ["sudbahnhof", "sudbf"],
+  sudbf: ["sudbahnhof", "sudbf"],
+};
+
+/** True wenn JEDES Wort aus der Query im Namen vorkommt. Mit Synonym-
+ *  Erweiterung für Hbf/Bahnhof-Compounds. Wenn ein Wort >= 5 Zeichen hat
+ *  und kein direkter Match: fall back auf 4-Char-Prefix-Match (deckt
+ *  Spelling-Varianten und ungewöhnliche Compound-Formen ab). */
+function allWordsMatch(name: string, query: string): boolean {
+  const nameNorm = normalizeForMatch(name);
+  const queryWords = normalizeForMatch(query).split(/\s+/).filter(Boolean);
+  if (queryWords.length === 0) return false;
+  return queryWords.every((w) => {
+    const variants = STATION_SYNONYMS[w] ?? [w];
+    if (variants.some((v) => nameNorm.includes(v))) return true;
+    // Lenient-Fallback: für Wörter ≥ 5 Zeichen reicht der 4-Char-Prefix
+    // im Namen. So matched „Westbahnhof" (12 chars) gegen „westbf" via
+    // Prefix „west", und unbekannte Compound-Formen werden mitgenommen.
+    if (w.length >= 5) {
+      return nameNorm.includes(w.slice(0, 4));
+    }
+    return false;
+  });
+}
+
+/** Englische Stadt-Namen → deutsche Schreibweise für HAFAS-Lookup. HAFAS DB
+ *  versteht die englischen Varianten oft (HAFAS returnt sie sogar), aber
+ *  unser strikter 4-Char-Prefix-Match (gegen die HAFAS-Resultate, die
+ *  meist im deutschen Namensraum liegen) braucht den DE-Namen schon in
+ *  der Anfrage. */
+function applyCityAlias(label: string): string {
+  const aliases: Record<string, string> = {
+    munich: "München",
+    cologne: "Köln",
+    vienna: "Wien",
+    nuremberg: "Nürnberg",
+    geneva: "Genf",
+    zurich: "Zürich",
+    prague: "Prag",
+    warsaw: "Warschau",
+  };
+  let result = label;
+  for (const [en, de] of Object.entries(aliases)) {
+    // Word-Boundary (\b) damit "Munich" matched, "communicate" aber nicht.
+    result = result.replace(new RegExp(`\\b${en}\\b`, "gi"), de);
+  }
+  return result;
 }
 
 function parseJourneys(raw: unknown, input: ProviderSearchInput): NormalizedResult[] {

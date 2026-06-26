@@ -57,6 +57,16 @@ module.exports = {
         },
       ],
       "@maplibre/maplibre-react-native",
+      "react-native-bottom-tabs",
+      [
+        "expo-speech-recognition",
+        {
+          microphonePermission:
+            "Binch nutzt das Mikrofon, um deine Sprachnachrichten an Bo zu transkribieren.",
+          speechRecognitionPermission:
+            "Binch nutzt Spracherkennung, um deine Anfragen an Bo zu verstehen.",
+        },
+      ],
     ],
     extra: {
       apiBaseUrl: API_BASE_URL,

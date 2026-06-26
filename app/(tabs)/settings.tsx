@@ -30,6 +30,7 @@ import {
   Pencil,
 } from "lucide-react-native";
 import { useSearchStore, Locale } from "@/stores/searchStore";
+import { useAccent, ACCENT_LIST, type AccentId } from "@/lib/theme/accent";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
 import { authLogout, authUpdateAvatar } from "@/lib/api/client";
@@ -90,6 +91,7 @@ export default function SettingsScreen() {
 
 /* ─────────────────────── HUB ─────────────────────── */
 function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
+  const accent = useAccent();
   const t = useT();
   const isAuthed = useSearchStore((s) => s.authUser !== null);
   const token = useSearchStore((s) => s.authToken);
@@ -165,8 +167,8 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
           }}
           style={({ pressed }) => [styles.signIn, pressed && { opacity: 0.7 }]}
         >
-          <LogIn size={18} color={C.green} strokeWidth={2} />
-          <Text style={styles.signInText}>{t("auth.guest.cta")}</Text>
+          <LogIn size={18} color={accent.solid} strokeWidth={2} />
+          <Text style={[styles.signInText, { color: accent.solid }]}>{t("auth.guest.cta")}</Text>
         </RippleTouch>
       )}
 
@@ -176,6 +178,7 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
 }
 
 function ProfileCard() {
+  const accent = useAccent();
   const t = useT();
   const user = useSearchStore((s) => s.authUser);
   const openAuth = useSearchStore((s) => s.openAuthOverlay);
@@ -215,7 +218,7 @@ function ProfileCard() {
             <Image source={{ uri: user.avatarDataUrl }} style={styles.avatar} />
           ) : isAuthed ? (
             <LinearGradient
-              colors={[C.green, C.greenDark]}
+              colors={[accent.solid, accent.dark]}
               start={{ x: 0, y: 0 }}
               end={{ x: 1, y: 1 }}
               style={styles.avatar}
@@ -227,8 +230,8 @@ function ProfileCard() {
               <User size={26} color={C.g2} strokeWidth={2} />
             </View>
           )}
-          <View pointerEvents="none" style={styles.avatarRing} />
-          {isAuthed ? <View style={styles.avatarStatusDot} /> : null}
+          <View pointerEvents="none" style={[styles.avatarRing, { borderColor: accent.border }]} />
+          {isAuthed ? <View style={[styles.avatarStatusDot, { backgroundColor: accent.solid }]} /> : null}
         </Pressable>
       </View>
 
@@ -241,10 +244,11 @@ function ProfileCard() {
   );
 }
 
-function Stat({ val, label, accent, withDivider }: { val: string; label: string; accent?: boolean; withDivider?: boolean }) {
+function Stat({ val, label, accent: isAccent, withDivider }: { val: string; label: string; accent?: boolean; withDivider?: boolean }) {
+  const accentColor = useAccent();
   return (
     <View style={[styles.statCol, withDivider && styles.statColDivider]}>
-      <Text style={[styles.statVal, accent && { color: C.green }]}>{val}</Text>
+      <Text style={[styles.statVal, isAccent && { color: accentColor.solid }]}>{val}</Text>
       <Text style={styles.statLbl}>{label}</Text>
     </View>
   );
@@ -282,6 +286,7 @@ function SectionCard({
 
 /* ─────────────────────── DETAILS ─────────────────────── */
 function DetailsScreen({ onBack }: { onBack: () => void }) {
+  const accent = useAccent();
   const t = useT();
   const user = useSearchStore((s) => s.authUser);
   const token = useSearchStore((s) => s.authToken);
@@ -368,7 +373,7 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
             <Image source={{ uri: user.avatarDataUrl }} style={styles.avatarLarge} />
           ) : user ? (
             <LinearGradient
-              colors={[C.green, C.greenDark]}
+              colors={[accent.solid, accent.dark]}
               start={{ x: 0, y: 0 }}
               end={{ x: 1, y: 1 }}
               style={styles.avatarLarge}
@@ -381,7 +386,7 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
             </View>
           )}
           {user ? (
-            <View style={styles.avatarEditDot}>
+            <View style={[styles.avatarEditDot, { backgroundColor: accent.solid }]}>
               {avatarBusy ? (
                 <ActivityIndicator size="small" color="#000" />
               ) : (
@@ -393,7 +398,7 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
         {user ? (
           <View style={{ flexDirection: "row", gap: 14, alignItems: "center" }}>
             <Pressable onPress={onPickPhoto} disabled={avatarBusy} hitSlop={6}>
-              <Text style={styles.editPhotoText}>{t("settings.detail.editphoto")}</Text>
+              <Text style={[styles.editPhotoText, { color: accent.solid }]}>{t("settings.detail.editphoto")}</Text>
             </Pressable>
             {user.avatarDataUrl ? (
               <Pressable onPress={onRemovePhoto} disabled={avatarBusy} hitSlop={6}>
@@ -405,7 +410,7 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
           </View>
         ) : (
           <Pressable onPress={() => { haptic("button"); openAuth(); }} hitSlop={6}>
-            <Text style={styles.editPhotoText}>{t("auth.guest.cta")}</Text>
+            <Text style={[styles.editPhotoText, { color: accent.solid }]}>{t("auth.guest.cta")}</Text>
           </Pressable>
         )}
       </View>
@@ -466,6 +471,9 @@ function SettingsSubScreen({ onBack }: { onBack: () => void }) {
   const t = useT();
   const theme = useSearchStore((s) => s.theme);
   const setTheme = useSearchStore((s) => s.setTheme);
+  const accentId = useSearchStore((s) => s.accent);
+  const setAccent = useSearchStore((s) => s.setAccent);
+  const accent = useAccent();
   const locale = useSearchStore((s) => s.locale);
   const setLocale = useSearchStore((s) => s.setLocale);
   const currency = useSearchStore((s) => s.currency);
@@ -483,7 +491,8 @@ function SettingsSubScreen({ onBack }: { onBack: () => void }) {
     <View>
       <BackHeader title={t("settings.title")} onBack={onBack} />
 
-      {/* APPEARANCE */}
+      {/* APPEARANCE — Theme-Karten mit Mock-UI im Preview, Footer wird bei
+          Active accent-solid mit schwarzem Text + Check-Icon. */}
       <StripeLabel text={t("settings.appearance")} firstSection />
       <View style={styles.themeRow}>
         {THEMES.map((th) => {
@@ -495,24 +504,68 @@ function SettingsSubScreen({ onBack }: { onBack: () => void }) {
                 haptic("button");
                 setTheme(th.id);
               }}
-              style={[styles.themeCard, { borderColor: active ? C.green : C.border }]}
+              style={[styles.themeCardOuter, { backgroundColor: active ? accent.solid : "transparent" }]}
             >
-              <View style={[styles.themePreview, { backgroundColor: th.bg }]}>
-                <View style={[styles.themePreviewBar, { backgroundColor: th.surface }]} />
-                <View style={[styles.themePreviewBlock, { backgroundColor: th.surface }]} />
-              </View>
-              <View style={styles.themeLabelRow}>
-                <Text style={[styles.themeLabel, { color: active ? C.green : C.g1 }]}>
-                  {t(`theme.label.${th.id}`)}
-                </Text>
-                {active && <Check size={14} color={C.green} strokeWidth={2.5} />}
+              <View style={[styles.themeCardInner, { borderColor: active ? "transparent" : C.border }]}>
+                <View style={[styles.themePreview, { backgroundColor: th.bg, alignItems: th.id === "light" ? "center" : "stretch" }]}>
+                  <View style={[styles.themePreviewBar, { backgroundColor: th.surface, width: th.id === "light" ? "78%" : "52%" }]} />
+                  <View style={[styles.themePreviewBlock, { backgroundColor: th.surface, width: th.id === "light" ? "88%" : "100%" }]} />
+                </View>
+                <View style={[styles.themeFooter, { backgroundColor: active ? accent.solid : C.s2 }]}>
+                  <Text style={[styles.themeFooterText, { color: active ? accent.textOnSolid : C.white }]}>
+                    {t(`theme.label.${th.id}`)}
+                  </Text>
+                  {active && <Check size={16} color={accent.textOnSolid} strokeWidth={2.6} />}
+                </View>
               </View>
             </Pressable>
           );
         })}
       </View>
 
-      {/* LANGUAGE */}
+      {/* COLOR — 3 Akzent-Paletten zur Auswahl. Swatch = LinearGradient mit
+          den 3 Stops aus accent.gradient. Selected: schwarzer Kreis mit
+          mini Check-Icon im Swatch + accent-solid Footer. */}
+      <StripeLabel text={t("settings.color")} />
+      <View style={styles.themeRow}>
+        {ACCENT_LIST.map((a) => {
+          const active = accentId === a.id;
+          return (
+            <Pressable
+              key={a.id}
+              onPress={() => {
+                haptic("button");
+                setAccent(a.id);
+              }}
+              style={[styles.themeCardOuter, { backgroundColor: active ? a.solid : "transparent" }]}
+            >
+              <View style={[styles.themeCardInner, { borderColor: active ? "transparent" : C.border }]}>
+                <LinearGradient
+                  colors={a.gradient}
+                  locations={[0, 0.52, 1]}
+                  start={{ x: 0, y: 0 }}
+                  end={{ x: 1, y: 1 }}
+                  style={styles.colorSwatch}
+                >
+                  {active && (
+                    <View style={styles.colorCheck}>
+                      <Check size={14} color={a.solid} strokeWidth={3} />
+                    </View>
+                  )}
+                </LinearGradient>
+                <View style={[styles.themeFooter, { backgroundColor: active ? a.solid : C.s2, justifyContent: "center" }]}>
+                  <Text style={[styles.themeFooterText, { color: active ? a.textOnSolid : C.white }]}>
+                    {t(`color.label.${a.id}`)}
+                  </Text>
+                </View>
+              </View>
+            </Pressable>
+          );
+        })}
+      </View>
+
+      {/* LANGUAGE — Liste mit 44px Code-Badge links, Active-Highlight via
+          accent.subtle. Code+Name fett wenn aktiv, Check rechts. */}
       <StripeLabel text={t("settings.language")} />
       <Group>
         {LANGS.map((l, i) => {
@@ -527,11 +580,11 @@ function SettingsSubScreen({ onBack }: { onBack: () => void }) {
               style={[
                 styles.row,
                 i < LANGS.length - 1 && styles.rowDivider,
-                active && { backgroundColor: "rgba(127,234,77,0.04)" },
+                active && { backgroundColor: accent.subtle },
               ]}
             >
-              <View style={[styles.rowIcon, { backgroundColor: C.s2 }]}>
-                <Text style={[styles.langFlagText, { color: active ? C.green : C.g2 }]}>
+              <View style={[styles.langBadge, { backgroundColor: active ? accent.subtle : C.s2 }]}>
+                <Text style={[styles.langBadgeText, { color: active ? accent.solid : C.g2 }]}>
                   {l.flag}
                 </Text>
               </View>
@@ -541,13 +594,13 @@ function SettingsSubScreen({ onBack }: { onBack: () => void }) {
                   {
                     flex: 1,
                     color: active ? C.white : C.g1,
-                    fontWeight: active ? "600" : "400",
+                    fontWeight: active ? "700" : "500",
                   },
                 ]}
               >
                 {l.label}
               </Text>
-              {active && <Check size={16} color={C.green} strokeWidth={2.5} />}
+              {active && <Check size={16} color={accent.solid} strokeWidth={2.6} />}
             </Pressable>
           );
         })}
@@ -572,15 +625,15 @@ function SettingsSubScreen({ onBack }: { onBack: () => void }) {
               style={[
                 styles.currencyPill,
                 {
-                  backgroundColor: active ? C.green : C.s1,
-                  borderColor: active ? C.green : C.border,
+                  backgroundColor: active ? accent.solid : "transparent",
+                  borderColor: active ? accent.solid : C.border,
                 },
               ]}
             >
               <Text
                 style={[
                   styles.currencyPillText,
-                  { color: active ? "#000" : C.g2, fontWeight: active ? "700" : "500" },
+                  { color: active ? accent.textOnSolid : C.g1, fontWeight: "700" },
                 ]}
               >
                 {c}
@@ -642,13 +695,13 @@ function SettingsSubScreen({ onBack }: { onBack: () => void }) {
                 }}
                 style={[
                   styles.toastSegmentItem,
-                  active && { backgroundColor: C.green },
+                  active && { backgroundColor: accent.solid },
                 ]}
               >
                 <Text
                   style={[
                     styles.toastSegmentText,
-                    { color: active ? "#000" : C.g1, fontWeight: active ? "700" : "500" },
+                    { color: active ? accent.textOnSolid : C.g1, fontWeight: active ? "700" : "500" },
                   ]}
                 >
                   {t(`settings.toast.${pos}`)}
@@ -751,9 +804,10 @@ function SLabel({ text }: { text: string }) {
 }
 
 function StripeLabel({ text, firstSection }: { text: string; firstSection?: boolean }) {
+  const accent = useAccent();
   return (
     <View style={[styles.stripeLabel, firstSection && { paddingTop: 16 }]}>
-      <View style={styles.stripeBar} />
+      <View style={[styles.stripeBar, { backgroundColor: accent.solid }]} />
       <Text style={styles.stripeLabelText}>{text.toUpperCase()}</Text>
     </View>
   );
@@ -818,6 +872,7 @@ function ToggleRow({
   onChange: (v: boolean) => void;
   isLast?: boolean;
 }) {
+  const accent = useAccent();
   return (
     <View style={[styles.row, !isLast && styles.rowDivider]}>
       <View style={[styles.rowIcon, { backgroundColor: C.s2 }]}>{icon}</View>
@@ -828,7 +883,7 @@ function ToggleRow({
       <Switch
         value={value}
         onValueChange={onChange}
-        trackColor={{ false: C.s3, true: C.green }}
+        trackColor={{ false: C.s3, true: accent.solid }}
         thumbColor="#FFFFFF"
         ios_backgroundColor={C.s3}
       />
@@ -838,6 +893,7 @@ function ToggleRow({
 
 /* ─── ToggleRow icons ─── */
 function IconHaptic() {
+  const accent = useAccent();
   return (
     <Svg width={16} height={16} viewBox="0 0 24 24">
       <Path d="M8 6.5C6.2 7.8 5 9.8 5 12s1.2 4.2 3 5.5" stroke={C.white} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" fill="none" />
@@ -847,6 +903,7 @@ function IconHaptic() {
   );
 }
 function IconBell() {
+  const accent = useAccent();
   return (
     <Svg width={16} height={16} viewBox="0 0 24 24">
       <Path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" stroke={C.white} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" fill="none" />
@@ -855,6 +912,7 @@ function IconBell() {
   );
 }
 function IconAlert() {
+  const accent = useAccent();
   return (
     <Svg width={16} height={16} viewBox="0 0 24 24">
       <Circle cx={12} cy={12} r={4} stroke={C.white} strokeWidth={2} fill="none" />
@@ -865,20 +923,21 @@ function IconAlert() {
 
 /* ─── Hub flat illustrations ─── */
 function IlluDetails() {
+  const accent = useAccent();
   return (
     <Svg width={80} height={72} viewBox="0 0 80 72">
       <Circle cx={32} cy={18} r={10} fill="#C8C8CC" />
       <Path d="M22 16 Q22 8 32 7 Q42 8 42 16 L42 13 Q39 5 32 5 Q25 5 22 13Z" fill="#2E2E30" />
-      <Rect x={23} y={27} width={18} height={20} rx={6} fill={C.green} />
-      <Rect x={14} y={28} width={10} height={6} rx={3} fill={C.green} />
-      <Rect x={41} y={28} width={10} height={6} rx={3} fill={C.green} />
+      <Rect x={23} y={27} width={18} height={20} rx={6} fill={accent.solid} />
+      <Rect x={14} y={28} width={10} height={6} rx={3} fill={accent.solid} />
+      <Rect x={41} y={28} width={10} height={6} rx={3} fill={accent.solid} />
       <Rect x={25} y={45} width={6} height={14} rx={3} fill="#242425" />
       <Rect x={33} y={45} width={6} height={14} rx={3} fill="#242425" />
-      <Rect x={46} y={22} width={28} height={20} rx={4} fill="#1F1F20" stroke={C.green} strokeWidth={1.2} />
-      <Rect x={46} y={22} width={28} height={6} rx={3} fill={C.green} fillOpacity={0.35} />
-      <Circle cx={53} cy={35} r={3.5} fill={C.green} fillOpacity={0.6} />
-      <Rect x={58} y={33} width={10} height={1.5} rx={0.75} fill={C.green} fillOpacity={0.5} />
-      <Rect x={58} y={36.5} width={7} height={1.5} rx={0.75} fill={C.green} fillOpacity={0.3} />
+      <Rect x={46} y={22} width={28} height={20} rx={4} fill="#1F1F20" stroke={accent.solid} strokeWidth={1.2} />
+      <Rect x={46} y={22} width={28} height={6} rx={3} fill={accent.solid} fillOpacity={0.35} />
+      <Circle cx={53} cy={35} r={3.5} fill={accent.solid} fillOpacity={0.6} />
+      <Rect x={58} y={33} width={10} height={1.5} rx={0.75} fill={accent.solid} fillOpacity={0.5} />
+      <Rect x={58} y={36.5} width={7} height={1.5} rx={0.75} fill={accent.solid} fillOpacity={0.3} />
       <Circle cx={28} cy={17} r={1.2} fill="#2E2E30" />
       <Circle cx={36} cy={17} r={1.2} fill="#2E2E30" />
       <Path d="M28 22 Q32 25 36 22" stroke="#2E2E30" strokeWidth={1.2} strokeLinecap="round" fill="none" />
@@ -887,23 +946,24 @@ function IlluDetails() {
 }
 
 function IlluSettings() {
+  const accent = useAccent();
   return (
     <Svg width={80} height={72} viewBox="0 0 80 72">
       <Rect x={4} y={56} width={72} height={5} rx={2.5} fill="#242425" />
       <Rect x={14} y={46} width={48} height={10} rx={2} fill="#242425" />
-      <Rect x={16} y={18} width={44} height={30} rx={3} fill="#1F1F20" stroke={C.green} strokeWidth={1} strokeOpacity={0.4} />
+      <Rect x={16} y={18} width={44} height={30} rx={3} fill="#1F1F20" stroke={accent.solid} strokeWidth={1} strokeOpacity={0.4} />
       <Rect x={21} y={26} width={22} height={2.5} rx={1.25} fill="#2E2E30" />
-      <Rect x={21} y={26} width={13} height={2.5} rx={1.25} fill={C.green} fillOpacity={0.7} />
-      <Circle cx={34} cy={27.25} r={3} fill={C.green} />
+      <Rect x={21} y={26} width={13} height={2.5} rx={1.25} fill={accent.solid} fillOpacity={0.7} />
+      <Circle cx={34} cy={27.25} r={3} fill={accent.solid} />
       <Rect x={21} y={33} width={22} height={2.5} rx={1.25} fill="#2E2E30" />
-      <Rect x={21} y={33} width={16} height={2.5} rx={1.25} fill={C.green} fillOpacity={0.5} />
-      <Circle cx={37} cy={34.25} r={3} fill={C.green} fillOpacity={0.8} />
+      <Rect x={21} y={33} width={16} height={2.5} rx={1.25} fill={accent.solid} fillOpacity={0.5} />
+      <Circle cx={37} cy={34.25} r={3} fill={accent.solid} fillOpacity={0.8} />
       <Rect x={21} y={40} width={22} height={2.5} rx={1.25} fill="#2E2E30" />
-      <Rect x={21} y={40} width={8} height={2.5} rx={1.25} fill={C.green} fillOpacity={0.4} />
-      <Circle cx={29} cy={41.25} r={3} fill={C.green} fillOpacity={0.6} />
+      <Rect x={21} y={40} width={8} height={2.5} rx={1.25} fill={accent.solid} fillOpacity={0.4} />
+      <Circle cx={29} cy={41.25} r={3} fill={accent.solid} fillOpacity={0.6} />
       <Circle cx={64} cy={34} r={9} fill="#C8C8CC" />
       <Path d="M55 32 Q55 25 64 24 Q73 25 73 32 L73 29 Q70 22 64 22 Q58 22 55 29Z" fill="#2E2E30" />
-      <Path d="M56 42 Q56 39 64 39 Q72 39 72 42 L74 56 L54 56Z" fill={C.green} fillOpacity={0.7} />
+      <Path d="M56 42 Q56 39 64 39 Q72 39 72 42 L74 56 L54 56Z" fill={accent.solid} fillOpacity={0.7} />
       <Circle cx={60} cy={33} r={1.2} fill="#2E2E30" />
       <Circle cx={68} cy={33} r={1.2} fill="#2E2E30" />
       <Path d="M60 38 Q64 41 68 38" stroke="#2E2E30" strokeWidth={1.2} strokeLinecap="round" fill="none" />
@@ -912,27 +972,28 @@ function IlluSettings() {
 }
 
 function IlluSupport() {
+  const accent = useAccent();
   return (
     <Svg width={80} height={72} viewBox="0 0 80 72">
       <Circle cx={34} cy={22} r={11} fill="#C8C8CC" />
       <Path d="M23 20 Q23 11 34 10 Q45 11 45 20 L45 16 Q42 8 34 8 Q26 8 23 16Z" fill="#242425" />
-      <Path d="M23 19 Q23 10 34 10 Q45 10 45 19" stroke={C.green} strokeWidth={2.5} fill="none" strokeLinecap="round" />
-      <Rect x={20} y={18} width={6} height={8} rx={2.5} fill={C.green} />
-      <Rect x={42} y={18} width={6} height={8} rx={2.5} fill={C.green} />
-      <Path d="M23 24 Q17 28 16 33" stroke={C.green} strokeWidth={2} strokeLinecap="round" fill="none" />
-      <Circle cx={15} cy={35} r={2.5} fill={C.green} />
-      <Rect x={25} y={31} width={18} height={20} rx={6} fill={C.green} fillOpacity={0.8} />
-      <Rect x={15} y={32} width={11} height={6} rx={3} fill={C.green} fillOpacity={0.8} />
+      <Path d="M23 19 Q23 10 34 10 Q45 10 45 19" stroke={accent.solid} strokeWidth={2.5} fill="none" strokeLinecap="round" />
+      <Rect x={20} y={18} width={6} height={8} rx={2.5} fill={accent.solid} />
+      <Rect x={42} y={18} width={6} height={8} rx={2.5} fill={accent.solid} />
+      <Path d="M23 24 Q17 28 16 33" stroke={accent.solid} strokeWidth={2} strokeLinecap="round" fill="none" />
+      <Circle cx={15} cy={35} r={2.5} fill={accent.solid} />
+      <Rect x={25} y={31} width={18} height={20} rx={6} fill={accent.solid} fillOpacity={0.8} />
+      <Rect x={15} y={32} width={11} height={6} rx={3} fill={accent.solid} fillOpacity={0.8} />
       <Rect x={27} y={49} width={6} height={14} rx={3} fill="#242425" />
       <Rect x={35} y={49} width={6} height={14} rx={3} fill="#242425" />
       <Circle cx={29} cy={21} r={1.2} fill="#2E2E30" />
       <Circle cx={39} cy={21} r={1.2} fill="#2E2E30" />
       <Path d="M29 26 Q34 29 39 26" stroke="#2E2E30" strokeWidth={1.2} strokeLinecap="round" fill="none" />
-      <Rect x={50} y={6} width={26} height={20} rx={6} fill="#1F1F20" stroke={C.green} strokeWidth={1} />
-      <Path d="M54 26 L51 32 L60 26" fill="#1F1F20" stroke={C.green} strokeWidth={1} />
-      <Circle cx={58} cy={16} r={2} fill={C.green} fillOpacity={0.8} />
-      <Circle cx={63} cy={16} r={2} fill={C.green} fillOpacity={0.8} />
-      <Circle cx={68} cy={16} r={2} fill={C.green} fillOpacity={0.8} />
+      <Rect x={50} y={6} width={26} height={20} rx={6} fill="#1F1F20" stroke={accent.solid} strokeWidth={1} />
+      <Path d="M54 26 L51 32 L60 26" fill="#1F1F20" stroke={accent.solid} strokeWidth={1} />
+      <Circle cx={58} cy={16} r={2} fill={accent.solid} fillOpacity={0.8} />
+      <Circle cx={63} cy={16} r={2} fill={accent.solid} fillOpacity={0.8} />
+      <Circle cx={68} cy={16} r={2} fill={accent.solid} fillOpacity={0.8} />
     </Svg>
   );
 }
@@ -1143,6 +1204,21 @@ const styles = StyleSheet.create({
 
   /* — theme cards — */
   themeRow: { flexDirection: "row", paddingHorizontal: 16, gap: 10 },
+  // Two-Layer-Card: Outer-Ring wird beim Active mit accent-solid eingefärbt
+  // (4px Padding) und Inner-Card hat eigenen Border der dann transparent
+  // wird damit der Outer-Ring durchscheint. Look matched die Designvorlage
+  // (Lime-Glow um die ausgewählte Card).
+  themeCardOuter: { flex: 1, borderRadius: 18, padding: 4 },
+  themeCardInner: { borderRadius: 14, overflow: "hidden", borderWidth: 1 },
+  themeFooter: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 13, paddingVertical: 10 },
+  themeFooterText: { fontSize: 14, fontWeight: "700" },
+  // Color-Swatch im Color-Picker: 54px hoher Gradient-Block mit Check-Badge.
+  colorSwatch: { height: 54, alignItems: "center", justifyContent: "center" },
+  colorCheck: { width: 26, height: 26, borderRadius: 13, backgroundColor: "rgba(0,0,0,0.82)", alignItems: "center", justifyContent: "center" },
+  // Language-Badge: 44×44, rounded 13, code-Text 13pt 800 — replaces den
+  // alten rowIcon-Look damit die Settings konsistent zur Design-Vorlage sind.
+  langBadge: { width: 44, height: 44, borderRadius: 13, alignItems: "center", justifyContent: "center" },
+  langBadgeText: { fontSize: 13, fontWeight: "800" },
   themeCard: { flex: 1, borderRadius: 16, borderWidth: 2, overflow: "hidden" },
   themePreview: {
     height: 72,

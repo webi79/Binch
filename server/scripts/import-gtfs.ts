@@ -29,6 +29,44 @@ const COUNTRY = process.env.GTFS_COUNTRY ?? "Germany";
 const CODE_PREFIX = process.env.GTFS_CODE_PREFIX ?? "gtfs:";
 const CHUNK = 500;
 
+/** UIC-Country-Code (erste 2 Ziffern einer 7-stelligen Bahn-ID) pro Land.
+ *  Quelle: UIC merkblatt. Wenn wir den hafas_id-Wert beim Import speichern,
+ *  muss dessen Prefix zum Land passen — sonst kollidiert er mit der UIC
+ *  eines anderen Landes und HAFAS resolvt die ID dort hin (typisch:
+ *  BE-Feed-Lille-Stop 8728600 → HAFAS gibt NL/LU-Bus-Stop). */
+const UIC_PREFIX_BY_COUNTRY: Record<string, string> = {
+  Germany: "80",
+  Austria: "81",
+  Luxembourg: "82",
+  Italy: "83",
+  Netherlands: "84",
+  Switzerland: "85",
+  Denmark: "86",
+  France: "87",
+  Belgium: "88",
+  Poland: "51",
+  "Czech Republic": "54",
+  Hungary: "55",
+  Slovakia: "56",
+  Slovenia: "79",
+  Croatia: "78",
+  Greece: "73",
+  Spain: "71",
+  Portugal: "94",
+  Sweden: "74",
+  Norway: "76",
+  Finland: "10",
+  "United Kingdom": "70",
+  Ireland: "60",
+};
+
+/** Liefert UIC-Country-Code-Prefix für ein Land, oder null wenn unbekannt
+ *  (in dem Fall: hafas_id ohne Prefix-Validation übernehmen — besser als
+ *  alle Einträge ablehnen). */
+function uicPrefixForCountry(country: string): string | null {
+  return UIC_PREFIX_BY_COUNTRY[country] ?? null;
+}
+
 type Subtype =
   | "LONG_DISTANCE"
   | "REGIONAL"
@@ -438,7 +476,19 @@ async function main() {
     const subtype = hasData ? dominantSubtype(subtypeCounts) : "BUS";
     const kinds = hasData ? kindsForStop(subtypeCounts) : ["bus" as Kind];
     const type = subtypeToType(subtype);
-    const hafasId = /^\d{7}$/.test(stopId) ? stopId : null;
+    // hafas_id nur setzen wenn die 7-stellige ID auch zum tatsächlichen
+    // (Polygon-erkannten) Land passt — sonst gibt's ID-Kollisionen mit
+    // anderen Ländern. Beispiel: BE-Feed enthält Lille-Stops mit IDs wie
+    // 8728600, die zwar 7-stellig sind, aber das HAFAS-UIC-Prefix `87` ist
+    // für Frankreich, nicht Belgien (88). Wenn wir die als BE-hafas_id
+    // speichern, mapped DB-HAFAS sie später auf irgendwelche
+    // Dentergem/Unterhaching-Bus-Stops → 0-Treffer-Suchen.
+    const expectedUicPrefix = uicPrefixForCountry(rowCountry);
+    const hafasId =
+      /^\d{7}$/.test(stopId) &&
+      (!expectedUicPrefix || stopId.slice(0, 2) === expectedUicPrefix)
+        ? stopId
+        : null;
 
     out.push({
       code,
@@ -482,6 +532,39 @@ async function main() {
   }
 
   console.log(`[gtfs:${COUNTRY}] done in ${((Date.now() - t0) / 1000).toFixed(1)}s.`);
+
+  // Post-Import-Audit: prüft Stops mit verdächtigen hafas_id-Präfixen gegen
+  // HAFAS und löscht klare LU/NL-Kollisionen automatisch. Nur für das gerade
+  // importierte Land, damit der Audit-Scope klein bleibt. AUTO_CLEAN=1 sorgt
+  // für stille Reparatur ohne User-Eingriff. Bei DE zusätzlich noch der
+  // Hbf-Audit (StaDa-Sub-Code-Kollisionen).
+  console.log(`[gtfs:${COUNTRY}] running post-import audit…`);
+  const { spawnSync } = await import("node:child_process");
+  const scriptDir = new URL("./", import.meta.url).pathname;
+  const suspectAudit = spawnSync(
+    "npx",
+    [
+      "tsx",
+      `${scriptDir}audit-suspect-hafas-ids.ts`,
+      `--country=${COUNTRY}`,
+      "--auto-clean",
+    ],
+    { stdio: "inherit" },
+  );
+  if (suspectAudit.status !== 0) {
+    console.warn(`[gtfs:${COUNTRY}] post-import suspect-audit failed (status=${suspectAudit.status})`);
+  }
+  if (COUNTRY === "Germany") {
+    const hbfAudit = spawnSync(
+      "npx",
+      ["tsx", `${scriptDir}audit-hbf-hafas-ids.ts`, "--auto-clean"],
+      { stdio: "inherit" },
+    );
+    if (hbfAudit.status !== 0) {
+      console.warn(`[gtfs:${COUNTRY}] post-import hbf-audit failed (status=${hbfAudit.status})`);
+    }
+  }
+
   process.exit(0);
 }
 

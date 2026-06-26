@@ -1,6 +1,7 @@
 import { memo, useMemo } from "react";
 import { GeoJSONSource, Layer } from "@maplibre/maplibre-react-native";
 import { MapMarker } from "@/lib/surroundings/mockData";
+import { useAccent } from "@/lib/theme/accent";
 
 /**
  * Rendert Marker als Vector-Layer (statt einzelne Overlay-Views) — pannt
@@ -17,7 +18,8 @@ import { MapMarker } from "@/lib/surroundings/mockData";
  *   4. Marker-Icon         → Lucide-Icon (Train/Bus/Plane/Tram/Ship)
  */
 
-const LIME = "#7FEA4D";
+// LIME entfernt auf Modul-Ebene — wird zur Laufzeit aus useAccent() berechnet
+// und innerhalb der MarkerLayer-Komponente als lokale Konstante geschadowed.
 const TRAIN_YELLOW = "#FFD60A";
 const BUS_PURPLE = "#9D5FE0";
 const WHITE = "#FFFFFF";
@@ -78,6 +80,11 @@ const MM_OFFSET_3_RIGHT: [number, number] = [56, 0];
 
 
 export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }: Props) {
+  // Akzent fließt in alle „airport"-Marker (in MapLibre-Style-Expressions als
+  // Literal-Hex eingebettet). Train/Bus/Cruise haben weiterhin Mode-spezifische
+  // Farben (Gelb/Lila/Blau) damit Marker-Typen visuell unterscheidbar bleiben.
+  const accent = useAccent();
+  const LIME = accent.solid;
   // Marker werden auf drei GeoJSON-Sources aufgeteilt, damit Clustering
   // pro Modus gesteuert werden kann (MapLibre kann Clustering nur global
   // pro Source schalten):

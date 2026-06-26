@@ -138,6 +138,13 @@ export async function dbRestLiveLocations(
 
   const list = Array.isArray(data) ? data : Object.values(data);
 
+  // Soundex-Fallback bei HAFAS: bei „Hoefkade" (NL-Tram) liefert /locations
+  // ähnlich-klingende DE-Bahnhöfe wie „Höfingen", „Höfen(Enz) Bf" zurück. Die
+  // wollen wir nicht in die Autocomplete kippen — also nur Treffer behalten,
+  // deren Name normalisiert mit dem Query-Prefix anfängt. Prefix-Länge =
+  // min(4, query.length) damit kurze Eingaben („Köl") noch matchen.
+  const wantPrefix = normalizeForMatch(trimmed).slice(0, Math.min(4, trimmed.length));
+
   const out: LiveLocation[] = [];
   const seenName = new Set<string>();
   for (const s of list) {
@@ -145,6 +152,7 @@ export async function dbRestLiveLocations(
     // Journey-Suchen unbrauchbar und müssen rausgefiltert werden. HAFAS markiert
     // Bahnhöfe als type=station oder type=stop (z.B. Paris Est).
     if (!s?.id || !s?.name || (s.type !== "station" && s.type !== "stop")) continue;
+    if (wantPrefix && !normalizeForMatch(s.name).startsWith(wantPrefix)) continue;
     // HAFAS mischt echte Bahnhöfe (7-stellige UIC-IDs, z.B. 8000584=Willich-Anrath)
     // mit lokalen Bus-/Tramhalten (kürzere IDs wie 821676=„Anrath Bahnhof"). Wir
     // behalten beide, markieren aber nur die UIC-Bahnhöfe als TRAIN, damit die
@@ -173,6 +181,16 @@ export async function dbRestLiveLocations(
     });
   }
   return out.slice(0, 25);
+}
+
+/** Lowercase + Diakritika-Entfernung für robusten Name-Vergleich.
+ *  „Köln Hbf" → „koln hbf", „Höfingen" → „hofingen", „Hoefkade" → „hoefkade". */
+function normalizeForMatch(s: string): string {
+  return s
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .trim();
 }
 
 export type { AutocompleteItem };

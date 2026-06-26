@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   StyleSheet,
   View,
@@ -9,7 +9,7 @@ import {
   Pressable,
   useWindowDimensions,
 } from "react-native";
-import { showAlert } from "@/lib/alert";
+import { ClearSearchHistoryAlert } from "@/components/ui/ClearSearchHistoryAlert";
 import Animated, {
   FadeIn,
   FadeOut,
@@ -79,25 +79,16 @@ function RecentHistorySheet() {
       }
     });
 
+  const [confirmVisible, setConfirmVisible] = useState(false);
   const handleClear = () => {
     haptic("button");
     if (recentSearches.length === 0) return;
-    showAlert(
-      t("home.recent.clear.title"),
-      t("home.recent.clear.body"),
-      [
-        { text: t("home.recent.clear.cancel"), style: "cancel" },
-        {
-          text: t("home.recent.clear.confirm"),
-          style: "destructive",
-          onPress: () => {
-            haptic("important");
-            clearRecentSearches();
-            close();
-          },
-        },
-      ]
-    );
+    setConfirmVisible(true);
+  };
+  const handleConfirmClear = () => {
+    setConfirmVisible(false);
+    clearRecentSearches();
+    close();
   };
 
   return (
@@ -145,6 +136,16 @@ function RecentHistorySheet() {
           ))}
         </ScrollView>
       </Animated.View>
+
+      <ClearSearchHistoryAlert
+        visible={confirmVisible}
+        onCancel={() => setConfirmVisible(false)}
+        onConfirm={handleConfirmClear}
+        title={t("home.recent.clear.title")}
+        message={t("home.recent.clear.body")}
+        confirmLabel={t("home.recent.clear.confirm")}
+        cancelLabel={t("home.recent.clear.cancel")}
+      />
     </View>
   );
 }

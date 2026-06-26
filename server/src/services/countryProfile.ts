@@ -45,6 +45,11 @@ const COUNTRY_TO_PROFILE: Record<string, HafasProfileKey> = {
   Poland: "pkp",
   Luxembourg: "cfl",
   Denmark: "rejseplanen",
+  // Belgium: SNCB-HAFAS-API ist defekt ("Invalid client version") — wir nutzen
+  // stattdessen das DB-Profil via db-vendo. DB-HAFAS kennt die meisten BE-
+  // Stationen (UIC-Prefix 88) durch IC/ICE/Thalys-Integration. Stops die DB
+  // nicht kennt liefern leere Boards (Walk-+-Train-Hybrid übernimmt dann).
+  Belgium: "db",
   // Schweiz: kein national-Profile, default Bern/Mittelland. Andere Regionen
   // (Zürich/Genf) werden per Coord-Bbox überschrieben.
   Switzerland: "bls",
@@ -57,6 +62,7 @@ const GTFS_PREFIX_TO_PROFILE: Array<[RegExp, HafasProfileKey]> = [
   [/^gtfs:pl:/i, "pkp"],
   [/^gtfs:lu:/i, "cfl"],
   [/^gtfs:dk:/i, "rejseplanen"],
+  [/^gtfs:be:/i, "db"],
 ];
 
 /** UIC-Country-Code-Prefix (erste 2 Ziffern einer 7-stelligen EVA-Nummer) →
@@ -70,7 +76,8 @@ const UIC_PREFIX_TO_PROFILE: Record<string, HafasProfileKey> = {
   "82": "cfl", // Luxembourg
   "51": "pkp", // Poland
   "86": "rejseplanen", // Denmark
-  // 83 (IT), 84 (NL), 85 (CH), 87 (FR), 88 (BE) — kein hafas-client-Profile
+  "88": "db", // Belgium — via DB-HAFAS (sncb-Profile defekt, siehe Kommentar oben)
+  // 83 (IT), 84 (NL), 85 (CH), 87 (FR) — kein hafas-client-Profile
   // verfügbar/funktionierend. Stops dort liefern `null` → empty StopBoard.
 };
 

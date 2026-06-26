@@ -23,10 +23,17 @@ import Animated, {
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { format, parseISO } from "date-fns";
 import { de, enGB, es, fr } from "date-fns/locale";
-import { ChevronDown, Footprints, Clock, CircleDot } from "lucide-react-native";
+import { ChevronDown, Footprints, Clock, CircleDot, Map as MapIcon } from "lucide-react-native";
+import { useRouter, usePathname } from "expo-router";
 import { useSearchStore } from "@/stores/searchStore";
 import { useT } from "@/lib/i18n/useT";
+import { formatTimeInZone } from "@/lib/time-format";
 import { LegInfo, SearchResult } from "@/types/search";
+import { buildRoutePlan } from "@/lib/routing/buildRoute";
+import { fetchTripPolylines } from "@/lib/api/client";
+import { haptic } from "@/lib/haptics";
+import { RippleTouch } from "@/components/ui/RippleTouch";
+import { useAccent } from "@/lib/theme/accent";
 
 // Farbpalette aus dem App-Theme — die hellere Lime aus dem Mockup ist bewusst
 // auf unsere Brand-Lime gedimmt (#7FEA4D), Card/Surface-Stufen matchen
@@ -63,9 +70,12 @@ function formatDuration(min: number): string {
   return `${h}h ${m}min`;
 }
 
-function timeOf(iso: string): string {
+// TZ-bewusst (siehe DetailsOverlay): Flüge speichern "floating local time" mit
+// Zone "UTC" → verbatim. Mit echter IANA-Zone (Züge) korrekt konvertiert; ohne
+// Zone Fallback auf Geräte-Lokalzeit.
+function timeOf(iso: string, tz?: string): string {
   try {
-    return format(parseISO(iso), "HH:mm");
+    return formatTimeInZone(iso, tz);
   } catch {
     return "";
   }
@@ -142,21 +152,73 @@ export function LegTimelineOverlay() {
   const open = useSearchStore((s) => s.legTimelineOverlayOpen);
   const selectedResult = useSearchStore((s) => s.selectedResult);
   const directTripResult = useSearchStore((s) => s.directTripResult);
+  const context = useSearchStore((s) => s.selectedResultContext);
+  const pathname = usePathname();
   // Direct-Trip-Flow (Bus-Tap aus dem Stop-Sheet) hat Vorrang vor
   // selectedResult — sonst würde der vorher gewählte Trip aus der Such-
   // Liste die Timeline füllen statt der gerade getappten Bus-Abfahrt.
   const result = directTripResult ?? selectedResult;
   if (!open || !result) return null;
-  return <LegTimelineSheet result={result} />;
+  // Wenn der Sheet aus dem Search-Flow geöffnet wurde (selectedResultContext
+  // gesetzt) und wir gerade auf einer anderen Route sind (z.B. Map-Push),
+  // verstecken wir den Sheet VISUELL (display:none), aber UNMOUNTEN ihn
+  // NICHT. Sonst würde beim Zurückkommen die Slide-In-Animation neu
+  // abspielen → laggt sichtbar während des Pop-Übergangs.
+  const hiddenForOtherRoute =
+    !directTripResult && context != null && pathname !== context.pathname;
+  return <LegTimelineSheet result={result} hidden={hiddenForOtherRoute} />;
 }
 
-function LegTimelineSheet({ result }: { result: SearchResult }) {
+function LegTimelineSheet({ result, hidden }: { result: SearchResult; hidden?: boolean }) {
+  const accent = useAccent();
   const close = useSearchStore((s) => s.closeLegTimelineOverlay);
+  const setRoute = useSearchStore((s) => s.setRoute);
+  const setRoutePolylines = useSearchStore((s) => s.setRoutePolylines);
+  const selectedResultContext = useSearchStore((s) => s.selectedResultContext);
+  const stashSurroundingsForRoute = useSearchStore((s) => s.stashSurroundingsForRoute);
   const locale = useSearchStore((s) => s.locale);
   const t = useT();
+  const router = useRouter();
   const { height } = useWindowDimensions();
   const sheetHeight = height * 0.88;
   const sheetTop = height - sheetHeight;
+
+  function onShowMap() {
+    haptic("button");
+    const plan = buildRoutePlan(result);
+    if (!plan) return;
+
+    if (selectedResultContext) {
+      // Search-Results-Flow (User kam aus /search/results → Card → Details
+      // → LegTimeline). Wir pushen eine eigene Route /search/route-map IM
+      // selben Tab-Stack auf — KEIN Tab-Wechsel mehr, KEIN router.replace
+      // der den Results-Screen frisch mountet (was beim Back-Navigieren
+      // den ganzen Loader + Fade-In neu spielte → gefühlter Lag).
+      // Results bleibt drunter gemountet, Back-Button im route-map ruft
+      // router.back() → pop, fertig.
+      setRoute({
+        ...plan,
+        previousHref: selectedResultContext,
+      });
+      router.push("/search/route-map");
+    } else {
+      // Surroundings-Flow — egal ob direct-trip (Tram/Bus-Departure) oder
+      // Booking (ICE/IC vom Stop-Tap). Wir sind schon im Surroundings-Tab.
+      // Stash den kompletten UI-Zustand (Slide + DetailsOverlay +
+      // LegTimelineOverlay) → alles slidet/verschwindet → User sieht die
+      // Route sauber auf der Karte. Back-Button (RouteBanner) restored
+      // alles wieder.
+      setRoute(plan);
+      stashSurroundingsForRoute();
+    }
+
+    const tripIds = plan.legs.map((l) => l.tripId).filter((id): id is string => Boolean(id));
+    if (tripIds.length > 0) {
+      fetchTripPolylines(tripIds)
+        .then((r) => setRoutePolylines(r.polylines))
+        .catch(() => {});
+    }
+  }
 
   useEffect(() => {
     if (Platform.OS !== "android") return;
@@ -200,7 +262,7 @@ function LegTimelineSheet({ result }: { result: SearchResult }) {
   })();
   const departTime = (() => {
     try {
-      return format(parseISO(result.departTime), "HH:mm");
+      return formatTimeInZone(result.departTime, result.originTz);
     } catch {
       return "";
     }
@@ -212,10 +274,16 @@ function LegTimelineSheet({ result }: { result: SearchResult }) {
       : result.stops === 1
       ? t("details.stop.one")
       : t("details.stop.many").replace("{count}", String(result.stops));
-  const stopsAccent = result.stops === 0 ? C.lime : C.amber;
+  const stopsAccent = result.stops === 0 ? accent.solid : C.amber;
 
   return (
-    <View style={[StyleSheet.absoluteFillObject, { zIndex: 300, elevation: 32 }]}>
+    <View
+      style={[
+        StyleSheet.absoluteFillObject,
+        { zIndex: 300, elevation: 32, opacity: hidden ? 0 : 1 },
+      ]}
+      pointerEvents={hidden ? "none" : "auto"}
+    >
       <Animated.View
         entering={FadeIn.duration(220)}
         exiting={FadeOut.duration(180)}
@@ -266,7 +334,7 @@ function LegTimelineSheet({ result }: { result: SearchResult }) {
           <View style={styles.timeline}>
             {/* Vertical lime rail behind all dots — abs-positioned, exakt
                 ausgerichtet auf die Dot-Mitten via SIDE_PAD + TIME_COL_W + GAP + DOT/2 */}
-            <View style={styles.timeRail} pointerEvents="none" />
+            <View style={[styles.timeRail, { backgroundColor: accent.solid }]} pointerEvents="none" />
 
             {legs.map((leg, idx) => {
               const next = legs[idx + 1];
@@ -283,23 +351,37 @@ function LegTimelineSheet({ result }: { result: SearchResult }) {
               return (
                 <View key={`${leg.origin}-${idx}`}>
                   <StationRow
-                    time={timeOf(leg.departTime)}
+                    time={timeOf(leg.departTime, result.originTz)}
                     name={leg.originLabel ?? leg.origin}
                     platform={leg.departPlatform}
                     terminal={isFirstLeg}
                   />
                   <TransportSegment leg={leg} />
                   <StationRow
-                    time={timeOf(leg.arriveTime)}
+                    time={timeOf(leg.arriveTime, result.destinationTz)}
                     name={leg.destLabel ?? leg.destination}
                     platform={leg.arrivePlatform}
                     terminal={isLastLeg}
                   />
-                  {next ? <TransferSegment minutes={transferMin} /> : null}
+                  {next ? (
+                    <TransferSegment
+                      minutes={transferMin}
+                      isFlight={leg.product === "flight"}
+                    />
+                  ) : null}
                 </View>
               );
             })}
           </View>
+
+          {/* Show-on-Map-Button — identischer Style + Press-Ripple wie der
+              Details-anzeigen-Button im DetailsOverlay (Ghost-Pille mit Lime-
+              Label). Liegt im ScrollView damit's mit dem Inhalt scrollt statt
+              fest am Boden. */}
+          <RippleTouch onPress={onShowMap} style={styles.mapBtn}>
+            <MapIcon size={15} color={accent.solid} strokeWidth={2.5} />
+            <Text style={[styles.mapBtnLabel, { color: accent.solid }]}>{t("details.showmap")}</Text>
+          </RippleTouch>
         </ScrollView>
       </Animated.View>
     </View>
@@ -350,10 +432,11 @@ function StationRow({
   platform?: string;
   terminal?: boolean;
 }) {
+  const accent = useAccent();
   return (
     <View style={styles.row}>
       <Text style={styles.timeLabel}>{time}</Text>
-      <View style={[styles.dot, terminal && styles.dotTerminal]} />
+      <View style={[styles.dot, { borderColor: accent.solid }, terminal && { backgroundColor: accent.solid }]} />
       <View style={styles.stationBody}>
         <Text style={styles.stationName} numberOfLines={1}>
           {name}
@@ -366,21 +449,30 @@ function StationRow({
 
 function PlatformChip({ value }: { value: string }) {
   const t = useT();
+  const accent = useAccent();
   return (
-    <View style={styles.platformChip}>
-      <Text style={styles.platformChipText}>{t("details.platform")} {value}</Text>
+    <View style={[styles.platformChip, { backgroundColor: accent.subtle }]}>
+      <Text style={[styles.platformChipText, { color: accent.solid }]}>{t("details.platform")} {value}</Text>
     </View>
   );
 }
 
 function TransportSegment({ leg }: { leg: SyntheticLeg }) {
+  const accent = useAccent();
   const t = useT();
   const [open, setOpen] = useState(false);
   const lineLabel = leg.line ?? productLabel(leg.product) ?? "";
   const lineColor = productColor(leg.product);
   const stops = leg.stops ?? 0;
   const stopovers = leg.stopovers ?? [];
-  const destinationLabel = leg.direction ?? leg.destLabel ?? leg.destination;
+  // Flug: „toward" = ZIEL-Flughafen dieses Legs (leg.direction ist bei Flügen
+  // die Airline — das gehört NICHT hinter „toward"). Bahn/Bus: leg.direction ist
+  // der Zuglauf-Headsign (z.B. „nach München Hbf", oft über den Ausstieg hinaus)
+  // = die korrekte Richtungsangabe, daher dort weiter bevorzugt.
+  const destinationLabel =
+    leg.product === "flight"
+      ? (leg.destLabel ?? leg.destination)
+      : (leg.direction ?? leg.destLabel ?? leg.destination);
   return (
     <View style={styles.segment}>
       <View style={styles.timeCol}>
@@ -408,9 +500,9 @@ function TransportSegment({ leg }: { leg: SyntheticLeg }) {
           {stops > 0 ? (
             <Pressable onPress={() => setOpen((v) => !v)} style={styles.stopsToggle} hitSlop={6}>
               <View style={{ transform: [{ rotate: open ? "180deg" : "0deg" }] }}>
-                <ChevronDown size={13} color={C.lime} strokeWidth={2.5} />
+                <ChevronDown size={13} color={accent.solid} strokeWidth={2.5} />
               </View>
-              <Text style={styles.stopsToggleText}>
+              <Text style={[styles.stopsToggleText, { color: accent.solid }]}>
                 {stops === 1
                   ? t("details.stop.one")
                   : t("details.stop.many").replace("{count}", String(stops))}
@@ -435,7 +527,8 @@ function TransportSegment({ leg }: { leg: SyntheticLeg }) {
   );
 }
 
-function TransferSegment({ minutes }: { minutes: number }) {
+function TransferSegment({ minutes, isFlight }: { minutes: number; isFlight?: boolean }) {
+  const accent = useAccent();
   const t = useT();
   return (
     <View style={styles.segment}>
@@ -445,13 +538,19 @@ function TransferSegment({ minutes }: { minutes: number }) {
       </View>
       <View style={styles.segmentBody}>
         <View style={styles.transferCard}>
-          <View style={styles.walkBadge}>
-            <Footprints size={16} color={C.lime} strokeWidth={2.2} />
+          <View style={[styles.walkBadge, { backgroundColor: accent.subtle }]}>
+            {/* Flug-Umstieg = Aufenthalt am Flughafen (Uhr), kein Fußweg zum Gleis. */}
+            {isFlight ? (
+              <Clock size={16} color={accent.solid} strokeWidth={2.2} />
+            ) : (
+              <Footprints size={16} color={accent.solid} strokeWidth={2.2} />
+            )}
           </View>
           <View style={{ flex: 1 }}>
             <Text style={styles.transferTitle}>{t("details.transfer")}</Text>
             <Text style={styles.transferMeta}>
-              {formatDuration(minutes)} {t("details.transferwalk")}
+              {formatDuration(minutes)}{" "}
+              {isFlight ? t("details.transferwait") : t("details.transferwalk")}
             </Text>
           </View>
         </View>
@@ -520,7 +619,6 @@ const styles = StyleSheet.create({
     bottom: 24,
     left: SIDE_PAD + TIME_COL_W + GAP + DOT / 2 - 1.25,
     width: 2.5,
-    backgroundColor: C.lime,
     opacity: 0.35,
     borderRadius: 2,
   },
@@ -547,10 +645,9 @@ const styles = StyleSheet.create({
     borderRadius: DOT / 2,
     backgroundColor: C.bg,
     borderWidth: 2.5,
-    borderColor: C.lime,
     zIndex: 1,
   },
-  dotTerminal: { backgroundColor: C.lime },
+  dotTerminal: {},
   stationBody: {
     flex: 1,
     flexDirection: "row",
@@ -568,12 +665,12 @@ const styles = StyleSheet.create({
   platformChip: {
     paddingHorizontal: 10,
     paddingVertical: 5,
-    backgroundColor: C.limeSoft,
+
     borderRadius: 9999,
     borderWidth: 1,
     borderColor: "rgba(127,234,77,0.3)",
   },
-  platformChipText: { fontSize: 11, fontWeight: "700", color: C.lime },
+  platformChipText: { fontSize: 11, fontWeight: "700" },
 
   /* Segment (shared by transport + transfer) */
   segment: {
@@ -611,7 +708,7 @@ const styles = StyleSheet.create({
     backgroundColor: C.cardSoft,
     borderRadius: 9999,
   },
-  stopsToggleText: { color: C.lime, fontSize: 12, fontWeight: "700" },
+  stopsToggleText: { fontSize: 12, fontWeight: "700" },
   stopList: {
     marginTop: 2,
     paddingTop: 10,
@@ -639,7 +736,7 @@ const styles = StyleSheet.create({
     width: 30,
     height: 30,
     borderRadius: 10,
-    backgroundColor: C.limeSoft,
+
     alignItems: "center",
     justifyContent: "center",
   },
@@ -656,4 +753,26 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
   },
   dottedLineDash: { width: 2, height: 4, backgroundColor: C.sub, borderRadius: 1 },
+
+  // Show-on-Map-Button — Style 1:1 vom „Details anzeigen"-Ghost-Button im
+  // DetailsOverlay übernommen (gleiche Pille mit Lime-Label).
+  mapBtn: {
+    marginTop: 20,
+    marginHorizontal: SIDE_PAD,
+    paddingVertical: 12,
+    borderRadius: 9999,
+    borderWidth: 1,
+    borderColor: C.border,
+    backgroundColor: "transparent",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+  },
+  mapBtnLabel: {
+
+    fontSize: 14,
+    fontWeight: "700",
+    letterSpacing: -0.15,
+  },
 });

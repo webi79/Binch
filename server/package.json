@@ -59,6 +59,7 @@
     "import:gtfs:all": "npm run import:gtfs:de:all && npm run import:gtfs:at && npm run import:gtfs:fr && npm run import:gtfs:nl && npm run import:gtfs:ch && npm run import:gtfs:cz && npm run import:gtfs:pl && npm run import:gtfs:be:all"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.100.1",
     "@fastify/cors": "^10.0.1",
     "@fastify/multipart": "^10.0.0",
     "@napi-rs/canvas": "^0.1.100",

@@ -10,6 +10,14 @@ import type {
 const RAPIDAPI_HOST = "google-flights2.p.rapidapi.com";
 const SEARCH_URL = `https://${RAPIDAPI_HOST}/api/v1/searchFlights`;
 
+// Google liefert Zeiten als naive LOKALZEIT am jeweiligen Flughafen — ohne
+// Offset/Zeitzone. Wir speichern die Wall-Clock-Komponenten als UTC-ISO und
+// markieren die Result-Zone als "UTC", sodass der Client sie via
+// formatInTimeZone(.,"UTC") VERBATIM anzeigt (kein Geräte-TZ-Doppel-Offset =
+// der gemeldete "+2h"-Bug). „Floating local time": robust für jeden Flughafen
+// ohne IATA→IANA-DB, für die Anzeige korrekt (Dauer kommt aus Googles `raw`).
+const FLIGHT_TZ = "UTC";
+
 export const googleFlightsProvider: SearchProvider = {
   name: "google-flights",
   mode: "FLIGHT",
@@ -41,29 +49,62 @@ export const googleFlightsProvider: SearchProvider = {
     url.searchParams.set("travel_class", flightClass);
     url.searchParams.set("type", input.returnDate ? "1" : "2");
 
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "x-rapidapi-key": config.RAPIDAPI_KEY ?? "",
-        "x-rapidapi-host": RAPIDAPI_HOST,
-      },
-      signal,
-    });
+    // Die google-flights2-API ist STARK nicht-deterministisch: dieselbe Anfrage
+    // liefert mal 0, mal das KORREKTE günstige Set (z.B. 8 Flüge, Pegasus 185€ =
+    // wie Google), mal ein „Garbage"-Set aus vielen teuren Mehrleg-Combos (z.B.
+    // 57 Flüge, Eurowings/SWISS 1502€). NICHT nach Anzahl wählen — das Garbage-Set
+    // ist GRÖSSER aber falsch. Stattdessen über bis zu SEARCH_MAX_ATTEMPTS das
+    // Ergebnis mit dem GÜNSTIGSTEN Min-Preis behalten (bei ähnlichem Preis gewinnt
+    // die längere Liste). So bekommen wir das echte, günstige Google-Set, sobald
+    // es in EINEM der Versuche auftaucht. 3 Versuche deckeln die Latenz unter dem
+    // 25s-Client-Timeout. Mehr Treffer gibt's on-demand über „Mehr Ergebnisse".
+    const SEARCH_MAX_ATTEMPTS = 3;
+    const minPrice = (rs: NormalizedResult[]): number => {
+      let m = Infinity;
+      for (const r of rs) if (r.price > 0 && r.price < m) m = r.price;
+      return m;
+    };
+    let statusCode = 0;
+    let raw: unknown = null;
+    let best: NormalizedResult[] = [];
+    let bestMin = Infinity;
 
-    const statusCode = res.status;
-    const raw = (await res.json().catch(() => null)) as unknown;
-    const durationMs = Date.now() - start;
-
-    if (!res.ok || !raw) {
-      return { results: [], raw, statusCode, durationMs };
+    for (let attempt = 0; attempt < SEARCH_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 400));
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          method: "GET",
+          headers: {
+            "x-rapidapi-key": config.RAPIDAPI_KEY ?? "",
+            "x-rapidapi-host": RAPIDAPI_HOST,
+          },
+          signal,
+        });
+      } catch {
+        break; // Abbruch (z.B. Signal) → raus
+      }
+      statusCode = res.status;
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!res.ok || !body) continue;
+      const parsed = parseGoogleFlights(body, input);
+      if (parsed.length === 0) continue;
+      const m = minPrice(parsed);
+      // Deutlich günstiger (<90 %) = das richtige Set → übernehmen. Ähnlicher
+      // Preis (±10 %, gleicher „Modus") → die größere Liste gewinnt. Deutlich
+      // teurer → verwerfen (Garbage-Mode).
+      const isBetter =
+        best.length === 0 ||
+        m < bestMin * 0.9 ||
+        (m <= bestMin * 1.1 && parsed.length > best.length);
+      if (isBetter) {
+        best = parsed;
+        bestMin = m;
+        raw = body;
+      }
     }
 
-    return {
-      results: parseGoogleFlights(raw, input),
-      raw,
-      statusCode,
-      durationMs,
-    };
+    return { results: best, raw, statusCode, durationMs: Date.now() - start };
   },
 };
 
@@ -193,6 +234,9 @@ function parseGoogleFlights(raw: unknown, input: ProviderSearchInput): Normalize
       destination: airportCode(last.arrival_airport) || input.destination,
       originLabel: airportName(first.departure_airport) ?? input.originLabel,
       destLabel: airportName(last.arrival_airport) ?? input.destLabel,
+      // "UTC" = die Wall-Clock-Zeiten werden verbatim angezeigt (siehe FLIGHT_TZ).
+      originTz: FLIGHT_TZ,
+      destinationTz: FLIGHT_TZ,
       departTime: depart,
       arriveTime: arrive,
       durationMinutes,
@@ -213,10 +257,29 @@ function parseGoogleFlights(raw: unknown, input: ProviderSearchInput): Normalize
 
 function toIso(value?: string): string | null {
   if (!value) return null;
+  // Naive Lokalzeit "2026-6-23 07:15" (unpadded) oder "2026-06-23T07:15":
+  // Wall-Clock-Komponenten als UTC interpretieren (NICHT new Date(), das von
+  // der Server-TZ abhängt und das Format inkonsistent parst). Siehe FLIGHT_TZ.
+  const m = value.match(/(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})/);
+  if (m) {
+    return new Date(Date.UTC(+m[1]!, +m[2]! - 1, +m[3]!, +m[4]!, +m[5]!)).toISOString();
+  }
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return null;
   return d.toISOString();
 }
+
+/** Best-effort Sprache/Land pro Währung für die Google-Flights-Fallback-URL.
+ *  Locale wird serverseitig (noch) nicht durchgereicht, daher leiten wir `hl`
+ *  (Sprache) + `gl` (Land) aus der vom User gewählten Währung ab. `curr` ist
+ *  immer korrekt (= die App-Währung) — das ist der Teil der den USD-Bug fixt. */
+const CURRENCY_LOCALE: Record<string, { hl: string; gl: string }> = {
+  EUR: { hl: "de", gl: "DE" },
+  USD: { hl: "en", gl: "US" },
+  GBP: { hl: "en", gl: "GB" },
+  CHF: { hl: "de", gl: "CH" },
+  PLN: { hl: "pl", gl: "PL" },
+};
 
 /**
  * SerpAPI's `booking_token` ist nur via 2nd-Call-API einlösbar — Google selbst
@@ -225,6 +288,11 @@ function toIso(value?: string): string | null {
  * Flugnummer (`tt=o`, `flight=<NR>`), sodass die Suchergebnisseite auf genau
  * diese Verbindung vor-filtert. So wenig "Liste mit mehreren Tickets" wie ohne
  * direkten Airline-API-Zugang machbar ist.
+ *
+ * WICHTIG: `curr` (Währung) + `hl`/`gl` (Sprache/Land) müssen mit — ohne `curr`
+ * rendert Google Flights die Seite in USD (Geo-Default), sodass der User „den
+ * gleichen Preis in Dollar" sieht obwohl die App EUR anzeigt. Mit `curr` ist
+ * die Fallback-Seite in derselben Währung wie die App-Anzeige.
  */
 function buildDeepLink(
   _token: string,
@@ -232,11 +300,16 @@ function buildDeepLink(
   departIso: string | null,
   flightNumber?: string,
 ): string {
+  const curr = (input.currency || "EUR").toUpperCase();
+  const loc = CURRENCY_LOCALE[curr] ?? { hl: "en", gl: "US" };
   const params = new URLSearchParams({
     f: input.origin,
     t: input.destination,
     d: input.departDate,
     tt: "o",
+    curr,
+    hl: loc.hl,
+    gl: loc.gl,
   });
   if (flightNumber) params.set("flight", flightNumber.replace(/\s+/g, ""));
   if (departIso) {

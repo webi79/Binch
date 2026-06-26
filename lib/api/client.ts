@@ -72,7 +72,9 @@ function searchParamsForApi(p: SearchParams, opt?: SearchOptions) {
 }
 
 export function searchFlights(p: SearchParams, opt?: SearchOptions): Promise<SearchResponse> {
-  return getJson("/api/search/flights", searchParamsForApi(p, opt));
+  // 25s: die Flugsuche pollt die flaky API mehrfach (keep-best) + persistiert
+  // viele Treffer → kann länger dauern als der 20s-Default. Loader läuft solange.
+  return getJson("/api/search/flights", searchParamsForApi(p, opt), 25_000);
 }
 
 export function searchTrains(p: SearchParams, opt?: SearchOptions): Promise<SearchResponse> {
@@ -100,6 +102,22 @@ export function fetchLocations(query: string, mode: TravelMode | "ALL" = "ALL"):
   return getJson<{ results: Location[] }>("/api/locations", { q: query, mode }, 15_000).then(
     (r) => r.results ?? [],
   );
+}
+
+export type LocationByCode =
+  | { code: string; label: string; exists: true }
+  | { code: string; exists: false };
+
+/** Batch-Lookup: holt für eine Liste von Codes den aktuellen Label-Stand aus
+ *  der DB. Wenn ein Code nicht mehr existiert → `exists: false`. Wird beim
+ *  App-Start für die Validierung persistierter Recent-Searches benutzt. */
+export function fetchLocationsByCodes(codes: string[]): Promise<LocationByCode[]> {
+  if (codes.length === 0) return Promise.resolve([]);
+  return getJson<{ results: LocationByCode[] }>(
+    "/api/locations/by-codes",
+    { codes: codes.join(",") },
+    10_000,
+  ).then((r) => r.results ?? []);
 }
 
 export type SurroundingsKind = "train" | "subway" | "bus" | "tram" | "airport" | "cruise";
@@ -205,22 +223,27 @@ export interface TripDetailResponse {
 
 export function fetchTripDetail(
   tripId: string,
-  opts: { fromStopId?: string; stopCode?: string } = {},
+  opts: { fromStopId?: string; fromStopLabel?: string; stopCode?: string; direction?: string } = {},
 ): Promise<TripDetailResponse> {
   // tripId muss als Query-Param gesendet werden — Path-Param funktioniert
   // nicht weil HAFAS-IDs `#`/`|`/Padding-Spaces enthalten, an denen Fastify's
   // Router scheitert. URL-Builder kodiert den Query-Wert sauber.
-  //   fromStopId — optionaler HAFAS-Stop-Id-Filter, slicet Stops auf
-  //                User-Halt bis Endstation.
-  //   stopCode   — interner Stop-Code (`gtfs:at:…`, `sta:…`, …). Daraus leitet
-  //                der Server das HAFAS-Profil ab (dbnav für DE, oebb für AT,
-  //                pkp für PL, cfl für LU, rejseplanen für DK).
+  //   fromStopId    — optionaler HAFAS-Stop-Id-Filter, slicet Stops auf
+  //                   User-Halt bis Endstation.
+  //   fromStopLabel — Name des User-Halts als Fallback wenn die ID nicht in
+  //                   den Trip-Stopovers matched (passiert bei BVG/VBB-Bus-
+  //                   Stops wo lokale IDs nicht mit HAFAS-Trip-Body IDs
+  //                   übereinstimmen).
+  //   stopCode      — interner Stop-Code (`gtfs:at:…`, `sta:…`, …). Daraus
+  //                   leitet der Server das HAFAS-Profil ab.
   return getJson<TripDetailResponse>(
     "/api/trips/detail",
     {
       tripId,
       ...(opts.fromStopId ? { fromStopId: opts.fromStopId } : {}),
+      ...(opts.fromStopLabel ? { fromStopLabel: opts.fromStopLabel } : {}),
       ...(opts.stopCode ? { stopCode: opts.stopCode } : {}),
+      ...(opts.direction ? { direction: opts.direction } : {}),
     },
     12_000,
   );
@@ -291,6 +314,10 @@ export interface FlightBookingOption {
    *  `${API_BASE_URL}/api/flights/booking-url?token=...`.
    *  Server resolved den Token zu RapidAPI und 302-redirected zum Anbieter. */
   providerToken: string;
+  /** Bereits serverseitig aufgelöster Direkt-Deeplink (enthält den echten
+   *  Website-Preis). Wenn gesetzt, öffnet der Client diesen direkt statt den
+   *  token-basierten Redirect-Umweg zu gehen. */
+  resolvedUrl?: string;
 }
 
 export interface FlightBookingOptionsResponse {
@@ -311,6 +338,10 @@ export function fetchFlightBookingOptions(input: {
   returnDate?: string;
   passengers?: number;
   currency?: string;
+  /** App-Sprache (de/en/fr/es) — Anbieter-Deeplinks öffnen in dieser Sprache. */
+  lang?: string;
+  /** Card-/Suchpreis dieses Flugs — Detail-Günstigster wird darauf gesnappt. */
+  searchPrice?: number;
 }): Promise<FlightBookingOptionsResponse> {
   const params = new URLSearchParams({
     token: input.token,
@@ -321,7 +352,15 @@ export function fetchFlightBookingOptions(input: {
   if (input.returnDate) params.set("returnDate", input.returnDate);
   if (input.passengers !== undefined) params.set("passengers", String(input.passengers));
   if (input.currency) params.set("currency", input.currency);
-  return getJson<FlightBookingOptionsResponse>(`/api/flights/booking-options?${params.toString()}`, undefined, 12_000);
+  if (input.lang) params.set("lang", input.lang);
+  if (input.searchPrice !== undefined && input.searchPrice > 0) {
+    params.set("searchPrice", String(input.searchPrice));
+  }
+  // 18s: die google-flights2-API ist flaky (liefert denselben Token mal leer,
+  // mal „Invalid"), daher retryt der Server mehrfach (RETRY_ATTEMPTS) + löst
+  // Deeplinks auf. Das braucht im Worst Case >12s — lieber etwas länger laden
+  // (Skeletons) als auf den Single-Provider-Fallback zu kippen.
+  return getJson<FlightBookingOptionsResponse>(`/api/flights/booking-options?${params.toString()}`, undefined, 18_000);
 }
 
 export interface ParsedTicketResponse {
@@ -331,20 +370,30 @@ export interface ParsedTicketResponse {
     flightNumber?: string;
     fromCode?: string;
     fromCity?: string;
+    fromStation?: string;
     toCode?: string;
     toCity?: string;
+    toStation?: string;
     departTime?: string;
     arriveTime?: string;
     durationMinutes?: number;
     passenger?: string;
     seat?: string;
+    wagon?: string;
     travelClass?: string;
+    bookingRef?: string;
   };
   pageImage: string;
   pageWidth: number;
   pageHeight: number;
   pageCount: number;
   originalName?: string;
+  /** Aus dem PDF rausgeschnittenes Original-Code-Bild (QR/Aztec/Barcode).
+   *  Bit-genau gecroppt aus dem Page-PNG — NICHT regeneriert, also scanbar.
+   *  null wenn Vision den Code nicht lokalisieren konnte. */
+  codeImage?: string | null;
+  /** Form-Faktor des Codes — bestimmt das Aspect-Ratio im Detail-Screen. */
+  codeType?: "qr" | "barcode" | null;
 }
 
 export interface AuthUser {
@@ -383,6 +432,10 @@ async function postJson<T>(path: string, body: unknown, token?: string): Promise
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
+}
+
+export function authCheckEmail(email: string): Promise<{ exists: boolean }> {
+  return postJson("/api/auth/check-email", { email });
 }
 
 export function authRegister(input: {

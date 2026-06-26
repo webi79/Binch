@@ -22,12 +22,14 @@ import {
 } from "react-native-gesture-handler";
 import { showAlert } from "@/lib/alert";
 import * as DocumentPicker from "expo-document-picker";
+import * as FileSystem from "expo-file-system/legacy";
 import { Plane, TrainFront, Bus, Ship } from "lucide-react-native";
 import { TravelMode } from "@/types/search";
 import { Ticket } from "@/types/saved";
 import { useT } from "@/lib/i18n/useT";
 import { parseTicketPdf } from "@/lib/api/client";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import { useAccent } from "@/lib/theme/accent";
 
 interface Props {
   visible: boolean;
@@ -64,6 +66,7 @@ function AddTicketSheet({
   onAdd: Props["onAdd"];
 }) {
   const t = useT();
+  const accent = useAccent();
   const [busy, setBusy] = useState(false);
 
   const translateY = useSharedValue(0);
@@ -105,24 +108,49 @@ function AddTicketSheet({
       const ratio =
         parsed.pageWidth > 0 ? parsed.pageHeight / parsed.pageWidth : undefined;
 
+      // PDF aus dem Cache (DocumentPicker copyToCacheDirectory) ins
+      // persistente Document-Directory verschieben. Sonst kann der OS-Cache
+      // sie jederzeit löschen → "Original-PDF öffnen"-Button im Detail-Screen
+      // wäre nach 1-2 Tagen kaputt. Filename = ticket-{timestamp}-{name}.pdf
+      // damit's eindeutig ist (mehrere Imports vom selben PDF überschreiben
+      // sich nicht).
+      const docDir = FileSystem.documentDirectory ?? "";
+      const safeName = (asset.name ?? "ticket.pdf").replace(/[^\w.-]/g, "_");
+      const persistedUri = `${docDir}tickets/${Date.now()}-${safeName}`;
+      try {
+        await FileSystem.makeDirectoryAsync(`${docDir}tickets`, { intermediates: true });
+        await FileSystem.copyAsync({ from: asset.uri, to: persistedUri });
+      } catch {
+        // Wenn Persistierung fehlschlägt (z.B. kein Speicherplatz), trotzdem
+        // weiter — pdfUri bleibt dann undefined, der Button im Detail-Screen
+        // wird ausgeblendet.
+      }
+
       onAdd({
         mode: parsed.fields.mode ?? fallbackMode,
         carrier: parsed.fields.carrier,
         flightNumber: parsed.fields.flightNumber,
         fromCode: parsed.fields.fromCode,
         fromCity: parsed.fields.fromCity,
+        fromStation: parsed.fields.fromStation,
         toCode: parsed.fields.toCode,
         toCity: parsed.fields.toCity,
+        toStation: parsed.fields.toStation,
         departTime: parsed.fields.departTime,
         arriveTime: parsed.fields.arriveTime,
         durationMinutes: parsed.fields.durationMinutes,
         stops: 0,
         passenger: parsed.fields.passenger,
         seat: parsed.fields.seat,
+        wagon: parsed.fields.wagon,
         travelClass: parsed.fields.travelClass,
         pageImage: parsed.pageImage,
         pageImageRatio: ratio,
         originalName: parsed.originalName ?? asset.name,
+        bookingRef: parsed.fields.bookingRef,
+        pdfUri: persistedUri,
+        codeImage: parsed.codeImage ?? undefined,
+        codeType: parsed.codeType ?? undefined,
       });
 
       onClose();
@@ -149,7 +177,7 @@ function AddTicketSheet({
 
           {busy ? (
             <View style={styles.busyWrap}>
-              <ActivityIndicator size="large" color="#7FEA4D" />
+              <ActivityIndicator size="large" color={accent.solid} />
               <Text style={styles.busyText}>{t("saved.modal.parsing")}</Text>
             </View>
           ) : (

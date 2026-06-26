@@ -13,6 +13,7 @@ import {
   useWindowDimensions,
 } from "react-native";
 import Animated, {
+  cancelAnimation,
   Easing,
   runOnJS,
   useAnimatedStyle,
@@ -42,21 +43,23 @@ import {
 } from "lucide-react-native";
 import { format, parseISO } from "date-fns";
 import { de, enGB, es, fr } from "date-fns/locale";
+import { formatTimeInZone } from "@/lib/time-format";
 import { useT } from "@/lib/i18n/useT";
 import { useSearchStore } from "@/stores/searchStore";
 import { haptic } from "@/lib/haptics";
+import { usePathname } from "expo-router";
 import {
   redirectUrl,
   fetchFlightBookingOptions,
-  flightBookingUrl,
   type FlightBookingOption,
 } from "@/lib/api/client";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { displayCode, displayProvider, logoUrls } from "@/lib/results/logos";
 import { tripSignature } from "@/lib/results/signature";
 import { TravelMode } from "@/types/search";
+import { useAccent } from "@/lib/theme/accent";
 
 /**
  * Details-Slide als globales Overlay (Pattern wie SearchHeroOverlay).
@@ -142,15 +145,35 @@ export function DetailsOverlay() {
   const clearSelectedResult = useSearchStore((s) => s.clearSelectedResult);
   const pending = useSearchStore((s) => s.selectedResultPending);
   const locale = useSearchStore((s) => s.locale);
-  const savedTrips = useSearchStore((s) => s.savedTrips);
-  const toggleSavedTrip = useSearchStore((s) => s.toggleSavedTrip);
-  const showSavedToast = useSearchStore((s) => s.showSavedToast);
-  const openLegTimelineOverlay = useSearchStore((s) => s.openLegTimelineOverlay);
+  // O(1) Set-Lookup statt ganzem savedTrips-Array: sonst kriegt der
+  // Overlay bei JEDEM Save eine neue Array-Ref → full re-render des
+  // großen DetailsContent-Trees. Mit boolean-Selector re-rendert nur,
+  // wenn sich der favored-Status des aktuellen Result ändert.
+  const favored = useSearchStore((s) => {
+    if (!s.selectedResult) return false;
+    return s.savedTripSignatures.has(tripSignature(s.selectedResult));
+  });
+  // Actions als stable refs aus getState() — keine Subscription-Slots
+  // belegen (siehe ResultCard-Kommentar).
+  const toggleSavedTrip = useSearchStore.getState().toggleSavedTrip;
+  const showSavedToast = useSearchStore.getState().showSavedToast;
+  const openLegTimelineOverlay = useSearchStore.getState().openLegTimelineOverlay;
   // Direct-Trip-Flow vom Stop-Sheet (Bus-Tap): umgeht den Booking-Overlay
   // komplett — wir rendern dann nichts, LegTimelineOverlay übernimmt direkt.
   const directTripResult = useSearchStore((s) => s.directTripResult);
+  // Wo wurde das Overlay geöffnet? Wir behalten den State über Tab-Wechsel
+  // hinweg — wenn der User aber auf einer anderen Route ist (z.B. „Show on
+  // Map" hat ihn nach Surroundings geschickt), sollen wir uns visuell
+  // verstecken statt auf der Map zu liegen. Kommt er zurück, sind Pathname
+  // und Context wieder gleich → wir zeigen uns automatisch wieder an.
+  const pathname = usePathname();
+  const context = useSearchStore((s) => s.selectedResultContext);
 
   if (!result || directTripResult) return null;
+  // Wenn wir auf einer anderen Route sind (z.B. Map-Push obendrauf),
+  // verstecken wir den Sheet VISUELL statt zu unmounten — sonst feuert
+  // beim Zurückkommen die Slide-In-Animation neu und es laggt.
+  const hiddenForOtherRoute = context != null && pathname !== context.pathname;
 
   return (
     <DetailsContent
@@ -159,10 +182,11 @@ export function DetailsOverlay() {
       pending={pending}
       clearSelectedResult={clearSelectedResult}
       locale={locale}
-      savedTrips={savedTrips}
+      favored={favored}
       toggleSavedTrip={toggleSavedTrip}
       showSavedToast={showSavedToast}
       openLegTimelineOverlay={openLegTimelineOverlay}
+      hidden={hiddenForOtherRoute}
     />
   );
 }
@@ -176,10 +200,13 @@ interface ContentProps {
   pending: boolean;
   clearSelectedResult: () => void;
   locale: "en" | "de" | "fr" | "es";
-  savedTrips: ReturnType<typeof useSearchStore.getState>["savedTrips"];
+  favored: boolean;
   toggleSavedTrip: ReturnType<typeof useSearchStore.getState>["toggleSavedTrip"];
   showSavedToast: ReturnType<typeof useSearchStore.getState>["showSavedToast"];
   openLegTimelineOverlay: () => void;
+  /** Sheet komplett mounted lassen, nur visuell unsichtbar machen (für
+   *  Map-Push-Detour). Vermeidet Slide-In-Re-Animation beim Zurückkommen. */
+  hidden?: boolean;
 }
 
 function DetailsContent({
@@ -188,26 +215,44 @@ function DetailsContent({
   pending,
   clearSelectedResult,
   locale,
-  savedTrips,
+  favored,
   toggleSavedTrip,
   showSavedToast,
   openLegTimelineOverlay,
+  hidden,
 }: ContentProps) {
   const t = useT();
+  const accent = useAccent();
   const screenWidth = useWindowDimensions().width;
 
   const translateX = useSharedValue(screenWidth);
   const slideStyle = useAnimatedStyle(() => ({
     transform: [{ translateX: translateX.value }],
   }));
+  // Slide-In erst NACH dem ersten Paint starten — gibt React eine Frame Zeit
+  // den schweren Sub-Tree (ScrollView, Provider-Liste, useQuery-Setup etc.)
+  // zu mounten BEVOR die Animation läuft. Sonst stutter't der Slide weil
+  // JS-Thread durchs Mounten beschäftigt ist während die UI-Thread-Worklets
+  // rendern wollen. requestAnimationFrame = nächster Frame nach Paint.
   useEffect(() => {
-    translateX.value = withTiming(0, {
-      duration: 260,
-      easing: Easing.out(Easing.cubic),
+    const id = requestAnimationFrame(() => {
+      translateX.value = withTiming(0, {
+        duration: 260,
+        easing: Easing.out(Easing.cubic),
+      });
     });
+    return () => cancelAnimationFrame(id);
   }, [translateX]);
 
   const [closing, setClosing] = useState(false);
+  // Defer-Wrapper für den Unmount-Trigger: die letzte Frame der Slide-Out-
+  // Animation soll sauber zu Ende paintet werden BEVOR React den DetailsContent-
+  // Subtree unmountet (das Unmounten ist JS-Thread-Arbeit die sich mit der
+  // Animation kann's beißt). Eine rAF nach der Animation = Animation
+  // vollständig sichtbar, dann Unmount.
+  const clearAfterFrame = () => {
+    requestAnimationFrame(clearSelectedResult);
+  };
   const animateClose = () => {
     if (closing) return;
     setClosing(true);
@@ -215,7 +260,7 @@ function DetailsContent({
       screenWidth,
       { duration: 260, easing: Easing.in(Easing.cubic) },
       (finished) => {
-        if (finished) runOnJS(clearSelectedResult)();
+        if (finished) runOnJS(clearAfterFrame)();
       },
     );
   };
@@ -242,8 +287,10 @@ function DetailsContent({
   const urls = logoUrls(result, carrier);
   const [logoIdx, setLogoIdx] = useState(0);
   const ModeIcon = MODE_ICON[result.mode] ?? Plane;
-  const resultSig = tripSignature(result);
-  const favored = savedTrips.some((trip) => tripSignature(trip) === resultSig);
+  // `favored` kommt jetzt als primitive Prop vom Outer-Component — der
+  // benutzt einen boolean-Selector damit der DetailsOverlay nur re-rendert
+  // wenn sich der favored-Status DES AKTUELLEN Result ändert, nicht bei
+  // jeder savedTrips-Mutation.
   const isDirect = result.stops === 0;
   const stopVia = !isDirect && result.stopLabels?.length ? result.stopLabels[0] : null;
   const stopLabel =
@@ -259,16 +306,20 @@ function DetailsContent({
       return "";
     }
   })();
+  // TZ-bewusst: Flüge speichern "floating local time" mit originTz/destinationTz
+  // = "UTC" → formatTimeInZone zeigt die Wall-Clock verbatim (kein +2h-Bug).
+  // Züge/Busse mit echter IANA-Zone werden korrekt in ihrer Zone angezeigt;
+  // ohne Zone fällt formatTimeInZone auf Geräte-Lokalzeit zurück (= alt).
   const departTime = (() => {
     try {
-      return format(parseISO(result.departTime), "HH:mm");
+      return formatTimeInZone(result.departTime, result.originTz);
     } catch {
       return "";
     }
   })();
   const arriveTime = (() => {
     try {
-      return format(parseISO(result.arriveTime), "HH:mm");
+      return formatTimeInZone(result.arriveTime, result.destinationTz);
     } catch {
       return "";
     }
@@ -281,15 +332,11 @@ function DetailsContent({
   const paxLabel = t(paxKey).replace("{count}", String(passengers));
   const classLabel = result.mode === "FLIGHT" ? t("search.class.economy") : t("search.class.second");
 
-  // Multi-Provider-Liste für Flüge: Google Flights liefert pro Itinerary
-  // mehrere Buchungs-Optionen (Airline-direct, Expedia, Kiwi, trip.com, …).
-  // Wir holen die On-Demand wenn das Sheet öffnet — Search-Time wäre teurer
-  // (1 Call pro Result = 10-20× mehr API-Hits) und meistens unnötig (User
-  // schaut nur ein paar Details an).
   const isFlight = result.mode === "FLIGHT";
   const bookingToken = result.bookingToken;
+  const queryClient = useQueryClient();
   const optionsQuery = useQuery({
-    queryKey: ["flightBookingOptions", bookingToken, result.currency, passengers],
+    queryKey: ["flightBookingOptions", bookingToken, result.currency, passengers, locale],
     queryFn: () =>
       fetchFlightBookingOptions({
         token: bookingToken!,
@@ -298,54 +345,49 @@ function DetailsContent({
         departDate: result.departTime.slice(0, 10),
         passengers,
         currency: result.currency.toUpperCase(),
+        lang: locale,
+        searchPrice: result.price,
       }),
-    // Bewusst NICHT auf contentReady gated — der Network-Call läuft auf
-    // dem JS-/Background-Thread und konkurriert nicht mit der Slide-In-
-    // Spring-Animation (Reanimated, UI-Thread). Wir feuern SOFORT beim
-    // Mount, sodass die ~1-3s RapidAPI-Latenz parallel zur 260ms Slide-In
-    // läuft. Effekt: bei normalen Verbindungen ist die Provider-Liste
-    // schon da wenn der Section-Container sichtbar wird.
     enabled: isFlight && !!bookingToken,
     staleTime: 5 * 60_000,
     retry: 1,
   });
   const remoteOptions = optionsQuery.data?.options ?? [];
 
+  useEffect(() => {
+    return () => {
+      if (bookingToken) {
+        queryClient.removeQueries({
+          queryKey: ["flightBookingOptions", bookingToken, result.currency, passengers, locale],
+          exact: true,
+        });
+      }
+    };
+  }, [queryClient, bookingToken, result.currency, passengers, locale]);
+
   const bookUrl = result.redirectToken
     ? redirectUrl(result.redirectToken)
     : result.deepLink || "";
 
-  // Anbieter-Liste für die UI. Bei Flügen mit echten Daten zeigen wir die
-  // remote-Optionen mit Sort + Recommended-Markierung; sonst fallen wir auf
-  // den Single-Provider aus dem Search-Result zurück (Bahn/Bus/Cruise haben
-  // aktuell nur einen Anbieter — DB/FlixBus/etc.). Die „Empfohlen"-Pille
-  // wird nur gesetzt wenn >1 Provider existiert (sonst ist sie redundant).
+  const flightOptionsLoading = isFlight && !!bookingToken && optionsQuery.isLoading;
+
   const providerList: ProviderRow[] = (() => {
     if (isFlight && remoteOptions.length > 0) {
-      const rows = remoteOptions.map(toProviderRow);
+      const rows = remoteOptions.map((o) => toProviderRow(o, bookUrl));
       rows.sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity));
       if (rows.length > 1 && rows[0]!.price !== undefined) rows[0]!.recommended = true;
       return rows;
     }
-    // Single-Provider-Fallback (Bahn/Bus/Cruise): füllen mit den passenden
-    // Defaults pro Mode damit die neue Card-Anzeige (24/7-Service, Gepäck,
-    // Logo) trotzdem voll genutzt wird.
+    if (flightOptionsLoading) return [];
     return [
       {
         name: carrier,
         url: bookUrl,
         price: result.price,
         currency: result.currency,
-        // Erstes URL aus der logoUrls()-Kandidatenliste — z.B. DB-Logo für
-        // Train, FlixBus-Logo für Bus, Cruise-Provider-Favicon wo vorhanden.
         logo: urls[0],
         isAirline: result.mode === "FLIGHT",
-        // 24/7-Hotline: DB Service-Nummer, FlixBus-Chat, Reederei-Hotlines.
-        // Bei Airline-Direct (Edge-Case ohne Booking-Options-Antwort) auch true.
         support: true,
-        // Bahn/Bus/Cruise haben keine harte Gepäck-Beschränkung — beide aktiv.
-        // Bei Flug-Fallback (sollte selten passieren — z.B. wenn Token expired)
-        // konservativ: nur Handgepäck inkludiert.
         carryOn: true,
         checked: result.mode !== "FLIGHT",
       },
@@ -379,9 +421,9 @@ function DetailsContent({
 
   function onToggleFav() {
     haptic("button");
-    const justSaved = !favored;
+    // toggleSavedTrip löst den Save-Toast intern aus (batched in einem
+    // set() — sonst zwei Render-Wellen pro Save).
     toggleSavedTrip(result, passengers);
-    if (justSaved) showSavedToast(result);
   }
 
   const currentLogoUrl = urls[logoIdx];
@@ -391,12 +433,13 @@ function DetailsContent({
 
   return (
     <Animated.View
+      pointerEvents={hidden ? "none" : "auto"}
       style={[
         StyleSheet.absoluteFill,
         // Höher als StopDetailSheet (zIndex 100, elevation 16) damit der
         // Overlay GANZ VORNE liegt, wenn er via Departure-Tap aus dem
         // Surroundings-Sheet geöffnet wird.
-        { zIndex: 200, elevation: 24 },
+        { zIndex: 200, elevation: 24, opacity: hidden ? 0 : 1 },
         slideStyle,
       ]}
     >
@@ -490,7 +533,7 @@ function DetailsContent({
               <View style={{ alignItems: "flex-end" }}>
                 {/* Stops + Duration sind im Pending-Stub beide 0 / "Direkt" —
                     auch hier Em-Dash bis die echten Daten da sind. */}
-                <Text style={isDirect ? styles.stopsTextDirect : styles.stopsText}>
+                <Text style={[isDirect ? styles.stopsTextDirect : styles.stopsText, isDirect && { color: accent.solid }]}>
                   {pending ? "—" : stopLabel}
                 </Text>
                 <Text style={styles.durationText}>
@@ -508,10 +551,10 @@ function DetailsContent({
                   haptic("button");
                   openLegTimelineOverlay();
                 }}
-                style={styles.detailsBtn}
+                style={[styles.detailsBtn, { borderColor: accent.solid }]}
               >
-                <Text style={styles.detailsBtnLabel}>{t("details.viewdetails")}</Text>
-                <ArrowRight size={15} color={C.lime} strokeWidth={2.5} />
+                <Text style={[styles.detailsBtnLabel, { color: accent.solid }]}>{t("details.viewdetails")}</Text>
+                <ArrowRight size={15} color={accent.solid} strokeWidth={2.5} />
               </RippleTouch>
             ) : null}
           </View>
@@ -540,13 +583,19 @@ function DetailsContent({
 
               <SectionHeader
                 title={t("details.bookticket")}
-                caption={`${providerCountLabel} · ${pricesLabel}`}
+                caption={
+                  flightOptionsLoading ? pricesLabel : `${providerCountLabel} · ${pricesLabel}`
+                }
               />
               <View style={styles.sectionContent}>
-                {/* Pending-State: nur Skeletons. Wir wissen noch gar nichts
-                    über Provider/Preise weil die Search-API noch läuft. Sobald
-                    `pending` false wird, switcht's auf die echten Cards. */}
-                {pending ? (
+                {/* Skeletons solange entweder der Surroundings-Stub noch die
+                    echte Search-API abwartet (`pending`) ODER die Flug-Buchungs-
+                    Optionen noch laden (`flightOptionsLoading`). In beiden Fällen
+                    kennen wir noch keine echten Preise — wir zeigen bewusst
+                    KEINEN Schätzpreis, sonst springt er beim Reinkommen der
+                    realen Optionen. Sobald die echten Provider da sind (oder ein
+                    ehrlicher Single-Provider-Fallback), switcht's auf die Cards. */}
+                {pending || flightOptionsLoading ? (
                   <>
                     <ProviderCardSkeleton />
                     <ProviderCardSkeleton />
@@ -557,17 +606,6 @@ function DetailsContent({
                     {providerList.map((p, i) => (
                       <ProviderCard key={`${p.name}-${i}`} provider={p} t={t} />
                     ))}
-                    {/* Skeletons zusätzlich für Flug-Multi-Provider-Liste,
-                        solange `getBookingDetails` lädt — wir zeigen den
-                        Airline-Fallback aus dem Search-Result + 3 Skeletons
-                        für die weiteren OTAs die gleich nachkommen. */}
-                    {isFlight && optionsQuery.isLoading && remoteOptions.length === 0 ? (
-                      <>
-                        <ProviderCardSkeleton />
-                        <ProviderCardSkeleton />
-                        <ProviderCardSkeleton />
-                      </>
-                    ) : null}
                   </>
                 )}
               </View>
@@ -631,10 +669,15 @@ function hasSupport24_7(providerName: string): boolean {
   return false;
 }
 
-function toProviderRow(o: FlightBookingOption): ProviderRow {
+function toProviderRow(o: FlightBookingOption, fallbackUrl: string): ProviderRow {
   return {
     name: o.name,
-    url: flightBookingUrl(o.providerToken),
+    // Serverseitig aufgelöster Direkt-Deeplink (führt zum echten Website-Preis,
+    // der auch in o.price steht). Falls die Auflösung serverseitig fehlschlug,
+    // NICHT den token-basierten /booking-url-Endpoint nehmen — dessen Token ist
+    // beim Tap meist abgelaufen → „token may be expired"-Error. Stattdessen der
+    // allgemeine Redirect (landet auf dem Flug bei Google Flights statt Error).
+    url: o.resolvedUrl ?? fallbackUrl,
     price: o.price,
     currency: o.currency,
     logo: o.website ? `https://www.google.com/s2/favicons?sz=64&domain=${o.website}` : undefined,
@@ -691,6 +734,7 @@ function ProviderCard({
   provider: ProviderRow;
   t: (key: string) => string;
 }) {
+  const accent = useAccent();
   // Wenn das Logo-Bild fehlerhaft lädt, fallen wir nach dem onError auf
   // den 2-Letter-Code-Fallback zurück. Verhindert dass die Provider-Card
   // mit einer leeren transparenten Logo-Box endet.
@@ -715,11 +759,17 @@ function ProviderCard({
   const showSupport = provider.support === true;
   const showBaggage = provider.carryOn !== undefined || provider.checked !== undefined;
   return (
-    <View style={[styles.providerCard, isRec && styles.providerCardRecommended]}>
+    <View
+      style={[
+        styles.providerCard,
+        isRec && styles.providerCardRecommended,
+        isRec && { borderColor: accent.solid },
+      ]}
+    >
       {/* Empfohlener-Anbieter-Pille oben — nur beim günstigsten Provider. */}
       {isRec ? (
         <View style={styles.recommendedRow}>
-          <View style={styles.recommendedBadge}>
+          <View style={[styles.recommendedBadge, { backgroundColor: accent.solid }]}>
             <Award size={13} color={C.black} strokeWidth={2.4} />
             <Text style={styles.recommendedText}>{t("details.recommended")}</Text>
             <Info size={12} color="rgba(0,0,0,0.55)" strokeWidth={2} />
@@ -756,7 +806,7 @@ function ProviderCard({
         </View>
         <View style={{ alignItems: "flex-end" }}>
           <Text style={styles.priceLabel}>{t("details.priceprefix")}</Text>
-          <Text style={styles.priceValue}>
+          <Text style={[styles.priceValue, { color: accent.solid }]}>
             {provider.price !== undefined && provider.price > 0
               ? `${provider.price.toFixed(0)} ${(provider.currency ?? "EUR").toUpperCase()}`
               : "—"}
@@ -767,8 +817,8 @@ function ProviderCard({
       {/* 24/7-Service Pille — nur wenn der Anbieter dafür bekannt ist. */}
       {showSupport ? (
         <View style={styles.serviceRow}>
-          <View style={styles.serviceCheck}>
-            <Check size={11} color={C.lime} strokeWidth={3.2} />
+          <View style={[styles.serviceCheck, { backgroundColor: accent.subtle }]}>
+            <Check size={11} color={accent.solid} strokeWidth={3.2} />
           </View>
           <Text style={styles.serviceText}>{t("details.support247")}</Text>
         </View>
@@ -817,10 +867,11 @@ function ProviderCard({
  *  = farbig + lime Check-Badge, inaktiv = ausgegraut + rotes X-Badge. */
 function BaggageCell({ active, icon }: { active: boolean; icon: "carryOn" | "checked" }) {
   const Icon = icon === "carryOn" ? Briefcase : Luggage;
+  const accent = useAccent();
   return (
     <View style={styles.baggageCell}>
       <Icon size={22} color={active ? C.text : C.subDim} strokeWidth={1.8} />
-      <View style={[styles.baggageBadge, { backgroundColor: active ? C.lime : C.surface3 }]}>
+      <View style={[styles.baggageBadge, { backgroundColor: active ? accent.solid : C.surface3 }]}>
         {active ? (
           <Check size={8} color={C.black} strokeWidth={3.5} />
         ) : (
@@ -841,6 +892,11 @@ function ProviderCardSkeleton() {
   const pulse = useSharedValue(0.5);
   useEffect(() => {
     pulse.value = withRepeat(withTiming(0.9, { duration: 900 }), -1, true);
+    // Cleanup: ohne cancelAnimation läuft der withRepeat-Loop für IMMER auf
+    // dem UI-Thread weiter, auch nach Unmount. 3 Skeletons × jedes Mal wenn
+    // DetailsOverlay öffnet = nach 10 Opens 30 Geister-Worklets die pro Frame
+    // evaluiert werden → spürbarer App-weiter Slowdown über die Zeit.
+    return () => cancelAnimation(pulse);
   }, [pulse]);
   const pulseStyle = useAnimatedStyle(() => ({ opacity: pulse.value }));
   return (
@@ -946,7 +1002,7 @@ const styles = StyleSheet.create({
   trainTimeDash: { color: C.sub },
   trainVia: { fontSize: 13, color: C.sub, marginTop: 3, fontWeight: "500" },
   stopsText: { fontSize: 13, fontWeight: "700", color: C.alert },
-  stopsTextDirect: { fontSize: 13, fontWeight: "700", color: C.lime },
+  stopsTextDirect: { fontSize: 13, fontWeight: "700" },
   durationText: { fontSize: 13, color: C.sub, marginTop: 3, fontWeight: "500" },
 
   /* Details ghost button */
@@ -962,7 +1018,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     gap: 6,
   },
-  detailsBtnLabel: { color: C.lime, fontSize: 14, fontWeight: "700", letterSpacing: -0.15 },
+  detailsBtnLabel: { fontSize: 14, fontWeight: "700", letterSpacing: -0.15 },
 
   /* Section */
   sectionHeader: { paddingTop: 24, paddingBottom: 12 },
@@ -1000,7 +1056,8 @@ const styles = StyleSheet.create({
   },
   providerCardRecommended: {
     borderWidth: 1.5,
-    borderColor: C.lime,
+    // borderColor wird inline auf accent.solid gesetzt (dynamischer Akzent) —
+    // ohne borderColor rendert RN die Border sonst schwarz.
   },
 
   /* „Empfohlener Anbieter" Badge oben */
@@ -1008,7 +1065,7 @@ const styles = StyleSheet.create({
   recommendedBadge: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: C.lime,
+
     borderRadius: 9999,
     paddingVertical: 5,
     paddingHorizontal: 10,
@@ -1037,7 +1094,7 @@ const styles = StyleSheet.create({
     width: 18,
     height: 18,
     borderRadius: 999,
-    backgroundColor: C.limeSoft,
+
     alignItems: "center",
     justifyContent: "center",
   },
@@ -1118,7 +1175,7 @@ const styles = StyleSheet.create({
     letterSpacing: 0.8,
     textTransform: "uppercase",
   },
-  priceValue: { fontSize: 22, fontWeight: "800", color: C.lime, letterSpacing: -0.5, marginTop: 2 },
+  priceValue: { fontSize: 22, fontWeight: "800", letterSpacing: -0.5, marginTop: 2 },
   providerCta: {
     // Kein backgroundColor — der GradientFill rendert als Absolute-Fill-Child
     // den Hintergrund. `overflow: hidden` clipped den Gradient an der

@@ -1,4 +1,4 @@
-import { memo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { View, Text, Share, Image, StyleSheet } from "react-native";
 import { useRouter, usePathname, useLocalSearchParams } from "expo-router";
 import { Heart, Share2, Plane, Train, Bus, Ship, ChevronRight, Route as RouteIcon } from "lucide-react-native";
@@ -14,6 +14,7 @@ import { useSearchStore } from "@/stores/searchStore";
 import { useT } from "@/lib/i18n/useT";
 import { formatTimeInZone, formatDateInZone } from "@/lib/time-format";
 import { redirectUrl, fetchTripPolylines, fetchFlightBookingOptions } from "@/lib/api/client";
+import { useAccent } from "@/lib/theme/accent";
 import { useQueryClient } from "@tanstack/react-query";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
@@ -61,19 +62,37 @@ function currencyCode(code: string): string {
 }
 
 function ResultCardInner({ result, passengers = 1 }: Props) {
+  const accent = useAccent();
   const t = useT();
   const router = useRouter();
   const pathname = usePathname();
   const currentParams = useLocalSearchParams();
-  const savedTrips = useSearchStore((s) => s.savedTrips);
-  const toggleSavedTrip = useSearchStore((s) => s.toggleSavedTrip);
-  const selectResult = useSearchStore((s) => s.selectResult);
-  const showSavedToast = useSearchStore((s) => s.showSavedToast);
-  const setRoute = useSearchStore((s) => s.setRoute);
-  const setRoutePolylines = useSearchStore((s) => s.setRoutePolylines);
+  // Sig pro Render einmal berechnen statt im Selector und im handleSave-
+  // Callback erneut.
+  const resultSig = useMemo(() => tripSignature(result), [result]);
+  // KRITISCH: Subscribe nur zum Boolean ob DIESES result gespeichert ist,
+  // NICHT zur ganzen savedTrips-Array. Vorher: jeder Save → savedTrips
+  // bekommt neue Array-Ref → alle 5-20 sichtbaren ResultCards re-rendern
+  // + iterieren ALLE saved trips für ihren .some()-Check. Wachstum:
+  // O(N_cards × M_saved) pro Save → mit jedem gespeicherten Trip wurde die
+  // App messbar langsamer.
+  // Jetzt: O(1) Set-Lookup auf `savedTripSignatures` + Boolean-Vergleich
+  // → Re-Render dieser einen Card nur wenn IHR favored-State sich ändert,
+  // unabhängig wie viele Trips gespeichert sind.
+  const favored = useSearchStore((s) => s.savedTripSignatures.has(resultSig));
+  // App-Sprache für die Deeplink-Lokalisierung (Teil des Prefetch-QueryKeys,
+  // muss mit DetailsOverlay übereinstimmen damit der Prefetch-Cache greift).
+  const locale = useSearchStore((s) => s.locale);
+  // Actions sind stable refs → wir holen sie direkt aus getState() statt
+  // sie zu subscriben. Sonst hängen pro ResultCard 4 zusätzliche Store-
+  // Subscriber-Slots, die bei JEDER Store-Mutation ihren Selector evaluieren
+  // (auch wenn das Ergebnis derselbe Function-Ref ist). Bei 5-20 sichtbaren
+  // Cards × 4 Subscriptions wird das spürbar.
+  const toggleSavedTrip = useSearchStore.getState().toggleSavedTrip;
+  const selectResult = useSearchStore.getState().selectResult;
+  const setRoute = useSearchStore.getState().setRoute;
+  const setRoutePolylines = useSearchStore.getState().setRoutePolylines;
   const queryClient = useQueryClient();
-  const resultSig = tripSignature(result);
-  const favored = savedTrips.some((trip) => tripSignature(trip) === resultSig);
 
   const bookUrl = result.redirectToken
     ? redirectUrl(result.redirectToken)
@@ -99,7 +118,22 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
     // Overlay-Pattern: nur den Store füllen — DetailsOverlay im _layout
     // hört auf `selectedResult` und slidet rein. Kein router.push mehr,
     // also keine Navigation-Stack-Mount-Arbeit die den Slide-Start verzögert.
-    selectResult(result, passengers);
+    //
+    // Zusätzlich Route-Kontext mit speichern. Die Overlays (DetailsOverlay/
+    // LegTimelineOverlay) sind global gemountet → ihre eigenen useLocalSearchParams
+    // liefern leere Objekte. Damit „Show on Map" aus dem LegTimeline später
+    // sauber via previousHref zurück zur Ergebnis-Liste navigieren kann, muss
+    // hier (im Results-Screen, wo die echten Params verfügbar sind) der Kontext
+    // mit eingefangen werden.
+    const paramsObj: Record<string, string> = {};
+    for (const [k, v] of Object.entries(currentParams)) {
+      if (typeof v === "string") paramsObj[k] = v;
+      else if (Array.isArray(v) && typeof v[0] === "string") paramsObj[k] = v[0];
+    }
+    selectResult(result, passengers, {
+      pathname,
+      params: Object.keys(paramsObj).length > 0 ? paramsObj : undefined,
+    });
     haptic("important");
 
     // Prefetch: schon beim Card-Tap die Buchungs-Optionen für diesen Flug
@@ -109,7 +143,7 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
     // der Slide-Animation (die läuft auf der UI-Thread via Reanimated).
     if (result.mode === "FLIGHT" && result.bookingToken) {
       queryClient.prefetchQuery({
-        queryKey: ["flightBookingOptions", result.bookingToken, result.currency, passengers],
+        queryKey: ["flightBookingOptions", result.bookingToken, result.currency, passengers, locale],
         queryFn: () =>
           fetchFlightBookingOptions({
             token: result.bookingToken!,
@@ -118,6 +152,8 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
             departDate: result.departTime.slice(0, 10),
             passengers,
             currency: result.currency.toUpperCase(),
+            lang: locale,
+            searchPrice: result.price,
           }),
         staleTime: 5 * 60_000,
       });
@@ -132,13 +168,14 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
   function onToggleFav() {
     haptic("button");
     const justSaved = !favored;
+    // toggleSavedTrip batcht Save + Toast in einem set() (sonst zwei
+    // Render-Wellen). Hier nur noch die lokale Scale-Bounce-Animation.
     toggleSavedTrip(result, passengers);
     if (justSaved) {
       scale.value = withSequence(
         withTiming(0.92, { duration: 140, easing: Easing.out(Easing.quad) }),
         withTiming(1, { duration: 320, easing: Easing.elastic(1.5) })
       );
-      showSavedToast(result);
     }
   }
 
@@ -146,19 +183,14 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
     haptic("button");
     const plan = buildRoutePlan(result);
     if (!plan) return;
-    // pathname + Query-Params merken damit der Back-Arrow in Surroundings
-    // exakt zum Screen zurück springt — INKLUSIVE origin/destination/dates,
-    // sonst hat der Results-Screen keine Such-Parameter und zeigt leer an.
-    const params: Record<string, string> = {};
-    for (const [k, v] of Object.entries(currentParams)) {
-      if (typeof v === "string") params[k] = v;
-      else if (Array.isArray(v) && typeof v[0] === "string") params[k] = v[0];
-    }
-    setRoute({
-      ...plan,
-      previousHref: { pathname, params: Object.keys(params).length > 0 ? params : undefined },
-    });
-    router.navigate("/(tabs)/surroundings");
+    // PUSH /search/route-map IM selben Stack — KEIN Tab-Wechsel mehr,
+    // KEIN router.replace mit previousHref. Results-Screen bleibt drunter
+    // gemountet, Back im RouteMapScreen ruft router.back() → pop. Vorher
+    // ging das via Surroundings-Tab + router.replace, was beim Zurück-
+    // Navigieren den Results-Screen frisch mountete → Loader-Animation
+    // spielte unnötig wieder ab.
+    setRoute({ ...plan });
+    router.push("/search/route-map");
 
     const tripIds = plan.legs.map((l) => l.tripId).filter((id): id is string => Boolean(id));
     if (tripIds.length > 0) {
@@ -244,11 +276,11 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
         <View style={styles.timeCenter}>
           <Text style={styles.durationText}>{formatDuration(result.durationMinutes)}</Text>
           <View style={styles.dottedLineWrap}>
-            <View style={[styles.dot, { backgroundColor: isDirect ? C.lime : "#FFB266" }]} />
+            <View style={[styles.dot, { backgroundColor: isDirect ? accent.solid : "#FFB266" }]} />
             <View style={styles.dottedLine} />
-            <View style={[styles.dot, { backgroundColor: isDirect ? C.lime : "#FFB266" }]} />
+            <View style={[styles.dot, { backgroundColor: isDirect ? accent.solid : "#FFB266" }]} />
           </View>
-          <Text style={isDirect ? styles.statusDirect : styles.statusStops} numberOfLines={1}>
+          <Text style={[isDirect ? styles.statusDirect : styles.statusStops, isDirect && { color: accent.solid }]} numberOfLines={1}>
             {stopLabel}
           </Text>
         </View>
@@ -293,7 +325,7 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
       <View style={styles.footerRow}>
         <View style={styles.priceCol}>
           {result.price > 0 ? (
-            <Text style={styles.priceText}>
+            <Text style={[styles.priceText, { color: accent.solid }]}>
               <Text style={styles.priceLabelInline}>{t("results.from")} </Text>
               {result.price.toFixed(0)}
               <Text style={styles.priceCurrency}>  {currencyCode(result.currency)}</Text>
@@ -369,7 +401,8 @@ const styles = StyleSheet.create({
     width: "100%",
     gap: 4,
   },
-  dot: { width: 6, height: 6, borderRadius: 3, backgroundColor: C.lime },
+  // backgroundColor inline mit accent.solid gesetzt am Use-Site.
+  dot: { width: 6, height: 6, borderRadius: 3 },
   dottedLine: {
     flex: 1,
     height: 0,
@@ -377,7 +410,8 @@ const styles = StyleSheet.create({
     borderColor: C.subDim,
     borderStyle: "dashed",
   },
-  statusDirect: { color: C.lime, fontWeight: "700", fontSize: 12 },
+  // color inline mit accent.solid gesetzt.
+  statusDirect: { fontWeight: "700", fontSize: 12 },
   statusStops: { color: "#FFB266", fontWeight: "700", fontSize: 12 },
 
   metaRow: {
@@ -400,7 +434,8 @@ const styles = StyleSheet.create({
   },
   priceCol: { flex: 1 },
   priceLabelInline: { color: C.sub, fontSize: 11, fontWeight: "700", letterSpacing: 0.4 },
-  priceText: { color: C.lime, fontSize: 22, fontWeight: "800", letterSpacing: -0.5 },
+  // color inline mit accent.solid gesetzt.
+  priceText: { fontSize: 22, fontWeight: "800", letterSpacing: -0.5 },
   priceCurrency: { color: C.text, fontSize: 12, fontWeight: "700", letterSpacing: 0 },
   priceUnknownText: { color: C.sub, fontSize: 13, fontWeight: "600", marginTop: 1 },
   cta: {

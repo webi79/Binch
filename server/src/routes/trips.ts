@@ -209,6 +209,10 @@ async function fetchTripBody(
 async function fetchTripDetail(
   tripId: string,
   fromStopId: string | undefined,
+  fromStopLabel: string | undefined,
+  fromStopLat: number | undefined,
+  fromStopLng: number | undefined,
+  boardDirection: string | undefined,
   profile: HafasProfileKey,
 ): Promise<TripDetailResponse | null> {
   const trip = await fetchTripBody(profile, tripId);
@@ -219,15 +223,153 @@ async function fetchTripDetail(
   // Slice unten.
   const rawStops = trip.stopovers ?? [];
 
-  // Falls `fromStopId` angegeben ist: schneide die Stop-Liste ab dem User-Stop
-  // ab. Beispiel: Bus 245 fährt 17:56→18:34, User steigt um 18:08 am Lüneburg-
-  // str-Halt ein. Wir wollen 18:08→18:34 anzeigen, nicht die volle Linie.
-  // Match per HAFAS-Stop-ID (zuverlässig). Wenn der Stop nicht gefunden wird,
-  // fallen wir zurück auf den vollen Trip (besser irgendwas zeigen als nichts).
+  // Slice die Stop-Liste auf den User-Halt (Beispiel: Bus 245 fährt 17:56→18:34,
+  // User steigt um 18:08 ein → wir wollen 18:08→18:34 anzeigen, nicht die volle
+  // Linie inklusive der Stops vor dem User). Mehrere Match-Strategien probiert,
+  // weil HAFAS-IDs zwischen Stop-Board und Trip-Stopovers nicht immer 1:1
+  // matchen (Stops haben oft Station-vs-Platform-Hierarchie):
+  //   1. Exakter Stop-ID-Match
+  //   2. ID-Prefix-Match (parent_station vs platform_id Variation)
+  //   3. Name-Match (fuzzy, lowercase) — case der User-Stop kein hafas_id hat
+  //      oder die IDs einfach nicht übereinstimmen (passiert bei Berlin BVG-
+  //      Bus-Stops wo VBB-IDs anders sind als BVG-Trip-IDs)
+  // Common city-name-Varianten zwischen englisch (in unseren GTFS-Labels)
+  // und deutsch (in HAFAS-Trip-Bodies). Müssen normalisiert werden sonst
+  // matched „Munich Chiemgaustraße" nicht „München, Chiemgaustraße".
+  const cityAliases: Record<string, string> = {
+    munich: "münchen",
+    cologne: "köln",
+    vienna: "wien",
+    nuremberg: "nürnberg",
+    geneva: "genf",
+    zurich: "zürich",
+    prague: "prag",
+    warsaw: "warschau",
+    // „Hauptbahnhof" → „hbf" damit beide Schreibweisen denselben Token
+    // erzeugen. Praxis-Bug: User-Label „Berlin Hbf" tokenized zu [berlin, hbf],
+    // HAFAS-Trip-Stop „Berlin Hauptbahnhof" → ohne Alias zu [berlin, …] und
+    // matched nicht — wir landen stattdessen auf „Berlin Mahlsdorf" das auch
+    // „berlin" hat aber 22 km woanders ist.
+    hauptbahnhof: "hbf",
+  };
+  // Tokenizer: lowercase, Sonderzeichen (inkl. Bindestriche, Slashes, Punkte)
+  // zu Whitespace, in Wörter splitten, City-Aliase normalisieren.
+  // Bindestriche MÜSSEN gesplittet werden — sonst wird „Hamm-Westtünnen" zu
+  // einem einzigen Token „hamm-westtünnen" der weder „hamm" noch „westtünnen"
+  // matched. Praxis-Bug: User tippte „Hamm Westtünnen Bahnhof" im Surroundings,
+  // Trip-Stops hatten „Hamm-Westtünnen" — kein Match → falscher Slice-Start.
+  // Stop-Words wie „bahnhof"/„station" filtern wir weg sonst pollen sie die
+  // Match-Scores: „Hessen Bahnhof Hamm Westf" hätte sonst auf {hamm, bahnhof}
+  // = 2 Tokens gematched obwohl Bahnhof ein Generic-Qualifier ist.
+  // ABER: „Hbf" / „Hauptbahnhof" BEHALTEN wir als Token — die sind so spezifisch
+  // dass sie zwischen sub-Stops in einer Stadt unterscheiden (Berlin Hbf vs
+  // Berlin Mahlsdorf). Via cityAliases werden die zwei Schreibweisen unifiziert.
+  const STOP_WORDS = new Set([
+    "bahnhof", "bahnhst", "bahnsteig", "bahnsteige",
+    "station", "stop", "stops", "haltestelle", "halt",
+    "gleis", "platform", "platt",
+    // DB-/regional-Qualifier („Hamm Westf", „Bad Münster a Stein")
+    "westf", "westfalen", "westfälisch",
+    // Generische Straßen-/Wege-/Brücken-Bezeichner — zu unscharf um zwischen
+    // Stops zu unterscheiden. Praxis-Bug: „Tegeler Weg/Jungfernheide" matched
+    // fälschlich „Gandenitzer Weg, Berlin" auf {weg, berlin} = 2 Tokens und
+    // gewinnt damit den ersten Iterations-Slot, „Jungfernheide Bahnhof"
+    // verliert via > statt >=.
+    "weg", "wege",
+    "str", "straße", "strasse",
+    "brücke", "brucke",
+    "platz",
+    "allee",
+    "gasse",
+    "ring",
+    "ufer",
+  ]);
+  const tokenize = (s: string): string[] => {
+    const cleaned = s.toLowerCase().replace(/[,()./\-]/g, " ").replace(/\s+/g, " ").trim();
+    return cleaned
+      .split(" ")
+      .map((w) => cityAliases[w] ?? w)
+      .filter((w) => w.length > 2 && !STOP_WORDS.has(w));
+  };
+
+  // Haversine in Metern — für den Coord-Fallback unten. Ein bisschen
+  // overkill für kurze Distanzen (man könnte auch dx²+dy² in Lat/Lon nehmen)
+  // aber die korrekte Form ist hier schnell genug (200 stops × 1 Trig-Calc).
+  const haversineMeters = (la1: number, lo1: number, la2: number, lo2: number): number => {
+    const R = 6_371_000;
+    const dLat = ((la2 - la1) * Math.PI) / 180;
+    const dLon = ((lo2 - lo1) * Math.PI) / 180;
+    const a = Math.sin(dLat / 2) ** 2
+      + Math.cos((la1 * Math.PI) / 180) * Math.cos((la2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(a));
+  };
+
   let startIdx = 0;
   if (fromStopId) {
     const idx = rawStops.findIndex((s) => s.stop?.id === fromStopId);
     if (idx >= 0) startIdx = idx;
+    else {
+      // Prefix-Match: trip-stops könnten Platform-IDs sein (parentId + Suffix)
+      const idx2 = rawStops.findIndex((s) => s.stop?.id?.startsWith(fromStopId + ":")
+        || (s.stop?.id && fromStopId.startsWith(s.stop.id + ":")));
+      if (idx2 >= 0) startIdx = idx2;
+    }
+  }
+  // Coord-Match (PRIMARY-SIGNAL wenn beide Coords vorhanden): finde den
+  // Trip-Stop der am nächsten zu unseren DB-Coords liegt. Token-Match
+  // unten ist ein guter Fallback, scheitert aber bei generischen Namen.
+  // Coords sind zuverlässig weil Bus-/Bahn-Stops geographisch eindeutig
+  // sind. Schwelle 500 m: HAFAS-Trip-Bodies enthalten oft nicht JEDEN
+  // physischen Stop sondern nur die wichtigsten (z.B. M21 listet
+  // „Jungfernheide Bahnhof" aber nicht „Tegeler Weg" 360m daneben — der
+  // User steht aber an Tegeler Weg). 500m fängt diesen Fall und ist eng
+  // genug um nicht zwischen 2 echten Stops zu verwechseln (urban inter-
+  // stop-distance liegt typisch 200-500m).
+  if (startIdx === 0 && fromStopLat != null && fromStopLng != null) {
+    let bestIdx = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < rawStops.length; i++) {
+      const loc = rawStops[i]!.stop?.location;
+      if (!loc || loc.latitude == null || loc.longitude == null) continue;
+      const d = haversineMeters(fromStopLat, fromStopLng, loc.latitude, loc.longitude);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx >= 0 && bestDist <= 500) startIdx = bestIdx;
+  }
+  if (startIdx === 0 && fromStopLabel) {
+    // Token-Set-Match: wir vergleichen distinktive Wörter, nicht Substrings.
+    // Beispiel: User-Label "Munich Chiemgaustraße" → tokens [munich→münchen,
+    // chiemgaustraße]. HAFAS-Stop "München, Chiemgaustraße" → tokens [münchen,
+    // chiemgaustraße]. Beide haben dieselbe Token-Menge → Match.
+    // Robust gegen Sprache (DE/EN-Stadtnamen) und Format-Variationen
+    // (Komma vs. Klammer-Klammer-Format).
+    const wantedTokens = new Set(tokenize(fromStopLabel));
+    if (wantedTokens.size > 0) {
+      // Bester Match = meiste überlappende Tokens. Bei Gleichstand: erster
+      // im Trip (kommt früher).
+      let bestIdx = -1;
+      let bestOverlap = 0;
+      for (let i = 0; i < rawStops.length; i++) {
+        const name = rawStops[i]!.stop?.name;
+        if (!name) continue;
+        const stopTokens = tokenize(name);
+        let overlap = 0;
+        for (const tok of stopTokens) if (wantedTokens.has(tok)) overlap++;
+        // Mindestens 1 token muss überlappen UND es muss ein "wirklicher"
+        // Match sein (nicht nur ein zufälliges "münchen" das in 100 Stops
+        // vorkommt). Wir verlangen Overlap >= min(2, wantedTokens.size) — also
+        // bei kurzen Labels (1 Token) reicht 1, bei längeren mind. 2.
+        const required = Math.min(2, wantedTokens.size);
+        if (overlap >= required && overlap > bestOverlap) {
+          bestOverlap = overlap;
+          bestIdx = i;
+        }
+      }
+      if (bestIdx >= 0) startIdx = bestIdx;
+    }
   }
   const slicedStops = rawStops.slice(startIdx);
   if (slicedStops.length === 0) return null;
@@ -282,7 +424,16 @@ async function fetchTripDetail(
   const originId = firstStop.stop?.id ?? trip.origin?.id ?? "";
   const destinationId = lastStop.stop?.id ?? trip.destination?.id ?? "";
   const originName = firstStop.stop?.name ?? trip.origin?.name ?? "";
-  const destinationName = lastStop.stop?.name ?? trip.destination?.name ?? "";
+  // destinationName: bevorzugt `trip.direction` (der Headsign-Name den der
+  // User auf dem Bus-Display sieht — z.B. „S+U Pankow"), nicht der operative
+  // letzte Halt (z.B. „Hadlichstr." wo die M27 nur wendet). Der User wählt
+  // den Bus nach Headsign aus, das soll konsistent in der Trip-Detail-Header
+  // sein. Stop-Liste selbst zeigt unverändert ALLE realen Stops bis zum
+  // technischen Endhalt.
+  // Reihenfolge: 1. Board-Direction (das was der User auf der getappten Card
+  // gesehen hat — höchste Konsistenz), 2. trip.direction (HAFAS-Headsign),
+  // 3. lastStop.stop.name, 4. trip.destination.name.
+  const destinationName = (boardDirection?.trim() || trip.direction?.trim() || lastStop.stop?.name || trip.destination?.name) ?? "";
   const originLat = firstStop.stop?.location?.latitude ?? trip.origin?.location?.latitude;
   const originLng = firstStop.stop?.location?.longitude ?? trip.origin?.location?.longitude;
   const destLat = lastStop.stop?.location?.latitude ?? trip.destination?.location?.latitude;
@@ -350,10 +501,21 @@ const tripDetailQuerySchema = z.object({
    *  Trip-Stop-Liste ab diesem Stop (zeigt nur ab-User-Halt bis Endstation
    *  statt ganzer Linie). */
   fromStopId: z.string().optional(),
+  /** Optional: Label des User-Halts (Name). Wird zusätzlich zur ID als
+   *  Fallback genutzt — manche Stops haben keine konsistente hafas_id
+   *  zwischen unseren Quellen, dann muss per Name gematched werden. */
+  fromStopLabel: z.string().optional(),
   /** Optional: Stop-Code unseres internen `locations.code`-Schemas (z.B.
    *  `gtfs:at:…` oder `sta:8011160`). Daraus leiten wir das HAFAS-Profile ab.
    *  Wenn fehlend, fallen wir auf "db" (Deutschland) zurück. */
   stopCode: z.string().optional(),
+  /** Optional: Direction-Label aus dem Board (wie es auf der getappten
+   *  Card stand, z.B. „Charlottenburg, Goerdelersteg"). Wird als destLabel
+   *  bevorzugt — sonst stimmt das Trip-Detail nicht mit dem überein was
+   *  der User vor dem Tap gesehen hat. HAFAS' `trip.direction` ist manchmal
+   *  ein anderer Headsign-Wert als der Board-Eintrag (z.B. M21 zeigt im
+   *  Board „Goerdelersteg" aber im Trip-Body steht „S+U Jungfernheide"). */
+  direction: z.string().optional(),
 });
 
 export async function tripsRoutes(app: FastifyInstance) {
@@ -394,6 +556,13 @@ export async function tripsRoutes(app: FastifyInstance) {
     // (vor/vvt/svv/etc.) — die holen wir per DB-Lookup. Ein extra Query pro
     // Trip-Detail-Call, aber das ist billig (indizierter Primary-Key).
     let profile: HafasProfileKey = "db";
+    // Stop-Coords aus unserer DB — werden im Slice-Match als Coord-Primary-
+    // Signal benutzt. Geographische Match-Strategie ist robuster als Namens-
+    // Tokens (Praxis-Bug: User-Stop „Kolschitzkygasse" matched nichts im
+    // Trip-Body weil HAFAS andere Schreibweise nutzt → wir landen auf dem
+    // Trip-Start „Wien Liesing Bahnhof" statt Kolschitzkygasse).
+    let stopLat: number | undefined;
+    let stopLng: number | undefined;
     if (parsed.data.stopCode) {
       const row = await db
         .select({
@@ -405,17 +574,23 @@ export async function tripsRoutes(app: FastifyInstance) {
         .where(eq(locations.code, parsed.data.stopCode))
         .limit(1);
       const r = row[0];
+      stopLat = r?.latitude != null ? Number(r.latitude) : undefined;
+      stopLng = r?.longitude != null ? Number(r.longitude) : undefined;
       profile =
         profileForStop({
           code: parsed.data.stopCode,
           country: r?.country ?? null,
-          latitude: r?.latitude != null ? Number(r.latitude) : null,
-          longitude: r?.longitude != null ? Number(r.longitude) : null,
+          latitude: stopLat ?? null,
+          longitude: stopLng ?? null,
         }) || "db";
     }
     const detail = await fetchTripDetail(
       parsed.data.tripId,
       parsed.data.fromStopId,
+      parsed.data.fromStopLabel,
+      stopLat,
+      stopLng,
+      parsed.data.direction,
       profile,
     );
     if (!detail) {

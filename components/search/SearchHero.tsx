@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Animated, {
   Easing,
   useAnimatedStyle,
@@ -10,16 +10,15 @@ import {
   Text,
   Pressable,
   ScrollView,
-  ImageBackground,
   StyleSheet,
   Platform,
+  type ViewStyle,
 } from "react-native";
+import { BinchHero, pickTimeOfDay, type HeroCategory } from "./BinchHero";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import { SegmentedToggle } from "@/components/ui/SegmentedToggle";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { LinearGradient } from "expo-linear-gradient";
-import DateTimePicker, {
-  DateTimePickerEvent,
-} from "@react-native-community/datetimepicker";
 import {
   Plane,
   Train,
@@ -36,8 +35,8 @@ import { Location, TravelMode } from "@/types/search";
 import { useT } from "@/lib/i18n/useT";
 import { useSearchStore } from "@/stores/searchStore";
 import { haptic } from "@/lib/haptics";
-import { LocationPicker } from "./LocationPicker";
 import { POPULAR_LOCATIONS } from "@/lib/data/popularLocations";
+import { useAccent } from "@/lib/theme/accent";
 
 const C = {
   bg: "#1A1A1A",
@@ -63,11 +62,14 @@ const DATE_LOCALES: Record<string, DateLocale> = {
   es: esLocale,
 };
 
-const HERO_IMAGES: Record<TravelMode, ReturnType<typeof require>> = {
-  FLIGHT: require("@/assets/search/fliegen.png"),
-  TRAIN: require("@/assets/search/trains.png"),
-  BUS: require("@/assets/search/buses.png"),
-  CRUISE: require("@/assets/search/cruises.png"),
+// Mapping unserer internen TravelMode-Codes auf die BinchHero-Categories.
+// BinchHero benutzt deutsche Slugs als Seed-Keys (flug/zug/bus/kreuzfahrt) —
+// jede Category bekommt eine eigene Dünen-Skyline-Phase.
+const HERO_CATEGORY: Record<TravelMode, HeroCategory> = {
+  FLIGHT: "flug",
+  TRAIN: "zug",
+  BUS: "bus",
+  CRUISE: "kreuzfahrt",
 };
 
 const MODE_ICON: Record<TravelMode, LucideIcon> = {
@@ -90,7 +92,10 @@ function tripTypesFor(mode: TravelMode): { id: TripType; key: string }[] {
     { id: "roundtrip", key: "search.tabs.roundtrip" },
     { id: "oneway", key: "search.tabs.oneway" },
   ];
-  if (mode === "FLIGHT") base.push({ id: "multicity", key: "search.tabs.multicity" });
+  // Multi-City ist noch nicht implementiert (kein Leg-Input, kein Server-Contract)
+  // → Tab vorerst ausgeblendet, damit er nicht ins Leere läuft. Wird als eigenes
+  // Feature nachgezogen (Client-UI + SearchParams.legs[] + beide Provider-Adapter).
+  // if (mode === "FLIGHT") base.push({ id: "multicity", key: "search.tabs.multicity" });
   return base;
 }
 
@@ -115,6 +120,7 @@ export function SearchHero({ mode }: Props) {
   const t = useT();
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const accent = useAccent();
   const locale = useSearchStore((s) => s.locale);
   const currency = useSearchStore((s) => s.currency);
   const addRecentSearch = useSearchStore((s) => s.addRecentSearch);
@@ -129,8 +135,24 @@ export function SearchHero({ mode }: Props) {
   const [returnDate, setReturnDate] = useState<Date | null>(null);
   const [pax, setPax] = useState(1);
   const [extraOpt, setExtraOpt] = useState(0);
-  const [pickerField, setPickerField] = useState<"from" | "to" | null>(null);
-  const [dateField, setDateField] = useState<"depart" | "return" | null>(null);
+  // LocationPicker läuft jetzt am Root-Level via LocationPickerHost.
+  // Store-getriebene Open/Result-Flow, keine lokale pickerField-State mehr.
+  // Picker läuft am Root-Level via DatePickerHost. Wir lesen das Result
+  // aus dem Store; das Field kommt direkt im Result mit, kein lokaler
+  // pendingDateField nötig → keine zusätzliche Re-Render-Welle in SearchHero
+  // beim Tap. heroPaused wird in BinchHero direkt aus dem Store gelesen.
+  // Breite des Title-Text via onLayout messen → der Strich darunter
+  // bekommt genau diese Breite.
+  const [titleWidth, setTitleWidth] = useState(0);
+  // Sobald User auf irgendwas TAPPT (außer dem Tripty-Toggle), wird die
+  // Hero-Animation final beendet — Sonne bleibt wo sie ist, Vögel/Geister
+  // verschwinden sofort. Einmal getriggert, bleibt's so bis zum nächsten
+  // Open des Search-Sheets.
+  const [animFinished, setAnimFinished] = useState(false);
+  const finishAnim = () => {
+    if (!animFinished) setAnimFinished(true);
+  };
+
   // Welche Felder beim letzten Submit fehlerhaft waren → rote Border. Wird
   // sobald der User das jeweilige Feld ausfüllt automatisch geleert.
   const [errors, setErrors] = useState<Set<ErrorField>>(() => new Set());
@@ -145,6 +167,19 @@ export function SearchHero({ mode }: Props) {
   const Icon = MODE_ICON[mode];
   const tripTypes = useMemo(() => tripTypesFor(mode), [mode]);
   const extraOpts = useMemo(() => extraOptionsFor(mode), [mode]);
+  // BinchHero-Props stabil halten damit memo greift. Time-of-Day einmal beim
+  // Mount auswerten — würde sich während einer Session sowieso kaum ändern.
+  // Style ist ein Konstantenliteral, sonst gibt's jedes Render eine neue
+  // Referenz und memo muss tief comparen / passt nicht.
+  const heroCategory = HERO_CATEGORY[mode];
+  const heroTime = useMemo(() => pickTimeOfDay(), []);
+  const heroStyle = useMemo<ViewStyle>(() => ({ flex: 1, height: undefined }), []);
+  // paused=true wenn Modal offen ODER User irgendwas getappt hat (animFinished).
+  // Beides verhindert dass die Hero-Animations weiter spielen.
+  // heroPaused fokussiert nur auf animFinished — die Picker-States werden
+  // direkt in BinchHero subscribed (kein Pass-Through nötig, spart einen
+  // SearchHero-Re-Render bei jedem Picker-Open).
+  const heroPaused = animFinished;
   const tripTypeIds = tripTypes.map((tt) => tt.id);
   const isRoundtrip = tripType === "roundtrip";
 
@@ -159,47 +194,88 @@ export function SearchHero({ mode }: Props) {
   // Visuelles Feedback beim Tausch: das Icon rotiert um 180° pro Klick.
   // Kumulativ (180, 360, 540...), damit jeder Tap eine sichtbare halbe Drehung
   // liefert, statt immer auf 180° zu springen.
+  //
+  // WICHTIG: das Target wird in einem Ref getrackt, nicht aus swapRotation.value
+  // gelesen. Bei einem Doppelklick während die erste Animation noch läuft hat
+  // swapRotation.value einen interpolierten Zwischenwert (z.B. 90° statt 180°),
+  // und `swapRotation.value + 180 = 270` statt der erwarteten 360. Mit dem
+  // Target-Ref inkrementieren wir IMMER um 180 unabhängig vom Animation-State.
   const swapRotation = useSharedValue(0);
+  const swapRotationTarget = useRef(0);
   const swapIconStyle = useAnimatedStyle(() => ({
     transform: [{ rotate: `${swapRotation.value}deg` }],
   }));
   function handleSwap() {
     haptic("button");
+    finishAnim();
     setOrigin(destination);
     setDestination(origin);
-    swapRotation.value = withTiming(swapRotation.value + 180, {
+    swapRotationTarget.current += 180;
+    swapRotation.value = withTiming(swapRotationTarget.current, {
       duration: 320,
       easing: Easing.out(Easing.cubic),
     });
   }
 
-  function onPickerSelect(loc: Location) {
-    if (pickerField === "from") {
-      setOrigin(loc);
+  // Result vom Root-Level LocationPickerHost lesen.
+  const locationPickerResult = useSearchStore((s) => s.locationPickerResult);
+  const lastLocationSessionRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!locationPickerResult) return;
+    if (locationPickerResult.sessionKey === lastLocationSessionRef.current) return;
+    lastLocationSessionRef.current = locationPickerResult.sessionKey;
+    if (locationPickerResult.field === "from") {
+      setOrigin(locationPickerResult.location);
       clearError("origin");
-    } else if (pickerField === "to") {
-      setDestination(loc);
+    } else {
+      setDestination(locationPickerResult.location);
       clearError("destination");
     }
-  }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locationPickerResult]);
 
-  function onDateChange(_: DateTimePickerEvent, picked?: Date) {
-    if (Platform.OS === "android") setDateField(null);
-    if (!picked) return;
-    if (dateField === "depart") {
+  const openLocationPicker = useSearchStore((s) => s.openLocationPicker);
+  const triggerLocationPicker = (field: "from" | "to") => {
+    openLocationPicker({
+      field,
+      mode,
+      suggested: POPULAR_LOCATIONS[mode],
+    });
+  };
+
+  // Result vom Root-Level DatePickerHost lesen. sessionKey ändert sich pro
+  // Open, sodass wir das Result genau einmal anwenden. Field kommt direkt
+  // im Result mit → keine lokale pendingDateField-State nötig.
+  const datePickerResult = useSearchStore((s) => s.datePickerResult);
+  const lastAppliedSessionRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!datePickerResult) return;
+    if (datePickerResult.sessionKey === lastAppliedSessionRef.current) return;
+    lastAppliedSessionRef.current = datePickerResult.sessionKey;
+    const picked = datePickerResult.date;
+    if (datePickerResult.field === "depart") {
       setDepartDate(picked);
       clearError("depart");
-      // Rückreise vor neuem Hin-Datum → invalid, also reset. User muss bewusst
-      // neu wählen, damit die Pille nicht heimlich auf einen Tag wandert den
-      // er nicht gemeint hat.
       if (returnDate && returnDate < picked) setReturnDate(null);
-    } else if (dateField === "return") {
+    } else if (datePickerResult.field === "return") {
       setReturnDate(picked);
       clearError("return");
     }
-  }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [datePickerResult]);
+
+  const openDatePicker = useSearchStore((s) => s.openDatePicker);
+  const triggerDatePicker = (field: "depart" | "return") => {
+    openDatePicker({
+      field,
+      initialDate:
+        field === "depart" ? departDate : (returnDate ?? departDate),
+      minimumDate: field === "return" && departDate ? departDate : new Date(),
+    });
+  };
 
   function handleSubmit() {
+    finishAnim();
     // Fehlende/ungültige Felder einsammeln und rot umrandet markieren.
     const missing = new Set<ErrorField>();
     if (!origin) missing.add("origin");
@@ -229,52 +305,79 @@ export function SearchHero({ mode }: Props) {
     });
     closeSearchOverlay();
     const travelClass = extraOpts[extraOpt] ?? "";
-    router.push({
-      pathname: "/search/results",
-      params: {
-        mode,
-        origin: origin.code,
-        destination: destination.code,
-        originLabel: origin.label,
-        destLabel: destination.label,
-        departDate: departIso,
-        returnDate: returnIso,
-        tripType,
-        passengers: String(pax),
-        currency,
-        travelClass,
-      },
-    });
+    // Navigation HINTER die SlideOutDown-Animation des Overlays (350ms)
+    // schieben. Sonst mountet die Results-Screen mit FlatList + Loader +
+    // useQuery gleichzeitig während das Overlay nach unten slidet → JS-Last
+    // blockt die UI-Thread-Animation → sichtbare Frame-Drops. Mit setTimeout
+    // hat die Slide-Animation den Frame frei und der User sieht's smooth.
+    setTimeout(() => {
+      router.push({
+        pathname: "/search/results",
+        params: {
+          mode,
+          origin: origin.code,
+          destination: destination.code,
+          originLabel: origin.label,
+          destLabel: destination.label,
+          departDate: departIso,
+          returnDate: returnIso,
+          tripType,
+          passengers: String(pax),
+          currency,
+          travelClass,
+        },
+      });
+    }, 280);
   }
 
   const formatDate = (d: Date) => format(d, "EEE, d MMM", { locale: dateLocale });
 
   return (
     <View style={styles.container}>
-      <ImageBackground
-        source={HERO_IMAGES[mode]}
-        style={[styles.hero, { paddingTop: insets.top, height: 310 + insets.top }]}
-        resizeMode="cover"
-      >
+      <View style={[styles.hero, { paddingTop: insets.top, height: 310 + insets.top }]}>
+        {/* BinchHero mountet sofort beim Slide-In — Sky + Dünen sind also
+            schon da. Animationen (Sun-Rise, Bird-Spawn) sind intern
+            deferred bis nach Slide-Ende → konkurriert nicht mit der
+            SearchHeroOverlay-SlideInDown-Animation. */}
+        <View style={StyleSheet.absoluteFill}>
+          <BinchHero
+            category={heroCategory}
+            time={heroTime}
+            melt={C.bg}
+            style={heroStyle}
+            paused={heroPaused}
+          />
+        </View>
+
+        {/* Dezentes Overlay nur am Bottom für Titel-Lesbarkeit. BinchHero
+            bringt eh schon einen eigenen Bottom-Fade in `melt` (= C.bg).
+            Vorher war hier ein 60%-Schwarz mitten im Bild — das hat die
+            Sky-Farben der Animation matschig gemacht. */}
         <LinearGradient
-          colors={["transparent", "rgba(26,26,26,0.6)", C.bg]}
-          locations={[0, 0.55, 1]}
+          colors={["transparent", "transparent", "rgba(26,26,26,0.45)"]}
+          locations={[0, 0.7, 1]}
           style={StyleSheet.absoluteFill}
           pointerEvents="none"
         />
 
         <View style={[styles.logoWrap, { top: insets.top + 16 }]} pointerEvents="none">
           <Text style={styles.logo}>
-            B<Text style={styles.logoAccent}>i</Text>nch
+            B<Text style={[styles.logoAccent, { color: accent.solid }]}>i</Text>nch
           </Text>
         </View>
 
         <View style={styles.heroBottom}>
           <View style={styles.titleRow}>
-            <Text style={styles.heroTitle}>{heroTitle}</Text>
+            <Text
+              style={styles.heroTitle}
+              onLayout={(e) => setTitleWidth(e.nativeEvent.layout.width)}
+            >
+              {heroTitle}
+            </Text>
             <RippleTouch
               onPress={() => {
                 haptic("button");
+                finishAnim();
                 openVoiceOverlay();
               }}
               borderless
@@ -284,9 +387,17 @@ export function SearchHero({ mode }: Props) {
               <Mic color={C.white} size={20} />
             </RippleTouch>
           </View>
-          <View style={styles.greenBar} />
+          {/* Strich darunter mit exakter Text-Breite (via onLayout des
+              Title-Text gemessen). Damit spannt die Linie genau über das
+              "Flug suchen" und nicht darüber hinaus. */}
+          <View
+            style={[
+              styles.greenBar,
+              { width: titleWidth, backgroundColor: accent.solid },
+            ]}
+          />
         </View>
-      </ImageBackground>
+      </View>
 
       <ScrollView
         style={styles.form}
@@ -295,25 +406,11 @@ export function SearchHero({ mode }: Props) {
         keyboardShouldPersistTaps="handled"
       >
         {tripTypes.length > 1 ? (
-          <View style={styles.toggleRow}>
-            {tripTypes.map((tt) => {
-              const active = tt.id === tripType;
-              return (
-                <Pressable
-                  key={tt.id}
-                  onPress={() => {
-                    haptic("button");
-                    setTripType(tt.id);
-                  }}
-                  style={[styles.toggleBtn, active && styles.toggleBtnActive]}
-                >
-                  <Text style={[styles.toggleText, active && styles.toggleTextActive]}>
-                    {t(tt.key)}
-                  </Text>
-                </Pressable>
-              );
-            })}
-          </View>
+          <SegmentedToggle
+            items={tripTypes.map((tt) => ({ id: tt.id, label: t(tt.key) }))}
+            selectedId={tripType}
+            onChange={(id) => setTripType(id as TripType)}
+          />
         ) : null}
 
         <View style={styles.fromToRow}>
@@ -321,7 +418,11 @@ export function SearchHero({ mode }: Props) {
             style={[styles.fieldBox, styles.flex1, errors.has("origin") && styles.fieldBoxError]}
             onPress={() => {
               haptic("button");
-              setPickerField("from");
+              // Picker-Open ZUERST — finishAnim deferred (pausiert Hero
+              // Animationen, was einen heavy Re-Render triggert). Sonst
+              // konkurriert das mit dem Slide-In.
+              triggerLocationPicker("from");
+              requestAnimationFrame(finishAnim);
             }}
           >
             <Text style={styles.fieldLabel}>{fromLabel.toUpperCase()}</Text>
@@ -333,7 +434,7 @@ export function SearchHero({ mode }: Props) {
 
           <RippleTouch onPress={handleSwap} style={styles.swapBtn}>
             <Animated.View style={swapIconStyle}>
-              <ArrowLeftRight size={20} color={C.green} />
+              <ArrowLeftRight size={20} color={accent.solid} />
             </Animated.View>
           </RippleTouch>
 
@@ -341,7 +442,8 @@ export function SearchHero({ mode }: Props) {
             style={[styles.fieldBox, styles.flex1, errors.has("destination") && styles.fieldBoxError]}
             onPress={() => {
               haptic("button");
-              setPickerField("to");
+              triggerLocationPicker("to");
+              requestAnimationFrame(finishAnim);
             }}
           >
             <Text style={styles.fieldLabel}>{toLabel.toUpperCase()}</Text>
@@ -357,7 +459,14 @@ export function SearchHero({ mode }: Props) {
             style={[styles.fieldBox, styles.flex1, errors.has("depart") && styles.fieldBoxError]}
             onPress={() => {
               haptic("button");
-              setDateField("depart");
+              // Picker ZUERST öffnen — der ist der wichtige Visual-Effekt.
+              // finishAnim() pausiert die Hero-Animationen (BinchHero/
+              // BinchCreatures) und triggert einen schweren Re-Render des
+              // ganzen Hero-Subtrees. Wenn das vor triggerDatePicker läuft,
+              // konkurriert es mit dem Slide-In → janky. requestAnimationFrame
+              // defert es um genau einen Frame.
+              triggerDatePicker("depart");
+              requestAnimationFrame(finishAnim);
             }}
           >
             <Text style={styles.fieldLabel}>{t("search.date.depart").toUpperCase()}</Text>
@@ -371,7 +480,8 @@ export function SearchHero({ mode }: Props) {
               style={[styles.fieldBox, styles.flex1, errors.has("return") && styles.fieldBoxError]}
               onPress={() => {
                 haptic("button");
-                setDateField("return");
+                triggerDatePicker("return");
+                requestAnimationFrame(finishAnim);
               }}
             >
               <Text style={styles.fieldLabel}>{t("search.date.return").toUpperCase()}</Text>
@@ -389,6 +499,7 @@ export function SearchHero({ mode }: Props) {
               <RippleTouch
                 onPress={() => {
                   haptic("button");
+                  finishAnim();
                   setPax((p) => Math.max(1, p - 1));
                 }}
                 borderless
@@ -400,10 +511,11 @@ export function SearchHero({ mode }: Props) {
               <RippleTouch
                 onPress={() => {
                   haptic("button");
+                  finishAnim();
                   setPax((p) => Math.min(9, p + 1));
                 }}
                 borderless
-                style={[styles.paxBtn, styles.paxBtnPlus]}
+                style={[styles.paxBtn, styles.paxBtnPlus, { backgroundColor: accent.solid }]}
               >
                 <Text style={[styles.paxBtnText, styles.paxBtnTextDark]}>+</Text>
               </RippleTouch>
@@ -420,11 +532,12 @@ export function SearchHero({ mode }: Props) {
                     key={opt}
                     onPress={() => {
                       haptic("button");
+                      finishAnim();
                       setExtraOpt(i);
                     }}
-                    style={[styles.pill, active && styles.pillActive]}
+                    style={[styles.pill, active && [styles.pillActive, { backgroundColor: accent.subtle, borderColor: accent.solid }]]}
                   >
-                    <Text style={[styles.pillText, active && styles.pillTextActive]}>
+                    <Text style={[styles.pillText, active && [styles.pillTextActive, { color: accent.solid }]]}>
                       {t(opt)}
                     </Text>
                   </Pressable>
@@ -437,37 +550,18 @@ export function SearchHero({ mode }: Props) {
         <RippleTouch
           onPress={handleSubmit}
           rippleColor="rgba(0,0,0,0.32)"
-          style={styles.cta}
+          style={[styles.cta, { backgroundColor: accent.solid }]}
         >
           <Icon size={20} color="rgba(0,0,0,0.6)" style={styles.ctaIcon} />
           <Text style={styles.ctaText}>{t("search.cta.compare")}</Text>
         </RippleTouch>
       </ScrollView>
 
-      <LocationPicker
-        visible={pickerField !== null}
-        onClose={() => setPickerField(null)}
-        onSelect={onPickerSelect}
-        field={pickerField ?? "from"}
-        mode={mode}
-        suggested={POPULAR_LOCATIONS[mode]}
-      />
+      {/* LocationPicker liegt am Root-Layout via LocationPickerHost.
+          Trigger via openLocationPicker. */}
 
-      {dateField !== null ? (
-        <DateTimePicker
-          value={(dateField === "depart" ? departDate : returnDate) ?? departDate ?? new Date()}
-          mode="date"
-          display={Platform.OS === "ios" ? "inline" : "default"}
-          // Rückreise-Picker: nicht vor Hin-Datum erlauben. Tage davor grayed out.
-          minimumDate={
-            dateField === "return" && departDate
-              ? departDate
-              : new Date()
-          }
-          onChange={onDateChange}
-          themeVariant="dark"
-        />
-      ) : null}
+      {/* BinchDatePicker ist im Root-Layout via DatePickerHost gemountet —
+          überdeckt damit auch die Nav-Bar. Trigger via openDatePicker. */}
 
       {/* preserve unused-tripTypeIds reference for future analytics hooks */}
       {tripTypeIds.length === 0 ? <View /> : null}
@@ -486,10 +580,23 @@ const styles = StyleSheet.create({
   // (scroll-paddingTop = insets.top + 8, plus Header-paddingTop = 8).
   logoWrap: { position: "absolute", left: 22, zIndex: 2 },
   logo: { fontSize: 26, fontWeight: "900", letterSpacing: -0.6, color: C.white },
-  logoAccent: { color: "#7FEA4D" },
+  logoAccent: {},
   heroBottom: { paddingHorizontal: 20, paddingBottom: 20 },
   titleRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  heroTitle: { fontSize: 28, fontWeight: "800", letterSpacing: -0.84, color: C.white, flex: 1 },
+  // KEIN flex:1 — sonst nimmt der Text immer die volle verfügbare Breite,
+  // und onLayout würde die Container-Breite (nicht die Text-Breite)
+  // reporten. flexShrink:1 erlaubt Schrumpfen falls der Title doch mal
+  // länger als der Platz wird (Safety, eigentlich passen alle vier
+  // Mode-Titles in eine Zeile).
+  heroTitle: {
+    fontSize: 28,
+    fontWeight: "800",
+    letterSpacing: -0.84,
+    color: C.white,
+    flexShrink: 1,
+  },
+  // Width wird inline gesetzt (= gemessene Text-Breite via onLayout).
+  greenBar: { marginTop: 8, height: 3, borderRadius: 2 },
   micButton: {
     width: 42,
     height: 42,
@@ -499,7 +606,6 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginLeft: 8,
   },
-  greenBar: { marginTop: 8, width: 36, height: 3, borderRadius: 2, backgroundColor: C.green },
 
   form: { flex: 1, backgroundColor: C.bg, marginTop: -18 },
   formContent: { padding: 16, gap: 10 },
@@ -512,7 +618,7 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   toggleBtn: { flex: 1, paddingVertical: 9, borderRadius: 11, alignItems: "center" },
-  toggleBtnActive: { backgroundColor: C.green },
+  toggleBtnActive: {},
   toggleText: { fontSize: 13, fontWeight: "600", color: C.gray2 },
   toggleTextActive: { color: "#000" },
 
@@ -560,19 +666,20 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  paxBtnPlus: { backgroundColor: C.green },
+  paxBtnPlus: {},
   paxBtnText: { fontSize: 18, color: C.white, lineHeight: 22 },
   paxBtnTextDark: { color: "#000" },
   paxCount: { fontSize: 20, fontWeight: "700", color: C.white },
 
   pillRow: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 4 },
   pill: { paddingVertical: 5, paddingHorizontal: 10, borderRadius: 9999, backgroundColor: C.surface3 },
-  pillActive: { backgroundColor: C.greenSubtle, borderWidth: 1, borderColor: C.green },
+  // backgroundColor + borderColor inline mit accent.subtle / accent.solid.
+  pillActive: { borderWidth: 1 },
   pillText: { fontSize: 11, fontWeight: "600", color: C.gray2 },
-  pillTextActive: { color: C.green },
+  pillTextActive: {},
 
   cta: {
-    backgroundColor: C.green,
+
     borderRadius: 16,
     paddingVertical: 17,
     flexDirection: "row",

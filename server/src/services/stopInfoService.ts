@@ -166,6 +166,13 @@ function normalize(raw: DbRestDeparture, board: StopBoard, idx: number): StopBoa
   if (!planned) return null;
   const lineName = raw.line?.name?.trim() ?? "";
   const product = raw.line?.product ?? raw.line?.mode ?? null;
+  // Anruf-Sammeltaxi / Rufbus rausfiltern: HAFAS markiert die als product=taxi
+  // mit Linien-Namen wie „RUF Helmo" oder „ALT 399". Sind on-demand, müssen
+  // vorher telefonisch gebucht werden — im normalen Departures-Board nutzlos
+  // und für den User verwirrend („was bedeutet RUF Helmo?"). Wir verstecken
+  // sie komplett. Falls jemand sie doch will, lässt sich das später per
+  // optionalem Query-Param wieder einblenden.
+  if (product === "taxi") return null;
   // direction = Endhaltestelle bei Abfahrten, provenance = Startbahnhof bei Ankünften.
   const direction = (board === "departures" ? raw.direction : raw.provenance)?.trim() ?? "";
   const delay = typeof raw.delay === "number" ? Math.round(raw.delay / 60) : null;
@@ -513,10 +520,18 @@ export async function resolveHafasByCoord(
   lng: number,
   label: string,
   profile: HafasProfileKey = "db",
+  /** Erwarteter Stop-Typ aus unserer DB. Wenn gesetzt, filtert der Resolver
+   *  HAFAS-Treffer nach passenden Produkten:
+   *    - BUS   → nur Stops mit `products.bus=true`, OHNE national/regional
+   *              (so wird ein direkt benachbarter Bahnhof nicht fälschlich
+   *              die Bus-Departures eines Bus-Stops liefern)
+   *    - TRAIN → nur Stops mit national/regional/suburban, kein reiner Bus
+   *  Ohne expectedType (oder ALL): kein Filter (z.B. Stadt-Lookup). */
+  expectedType?: "BUS" | "TRAIN" | "ALL" | null,
 ): Promise<string | null> {
-  // Profile in Cache-Key, sonst würden Coord-Treffer aus AT-Pfad fälschlich
-  // einen DE-Stop liefern wenn die Coords ähnlich liegen.
-  const key = `${profile}|${lat.toFixed(5)}|${lng.toFixed(5)}|${label.toLowerCase()}`;
+  // Profile + expectedType im Cache-Key — sonst würde ein vorheriger TRAIN-
+  // Resolve den BUS-Resolve mit der Train-Station beantworten.
+  const key = `${profile}|${expectedType ?? ""}|${lat.toFixed(5)}|${lng.toFixed(5)}|${label.toLowerCase()}`;
 
   const cached = resolveCache.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.hafasId;
@@ -543,19 +558,88 @@ export async function resolveHafasByCoord(
         signal: controller.signal,
       });
       if (!res.ok) return null;
-      const list = (await res.json()) as DbRestNearby[];
-      if (!Array.isArray(list) || list.length === 0) return null;
+      const listRaw = (await res.json()) as DbRestNearby[];
+      if (!Array.isArray(listRaw) || listRaw.length === 0) return null;
 
-      // Bestes Match: gleicher normalisierter Name. Fallback: nächst-
-      // gelegener Stop (sortiert db-rest schon).
-      const target = normalizeForMatch(label);
-      const byName = list.find((x) => x.id && x.name && normalizeForMatch(x.name) === target);
-      if (byName?.id) return byName.id;
+      // Type-Filter: Stops mit dem passenden Verkehrsmittel auswählen.
+      // Bus-Filter: nur `bus=true` verlangen — Multi-Modal-Stops (z.B.
+      // „Berlin Staaken Bhf" mit Regional+Bus) müssen weiterhin als Match
+      // möglich sein. Würden wir wie früher national/regional ausschließen,
+      // landen wir auf einem entfernteren reinen Bus-Stop statt am echten
+      // Bahnhofs-Vorplatz. Die Mixed-Departures bekommen wir nachher via
+      // Product-Filter in routes/stops.ts auf Bus-only gefiltert.
+      // Train-Filter: muss mindestens ein Schienen-Produkt haben (sonst
+      // landen wir auf einem Bus-Stop nebenan).
+      const matchesType = (x: DbRestNearby): boolean => {
+        if (!expectedType || expectedType === "ALL") return true;
+        const p = x.products ?? {};
+        if (expectedType === "BUS") return !!p.bus;
+        if (expectedType === "TRAIN") {
+          return !!(p.national || p.regional || p.regionalExpress || p.suburban || p.subway || p.tram);
+        }
+        return true;
+      };
+      const filtered = listRaw.filter(matchesType);
+      // Wenn der Filter alles wegfiltert → benutze die unfiltered Liste
+      // (Fallback: lieber irgendwas als nichts).
+      const list = filtered.length > 0 ? filtered : listRaw;
 
-      // Bevorzugt einen „station" über „stop" (Station aggregiert mehrere
-      // Plattformen → liefert mehr Departures pro Call).
-      const station = list.find((x) => x.id && x.type === "station");
-      if (station?.id) return station.id;
+      // Token-Set-Matching ist primär: zerlegt Label + HAFAS-Namen in Wort-
+      // Tokens, scort nach Overlap. Order-unabhängig (HAFAS dreht oft Word-
+      // Reihenfolge: „Hamm, Westtünnen/Dambergstr." in DB vs „Westtünnen/
+      // Dambergstr., Hamm (Westf)" in HAFAS).
+      // Stop-Words (bahnhof/westf/…) raus weil sie zu generisch sind. ABER:
+      // „Hbf"/„Hauptbahnhof" BEHALTEN — sie sind distinkt (Berlin Hbf vs
+      // Berlin Mahlsdorf). Über den Alias unifizieren wir die zwei
+      // Schreibweisen damit „Berlin Hbf" und „Berlin Hauptbahnhof" matchen.
+      // „Bhf" / „bf" sind Kurzformen → auf „hbf" alias-normalisieren falls
+      // sie als Bahnhofs-Marker funktionieren sollen (statt Stop-Word zu sein).
+      const RESOLVER_STOP_WORDS = new Set([
+        "bahnhof", "bahnhst", "stop", "halt",
+        "haltestelle", "station", "westf", "westfalen", "westfälisch",
+      ]);
+      const RESOLVER_ALIASES: Record<string, string> = {
+        hauptbahnhof: "hbf",
+        bhf: "hbf",
+        bf: "hbf",
+      };
+      const tokenize = (s: string): Set<string> => {
+        const cleaned = s.toLowerCase().replace(/[(),.;:/\-]/g, " ").replace(/\s+/g, " ").trim();
+        const out = new Set<string>();
+        for (const w of cleaned.split(" ")) {
+          if (w.length <= 2) continue;
+          const mapped = RESOLVER_ALIASES[w] ?? w;
+          if (!RESOLVER_STOP_WORDS.has(mapped)) out.add(mapped);
+        }
+        return out;
+      };
+      const targetTokens = tokenize(label);
+
+      let bestId: string | null = null;
+      let bestOverlap = 0;
+      for (const x of list) {
+        if (!x.id || !x.name) continue;
+        const cTokens = tokenize(x.name);
+        let overlap = 0;
+        for (const t of cTokens) if (targetTokens.has(t)) overlap++;
+        // > statt >= damit bei Gleichstand der ERSTE (= nächstgelegene)
+        // Treffer gewinnt; db-vendo sortiert nach Distance.
+        if (overlap > bestOverlap) {
+          bestOverlap = overlap;
+          bestId = x.id;
+        }
+      }
+      // Mindestens 1 Token muss matchen — sonst Fallback auf nächstgelegen.
+      if (bestId && bestOverlap >= 1) return bestId;
+
+      // Fallback ohne Token-Match: nur für TRAIN bevorzugen wir station-Type
+      // (Train-Aggregations-Stops liefern alle Plattformen auf einmal).
+      // Für BUS/ALL keinen station-Bias — der pickt sonst entfernte Bahnhöfe
+      // statt nahe Bus-Haltestellen.
+      if (expectedType === "TRAIN" || !expectedType) {
+        const station = list.find((x) => x.id && x.type === "station");
+        if (station?.id) return station.id;
+      }
 
       return list[0]?.id ?? null;
     } catch {

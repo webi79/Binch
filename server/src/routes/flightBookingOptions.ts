@@ -1,9 +1,9 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import {
-  getFlightBookingOptions,
-  getFlightBookingUrl,
-} from "../providers/flight/googleFlightsBooking.js";
+  getBookingOptions,
+  getBookingUrlByProviderToken,
+} from "../providers/flight/flightBookingDispatch.js";
 
 /**
  * Zwei Endpoints für die Multi-Provider-Buchung von Flügen:
@@ -32,6 +32,11 @@ const optionsQuerySchema = z.object({
   returnDate: z.string().optional(),
   passengers: z.coerce.number().int().min(1).max(9).default(1),
   currency: z.string().min(3).max(4).default("EUR"),
+  /** App-Sprache für die Sprach-Lokalisierung der Anbieter-Deeplinks. */
+  lang: z.enum(["de", "en", "fr", "es"]).optional(),
+  /** Card-/Suchpreis dieses Flugs — Detail snappt den günstigsten geschätzten
+   *  Anbieter darauf (Card == Detail-Günstigster). */
+  searchPrice: z.coerce.number().positive().optional(),
 });
 
 const urlQuerySchema = z.object({
@@ -46,7 +51,7 @@ export async function flightBookingOptionsRoutes(app: FastifyInstance) {
     }
     const q = parsed.data;
     try {
-      const options = await getFlightBookingOptions(q.token, {
+      const options = await getBookingOptions(q.token, {
         mode: "FLIGHT",
         origin: q.origin,
         destination: q.destination,
@@ -54,6 +59,8 @@ export async function flightBookingOptionsRoutes(app: FastifyInstance) {
         returnDate: q.returnDate,
         passengers: q.passengers,
         currency: q.currency.toUpperCase(),
+        lang: q.lang,
+        searchPrice: q.searchPrice,
       });
       return { options };
     } catch (err) {
@@ -72,7 +79,7 @@ export async function flightBookingOptionsRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: "Bad request" });
     }
     try {
-      const url = await getFlightBookingUrl(parsed.data.token);
+      const url = await getBookingUrlByProviderToken(parsed.data.token);
       if (!url) {
         return reply
           .code(404)

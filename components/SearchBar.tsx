@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { Text, TextInput, Pressable, StyleSheet, View, type StyleProp, type ViewStyle } from "react-native";
 import { useRouter } from "expo-router";
 import { Search as SearchIcon, Mic } from "lucide-react-native";
@@ -8,7 +9,7 @@ import { GradientFill } from "@/components/ui/GradientFill";
 
 const COLORS = {
   surface: "#242425",
-  lime: "#7FEA4D",
+  // lime entfernt — GradientFill liest den User-Akzent via useAccent().
   black: "#000000",
   white: "#FFFFFF",
   gray2: "#8A8A90",
@@ -41,6 +42,12 @@ interface InputProps extends CommonProps {
   value: string;
   onChangeText: (text: string) => void;
   autoFocus?: boolean;
+  /** Delay (ms) bevor der Focus auf das Input gesetzt wird. Nützlich wenn
+   *  der SearchBar in einem Modal/Slide-In sitzt — sofortiges autoFocus
+   *  triggert das Keyboard parallel zum Slide, was auf Android beim ersten
+   *  Mal spürbares Lag macht. Mit Delay startet das Keyboard erst NACH dem
+   *  Slide. */
+  autoFocusDelay?: number;
   onPress?: undefined;
 }
 
@@ -50,6 +57,35 @@ export function SearchBar(props: Props) {
   const t = useT();
   const router = useRouter();
   const openVoiceOverlay = useSearchStore((s) => s.openVoiceOverlay);
+  const inputRef = useRef<TextInput>(null);
+
+  // Verzögertes autoFocus: wenn autoFocusDelay gesetzt ist, fokussieren
+  // wir manuell via setTimeout statt mit nativem autoFocus-Prop. Damit
+  // wird der Keyboard-Cold-Start nicht parallel zum Slide-In ausgeführt.
+  // Außerdem reagiert das Effect auch wenn autoFocus von false→true togglet
+  // (z.B. weil ein parent-Overlay sichtbar wird) → wir können dann ein
+  // immer-gemountetes Picker-Overlay realisieren.
+  const inputAutoFocusDelay =
+    "autoFocusDelay" in props ? props.autoFocusDelay : undefined;
+  const inputAutoFocus = "autoFocus" in props ? props.autoFocus : undefined;
+  const hasInputValue = props.value !== undefined;
+  useEffect(() => {
+    if (!hasInputValue) return;
+    if (inputAutoFocus !== true) {
+      // autoFocus=false oder undefined → Input blur (z.B. wenn Overlay
+      // unsichtbar wird) damit das Keyboard sich schließt.
+      inputRef.current?.blur();
+      return;
+    }
+    if (inputAutoFocusDelay === undefined) {
+      // Nativer autoFocus übernimmt — der useEffect macht hier nichts.
+      return;
+    }
+    const id = setTimeout(() => {
+      inputRef.current?.focus();
+    }, inputAutoFocusDelay);
+    return () => clearTimeout(id);
+  }, [hasInputValue, inputAutoFocus, inputAutoFocusDelay]);
   const {
     placeholderKey = "home.search.placeholder",
     leadingLabel,
@@ -84,13 +120,16 @@ export function SearchBar(props: Props) {
         <SearchIcon size={18} color={COLORS.gray2} />
         {leadingLabel && <Text style={styles.leadingLabel}>{leadingLabel}</Text>}
         <TextInput
+          ref={inputRef}
           value={props.value}
           onChangeText={props.onChangeText}
           placeholder={placeholder}
           placeholderTextColor={COLORS.gray3}
           style={styles.input}
           autoCorrect={false}
-          autoFocus={props.autoFocus}
+          // Nativer autoFocus nur wenn KEIN Delay konfiguriert ist.
+          // Sonst übernimmt der useEffect oben das Fokussieren.
+          autoFocus={inputAutoFocus === true && inputAutoFocusDelay === undefined}
         />
         {mic}
       </View>

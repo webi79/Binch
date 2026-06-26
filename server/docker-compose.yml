@@ -98,6 +98,15 @@ services:
     # Rows in Batches laden — Node-Heap kann temporär 1-2 GB ziehen.
     mem_limit: 2g
 
+  # OTP-Routing wurde versucht aber auf diesem Host (15 GB RAM) ist NL OVAPI
+  # zu groß für den Graph-Build — der StopTimeMapper sprengt die JVM beim
+  # Mapping der 841 MB stop_times-Tabelle (~10 GB Heap-Bedarf). Wir machen
+  # stattdessen "Walk + Train Hybrid": non-Train-Origin findet nächsten
+  # Bahnhof via DB, ab dort DB-HAFAS-Routing. Siehe transitSchedule provider.
+  #
+  # OTP-Setup kann aus git history wiederhergestellt werden falls wir mal
+  # auf stärkere Hardware umziehen (>= 32 GB RAM).
+
 volumes:
   # `{}` = leeres Volume-Objekt mit Docker-Defaults (driver: local). Funktional
   # identisch zum bloßen `binch-db:` ohne Wert, aber strikte YAML-Schema-Linter

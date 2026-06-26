@@ -13,9 +13,10 @@ import {
   UtensilsCrossed,
 } from "lucide-react-native";
 import { MapMarker, MarkerKind, POI, USER_LOC, type Coord } from "@/lib/surroundings/mockData";
+import { useAccent } from "@/lib/theme/accent";
 
-const LIME = "#7FEA4D";
-const LIME_HALO = "rgba(127,234,77,0.35)";
+// LIME-Konstanten entfernt — Marker holen den User-Akzent via useAccent zur
+// Laufzeit. markerColors() nimmt den Akzent als Parameter.
 
 const MARKER_ICON: Record<MarkerKind, LucideIcon> = {
   train: Train,
@@ -26,8 +27,8 @@ const MARKER_ICON: Record<MarkerKind, LucideIcon> = {
   cruise: Ship,
 };
 
-function markerColors(type: MarkerKind): { bg: string; fg: string } {
-  if (type === "train" || type === "airport") return { bg: LIME, fg: "#000" };
+function markerColors(type: MarkerKind, accentSolid: string, accentTextOn: string): { bg: string; fg: string } {
+  if (type === "train" || type === "airport") return { bg: accentSolid, fg: accentTextOn };
   if (type === "subway") return { bg: "#1F3A8A", fg: "#FFFFFF" }; // Dunkelblau
   if (type === "tram") return { bg: "#2A2A2C", fg: "#FFFFFF" };
   if (type === "cruise") return { bg: "#6B95B5", fg: "#FFFFFF" };
@@ -40,8 +41,14 @@ function lngLat(c: Coord): [number, number] {
 }
 
 export const Marker = memo(function Marker({ m }: { m: MapMarker }) {
-  const { bg, fg } = markerColors(m.type);
+  const accent = useAccent();
+  const { bg, fg } = markerColors(m.type, accent.solid, accent.textOnSolid);
   const Icon = MARKER_ICON[m.type];
+  // Defensiv gegen unbekannte type-Werte: beim Zoomen rendern wir hunderte
+  // Marker und ein einzelner ungültiger type (z.B. „ferry" aus OSM-Daten)
+  // würde sonst „Cannot read property 'displayName' of undefined" auslösen
+  // und die ganze Surroundings-Map zum Crash bringen.
+  if (!Icon) return null;
   const size = m.big ? 36 : 28;
   const round = false;
 
@@ -49,7 +56,7 @@ export const Marker = memo(function Marker({ m }: { m: MapMarker }) {
     <MapLibreMarker id={m.id} lngLat={lngLat(m.coord)} anchor="bottom">
       <View style={styles.markerWrap}>
         {m.selected && (
-          <View style={[styles.halo, { borderRadius: round ? size : 16 }]} />
+          <View style={[styles.halo, { borderRadius: round ? size : 16, borderColor: accent.border }]} />
         )}
         <View
           style={[
@@ -59,14 +66,14 @@ export const Marker = memo(function Marker({ m }: { m: MapMarker }) {
               height: size,
               borderRadius: round ? size / 2 : 10,
               backgroundColor: bg,
-              borderColor: m.selected ? LIME : "rgba(0,0,0,0.45)",
+              borderColor: m.selected ? accent.solid : "rgba(0,0,0,0.45)",
             },
           ]}
         >
           <Icon color={fg} size={m.big ? 17 : 14} strokeWidth={2.2} />
           {m.label && (
-            <View style={styles.label}>
-              <Text style={styles.labelText}>{m.label}</Text>
+            <View style={[styles.label, { borderColor: accent.solid }]}>
+              <Text style={[styles.labelText, { color: accent.solid }]}>{m.label}</Text>
             </View>
           )}
         </View>
@@ -94,11 +101,12 @@ export function POIMarker({ p, id }: { p: POI; id: string }) {
 }
 
 export function UserPin({ coord = USER_LOC }: { coord?: Coord }) {
+  const accent = useAccent();
   return (
     <MapLibreMarker id="user-pin" lngLat={lngLat(coord)} anchor="center">
       <View style={styles.userPin}>
-        <View style={styles.userHalo} />
-        <View style={styles.userDot} />
+        <View style={[styles.userHalo, { backgroundColor: accent.subtle }]} />
+        <View style={[styles.userDot, { backgroundColor: accent.solid }]} />
       </View>
     </MapLibreMarker>
   );
@@ -116,7 +124,7 @@ const styles = StyleSheet.create({
     right: -10,
     bottom: -2,
     borderWidth: 3,
-    borderColor: LIME_HALO,
+
   },
   pin: {
     alignItems: "center",
@@ -133,7 +141,7 @@ const styles = StyleSheet.create({
     top: -6,
     right: -6,
     backgroundColor: "#1A1A1A",
-    borderColor: LIME,
+
     borderWidth: 1.5,
     paddingHorizontal: 4,
     paddingVertical: 1,
@@ -141,7 +149,7 @@ const styles = StyleSheet.create({
     minWidth: 14,
   },
   labelText: {
-    color: LIME,
+
     fontSize: 9,
     fontWeight: "800",
     textAlign: "center",
@@ -176,13 +184,13 @@ const styles = StyleSheet.create({
     width: 52,
     height: 52,
     borderRadius: 26,
-    backgroundColor: "rgba(127,234,77,0.18)",
+
   },
   userDot: {
     width: 20,
     height: 20,
     borderRadius: 10,
-    backgroundColor: LIME,
+
     borderWidth: 3,
     borderColor: "#1A1A1A",
   },

@@ -8,6 +8,7 @@ import { parseVoice } from "@/lib/voice/parse";
 import { useSearchStore } from "@/stores/searchStore";
 import { fetchLocations } from "@/lib/api/client";
 import { useT } from "@/lib/i18n/useT";
+import { useAccent } from "@/lib/theme/accent";
 
 let ExpoSpeechRecognitionModule: any = null;
 let useSpeechRecognitionEvent: (name: string, cb: (e: any) => void) => void = () => {};
@@ -20,6 +21,7 @@ try {
 }
 
 export default function VoiceScreen() {
+  const accent = useAccent();
   const router = useRouter();
   const t = useT();
   const locale = useSearchStore((s) => s.locale);
@@ -117,8 +119,8 @@ export default function VoiceScreen() {
         <Pressable
           onPress={listening ? stop : start}
           disabled={busy}
-          className="w-24 h-24 rounded-full bg-[#7FEA4D] items-center justify-center shadow-lg"
-          style={({ pressed }) => ({ opacity: pressed ? 0.85 : 1 })}
+          className="w-24 h-24 rounded-full items-center justify-center shadow-lg"
+          style={({ pressed }) => ({ backgroundColor: accent.solid, opacity: pressed ? 0.85 : 1 })}
         >
           {busy ? <ActivityIndicator color="#000" /> : <Mic color="#000000" size={40} />}
         </Pressable>

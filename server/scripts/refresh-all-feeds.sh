@@ -45,6 +45,24 @@ while IFS='|' read -r feed_id url active rest; do
   echo "--- $feed_id ---"
   if ./scripts/import-gtfs-feed.sh "$feed_id" "$url"; then
     ok=$((ok + 1))
+    # OTP-Coupling: Wenn das Volume gemounted ist UND der Feed in OTP-relevanten
+    # Ländern ist (aktuell nur NL), kopieren wir die ZIP rüber damit OTP beim
+    # nächsten Restart einen frischen Graph bauen kann. Die alte graph.obj
+    # wird gelöscht — der nächste OTP-Start triggert einen Rebuild.
+    if [[ -n "${OTP_FEED_DIR:-}" && -d "${OTP_FEED_DIR}" ]]; then
+      case "$feed_id" in
+        nl-ovapi)
+          src_zip="${TMPDIR:-/tmp}/binch-gtfs-schedule/$feed_id/feed.zip"
+          if [[ -f "$src_zip" ]]; then
+            echo "Copying $feed_id feed to OTP volume…"
+            cp "$src_zip" "${OTP_FEED_DIR}/${feed_id}.zip"
+            # Alter Graph muss weg — OTP rebuildet beim nächsten Start.
+            rm -f "${OTP_FEED_DIR}/graph.obj" "${OTP_FEED_DIR}/streetGraph.obj"
+            echo "OTP graph invalidated (will rebuild on next otp restart)"
+          fi
+          ;;
+      esac
+    fi
   else
     echo "❌ $feed_id failed"
     fail=$((fail + 1))

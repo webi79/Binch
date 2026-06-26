@@ -31,6 +31,7 @@ import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
 import { authLogin, authRegister } from "@/lib/api/client";
 import { GradientFill } from "@/components/ui/GradientFill";
+import { useAccent } from "@/lib/theme/accent";
 
 const C = {
   sheet: "#1F1F20",
@@ -56,6 +57,7 @@ function AuthSheet() {
   const close = useSearchStore((s) => s.closeAuthOverlay);
   const setAuth = useSearchStore((s) => s.setAuth);
   const t = useT();
+  const accent = useAccent();
   const { height } = useWindowDimensions();
 
   const [mode, setMode] = useState<Mode>("login");
@@ -295,7 +297,7 @@ function AuthSheet() {
                 }}
                 hitSlop={6}
               >
-                <Text style={styles.switchAction}>{switchAction}</Text>
+                <Text style={[styles.switchAction, { color: accent.solid }]}>{switchAction}</Text>
               </Pressable>
             </View>
         </ScrollView>

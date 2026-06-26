@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { consumeRedirectToken } from "../services/tokenService.js";
-import { resolveFlightBookingUrl } from "../providers/flight/googleFlightsBooking.js";
+import { resolveBookingUrl } from "../providers/flight/flightBookingDispatch.js";
 
 export async function redirectRoutes(app: FastifyInstance) {
   app.get<{ Params: { token: string } }>("/redirect/:token", async (req, reply) => {
@@ -16,7 +16,7 @@ export async function redirectRoutes(app: FastifyInstance) {
       consumed.bookingToken &&
       consumed.bookingContext?.mode === "FLIGHT"
     ) {
-      const direct = await resolveFlightBookingUrl(consumed.bookingToken, consumed.bookingContext);
+      const direct = await resolveBookingUrl(consumed.bookingToken, consumed.bookingContext);
       if (direct) return reply.redirect(direct, 302);
     }
 

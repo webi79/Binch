@@ -2,8 +2,13 @@ import { and, desc, eq, gte, isNull } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { providerResponses, searchRequests, searchResults } from "../db/schema.js";
 import type { TravelMode } from "../db/schema.js";
-import { activeProvidersForMode } from "../providers/registry.js";
-import type { LegInfo, NormalizedResult, ProviderSearchInput } from "../providers/types.js";
+import { activeProvidersForMode, activeFallbackProvidersForMode } from "../providers/registry.js";
+import type {
+  LegInfo,
+  NormalizedResult,
+  ProviderSearchInput,
+  SearchProvider,
+} from "../providers/types.js";
 import { sha256 } from "../util/hash.js";
 import { issueRedirectToken } from "./tokenService.js";
 import { enqueueRefresh as enqueueDbVendoRefresh } from "./dbVendoQueue.js";
@@ -91,7 +96,11 @@ interface Candidate {
  *  Da SWR ab 50% der TTL refresht, ist die effektive Stale-Garantie TTL/2. */
 const CACHE_TTL_BY_MODE: Record<TravelMode, number> = {
   TRAIN: 4 * 60 * 60 * 1000, //   4 h  — Fahrpläne stabil, Preise bei DB selten
-  FLIGHT: 10 * 60 * 1000, //      10 min → Preise max 5 min stale (SWR @ 5 min)
+  // 5 min: Flugpreise UND Googles booking_token-Gültigkeit ändern sich schnell.
+  // Ein zu lang gecachtes Result servierte einen veralteten booking_token →
+  // getBookingDetails liefert dann Fallback-/abweichende Preise. Kurzer Cache
+  // hält Token + Preise frisch (mehr Quota, aber Plan upgegradet).
+  FLIGHT: 5 * 60 * 1000, //       5 min
   BUS: 30 * 60 * 1000, //         30 min → Preise max 15 min stale
   CRUISE: 12 * 60 * 60 * 1000, // 12 h — selten Änderungen
 };
@@ -250,47 +259,56 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
 
   if (!request) throw new Error("Failed to insert search request");
 
-  const providers = activeProvidersForMode(input.mode);
   const candidates: Candidate[] = [];
   // Pagination-Token vom (ersten) Provider der einen liefert. Bei TRAIN ist
   // das dbVendo — andere Modes bleiben undefined.
   let paginationToken: string | undefined;
 
-  await Promise.all(
-    providers.map(async (p) => {
-      const start = Date.now();
-      try {
-        const out = await p.search(input);
-        if (out.paginationToken && !paginationToken) {
-          paginationToken = out.paginationToken;
-        }
-        const [pr] = await db
-          .insert(providerResponses)
-          .values({
+  const runProviders = async (list: SearchProvider[]) => {
+    await Promise.all(
+      list.map(async (p) => {
+        const start = Date.now();
+        try {
+          const out = await p.search(input);
+          if (out.paginationToken && !paginationToken) {
+            paginationToken = out.paginationToken;
+          }
+          const [pr] = await db
+            .insert(providerResponses)
+            .values({
+              requestId: request.id,
+              provider: p.name,
+              mode: input.mode,
+              statusCode: out.statusCode,
+              durationMs: out.durationMs || Date.now() - start,
+              rawResponse: out.raw as never,
+              resultCount: out.results.length,
+            })
+            .returning({ id: providerResponses.id });
+          if (!pr) return;
+          for (const r of out.results) {
+            candidates.push({ result: r, provider: p.name, providerResponseId: pr.id });
+          }
+        } catch (e) {
+          await db.insert(providerResponses).values({
             requestId: request.id,
             provider: p.name,
             mode: input.mode,
-            statusCode: out.statusCode,
-            durationMs: out.durationMs || Date.now() - start,
-            rawResponse: out.raw as never,
-            resultCount: out.results.length,
-          })
-          .returning({ id: providerResponses.id });
-        if (!pr) return;
-        for (const r of out.results) {
-          candidates.push({ result: r, provider: p.name, providerResponseId: pr.id });
+            error: e instanceof Error ? e.message : String(e),
+            durationMs: Date.now() - start,
+          });
         }
-      } catch (e) {
-        await db.insert(providerResponses).values({
-          requestId: request.id,
-          provider: p.name,
-          mode: input.mode,
-          error: e instanceof Error ? e.message : String(e),
-          durationMs: Date.now() - start,
-        });
-      }
-    }),
-  );
+      }),
+    );
+  };
+
+  await runProviders(activeProvidersForMode(input.mode));
+  // Fallback (FLIGHT: google-flights2) nur wenn die Primaries 0 Treffer lieferten
+  // — z.B. SearchAPI-Ausfall oder Round-Trip (SearchAPI = one-way-only). So
+  // verbrennt der Doppel-Call im Normalfall keine Quota.
+  if (candidates.length === 0) {
+    await runProviders(activeFallbackProvidersForMode(input.mode));
+  }
 
   const deduped = dedupe(candidates, input.mode);
 
@@ -546,7 +564,12 @@ function fingerprint(r: NormalizedResult, mode: TravelMode): string {
   const route = `${r.origin}->${r.destination}`;
 
   if (mode === "FLIGHT" && r.flightNumber) {
-    return `flight:${r.flightNumber.toUpperCase()}|${dep}|${route}`;
+    // ANKUNFT + STOPS gehören in den Fingerprint, sonst kollabieren völlig
+    // verschiedene Umsteigeverbindungen mit demselben ERSTEN Flug auf einen
+    // Eintrag (z.B. 57 DTM→HRG-Itineraries, alle mit erstem Eurowings-Flug aber
+    // anderen Anschlüssen/Ankünften → wurden auf 2 reduziert). dep+arr+stops+
+    // erste Flugnummer identifiziert echte Duplikate, behält aber distinkte Reisen.
+    return `flight:${r.flightNumber.toUpperCase()}|${dep}|${arr}|${r.stops}|${route}`;
   }
   const op = (r.operatedBy ?? "").toLowerCase();
   return `${mode.toLowerCase()}:${op}|${dep}|${arr}|${route}`;

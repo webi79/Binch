@@ -80,31 +80,77 @@ async function searchLocalDb(
   //   → Anrath Bahnhof (city=Willich) wird gefunden
   // Wenn die Suche einzeln gelassen würde („%willich anrath%"), würde nichts
   // matchen weil kein einziges Feld die exakte Sequenz enthält.
-  // Query-Normalization: User tippt manchmal „Hauptbahnhof", unsere DB-Labels
-  // sind aber auf „Hbf" normalisiert. Vor dem Tokenizen ersetzen damit beide
-  // Schreibweisen matchen. Word-Boundary in JS-Regex via \b.
-  const normalized = q.replace(/\bhauptbahnhof\b/gi, "Hbf");
-  const words = normalized.toLowerCase().split(/\s+/).filter(Boolean);
-  const wordFilters = words.map((word) => {
-    const like = `%${word}%`;
-    return or(
-      ilike(locations.label, like),
-      ilike(locations.city, like),
-      ilike(locations.country, like),
-      ilike(locations.code, like),
-    );
+  // Bidirektionale Synonym-Expansion: DB-Labels sind inkonsistent — manche
+  // StaDa-Einträge labeln „Hbf", andere „Hauptbahnhof"; manche OSM-Stops
+  // labeln „Bahnhof", manche „Station". Wir müssen pro Wort ALLE bekannten
+  // Varianten in die OR-Klausel packen, sonst matched „Wien Hbf" nicht gegen
+  // DB-Label „Wien Hauptbahnhof" (und Top-Match wäre dann ein zufälliger
+  // kleinerer Stop wie „Wien Blumental").
+  const SYNONYMS: Record<string, string[]> = {
+    hbf: ["hbf", "hauptbahnhof"],
+    hauptbahnhof: ["hbf", "hauptbahnhof"],
+    bf: ["bf", "bahnhof"],
+    bahnhof: ["bahnhof", "bf"],
+  };
+  // Split nicht nur an Whitespace sondern auch an Bindestrich/Slash/Komma —
+  // sonst matched „Bruxelles-Midi" nur exakt gegen Labels mit Bindestrich.
+  // Wenn die DB „Bruxelles Midi" (ohne Strich) oder „Bruxelles, Midi" hat,
+  // greift das Wort-Filter sonst nicht. Diese Trenner sind in Station-Namen
+  // immer optional.
+  const words = q.toLowerCase().split(/[\s\-/,]+/).filter(Boolean);
+  // Station-Suffix-Wörter sind in DB-Labels oft NICHT enthalten — kleinere
+  // Stationen heißen einfach „Werl" / „Lippstadt" / „Hamm", ohne „Hauptbahnhof".
+  // Wenn der User „Werl Hauptbahnhof" tippt würde der strikte AND-Filter
+  // beide Wörter verlangen → 0 Treffer obwohl Werl in der DB ist.
+  // Deshalb: Suffix-Wörter NICHT als Required-Filter, nur in Ranking-Score.
+  // (Wenn der User NUR „Hbf" tippt, fällt's auf alle Wörter zurück damit
+  // wenigstens Großstadt-Hbf's matchen.)
+  const STATION_SUFFIXES = new Set([
+    "hbf",
+    "hauptbahnhof",
+    "bahnhof",
+    "bf",
+    "station",
+    "airport",
+    "flughafen",
+  ]);
+  const nonSuffixWords = words.filter((w) => !STATION_SUFFIXES.has(w));
+  const filterWords = nonSuffixWords.length > 0 ? nonSuffixWords : words;
+  const wordFilters = filterWords.map((word) => {
+    const variants = SYNONYMS[word] ?? [word];
+    const conditions = variants.flatMap((v) => {
+      const like = `%${v}%`;
+      return [
+        ilike(locations.label, like),
+        ilike(locations.city, like),
+        ilike(locations.country, like),
+        ilike(locations.code, like),
+      ];
+    });
+    return or(...conditions);
   });
   const textFilter = wordFilters.length > 1 ? and(...wordFilters) : wordFilters[0];
 
   // Mode-spezifische Filter:
   //   - FLIGHT/CRUISE: nur exakter Type
-  //   - BUS/TRAIN: Type passend ODER ALL (Cities sind als ALL gespeichert)
+  //   - TRAIN: TRAIN + BUS + ALL — der User soll im Zug-Modus AUCH Bus-Stationen
+  //     finden (Bahn + Bus in einem Rutsch suchen). dbVendo (HAFAS) ist
+  //     intermodal und routet von/zu Bus-Stops genauso; FlixBus läuft im
+  //     TRAIN-Modus NICHT mit (siehe Registry). Tram/U-Bahn-Stops bleiben
+  //     ebenfalls drin (schedule-only Departures via transitScheduleProvider).
+  //   - BUS: BUS + ALL — nur Bus-Stationen (+ Cities), KEINE Bahnhöfe.
   //   - ALL: kein Filter, alles erlaubt
   let typeFilter;
   if (type === "FLIGHT" || type === "CRUISE") {
     typeFilter = eq(locations.type, type);
-  } else if (type === "BUS" || type === "TRAIN") {
-    typeFilter = or(eq(locations.type, type), eq(locations.type, "ALL"));
+  } else if (type === "TRAIN") {
+    typeFilter = or(
+      eq(locations.type, "TRAIN"),
+      eq(locations.type, "BUS"),
+      eq(locations.type, "ALL"),
+    );
+  } else if (type === "BUS") {
+    typeFilter = or(eq(locations.type, "BUS"), eq(locations.type, "ALL"));
   } else {
     typeFilter = undefined;
   }
@@ -123,6 +169,27 @@ async function searchLocalDb(
   const prefixLabelLike = `${firstWord}%`;
   const prefixCityLike = `${firstWord}%`;
   const fullQuery = q.trim().toLowerCase();
+
+  // ALLE-Query-Wörter-im-LABEL Score: zählt wie viele der User-Wörter im
+  // Label vorkommen (mit Synonym-Erweiterung für hbf/hauptbahnhof). Höher =
+  // bessere Übereinstimmung. Sortiert DESC. Beispiel:
+  //   Query „Wien Hbf" → Wörter: wien, hbf (+ hauptbahnhof als Synonym)
+  //   - Label „Wien Hauptbahnhof" → Score 2 (beide gefunden)
+  //   - Label „Wien Blumental"    → Score 1 (nur „wien")
+  // Damit kann der prominente Hauptbahnhof nicht durch kürzeren Tiebreaker
+  // von z.B. „Wien Blumental" überholt werden.
+  const labelWordScoreParts = words.map((word) => {
+    const variants = SYNONYMS[word] ?? [word];
+    const ors = variants.map((v) => sql`${locations.label} ILIKE ${`%${v}%`}`);
+    // Drizzle's sql template OR-Verknüpfung via raw expansion
+    const orJoined = sql.join(ors, sql` OR `);
+    return sql`(CASE WHEN ${orJoined} THEN 1 ELSE 0 END)`;
+  });
+  const labelMatchScore =
+    labelWordScoreParts.length > 0
+      ? sql.join(labelWordScoreParts, sql` + `)
+      : sql`0`;
+
   const rows = await db
     .select()
     .from(locations)
@@ -131,14 +198,25 @@ async function searchLocalDb(
       // 1. Type=ALL mit exaktem Label-Match: das ist DIE Stadt selbst — IMMER
       //    ganz oben.
       sql`CASE WHEN ${locations.type} = 'ALL' AND LOWER(${locations.label}) = ${fullQuery} THEN 0 ELSE 1 END`,
-      // 2. CITY-Match: Stops IN der gesuchten Stadt (auch wenn ihr Label
-      //    nicht exakt der Stadtname ist). „Amsterdam, Emmastraat" mit
-      //    city=Amsterdam schlägt OSM-Bus „Amsterdam" in Lyon (city=null).
+      // 2. ALLE Query-Wörter im LABEL — verhindert dass „Wien Blumental" über
+      //    „Wien Hauptbahnhof" gerankt wird (beide haben „wien", aber nur
+      //    Hauptbahnhof matched auch „hbf"/„hauptbahnhof"). DESC: mehr Wörter
+      //    im Label = besser. ZUERST hier rein (vor City-Match) — sonst kann
+      //    ein zufälliger Stop mit city=Wien den Hauptbahnhof noch immer
+      //    überholen.
+      sql`(${labelMatchScore}) DESC`,
+      // 3. CITY-Match: Stops IN der gesuchten Stadt (auch wenn ihr Label
+      //    nicht exakt der Stadtname ist).
       sql`CASE WHEN LOWER(${locations.city}) = ${fullQuery} THEN 0 ELSE 1 END`,
-      // 3. Exakter Label-Match (für Stops in anderen Städten die zufällig
-      //    so heißen — kommen aber NACH den Stops in der echten Stadt).
+      // 4. Exakter Label-Match.
       sql`CASE WHEN LOWER(${locations.label}) = ${fullQuery} THEN 0 ELSE 1 END`,
-      // 4. Type-Priorität: Flughäfen > Major-Stations > regional > Bus
+      // 5. HAFAS-ID vorhanden = direkt nutzbar für Provider (dbVendo, oebb
+      //    etc.) ohne Fuzzy-Lookup. Stationen mit hafasId IMMER vor
+      //    Stationen ohne — sonst landet ein osm:/gtfs:-Stop ohne ID oben
+      //    und dbVendo muss per Label suchen → falsche Treffer wie
+      //    „Wien Hbf" → „Wien Blumental".
+      sql`CASE WHEN ${locations.hafasId} IS NOT NULL THEN 0 ELSE 1 END`,
+      // 6. Type-Priorität: Flughäfen > Major-Stations > regional > Bus
       sql`CASE
             WHEN ${locations.type} = 'ALL' THEN 0
             WHEN ${locations.type} = 'FLIGHT' THEN 1
@@ -149,11 +227,11 @@ async function searchLocalDb(
             WHEN ${locations.type} = 'BUS' THEN 6
             ELSE 7
           END`,
-      // 5. Prefix-Match
+      // 7. Prefix-Match
       sql`CASE WHEN ${locations.label} ILIKE ${prefixLabelLike} THEN 0
                WHEN ${locations.city} ILIKE ${prefixCityLike} THEN 1
                ELSE 2 END`,
-      // 6. Tiebreaker: kürzeres Label
+      // 8. Tiebreaker: kürzeres Label
       sql`length(${locations.label}) asc`,
     )
     .limit(limit);
@@ -178,12 +256,39 @@ async function searchLocalDb(
  *  der Liste), DANN Live-Treffer nur wenn HAFAS-ID noch nicht abgedeckt.
  *  Da Caller `[...dbResults, ...liveResults]` reinpackt, ist die Iteration
  *  über das Array genau diese Reihenfolge — Lokal-First gewinnt automatisch. */
-/** Source-Priorität für Dedup. Niedriger = besser (gewinnt). StaDa-Daten sind
- *  am authoritative (DB-StaDa, klare HAFAS-IDs), dann GTFS (offizielle Feeds),
- *  dann OSM (community, viele Plattform-Plattform-Dupes pro Bahnhof). */
-function sourceRank(code: string): number {
-  if (code.startsWith("sta:")) return 0;
-  if (code.startsWith("gtfs:")) return 1;
+/** Länder für die wir GTFS-Feeds haben (keine HAFAS-Coverage). Für Stops in
+ *  diesen Ländern ist der `gtfs:<cc>:...`-Code direkt nutzbar — der
+ *  Stop-Board-Endpoint findet den Stop sofort, ohne fragilen Coord-Lookup.
+ *  Muss mit FEED_ID_BY_COUNTRY in gtfsSchedule.ts synchron bleiben. */
+const GTFS_PRIMARY_COUNTRIES = new Set([
+  "Netherlands",
+  "France",
+  "Italy",
+  "Spain",
+  "Czech Republic",
+  "Belgium",
+  "Hungary",
+  "Slovakia",
+  "United Kingdom",
+  "Portugal",
+]);
+
+/** Source-Priorität für Dedup. Niedriger = besser (gewinnt).
+ *
+ *  Für HAFAS-Länder (DE/AT/CH/PL/LU/DK/…): StaDa-Daten sind authoritative
+ *  (klare HAFAS-IDs, passen direkt zu db-rest/oebb/…), dann GTFS, dann OSM.
+ *
+ *  Für GTFS-Länder (NL/FR/IT/ES/…): umgekehrt — gtfs:<cc>:... ist der
+ *  direkte Schlüssel in die GTFS-Tabellen. Der StaDa-Eintrag würde im
+ *  Stop-Board-Endpoint einen Coord-Lookup auf ~100m triggern und für
+ *  Amsterdam Centraal & Co. leere Boards liefern weil StaDa-Coord und
+ *  GTFS-stoparea-Coord um >100m abweichen können. */
+function sourceRank(loc: ClientLocation): number {
+  const code = loc.code;
+  const isGtfsPrimary =
+    loc.country != null && GTFS_PRIMARY_COUNTRIES.has(loc.country);
+  if (code.startsWith("sta:")) return isGtfsPrimary ? 1 : 0;
+  if (code.startsWith("gtfs:")) return isGtfsPrimary ? 0 : 1;
   if (code.startsWith("osm:")) return 2;
   return 3;
 }
@@ -232,7 +337,20 @@ function mergeAndCap(list: ClientLocation[], limit: number): ClientLocation[] {
     }
     if (existingIdx >= 0) {
       const existing = out[existingIdx]!;
-      if (sourceRank(l.code) < sourceRank(existing.code)) {
+      // 1. hafasId-Präsenz trumpft Source-Prefix — eine Row MIT hafasId
+      //    ist für Provider direkt nutzbar (dbVendo, oebb, etc.) ohne
+      //    Fuzzy-Label-Lookup. Ohne diese Regel würde z.B. „Bruxelles-Midi"
+      //    als gtfs:be:... (kein hafasId) den sta:8814001-Eintrag (mit
+      //    hafasId) überholen → dbVendo macht Label-Lookup → falsche oder
+      //    keine Treffer.
+      const existingHasId = Boolean(existing.hafasId);
+      const candidateHasId = Boolean(l.hafasId);
+      if (candidateHasId !== existingHasId) {
+        if (candidateHasId) out[existingIdx] = l;
+        continue;
+      }
+      // 2. Bei gleichem hafasId-Status: Source-Prefix (sta vs gtfs vs osm)
+      if (sourceRank(l) < sourceRank(existing)) {
         out[existingIdx] = l;
       }
       continue;
