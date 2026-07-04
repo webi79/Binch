@@ -20,7 +20,6 @@ import { MapFabs } from "@/components/surroundings/MapFabs";
 import { MapSkeleton } from "@/components/surroundings/MapSkeleton";
 import { SurroundingsSheet } from "@/components/surroundings/SurroundingsSheet";
 import { SearchBar } from "@/components/SearchBar";
-import { LocationPicker } from "@/components/search/LocationPicker";
 import { POPULAR_LOCATIONS } from "@/lib/data/popularLocations";
 import { useT } from "@/lib/i18n/useT";
 import type { Location } from "@/types/search";
@@ -89,9 +88,9 @@ export default function SurroundingsScreen() {
   const [mode, setMode] = useState<SheetMode>("transit");
   const [mapType, setMapType] = useState<MapLayerType>("standard");
   const [trafficOn, setTrafficOn] = useState(false);
-  const [pickerOpen, setPickerOpen] = useState(false);
   const insets = useSafeAreaInsets();
   const mapRef = useRef<MapSurfaceHandle | null>(null);
+  const openLocationPicker = useSearchStore((s) => s.openLocationPicker);
   const { coord: userCoord, status: locationStatus, refresh: refreshLocation } = useUserLocation();
 
   const pendingRoute = useSearchStore((s) => s.pendingRoute);
@@ -388,41 +387,46 @@ export default function SurroundingsScreen() {
           <SearchBar
             placeholderKey="surroundings.search.placeholder"
             showMic={false}
-            onPress={() => setPickerOpen(true)}
+            // Öffnet den GLOBALEN LocationPicker (Root-Host, app/_layout) —
+            // der liegt visuell ÜBER der nativen Bottom-Tab-Bar. Vorher war
+            // der Picker hier lokal im Tab gemountet: die Tab-Bar blieb
+            // sichtbar und hob sich beim Keyboard-Öffnen nativ über die
+            // Tastatur (Material NavigationBarView IME-Insets). Über den
+            // Root-Host ist sie während der Suche komplett abgedeckt.
+            onPress={() =>
+              openLocationPicker({
+                field: "from",
+                mode: "ALL",
+                suggested: POPULAR_LOCATIONS.ALL,
+                title: t("surroundings.search.title"),
+                leadingLabel: "",
+                placeholderKey: "surroundings.search.placeholder",
+                onSelect: (loc: Location) => {
+                  // Mode an den Treffer-Typ anpassen, damit das passende
+                  // Marker-Icon an der Zielposition sichtbar ist (sonst
+                  // springt die Map zwar hin, der User sieht aber das
+                  // falsche Layer).
+                  const nextMode: SheetMode =
+                    loc.type === "FLIGHT"
+                      ? "airport"
+                      : loc.type === "CRUISE"
+                        ? "cruise"
+                        : "transit";
+                  if (nextMode !== mode) setMode(nextMode);
+                  const coord = resolveLocationCoord(loc);
+                  if (!coord) return;
+                  // Zoom-Level je nach Treffer-Typ: bei Flughäfen weiter
+                  // raus (man will den Hub und Umgebung sehen), bei Bahnhof/
+                  // Bushaltestelle näher dran (Stadt-Detail), bei Häfen mittel.
+                  const zoom =
+                    loc.type === "FLIGHT" ? 11 : loc.type === "CRUISE" ? 12 : 14;
+                  mapRef.current?.flyTo(coord.latitude, coord.longitude, zoom);
+                },
+              })
+            }
           />
         </View>
       )}
-
-      <LocationPicker
-        visible={pickerOpen}
-        onClose={() => setPickerOpen(false)}
-        onSelect={(loc: Location) => {
-          setPickerOpen(false);
-          // Mode an den Treffer-Typ anpassen, damit das passende Marker-Icon
-          // an der Zielposition sichtbar ist (sonst springt die Map zwar
-          // hin, der User sieht aber das falsche Layer).
-          const nextMode: SheetMode =
-            loc.type === "FLIGHT"
-              ? "airport"
-              : loc.type === "CRUISE"
-                ? "cruise"
-                : "transit";
-          if (nextMode !== mode) setMode(nextMode);
-          const coord = resolveLocationCoord(loc);
-          if (!coord) return;
-          // Zoom-Level je nach Treffer-Typ: bei Flughäfen weiter raus
-          // (man will den Hub und Umgebung sehen), bei Bahnhof/Bushaltestelle
-          // näher dran (Stadt-Detail), bei Häfen mittel.
-          const zoom =
-            loc.type === "FLIGHT" ? 11 : loc.type === "CRUISE" ? 12 : 14;
-          mapRef.current?.flyTo(coord.latitude, coord.longitude, zoom);
-        }}
-        mode="ALL"
-        title={t("surroundings.search.title")}
-        leadingLabel=""
-        placeholderKey="surroundings.search.placeholder"
-        suggested={POPULAR_LOCATIONS.ALL}
-      />
 
 
       <MapFabs

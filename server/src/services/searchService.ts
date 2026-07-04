@@ -126,6 +126,10 @@ function cacheKey(input: SearchInput): string {
     // travelClass MUSS in den Key — sonst würde eine Economy-Suche eine
     // Business-Suche aus dem Cache bedienen (gleiche Strecke, andere Klasse).
     input.travelClass ?? "",
+    // departTime ebenso: der Surroundings-Departure-Tap verschiebt damit das
+    // dbVendo-Suchfenster. Ohne Key-Anteil würde ein 09:00-Tap die gecachten
+    // 14:00-Ergebnisse derselben Strecke/Tag serviert bekommen.
+    input.departTime ?? "",
   ].join("|");
 }
 
@@ -140,6 +144,11 @@ async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
   // bedienen (Economy-Resultate würden eine Business-Anfrage beantworten).
   // Lieber live fetchen als falsche Klassenpreise liefern.
   if (input.travelClass) return null;
+
+  // departTime (Surroundings-Departure-Tap) verschiebt das dbVendo-Such-
+  // fenster, wird aber ebenfalls nicht in der DB-Tabelle unterschieden —
+  // ein Cache-Hit könnte Ergebnisse eines anderen Zeitfensters liefern.
+  if (input.departTime) return null;
 
   // Round-Trip: Rückfahrt-Treffer werden nicht persistiert (kein `direction`
   // im Schema). Ein Cache-Hit würde nur die Hinfahrten liefern, was den

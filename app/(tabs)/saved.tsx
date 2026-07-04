@@ -3,14 +3,13 @@ import { View, Text, ScrollView } from "react-native";
 import type { SavedTrip } from "@/types/saved";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useIsFocused } from "@react-navigation/native";
-import { Plus, ChevronRight } from "lucide-react-native";
 import { useT } from "@/lib/i18n/useT";
 import { useSearchStore, type SearchStoreState } from "@/stores/searchStore";
 import { ResultCard } from "@/components/results/ResultCard";
 import { TicketCard } from "@/components/saved/TicketCard";
 import { AddTicketModal } from "@/components/saved/AddTicketModal";
 import { EmptyState } from "@/components/saved/EmptyState";
-import { RippleTouch } from "@/components/ui/RippleTouch";
+import { AddTicketButton } from "@/components/saved/AddTicketButton";
 import { SegmentedToggle } from "@/components/ui/SegmentedToggle";
 import { SlidingPanels } from "@/components/ui/SlidingPanels";
 import { useAccent } from "@/lib/theme/accent";
@@ -237,19 +236,7 @@ export default function SavedScreen() {
             contentContainerStyle={{ paddingBottom: 98 }}
             showsVerticalScrollIndicator={false}
           >
-            <RippleTouch
-              onPress={() => setShowModal(true)}
-              className="flex-row items-center rounded-2xl mx-4 mb-3.5 p-3.5"
-              style={{ backgroundColor: accent.subtle, borderWidth: 1, borderColor: accent.border }}
-            >
-              <View className="w-8 h-8 rounded-[9px] items-center justify-center mr-2.5" style={{ backgroundColor: accent.subtle }}>
-                <Plus size={18} color={accent.solid} strokeWidth={2.5} />
-              </View>
-              <Text className="flex-1 text-sm font-semibold" style={{ color: accent.solid }}>
-                {t("saved.tickets.add")}
-              </Text>
-              <ChevronRight size={16} color={accent.solid} />
-            </RippleTouch>
+            <AddTicketButton onPress={() => setShowModal(true)} />
 
             {tickets.length === 0 ? (
               <EmptyState tab="tickets" />

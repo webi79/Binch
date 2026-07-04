@@ -22,10 +22,12 @@ import { ConnectionNotFoundHost } from "@/components/ui/ConnectionNotFoundModal"
 // createNativeBottomTabNavigator (siehe app/(tabs)/_layout.tsx) übernimmt
 // die Rolle. Native = Tap wird auf UI-Thread verarbeitet = wirklich instant.
 import { SavedToastHost } from "@/components/ui/SavedToastHost";
+import { StationSaveToastHost } from "@/components/surroundings/StationSaveToastHost";
 import { TicketDetailOverlay } from "@/components/saved/TicketDetailOverlay";
 import { BinchSplash } from "@/components/ui/BinchSplash";
 import { BinchAuthScreen } from "@/components/auth/BinchAuthScreen";
 import { AuthHydrator } from "@/components/auth/AuthHydrator";
+import { migrateTicketImagesToFiles } from "@/lib/saved/ticketImages";
 import Animated, { FadeOut } from "react-native-reanimated";
 import { useState } from "react";
 
@@ -115,6 +117,16 @@ export default function RootLayout() {
     return () => clearTimeout(t);
   }, []);
 
+  // Einmalige Migration: Ticket-Bilder (früher Base64 im persistierten Store
+  // = Multi-MB-JSON.stringify bei jedem set() + AsyncStorage-CursorWindow-
+  // Risiko) auf file://-Dateien umziehen. Idempotent; nach der Hydration.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      void migrateTicketImagesToFiles();
+    }, 1500);
+    return () => clearTimeout(t);
+  }, []);
+
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       {/* Splash liegt GANZ AUSSEN — über SafeAreaProvider und allen Tabs,
@@ -194,6 +206,7 @@ export default function RootLayout() {
             <AppAlertHost />
             <ConnectionNotFoundHost />
             <SavedToastHost />
+            <StationSaveToastHost />
             {/* DatePickerHost ZULETZT vor Auth → liegt VISUELL ÜBER den
                 Tabs/Overlays inkl. Nav-Bar, sodass die Nav-Bar während des
                 Pickers nicht klickbar ist. */}

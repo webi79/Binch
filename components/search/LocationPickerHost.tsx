@@ -21,6 +21,9 @@ export function LocationPickerHost() {
       field={request?.field ?? "from"}
       mode={request?.mode ?? "ALL"}
       suggested={request?.suggested ?? []}
+      title={request?.title}
+      leadingLabel={request?.leadingLabel}
+      placeholderKey={request?.placeholderKey ?? "search.location.placeholder"}
     />
   );
 }

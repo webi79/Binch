@@ -114,6 +114,13 @@ export interface SavedToast {
   currency: string;
 }
 
+export interface StationToast {
+  /** Unique key, bumped each show so identical content retriggers animation */
+  key: number;
+  title: string;
+  subtitle: string;
+}
+
 export interface RecentSearch {
   id: string;
   mode: TravelMode;
@@ -159,6 +166,10 @@ interface SearchStore {
   savedToast: SavedToast | null;
   showSavedToast: (result: SearchResult) => void;
   hideSavedToast: () => void;
+  /** Toast beim Speichern einer Station (Surroundings-Tab). */
+  stationToast: StationToast | null;
+  showStationToast: (title: string, subtitle: string) => void;
+  hideStationToast: () => void;
   searchOverlayMode: TravelMode | null;
   /** Incrementiert bei jedem openSearchOverlay-Call. Wird als React-Key
    *  in SearchHeroOverlay genutzt um SearchHero pro Open frisch zu mounten —
@@ -203,6 +214,15 @@ interface SearchStore {
     field: "from" | "to";
     mode: TravelMode | "ALL";
     suggested: Location[];
+    /** Optionale Präsentation (z.B. Surroundings-Stationssuche). */
+    title?: string;
+    leadingLabel?: string;
+    placeholderKey?: string;
+    /** Wenn gesetzt, wird die Auswahl HIER abgeliefert statt in
+     *  locationPickerResult (Callback-Consumer wie Surroundings, die kein
+     *  from/to-Field-Konzept haben). Nicht persistiert — Request lebt nur
+     *  in-memory. */
+    onSelect?: (location: Location) => void;
   } | null;
   locationPickerResult: {
     sessionKey: number;
@@ -213,6 +233,10 @@ interface SearchStore {
     field: "from" | "to";
     mode: TravelMode | "ALL";
     suggested: Location[];
+    title?: string;
+    leadingLabel?: string;
+    placeholderKey?: string;
+    onSelect?: (location: Location) => void;
   }) => void;
   closeLocationPicker: () => void;
   confirmLocationPicker: (location: Location) => void;
@@ -303,6 +327,9 @@ interface SearchStore {
   tickets: Ticket[];
   addTicket: (t: Omit<Ticket, "id" | "createdAt">) => void;
   removeTicket: (id: string) => void;
+  /** Partielles Update eines Tickets — genutzt von der Bild-Migration
+   *  (lib/saved/ticketImages.ts), die data-URLs durch file://-URIs ersetzt. */
+  patchTicket: (id: string, patch: Partial<Ticket>) => void;
   /** Aktuell im Saved-Tab angetapptes Ticket — steuert das Root-Level
    *  TicketDetailOverlay (slide-from-right). null = Overlay geschlossen. */
   selectedTicket: Ticket | null;
@@ -408,6 +435,10 @@ export const useSearchStore = create<SearchStore>()(
           },
         }),
       hideSavedToast: () => set({ savedToast: null }),
+      stationToast: null,
+      showStationToast: (title, subtitle) =>
+        set({ stationToast: { key: Date.now(), title, subtitle } }),
+      hideStationToast: () => set({ stationToast: null }),
       searchOverlayMode: null,
       searchOverlaySession: 0,
       openSearchOverlay: (mode) =>
@@ -461,19 +492,30 @@ export const useSearchStore = create<SearchStore>()(
         }),
       locationPickerRequest: null,
       locationPickerResult: null,
-      openLocationPicker: ({ field, mode, suggested }) =>
+      openLocationPicker: ({ field, mode, suggested, title, leadingLabel, placeholderKey, onSelect }) =>
         set({
           locationPickerRequest: {
             sessionKey: Date.now(),
             field,
             mode,
             suggested,
+            title,
+            leadingLabel,
+            placeholderKey,
+            onSelect,
           },
         }),
       closeLocationPicker: () => set({ locationPickerRequest: null }),
       confirmLocationPicker: (location) =>
         set((state) => {
           if (!state.locationPickerRequest) return state;
+          // Callback-Consumer (z.B. Surroundings): Auswahl direkt abliefern,
+          // kein locationPickerResult — das würde sonst der SearchHero-Flow
+          // als from/to-Auswahl interpretieren.
+          if (state.locationPickerRequest.onSelect) {
+            state.locationPickerRequest.onSelect(location);
+            return { locationPickerRequest: null };
+          }
           return {
             locationPickerResult: {
               sessionKey: state.locationPickerRequest.sessionKey,
@@ -672,9 +714,12 @@ export const useSearchStore = create<SearchStore>()(
       favoriteResultIds: [],
       toggleFavorite: (id) =>
         set((state) => ({
+          // Cap 200: Result-IDs sind vergänglich (jede Suche erzeugt neue) —
+          // ohne Deckel wächst das persistierte Array über Monate unbegrenzt.
+          // Bei Überlauf fliegen die ältesten (vorne) raus.
           favoriteResultIds: state.favoriteResultIds.includes(id)
             ? state.favoriteResultIds.filter((x) => x !== id)
-            : [...state.favoriteResultIds, id],
+            : [...state.favoriteResultIds, id].slice(-200),
         })),
       savedTrips: [],
       savedTripSignatures: new Set<string>(),
@@ -787,6 +832,14 @@ export const useSearchStore = create<SearchStore>()(
           // Overlay mit-schließen damit keine Ghost-Daten gerendert werden.
           selectedTicket: state.selectedTicket?.id === id ? null : state.selectedTicket,
         })),
+      patchTicket: (id, patch) =>
+        set((state) => ({
+          tickets: state.tickets.map((t) => (t.id === id ? { ...t, ...patch } : t)),
+          selectedTicket:
+            state.selectedTicket?.id === id
+              ? { ...state.selectedTicket, ...patch }
+              : state.selectedTicket,
+        })),
       selectedTicket: null,
       openTicketDetail: (t) => set({ selectedTicket: t }),
       clearSelectedTicket: () => set({ selectedTicket: null }),
@@ -862,7 +915,10 @@ export const useSearchStore = create<SearchStore>()(
         savedStations: state.savedStations,
         tickets: state.tickets,
         authToken: state.authToken,
-        authUser: state.authUser,
+        // avatarDataUrl (bis ~800 KB Base64) NICHT mitpersistieren — es
+        // hinge sonst in jedem JSON.stringify des Persist-Layers mit drin.
+        // AuthHydrator holt den Avatar beim App-Start via /api/auth/me zurück.
+        authUser: state.authUser ? { ...state.authUser, avatarDataUrl: null } : null,
       }),
       // Nach Rehydration die `savedTripSignatures` aus den geladenen Trips
       // ableiten — Set ist nicht JSON-serialisierbar und wir wollen sie eh

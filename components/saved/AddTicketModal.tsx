@@ -27,7 +27,9 @@ import { Plane, TrainFront, Bus, Ship } from "lucide-react-native";
 import { TravelMode } from "@/types/search";
 import { Ticket } from "@/types/saved";
 import { useT } from "@/lib/i18n/useT";
-import { parseTicketPdf } from "@/lib/api/client";
+import { parseTicketPdf, TicketParseError } from "@/lib/api/client";
+import { useSearchStore } from "@/stores/searchStore";
+import { persistTicketImages } from "@/lib/saved/ticketImages";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useAccent } from "@/lib/theme/accent";
 
@@ -103,7 +105,12 @@ function AddTicketSheet({
       if (!asset) return;
 
       setBusy(true);
-      const parsed = await parseTicketPdf(asset.uri, asset.name, asset.mimeType ?? "application/pdf");
+      const parsed = await parseTicketPdf(
+        asset.uri,
+        asset.name,
+        asset.mimeType ?? "application/pdf",
+        useSearchStore.getState().authToken,
+      );
 
       const ratio =
         parsed.pageWidth > 0 ? parsed.pageHeight / parsed.pageWidth : undefined;
@@ -126,6 +133,15 @@ function AddTicketSheet({
         // wird ausgeblendet.
       }
 
+      // Page-/Code-Bild als PNG-Dateien ablegen und nur file://-URIs in den
+      // Store geben — Base64 im persistierten Store würde jeden Persist-
+      // stringify um MB aufblähen (JS-Thread-Blocks bei jedem set()).
+      const images = await persistTicketImages(
+        `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        parsed.pageImage,
+        parsed.codeImage ?? undefined,
+      );
+
       onAdd({
         mode: parsed.fields.mode ?? fallbackMode,
         carrier: parsed.fields.carrier,
@@ -144,18 +160,29 @@ function AddTicketSheet({
         seat: parsed.fields.seat,
         wagon: parsed.fields.wagon,
         travelClass: parsed.fields.travelClass,
-        pageImage: parsed.pageImage,
+        pageImage: images.pageImage,
         pageImageRatio: ratio,
         originalName: parsed.originalName ?? asset.name,
         bookingRef: parsed.fields.bookingRef,
         pdfUri: persistedUri,
-        codeImage: parsed.codeImage ?? undefined,
+        codeImage: images.codeImage,
         codeType: parsed.codeType ?? undefined,
       });
 
       onClose();
     } catch (err) {
-      showAlert(t("saved.modal.error.title"), (err as Error).message);
+      // Kontogebundener Endpoint: 401 = nicht eingeloggt → Login-Screen
+      // öffnen, 429 = Tageslimit des Kontos erreicht.
+      const status = err instanceof TicketParseError ? err.status : null;
+      if (status === 401) {
+        onClose();
+        useSearchStore.getState().openAuthOverlay();
+        return;
+      }
+      showAlert(
+        t("saved.modal.error.title"),
+        status === 429 ? t("saved.modal.error.ratelimit") : (err as Error).message,
+      );
     } finally {
       setBusy(false);
     }

@@ -18,7 +18,7 @@ import Animated, {
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useQuery } from "@tanstack/react-query";
-import { Star, Train, Bus, TramFront, Plane, Ship, type LucideIcon } from "lucide-react-native";
+import { Train, Bus, TramFront, Plane, Ship, type LucideIcon } from "lucide-react-native";
 import Svg, { Circle, Path } from "react-native-svg";
 import {
   fetchStopArrivals,
@@ -38,8 +38,7 @@ import { haptic } from "@/lib/haptics";
 import { showConnectionNotFound } from "@/lib/connectionNotFoundAlert";
 import type { SearchResult, TravelMode } from "@/types/search";
 import { useAccent } from "@/lib/theme/accent";
-
-const SAVED_GOLD = "#FFC107";
+import { SaveStarButton } from "@/components/surroundings/SaveStarButton";
 
 /**
  * Slide-Up-Sheet mit Abfahrten/Ankünften zur ausgewählten Haltestelle.
@@ -608,6 +607,7 @@ function StopDetailSheetInner() {
   const clearSelectedStop = useSearchStore((s) => s.clearSelectedStop);
   const savedStations = useSearchStore((s) => s.savedStations);
   const toggleSavedStation = useSearchStore((s) => s.toggleSavedStation);
+  const showStationToast = useSearchStore((s) => s.showStationToast);
   const selectResult = useSearchStore((s) => s.selectResult);
   const setSelectedResultPending = useSearchStore((s) => s.setSelectedResultPending);
   const clearSelectedResult = useSearchStore((s) => s.clearSelectedResult);
@@ -623,9 +623,18 @@ function StopDetailSheetInner() {
   const [displayStop, setDisplayStop] = useState<SelectedStop | null>(null);
 
   // Sobald ein neuer Stop ankommt, übernehmen wir ihn sofort als displayStop.
-  // Beim Schließen lassen wir displayStop noch ~Animation-Dauer stehen.
+  // Beim Schließen lassen wir displayStop die Slide-Out-Dauer (350ms) stehen
+  // und geben ihn DANACH frei. Ohne das Freigeben bliebe der komplette
+  // Sheet-Inhalt (Header-SVGs, Boards, Save-Stern) für immer im versteckten,
+  // TRANSFORMIERTEN Root-Sheet gemountet — Fabric compositet solchen Content
+  // bei jeder Overlay-Animation app-weit mit (→ Location-/DatePicker-Lag).
   useEffect(() => {
-    if (selectedStop) setDisplayStop(selectedStop);
+    if (selectedStop) {
+      setDisplayStop(selectedStop);
+      return;
+    }
+    const timer = setTimeout(() => setDisplayStop(null), 420);
+    return () => clearTimeout(timer);
   }, [selectedStop]);
 
   // Beim Open: stop = selectedStop (sofort sichtbar, ohne useEffect-Lag).
@@ -1000,22 +1009,21 @@ function StopDetailSheetInner() {
                   ? savedStations.some((s) => s.code === asLocation.code)
                   : false;
                 return (
-                  <Pressable
-                    hitSlop={12}
-                    style={styles.headerFav}
-                    onPress={() => {
-                      if (!asLocation) return;
-                      haptic("button");
-                      toggleSavedStation(asLocation);
-                    }}
-                    accessibilityLabel={saved ? "Unsave station" : "Save station"}
-                  >
-                    <Star
-                      size={22}
-                      color={saved ? SAVED_GOLD : C.white}
-                      fill={saved ? SAVED_GOLD : "transparent"}
+                  <View style={styles.headerFav}>
+                    <SaveStarButton
+                      saved={saved}
+                      onChange={(willSave) => {
+                        if (!asLocation) return;
+                        toggleSavedStation(asLocation);
+                        if (willSave) {
+                          showStationToast(
+                            t("surroundings.stationsaved"),
+                            asLocation.label.toUpperCase(),
+                          );
+                        }
+                      }}
                     />
-                  </Pressable>
+                  </View>
                 );
               })()}
             </View>

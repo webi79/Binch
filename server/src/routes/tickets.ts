@@ -7,8 +7,15 @@ import {
   isAiTicketParserAvailable,
   detectCodeRegion,
 } from "../services/ticketAiParser.js";
+import { requireUser } from "../services/authSession.js";
+import { rateLimit } from "../util/rateLimit.js";
 
 const MAX_BYTES = 12 * 1024 * 1024; // 12 MB
+
+/** Pro Konto: 20 Ticket-Parses pro Tag. Jeder Parse rendert ein PDF und
+ *  feuert zwei Claude-Vision/Text-Calls — mehr als ~5/Tag braucht kein
+ *  echter User, 20 lässt Luft für Fehlversuche. */
+const PARSES_PER_DAY = 20;
 
 /**
  * Croppt eine Bounding-Box (% Werte) aus dem Page-Image und gibt das Ergebnis
@@ -73,6 +80,20 @@ function mergeFields(ai: ParsedTicket | null, regex: ParsedTicket): ParsedTicket
 
 export async function ticketsRoutes(app: FastifyInstance) {
   app.post("/api/tickets/parse", async (req, reply) => {
+    // Kontogebunden — Parse kostet PDF-Rendering + Claude-Calls. Ohne
+    // Session → 401, der Client öffnet den Login-Screen.
+    const user = await requireUser(req);
+    if (!user) {
+      return reply.code(401).send({ error: "Login required" });
+    }
+    const rl = rateLimit("ticket-parse", user.id, PARSES_PER_DAY, 24 * 60 * 60 * 1000);
+    if (!rl.allowed) {
+      return reply
+        .code(429)
+        .header("Retry-After", rl.retryAfterSec)
+        .send({ error: "Rate limit reached", retryAfterSec: rl.retryAfterSec });
+    }
+
     const file = await req.file();
     if (!file) {
       return reply.code(400).send({ error: "No file uploaded" });

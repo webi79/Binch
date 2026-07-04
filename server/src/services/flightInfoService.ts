@@ -18,6 +18,10 @@ import type { StopBoard, StopBoardItem, StopBoardResponse } from "./stopInfoServ
 
 const CACHE_TTL_MS = 60 * 60 * 1000; // 60 min — Flugpläne sind stabil
 const MAX_RESULTS = 6;
+// Wir cachen die volle 12h-Liste (bis zu diesem Cap) und filtern erst beim
+// Servieren gegen „jetzt" — sonst würde der 60-min-Cache längst abgeflogene
+// Flüge weiterhin anzeigen. RAW_CACHE_MAX begrenzt nur den Speicher.
+const RAW_CACHE_MAX = 60;
 
 interface CacheEntry {
   data: StopBoardResponse;
@@ -161,7 +165,9 @@ async function fetchFromAeroDataBox(iata: string, board: StopBoard): Promise<Sto
       .filter((r): r is StopBoardItem => r !== null)
       // Schon vom Provider sortiert, aber zur Sicherheit nach planned aufsteigend
       .sort((a, b) => a.plannedTime.localeCompare(b.plannedTime))
-      .slice(0, MAX_RESULTS);
+      // NICHT auf MAX_RESULTS zuschneiden — die volle Liste wird gecacht, das
+      // Zeit-Filtern + Limitieren passiert beim Servieren (pruneStale).
+      .slice(0, RAW_CACHE_MAX);
     const fetchedAt = new Date().toISOString();
     return {
       results,
@@ -174,6 +180,26 @@ async function fetchFromAeroDataBox(iata: string, board: StopBoard): Promise<Sto
 }
 
 /**
+ * Filtert bereits abgeflogene/angekommene Einträge gegen die aktuelle Zeit und
+ * begrenzt auf MAX_RESULTS. Läuft bei JEDEM Serve (Cache-Hit wie frisch), damit
+ * der 60-min-Cache keine längst vergangenen Flüge mehr anzeigt.
+ *
+ * „Effektive" Zeit = actualTime (enthält bereits revised/predicted, siehe
+ * normalize) ?? plannedTime. Ein verspäteter, aber noch nicht abgeflogener Flug
+ * behält so eine Zukunfts-Zeit und bleibt sichtbar.
+ */
+function pruneStale(data: StopBoardResponse): StopBoardResponse {
+  const now = Date.now();
+  const results = data.results
+    .filter((r) => {
+      const eff = Date.parse(r.actualTime ?? r.plannedTime);
+      return !Number.isFinite(eff) || eff >= now;
+    })
+    .slice(0, MAX_RESULTS);
+  return { ...data, results };
+}
+
+/**
  * Holt Flughafen-Departures/-Arrivals mit Cache + Coalescing.
  *
  * @param iata IATA-Code des Airports (z.B. „FRA", „MUC")
@@ -183,10 +209,10 @@ export async function getFlightBoard(iata: string, board: StopBoard): Promise<St
   const key = cacheKey(iata, board);
 
   const cached = cache.get(key);
-  if (cached && cached.expiresAt > Date.now()) return cached.data;
+  if (cached && cached.expiresAt > Date.now()) return pruneStale(cached.data);
 
   const existing = inflight.get(key);
-  if (existing) return existing;
+  if (existing) return existing.then(pruneStale);
 
   const promise = fetchFromAeroDataBox(iata, board)
     .then((data) => {
@@ -197,5 +223,5 @@ export async function getFlightBoard(iata: string, board: StopBoard): Promise<St
       inflight.delete(key);
     });
   inflight.set(key, promise);
-  return promise;
+  return promise.then(pruneStale);
 }

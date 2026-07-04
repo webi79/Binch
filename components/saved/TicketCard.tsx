@@ -15,6 +15,7 @@ import { useSearchStore } from "@/stores/searchStore";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import { deleteTicketFiles } from "@/lib/saved/ticketImages";
 import {
   TicketHead,
   Perforation,
@@ -92,7 +93,12 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
         {
           text: t("common.delete"),
           style: "destructive",
-          onPress: () => removeTicket(ticket.id),
+          onPress: () => {
+            // Bild-/PDF-Dateien best-effort mitlöschen, damit das Document-
+            // Directory nicht mit verwaisten Dateien zumüllt.
+            deleteTicketFiles(ticket);
+            removeTicket(ticket.id);
+          },
         },
       ],
     );

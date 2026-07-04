@@ -60,8 +60,22 @@ export interface ChatStreamRequest {
    *  Turn-State, sodass Tools wie open_all_results über Turns hinweg
    *  funktionieren. */
   lastSearch?: LastSearchParams;
+  /** Session-Token — Bo ist kontogebunden (Server antwortet 401 ohne). */
+  authToken?: string | null;
   signal?: AbortSignal;
   onEvent: (event: ChatStreamEvent) => void;
+}
+
+/** Error mit HTTP-Status — Caller unterscheidet damit 401 (Login nötig)
+ *  und 429 (Konto-Rate-Limit) von generischen Fehlern. */
+export class ChatApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+  ) {
+    super(message);
+    this.name = "ChatApiError";
+  }
 }
 
 /** Heutiges Datum als yyyy-MM-dd in der lokalen TZ des Devices. */
@@ -84,6 +98,7 @@ export async function streamChat(req: ChatStreamRequest): Promise<void> {
     xhr.open("POST", `${API_BASE_URL}/api/chat/stream`);
     xhr.setRequestHeader("Content-Type", "application/json");
     xhr.setRequestHeader("Accept", "text/event-stream");
+    if (req.authToken) xhr.setRequestHeader("Authorization", `Bearer ${req.authToken}`);
 
     // SSE-Frame-Parsing: wir tracken den Offset bis zum letzten geparsten
     // Frame. Bei jedem progress-Event lesen wir nur den neuen Suffix von
@@ -121,10 +136,11 @@ export async function streamChat(req: ChatStreamRequest): Promise<void> {
         if (xhr.status !== 0 && xhr.status !== 200 && xhr.readyState === 4) {
           // HTTP-Fehler — Server hat einen Status != 200 geantwortet.
           reject(
-            new Error(
+            new ChatApiError(
               `Chat API ${xhr.status}${xhr.statusText ? ` ${xhr.statusText}` : ""}${
                 xhr.responseText ? `: ${xhr.responseText.slice(0, 200)}` : ""
               }`,
+              xhr.status,
             ),
           );
           return;

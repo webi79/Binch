@@ -493,10 +493,23 @@ export async function authUpdateAvatar(
   return j.user;
 }
 
+/** Error mit HTTP-Status — Caller unterscheidet 401 (Login nötig) und
+ *  429 (Konto-Tageslimit) von generischen Parse-Fehlern. */
+export class TicketParseError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+  ) {
+    super(message);
+    this.name = "TicketParseError";
+  }
+}
+
 export async function parseTicketPdf(
   uri: string,
   name: string,
-  mimeType = "application/pdf"
+  mimeType = "application/pdf",
+  token?: string | null,
 ): Promise<ParsedTicketResponse> {
   const url = `${API_BASE_URL}/api/tickets/parse`;
   const form = new FormData();
@@ -509,11 +522,17 @@ export async function parseTicketPdf(
   const res = await fetch(url, {
     method: "POST",
     body: form,
-    headers: { Accept: "application/json" },
+    headers: {
+      Accept: "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
-    throw new Error(`API ${res.status} ${res.statusText} for ${url}${txt ? ` :: ${txt}` : ""}`);
+    throw new TicketParseError(
+      `API ${res.status} ${res.statusText} for ${url}${txt ? ` :: ${txt}` : ""}`,
+      res.status,
+    );
   }
   return (await res.json()) as ParsedTicketResponse;
 }

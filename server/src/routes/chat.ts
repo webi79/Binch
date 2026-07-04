@@ -27,6 +27,12 @@ import {
   type ChatEvent,
   type ChatMessage,
 } from "../services/chatAgent.js";
+import { requireUser } from "../services/authSession.js";
+import { rateLimit } from "../util/rateLimit.js";
+
+/** Pro Konto: 30 Bo-Turns pro Stunde. Großzügig für echte Unterhaltungen
+ *  (jede Nachricht = 1 Turn), stoppt aber Token-Abuse über ein Konto. */
+const CHAT_TURNS_PER_HOUR = 30;
 
 const messageSchema = z.object({
   role: z.enum(["user", "assistant"]),
@@ -69,6 +75,22 @@ export async function chatRoutes(app: FastifyInstance) {
       return reply
         .code(503)
         .send({ error: "Chat unavailable — ANTHROPIC_API_KEY not configured" });
+    }
+
+    // Bo ist kontogebunden: jeder Turn kostet echte Claude-Tokens. Ohne
+    // Session → 401, der Client öffnet dann den Login-Screen. Das Budget
+    // hängt am User-Konto (nicht an der IP) — Gerätewechsel/geteiltes WLAN
+    // ändern nichts am Limit.
+    const user = await requireUser(req);
+    if (!user) {
+      return reply.code(401).send({ error: "Login required" });
+    }
+    const rl = rateLimit("chat", user.id, CHAT_TURNS_PER_HOUR, 60 * 60 * 1000);
+    if (!rl.allowed) {
+      return reply
+        .code(429)
+        .header("Retry-After", rl.retryAfterSec)
+        .send({ error: "Rate limit reached", retryAfterSec: rl.retryAfterSec });
     }
 
     const parsed = bodySchema.safeParse(req.body);

@@ -28,6 +28,9 @@ import { useLocalSearchParams, useRouter } from "expo-router";
 import { useIsFocused } from "@react-navigation/native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Animated, {
+  Extrapolation,
+  interpolate,
+  useAnimatedKeyboard,
   useAnimatedStyle,
   useSharedValue,
   withDelay,
@@ -47,7 +50,7 @@ import { useT } from "@/lib/i18n/useT";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
 import { useSearchStore } from "@/stores/searchStore";
-import { streamChat, todayLocal, type ChatStreamEvent, type LastSearchParams } from "@/lib/api/chat";
+import { streamChat, todayLocal, ChatApiError, type ChatStreamEvent, type LastSearchParams } from "@/lib/api/chat";
 import { pickWelcome } from "@/lib/assistant/welcomes";
 import { StopBoardCard } from "@/components/assistant/StopBoardCard";
 import type { SearchResult } from "@/types/search";
@@ -132,6 +135,8 @@ function AssistantScreenInner() {
   const isFocused = useIsFocused();
   const locale = useSearchStore((s) => s.locale);
   const currency = useSearchStore((s) => s.currency);
+  const authToken = useSearchStore((s) => s.authToken);
+  const openAuthOverlay = useSearchStore((s) => s.openAuthOverlay);
 
   // ?autoVoice=1 wird vom Home-Mic-Tap mitgeschickt → wir starten Voice direkt.
   const params = useLocalSearchParams<{ autoVoice?: string }>();
@@ -240,13 +245,28 @@ function AssistantScreenInner() {
   // Home-Indicator.
   const baseBottomPad = Math.max(12, insets.bottom + 8);
   const inputbarPadBottom = baseBottomPad;
-  // SNAP-Logik (kein useAnimatedKeyboard!): bei kbOffset-Änderung snappt
-  // BAR + Chat-Content in EINEM React-Commit zur neuen Position. Keine
-  // Animation = keine Layout-Animation-Kosten = kein Lag. OS-Keyboard
-  // slidet währenddessen sein eigenes Ding, der Chat snappt schon vor/
-  // während dieser Slide an die Endposition.
+  // Content-Padding der FlatList bleibt STATE-SNAP (kbOffset via
+  // keyboardDidShow): das ist Layout und läge sonst pro Frame auf dem
+  // JS-Thread. Der Snap passiert hinter dem letzten Bubble → unsichtbar.
   const barBottom = keyboardOpen ? kbOffset + BAR_LIFT_FROM_KB : 0;
   const contentPaddingBottom = inputbarHeight + barBottom + MSG_GAP_FROM_BAR;
+
+  // Die BAR selbst folgt dem Keyboard FRAME-SYNCED via useAnimatedKeyboard
+  // (WindowInsetsAnimation auf dem UI-Thread) — exakt der Mechanismus, der
+  // die native Bottom-Tab-Bar so smooth über das Keyboard hebt. Der alte
+  // keyboardDidShow-Snap feuerte erst NACH der Keyboard-Animation → die Bar
+  // sprang sichtbar. kb.height ist der volle IME-Inset ab physischem
+  // Screen-Bottom; die System-Nav-Bar (insets.bottom) ziehen wir ab, analog
+  // zur keyboardDidShow-Höhe (ime - systemBars) auf der die alte Position
+  // getunt war. Der BAR_LIFT wird über die ersten 80px eingeblendet statt
+  // hart addiert — kein 16px-Hop am Animationsstart.
+  const kb = useAnimatedKeyboard();
+  const navInset = insets.bottom;
+  const barAnimStyle = useAnimatedStyle(() => {
+    const kbHeight = Math.max(0, kb.height.value - navInset);
+    const lift = interpolate(kbHeight, [0, 80], [0, BAR_LIFT_FROM_KB], Extrapolation.CLAMP);
+    return { transform: [{ translateY: -(kbHeight + lift) }] };
+  });
 
   // Welcome-Message beim ersten Mount. Zufällige Variante aus pickWelcome,
   // damit der User nicht immer dieselbe Begrüßung sieht.
@@ -520,6 +540,7 @@ function AssistantScreenInner() {
           // Server-State (der per-Turn neu erstellt wird) wieder weiß was
           // gerade präsentiert wurde.
           lastSearch: lastSearchRef.current ?? undefined,
+          authToken,
           signal: ctrl.signal,
           onEvent: (ev) => handleStreamEvent(ev, botId),
         });
@@ -533,6 +554,11 @@ function AssistantScreenInner() {
           setMood("idle");
           return;
         }
+        // Bo ist kontogebunden: 401 = nicht eingeloggt → Login-Screen öffnen,
+        // 429 = Stunden-Kontingent des Kontos aufgebraucht. Beide bekommen
+        // eine spezifische Meldung statt des generischen Fehlers.
+        const status = err instanceof ChatApiError ? err.status : null;
+        if (status === 401) openAuthOverlay();
         const rawMessage = err instanceof Error ? err.message : String(err);
         if (__DEV__) console.log("[chat] stream error:", rawMessage);
         setMood("error");
@@ -540,10 +566,17 @@ function AssistantScreenInner() {
           replaceTyping(prev, {
             id: idGen(),
             kind: "error",
-            // Im Dev-Build zeigen wir die echte Fehlermeldung, damit wir sofort
-            // sehen ob's 404 (Server-Code alt), 503 (Key fehlt), Network o.ä.
-            // ist. In Prod fallback auf generisch.
-            message: __DEV__ ? rawMessage : t("assistant.error.generic"),
+            message:
+              status === 401
+                ? t("assistant.error.loginrequired")
+                : status === 429
+                  ? t("assistant.error.ratelimit")
+                  : // Im Dev-Build die echte Fehlermeldung, damit wir sofort
+                    // sehen ob's 404 (Server-Code alt), 503 (Key fehlt),
+                    // Network o.ä. ist. In Prod fallback auf generisch.
+                    __DEV__
+                    ? rawMessage
+                    : t("assistant.error.generic"),
           }),
         );
       } finally {
@@ -552,7 +585,7 @@ function AssistantScreenInner() {
         streamingBotIdRef.current = null;
       }
     },
-    [busy, locale, currency, t],
+    [busy, locale, currency, t, authToken, openAuthOverlay],
   );
 
   // Stream-Event-Handler — closure over botId der aktuellen Antwort.
@@ -825,13 +858,12 @@ function AssistantScreenInner() {
         }}
       />
 
-      {/* Input-Bar Wrapper — absolut positioniert, `bottom: barBottom`
-          snappt instant zur Position über dem Keyboard. State-driven via
-          Reanimated translateY hochgeschoben wenn das Keyboard erscheint.
-          kbOffset state. onLayout misst die echte Bar-Höhe für die
+      {/* Input-Bar Wrapper — absolut bei bottom:0, die Hochbewegung kommt
+          frame-synced mit dem Keyboard via barAnimStyle (useAnimatedKeyboard,
+          UI-Thread). onLayout misst die echte Bar-Höhe für die
           contentPaddingBottom-Berechnung. */}
-      <View
-        style={[styles.inputbarWrap, { bottom: barBottom }]}
+      <Animated.View
+        style={[styles.inputbarWrap, barAnimStyle]}
         onLayout={(e) => {
           const h = e.nativeEvent.layout.height;
           if (Math.abs(h - inputbarHeight) > 1) setInputbarHeight(h);
@@ -928,7 +960,7 @@ function AssistantScreenInner() {
         </Pressable>
       </View>
       )}
-      </View>
+      </Animated.View>
     </View>
   );
 }

@@ -1,0 +1,27 @@
+diff --git a/node_modules/react-native-bottom-tabs/android/src/main/java/com/rcttabview/RCTTabView.kt b/node_modules/react-native-bottom-tabs/android/src/main/java/com/rcttabview/RCTTabView.kt
+index 1d0c404..553348c 100644
+--- a/node_modules/react-native-bottom-tabs/android/src/main/java/com/rcttabview/RCTTabView.kt
++++ b/node_modules/react-native-bottom-tabs/android/src/main/java/com/rcttabview/RCTTabView.kt
+@@ -38,6 +38,22 @@ import com.google.android.material.navigation.NavigationBarView.LABEL_VISIBILITY
+ import com.google.android.material.transition.platform.MaterialFadeThrough
+ 
+ class ExtendedBottomNavigationView(context: Context) : BottomNavigationView(context) {
++  init {
++    // Binch-Patch: Material's BottomNavigationView wendet in seinem internen
++    // OnApplyWindowInsetsListener die legacy systemWindowInsets an — die
++    // schließen den IME ein. Mit Edge-to-Edge hebt sich die Bar dadurch
++    // über die geöffnete Tastatur. Wir ersetzen den Listener (nur einer pro
++    // View möglich) durch einen, der ausschließlich die System-Bars als
++    // Bottom-Padding anwendet und die Tastatur ignoriert → Bar bleibt
++    // statisch am Screen-Bottom.
++    val initialBottom = paddingBottom
++    androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(this) { v, insets ->
++      val bars = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars())
++      v.setPadding(v.paddingLeft, v.paddingTop, v.paddingRight, initialBottom + bars.bottom)
++      insets
++    }
++  }
++
+   override fun getMaxItemCount(): Int {
+     return 100
+   }
