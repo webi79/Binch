@@ -1,5 +1,5 @@
 diff --git a/node_modules/react-native-bottom-tabs/android/src/main/java/com/rcttabview/RCTTabView.kt b/node_modules/react-native-bottom-tabs/android/src/main/java/com/rcttabview/RCTTabView.kt
-index 1d0c404..553348c 100644
+index 1d0c404..d32333a 100644
 --- a/node_modules/react-native-bottom-tabs/android/src/main/java/com/rcttabview/RCTTabView.kt
 +++ b/node_modules/react-native-bottom-tabs/android/src/main/java/com/rcttabview/RCTTabView.kt
 @@ -38,6 +38,22 @@ import com.google.android.material.navigation.NavigationBarView.LABEL_VISIBILITY
@@ -25,3 +25,53 @@ index 1d0c404..553348c 100644
    override fun getMaxItemCount(): Int {
      return 100
    }
+@@ -205,7 +221,16 @@ class ReactBottomNavigationView(context: Context) : LinearLayout(context) {
+   private fun toggleViewVisibility(view: View, isVisible: Boolean) {
+     check(view is ViewGroup) { "Native component tree is corrupted." }
+ 
+-    view.visibility = if (isVisible) VISIBLE else GONE
++    // Binch-Patch: INVISIBLE statt GONE. GONE wirft die Page aus dem Render-
++    // Tree -> Android verwirft ihre Display-Lists/GPU-Ressourcen. Beim
++    // Zurückwechseln wird der gesamte Tab-Content dann LAZY waehrend der
++    // ersten Scroll-Geste auf dem RenderThread neu rasterisiert -> sichtbares
++    // Stottern, obwohl UI- und JS-Thread-FPS sauber sind. INVISIBLE haelt die
++    // Views im Render-Tree (nur nicht gezeichnet), Display-Lists bleiben
++    // erhalten, der Rueckwechsel ist sofort zeichenbereit. Touch ist ueber
++    // isEnabled=false weiterhin aus; Layout-Kosten sind identisch (alle
++    // Pages sind match_parent im selben FrameLayout).
++    view.visibility = if (isVisible) VISIBLE else INVISIBLE
+     view.isEnabled = isVisible
+   }
+ 
+diff --git a/node_modules/react-native-bottom-tabs/lib/module/DelayedFreeze.js b/node_modules/react-native-bottom-tabs/lib/module/DelayedFreeze.js
+index 29668ba..29af5d8 100644
+--- a/node_modules/react-native-bottom-tabs/lib/module/DelayedFreeze.js
++++ b/node_modules/react-native-bottom-tabs/lib/module/DelayedFreeze.js
+@@ -4,7 +4,7 @@ import React from 'react';
+ import { Freeze } from 'react-freeze';
+ import { jsx as _jsx } from "react/jsx-runtime";
+ // Animation delay for freeze effect.
+-const ANIMATION_DELAY = 200;
++const ANIMATION_DELAY = 0; // Binch-Patch, siehe src/DelayedFreeze.tsx
+ 
+ // This component delays the freeze effect by animation delay.
+ // So that the screen is not frozen immediately causing background flash.
+diff --git a/node_modules/react-native-bottom-tabs/src/DelayedFreeze.tsx b/node_modules/react-native-bottom-tabs/src/DelayedFreeze.tsx
+index 3e49daf..be42355 100644
+--- a/node_modules/react-native-bottom-tabs/src/DelayedFreeze.tsx
++++ b/node_modules/react-native-bottom-tabs/src/DelayedFreeze.tsx
+@@ -7,7 +7,13 @@ interface FreezeWrapperProps {
+ }
+ 
+ // Animation delay for freeze effect.
+-const ANIMATION_DELAY = 200;
++// Binch-Patch: 0 statt 200ms. Der 200ms-Delay existiert nur gegen den
++// Background-Flash WÄHREND einer Page-Wechsel-Animation — wir fahren
++// disablePageAnimations, der Wechsel ist instant. Mit 200ms landete der
++// Freeze-Commit des verlassenen Tabs (Suspense-Hide + Effect-Cleanups)
++// exakt im Scroll-Fenster nach dem Tab-Wechsel → sichtbare Ruckler auf
++// dem Ziel-Tab. Mit 0 passiert er im (eh busy) Wechsel-Moment.
++const ANIMATION_DELAY = 0;
+ 
+ // This component delays the freeze effect by animation delay.
+ // So that the screen is not frozen immediately causing background flash.

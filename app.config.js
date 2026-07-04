@@ -48,6 +48,10 @@ module.exports = {
     },
     plugins: [
       "expo-router",
+      // Scroll-Judder-Fix: pinnt die Display-Rate am App-Window (Details im
+      // Plugin). MUSS als Config-Plugin laufen — android/ ist gitignored
+      // (CNG), direkte Edits dort erreichen EAS-Builds nie.
+      "./plugins/withDisplayRatePin",
       "@react-native-community/datetimepicker",
       [
         "expo-location",

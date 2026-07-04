@@ -49,7 +49,14 @@ export default function TabsLayout() {
         // Wir schließen den SearchHero-Overlay damit er nicht weiter offen
         // bleibt während der Tab im Hintergrund wechselt.
         screenListeners={{
-          tabPress: () => closeSearchOverlay(),
+          tabPress: (e) => {
+            // TEMPORÄRE DIAGNOSE (Landing-Scroll-Ruckler): Marker im Metro-
+            // Log, um [jsstall]-Einträge dem Tab-Wechsel zuzuordnen.
+            if (__DEV__) {
+              console.log(`[jsstall] ── Tab-Wechsel → ${e.target?.split("-")[0] ?? "?"} (${new Date().toISOString().slice(14, 23)})`);
+            }
+            closeSearchOverlay();
+          },
         }}
         tabBarActiveTintColor={COLORS.active}
         tabBarInactiveTintColor={COLORS.inactive}
@@ -86,7 +93,14 @@ export default function TabsLayout() {
           options={{
             title: t("bottomnav.booking"),
             tabBarIcon: () => require("@/assets/tabs/home.png"),
-            freezeOnBlur: true,
+            // BEWUSST KEIN freezeOnBlur — anders als bei den anderen Tabs.
+            // react-freeze (Suspense) unmountet beim Blur den ganzen nativen
+            // Tree; beim Refocus wird er komplett NEU gemountet (JS-Re-Render
+            // + Fabric-Mount-Burst auf dem UI-Thread). Wer direkt nach dem
+            // Tab-Wechsel scrollt, scrollt mitten in diesen Burst → Ruckler
+            // trotz „120fps"-Anzeige. Die Landing ist der meistbesuchte Tab
+            // und hat im Hintergrund fast keine Kosten (keine Map, keine
+            // Loops, nur seltene Store-Re-Renders) — Freeze lohnt hier nicht.
           }}
         />
         <Tabs.Screen
