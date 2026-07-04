@@ -80,27 +80,23 @@ export default function TabsLayout() {
         translucent={false}
         scrollEdgeAppearance="opaque"
       >
-        {/* freezeOnBlur=true ist die ROOT-FIX gegen den App-weiten Lag der
-            nach jedem ersten Saved-/Surroundings-/Settings-Besuch auftrat:
-            react-native-bottom-tabs hat per Default `freezeOnBlur=false`,
-            d.h. unfocussierte Tabs bleiben AKTIV rendernd im Hintergrund
-            (Reanimated-Subscriptions, useEffects, Store-Subscriber laufen
-            alle weiter). Jeder einmal besuchte Tab fügt permanent JS- und
-            UI-Thread-Last hinzu. Mit Freeze stoppt React das Rendering der
-            unfocussierten Tabs via Suspense → Landing bleibt smooth. */}
+        {/* FREEZE-STRATEGIE (gemessen, nicht geraten):
+            freezeOnBlur stoppt Hintergrund-Rendering unfokussierter Tabs
+            (react-freeze/Suspense) — aber jeder Freeze/Unfreeze ist ein
+            dicker React-Commit + Fabric-Mount-Burst, der EXAKT im Moment
+            des Tab-Wechsels landet. Wer direkt nach dem Wechsel scrollt,
+            scrollt in diesen Burst → Erst-Scroll-Ruckler in JEDEM Tab
+            ([jsstall]-Messung: 50–130ms Stalls genau bei Entry in
+            gefrorene Tabs). Deshalb: Freeze NUR wo der Hintergrund-Nutzen
+            die Wechsel-Kosten übersteigt — bei der Map (MapLibre-GL-Thread,
+            Viewport-Queries). Landing/Saved/Settings sind leichte Trees
+            ohne Loops: ungefroren kosten sie im Hintergrund fast nichts,
+            und der Tab-Wechsel bleibt commit-frei. */}
         <Tabs.Screen
           name="index"
           options={{
             title: t("bottomnav.booking"),
             tabBarIcon: () => require("@/assets/tabs/home.png"),
-            // BEWUSST KEIN freezeOnBlur — anders als bei den anderen Tabs.
-            // react-freeze (Suspense) unmountet beim Blur den ganzen nativen
-            // Tree; beim Refocus wird er komplett NEU gemountet (JS-Re-Render
-            // + Fabric-Mount-Burst auf dem UI-Thread). Wer direkt nach dem
-            // Tab-Wechsel scrollt, scrollt mitten in diesen Burst → Ruckler
-            // trotz „120fps"-Anzeige. Die Landing ist der meistbesuchte Tab
-            // und hat im Hintergrund fast keine Kosten (keine Map, keine
-            // Loops, nur seltene Store-Re-Renders) — Freeze lohnt hier nicht.
           }}
         />
         <Tabs.Screen
@@ -116,7 +112,6 @@ export default function TabsLayout() {
           options={{
             title: t("bottomnav.saved"),
             tabBarIcon: () => require("@/assets/tabs/calendar.png"),
-            freezeOnBlur: true,
           }}
         />
         <Tabs.Screen
@@ -124,7 +119,6 @@ export default function TabsLayout() {
           options={{
             title: t("bottomnav.settings"),
             tabBarIcon: () => require("@/assets/tabs/user.png"),
-            freezeOnBlur: true,
           }}
         />
       </Tabs>
