@@ -26,7 +26,14 @@ const app = Fastify({
   },
 });
 
-await app.register(cors, { origin: true });
+// CORS: mit CORS_ORIGINS (Prod) nur die gelisteten Origins, ungesetzt (Dev)
+// wird jeder Origin reflektiert. Native App-Clients senden keinen Origin-
+// Header — das hier betrifft nur Browser-Clients.
+await app.register(cors, {
+  origin: config.CORS_ORIGINS
+    ? config.CORS_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean)
+    : true,
+});
 await app.register(multipart, { limits: { fileSize: 12 * 1024 * 1024 } });
 
 app.get("/health", async () => ({ ok: true }));

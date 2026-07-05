@@ -7,6 +7,15 @@ import type { FastifyRequest } from "fastify";
 import { eq } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { users, sessions } from "../db/schema.js";
+import { sha256 } from "../util/hash.js";
+
+/** In der DB liegt NUR der sha256-Hash des Session-Tokens — bei einem DB-Leak
+ *  (Backup, Dump) sind damit keine Sessions übernehmbar. Der Client hält das
+ *  Roh-Token; jeder Lookup hasht zuerst. (Einmalige Folge der Umstellung:
+ *  alte Klartext-Sessions matchen nicht mehr → User loggen sich neu ein.) */
+export function hashSessionToken(rawToken: string): string {
+  return sha256(rawToken);
+}
 
 /** lastSeenAt nur updaten wenn älter als das — sonst schreibt JEDER
  *  authentifizierte Request die Statistik-Spalte (Write-Amplification). */
@@ -30,6 +39,7 @@ export function bearerToken(req: FastifyRequest): string | null {
  *  ~800 KB Base64 halten und würde sonst bei jedem Auth-Check mit aus der DB
  *  gezogen. Endpoints die den Avatar brauchen (/me) laden ihn separat. */
 export async function resolveSession(token: string): Promise<SessionUser | null> {
+  const tokenHash = hashSessionToken(token);
   const [row] = await db
     .select({
       uid: users.id,
@@ -41,12 +51,12 @@ export async function resolveSession(token: string): Promise<SessionUser | null>
     })
     .from(sessions)
     .innerJoin(users, eq(users.id, sessions.userId))
-    .where(eq(sessions.token, token))
+    .where(eq(sessions.token, tokenHash))
     .limit(1);
 
   if (!row) return null;
   if (row.expiresAt.getTime() < Date.now()) {
-    await db.delete(sessions).where(eq(sessions.token, token));
+    await db.delete(sessions).where(eq(sessions.token, tokenHash));
     return null;
   }
 
@@ -54,7 +64,7 @@ export async function resolveSession(token: string): Promise<SessionUser | null>
     await db
       .update(sessions)
       .set({ lastSeenAt: new Date() })
-      .where(eq(sessions.token, token));
+      .where(eq(sessions.token, tokenHash));
   }
 
   return {

@@ -3,27 +3,29 @@ import { z } from "zod";
 import { runSearch } from "../services/searchService.js";
 import type { TravelMode } from "../db/schema.js";
 
+// .max() überall: die Werte landen in Cache-Keys, DB-Zeilen und Provider-URLs
+// — ohne Deckel wären sie nur durch die URL-Gesamtlänge begrenzt.
 const querySchema = z.object({
-  origin: z.string().min(1),
-  destination: z.string().min(1),
-  originLabel: z.string().optional(),
-  destLabel: z.string().optional(),
-  departDate: z.string().min(1),
+  origin: z.string().min(1).max(200),
+  destination: z.string().min(1).max(200),
+  originLabel: z.string().max(300).optional(),
+  destLabel: z.string().max(300).optional(),
+  departDate: z.string().min(1).max(40),
   /** Optional ISO-UTC-Zeitstempel — Surroundings-Tap setzt das, normale Suche
    *  lässt's weg. Wird vom dbVendo-Provider als Suchfenster-Start verwendet. */
-  departTime: z.string().optional(),
-  returnDate: z.string().optional(),
+  departTime: z.string().max(40).optional(),
+  returnDate: z.string().max(40).optional(),
   passengers: z.coerce.number().int().min(1).max(9).default(1),
-  currency: z.string().default("EUR"),
+  currency: z.string().max(8).default("EUR"),
   /** i18n-Key (z.B. "search.class.business"). Provider entscheiden selbst,
    *  ob/wie sie das umsetzen — wir reichen den Wert nur durch. */
-  travelClass: z.string().optional(),
+  travelClass: z.string().max(60).optional(),
   /** ?nocache=1 erzwingt frische Provider-Anfrage, sonst greift der 2h-Cache. */
   nocache: z.coerce.boolean().optional(),
   /** „Später"-Pagination: opaques Token aus der vorherigen Suche
    *  (HAFAS laterRef). Wird nur von TRAIN-Provider unterstützt; bei
    *  anderen Modes ignoriert. */
-  paginationToken: z.string().optional(),
+  paginationToken: z.string().max(2000).optional(),
 });
 
 const MODE_PATHS: Array<{ path: string; mode: TravelMode }> = [

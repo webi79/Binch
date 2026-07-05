@@ -37,6 +37,12 @@ const schema = z.object({
   // Anthropic Claude — Travel-Agent „Bo" (Haiku 4.5). Optional: ohne Key
   // antwortet /api/chat/stream mit 503 statt den Server-Boot zu blocken.
   ANTHROPIC_API_KEY: z.string().optional(),
+
+  // CORS-Allowlist, kommasepariert (z.B. "https://app.binch.example").
+  // Ungesetzt (Dev): jeder Origin wird reflektiert. Native App-Clients
+  // senden keinen Origin-Header — CORS betrifft nur Browser-Clients.
+  // Beim Hetzner-Prod-Deployment setzen!
+  CORS_ORIGINS: z.string().optional(),
 });
 
 export type Config = z.infer<typeof schema>;

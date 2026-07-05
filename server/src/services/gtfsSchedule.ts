@@ -268,14 +268,14 @@ export async function getScheduledStopBoard(args: {
     WITH today_trips AS (
       SELECT trip_id, route_id, headsign
       FROM gtfs_trips
-      WHERE feed_id = ${feedId} AND service_id = ANY(${sql.raw(`ARRAY[${serviceList.map((s) => `'${s.replace(/'/g, "''")}'`).join(",")}]::text[]`)})
+      WHERE feed_id = ${feedId} AND service_id = ANY(${sql.param(serviceList)}::text[])
     ),
     today_stops AS (
       SELECT st.trip_id, st.departure_seconds, st.arrival_seconds, tt.headsign, tt.route_id
       FROM gtfs_stop_times st
       INNER JOIN today_trips tt ON tt.trip_id = st.trip_id
       WHERE st.feed_id = ${feedId}
-        AND st.stop_id = ANY(${sql.raw(`ARRAY[${allStopIds.map((s) => `'${s.replace(/'/g, "''")}'`).join(",")}]::text[]`)})
+        AND st.stop_id = ANY(${sql.param(allStopIds)}::text[])
         AND ${timeCol} >= ${fromSec}
         AND ${timeCol} <= ${toSec}
     ),
@@ -283,7 +283,7 @@ export async function getScheduledStopBoard(args: {
     yesterday_trips AS (
       SELECT trip_id, route_id, headsign
       FROM gtfs_trips
-      WHERE feed_id = ${feedId} AND service_id = ANY(${sql.raw(`ARRAY[${ySvcList.map((s) => `'${s.replace(/'/g, "''")}'`).join(",")}]::text[]`)})
+      WHERE feed_id = ${feedId} AND service_id = ANY(${sql.param(ySvcList)}::text[])
     ),
     yesterday_stops AS (
       SELECT st.trip_id,
@@ -293,7 +293,7 @@ export async function getScheduledStopBoard(args: {
       FROM gtfs_stop_times st
       INNER JOIN yesterday_trips yt ON yt.trip_id = st.trip_id
       WHERE st.feed_id = ${feedId}
-        AND st.stop_id = ANY(${sql.raw(`ARRAY[${allStopIds.map((s) => `'${s.replace(/'/g, "''")}'`).join(",")}]::text[]`)})
+        AND st.stop_id = ANY(${sql.param(allStopIds)}::text[])
         AND ${timeCol} >= 86400
         AND ${timeCol} - 86400 >= ${fromSec}
         AND ${timeCol} - 86400 <= ${toSec}

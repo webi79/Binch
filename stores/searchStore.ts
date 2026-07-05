@@ -5,6 +5,7 @@ import { AppState } from "react-native";
 import { SearchResult, TravelMode, Location } from "@/types/search";
 import { SavedTrip, Ticket } from "@/types/saved";
 import { tripSignature } from "@/lib/results/signature";
+import { saveAuthToken } from "@/lib/auth/tokenStorage";
 import type { AuthUser } from "@/lib/api/client";
 import { fetchLocationsByCodes } from "@/lib/api/client";
 import { trimPolyline } from "@/lib/routing/trimPolyline";
@@ -852,9 +853,19 @@ export const useSearchStore = create<SearchStore>()(
       // sich selbst nachdem die Success-Animation durch ist. Vorher schloss
       // setAuth den Overlay sofort, was den Bo-Reinflieg-Effekt unsichtbar
       // gemacht hat. Die Closer-Pfade rufen jetzt explizit closeAuthOverlay.
-      setAuth: (token, user) => set({ authToken: token, authUser: user }),
+      // Write-through in den SecureStore (Keystore/Keychain): das Token wird
+      // NICHT mehr über die persist-Middleware in AsyncStorage geschrieben
+      // (siehe partialize) — Bearer-Tokens gehören nicht in eine
+      // unverschlüsselte, backup-fähige Datei.
+      setAuth: (token, user) => {
+        set({ authToken: token, authUser: user });
+        void saveAuthToken(token);
+      },
       setAuthUser: (user) => set({ authUser: user }),
-      clearAuth: () => set({ authToken: null, authUser: null }),
+      clearAuth: () => {
+        set({ authToken: null, authUser: null });
+        void saveAuthToken(null);
+      },
 
       savedStations: [],
       toggleSavedStation: (loc) =>
@@ -914,7 +925,8 @@ export const useSearchStore = create<SearchStore>()(
         savedTrips: state.savedTrips,
         savedStations: state.savedStations,
         tickets: state.tickets,
-        authToken: state.authToken,
+        // authToken bewusst NICHT hier: liegt im SecureStore (Keystore/
+        // Keychain), siehe lib/auth/tokenStorage.ts + AuthHydrator.
         // avatarDataUrl (bis ~800 KB Base64) NICHT mitpersistieren — es
         // hinge sonst in jedem JSON.stringify des Persist-Layers mit drin.
         // AuthHydrator holt den Avatar beim App-Start via /api/auth/me zurück.

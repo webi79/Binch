@@ -29,6 +29,7 @@ import {
 } from "./multiHafas.js";
 import type { HafasProfileKey, MultiHafasProfileKey } from "./countryProfile.js";
 import { getScheduledStopBoard } from "./gtfsSchedule.js";
+import { BoundedTtlCache } from "../util/boundedCache.js";
 
 export type StopBoard = "departures" | "arrivals";
 
@@ -489,13 +490,11 @@ export function getHottestKeys(limit: number): { hafasId: string; board: StopBoa
  * Cache: 24h pro (lat, lng, label) — Mapping ist stabil. Resolver ist im
  * Pfad „User klickt Marker → API muss schnell antworten" → Cache zwingend.
  */
-interface ResolveEntry {
-  hafasId: string | null;
-  expiresAt: number;
-}
-const resolveCache = new Map<string, ResolveEntry>();
-const resolveInflight = new Map<string, Promise<string | null>>();
 const RESOLVE_TTL_MS = 24 * 60 * 60 * 1000;
+// Bounded LRU: Keyspace hängt an User-Marker-Taps (Koordinaten+Label) und
+// wächst sonst unbegrenzt über die Prozess-Laufzeit.
+const resolveCache = new BoundedTtlCache<string | null>(500, RESOLVE_TTL_MS);
+const resolveInflight = new Map<string, Promise<string | null>>();
 
 interface DbRestNearby {
   id?: string;
@@ -533,8 +532,9 @@ export async function resolveHafasByCoord(
   // Resolve den BUS-Resolve mit der Train-Station beantworten.
   const key = `${profile}|${expectedType ?? ""}|${lat.toFixed(5)}|${lng.toFixed(5)}|${label.toLowerCase()}`;
 
+  // undefined = Cache-Miss; null ist ein gültiger (negativer) Cache-Wert.
   const cached = resolveCache.get(key);
-  if (cached && cached.expiresAt > Date.now()) return cached.hafasId;
+  if (cached !== undefined) return cached;
 
   const existing = resolveInflight.get(key);
   if (existing) return existing;
@@ -648,7 +648,7 @@ export async function resolveHafasByCoord(
       clearTimeout(timer);
     }
   })().then((id) => {
-    resolveCache.set(key, { hafasId: id, expiresAt: Date.now() + RESOLVE_TTL_MS });
+    resolveCache.set(key, id);
     return id;
   }).finally(() => {
     resolveInflight.delete(key);

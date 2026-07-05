@@ -5,7 +5,7 @@ import { db } from "../db/client.js";
 import { users, sessions } from "../db/schema.js";
 import { hashPassword, verifyPassword } from "../util/password.js";
 import { randomToken } from "../util/hash.js";
-import { bearerToken, resolveSession } from "../services/authSession.js";
+import { bearerToken, resolveSession, hashSessionToken } from "../services/authSession.js";
 import { rateLimit } from "../util/rateLimit.js";
 
 const SESSION_TTL_DAYS = 30;
@@ -50,7 +50,8 @@ const avatarSchema = z.object({
 async function createSession(userId: string): Promise<string> {
   const token = randomToken(32);
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
-  await db.insert(sessions).values({ token, userId, expiresAt });
+  // Nur den HASH persistieren — das Roh-Token sieht ausschließlich der Client.
+  await db.insert(sessions).values({ token: hashSessionToken(token), userId, expiresAt });
   return token;
 }
 
@@ -143,7 +144,7 @@ export async function authRoutes(app: FastifyInstance) {
   app.post("/api/auth/logout", async (req, reply) => {
     const token = bearerToken(req);
     if (token) {
-      await db.delete(sessions).where(eq(sessions.token, token));
+      await db.delete(sessions).where(eq(sessions.token, hashSessionToken(token)));
     }
     return reply.code(204).send();
   });
@@ -198,4 +199,7 @@ export async function authRoutes(app: FastifyInstance) {
   // Best-effort cleanup of expired sessions on startup. Cheap because of
   // the expires_at index.
   await db.delete(sessions).where(lt(sessions.expiresAt, sql`now()`));
+  // Einmalige Migration: Sessions aus der Klartext-Ära (Token ≠ sha256-Hex)
+  // sind nach der Hash-Umstellung unerreichbar — direkt löschen.
+  await db.delete(sessions).where(sql`${sessions.token} !~ '^[0-9a-f]{64}$'`);
 }

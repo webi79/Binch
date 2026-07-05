@@ -2,6 +2,7 @@ import { eq, sql } from "drizzle-orm";
 import { config } from "../../config.js";
 import { db } from "../../db/client.js";
 import { locations } from "../../db/schema.js";
+import { BoundedTtlCache } from "../../util/boundedCache.js";
 import type {
   SearchProvider,
   ProviderSearchInput,
@@ -83,7 +84,9 @@ interface DbJourneysResponse {
   journeys?: DbJourney[];
 }
 
-const stationCache = new Map<string, string>();
+// Bounded + TTL: Keys sind User-Suchbegriffe (unbegrenzter Keyspace), und
+// HAFAS-Station-IDs können sich ändern — 24h-TTL statt „für immer cachen".
+const stationCache = new BoundedTtlCache<string>(500, 24 * 60 * 60 * 1000);
 
 export const dbVendoProvider: SearchProvider = {
   name: "db-vendo",
