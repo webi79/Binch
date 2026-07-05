@@ -32,6 +32,11 @@ export function AuthHydrator() {
     started.current = true;
     let cancelled = false;
     void saveAuthToken(storeToken);
+    // Re-Persist erzwingen: der ALTE AsyncStorage-Blob enthält das Token noch
+    // im Klartext und würde sonst erst beim nächsten organischen Store-Write
+    // überschrieben (partialize lässt authToken jetzt weg). Ein leerer
+    // setState-Patch triggert die persist-Middleware sofort.
+    useSearchStore.setState({});
     (async () => {
       try {
         const user = await authMe(storeToken);
