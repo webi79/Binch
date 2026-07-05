@@ -18,10 +18,17 @@
       "distribution": "internal",
       "android": {
         "buildType": "apk"
+      },
+      "env": {
+        "COMMENT_apiBaseUrl": "Sobald der Hetzner-Server steht: EXPO_PUBLIC_API_BASE_URL auf die https-Domain setzen (Release-Builds blocken cleartext-HTTP, LAN-IP geht dort nie).",
+        "EXPO_PUBLIC_API_BASE_URL": "http://192.168.2.84:3000"
       }
     },
     "production": {
-      "autoIncrement": true
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_API_BASE_URL": "http://192.168.2.84:3000"
+      }
     }
   },
   "submit": {
