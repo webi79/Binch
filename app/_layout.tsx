@@ -104,25 +104,6 @@ export default function RootLayout() {
     return () => sub.remove();
   }, []);
 
-  // ── TEMPORÄRE DIAGNOSE-SONDE (Landing-Scroll-Ruckler) ──────────────────
-  // Misst JS-Thread-Stalls: ein 100ms-Timer, der zu spät feuert, wurde vom
-  // JS-Thread blockiert. Loggt Stalls >32ms (= mind. 4 verpasste 120Hz-
-  // Frames) mit Dauer ins Metro-Log. Nur im Dev-Build aktiv.
-  // WIEDER ENTFERNEN sobald die Ursache gefunden ist.
-  useEffect(() => {
-    if (!__DEV__) return;
-    let last = Date.now();
-    const id = setInterval(() => {
-      const now = Date.now();
-      const drift = now - last - 100;
-      if (drift > 32) {
-        console.log(`[jsstall] JS-Thread ${drift}ms blockiert (${new Date(now).toISOString().slice(14, 23)})`);
-      }
-      last = now;
-    }, 100);
-    return () => clearInterval(id);
-  }, []);
-
   // Persistierte Recent-Searches + Saved-Stations gegen die aktuelle DB
   // validieren. Use-Case: nach Audit-Cleanup verweisen alte Recents auf
   // gelöschte/umgelabelte Codes (z.B. „Wien Hbf"-Eintrag zeigt eigentlich auf

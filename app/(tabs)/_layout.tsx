@@ -49,14 +49,7 @@ export default function TabsLayout() {
         // Wir schließen den SearchHero-Overlay damit er nicht weiter offen
         // bleibt während der Tab im Hintergrund wechselt.
         screenListeners={{
-          tabPress: (e) => {
-            // TEMPORÄRE DIAGNOSE (Landing-Scroll-Ruckler): Marker im Metro-
-            // Log, um [jsstall]-Einträge dem Tab-Wechsel zuzuordnen.
-            if (__DEV__) {
-              console.log(`[jsstall] ── Tab-Wechsel → ${e.target?.split("-")[0] ?? "?"} (${new Date().toISOString().slice(14, 23)})`);
-            }
-            closeSearchOverlay();
-          },
+          tabPress: () => closeSearchOverlay(),
         }}
         tabBarActiveTintColor={COLORS.active}
         tabBarInactiveTintColor={COLORS.inactive}
