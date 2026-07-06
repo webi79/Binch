@@ -31,7 +31,15 @@ services:
       - "3001:3000"
     environment:
       PORT: "3000"
-      DB_PROFILE: "dbnav"
+      # "db"-Profil (DB-Navigator + regio-guide-RIS) statt "dbnav":
+      # DBs reine Navigator-API (dbnav, app.services-bahn.de) blockt seit
+      # ~Juli 2026 alle Anfragen (Antwort OPS_BLOCKED → Zug-/Bus-Suchen
+      # lieferten 0 Ergebnisse). "dbweb" (bahn.de) umgeht zwar den Block,
+      # liefert aber Journeys OHNE Zeiten (null in db-vendo-client latest).
+      # "db" liefert Journeys MIT Zeiten + Preisen, Locations UND das
+      # Stop-Board (Departures) — alle drei von binch-server genutzten
+      # Endpoints verifiziert.
+      DB_PROFILE: "db"
       USER_AGENT: "binch-mobile/0.1"
 
   # Backend-Server selbst als Container — vereint Restart-Logik (Docker
