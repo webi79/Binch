@@ -515,7 +515,7 @@ export default function HomeScreen() {
       >
           <Header />
           <SearchBar
-            style={styles.searchBarSpacing}
+            style={[styles.searchBarSpacing, { borderWidth: 1.5, borderColor: accent.border }]}
             onPress={() => router.navigate("/assistant")}
             onMicPress={() =>
               router.navigate({ pathname: "/assistant", params: { autoVoice: "1" } })
@@ -689,7 +689,7 @@ const styles = StyleSheet.create({
   },
   sectionTitleSmall: {
     fontSize: 20,
-    fontWeight: FONT.bold,
+    fontWeight: FONT.extrabold,
     color: C.white,
     letterSpacing: -0.5,
   },
@@ -719,7 +719,7 @@ const styles = StyleSheet.create({
   },
   sectionTitle: {
     fontSize: 20,
-    fontWeight: FONT.bold,
+    fontWeight: FONT.extrabold,
     color: C.white,
     letterSpacing: -0.5,
   },
