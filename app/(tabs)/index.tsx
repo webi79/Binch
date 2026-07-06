@@ -515,7 +515,7 @@ export default function HomeScreen() {
       >
           <Header />
           <SearchBar
-            style={[styles.searchBarSpacing, { borderWidth: 1.5, borderColor: accent.border }]}
+            style={[styles.searchBarSpacing, { borderWidth: 1.5, borderColor: "rgba(255,255,255,0.14)" }]}
             onPress={() => router.navigate("/assistant")}
             onMicPress={() =>
               router.navigate({ pathname: "/assistant", params: { autoVoice: "1" } })
@@ -688,10 +688,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: 22,
   },
   sectionTitleSmall: {
-    fontSize: 20,
+    fontSize: 26,
     fontWeight: FONT.extrabold,
     color: C.white,
-    letterSpacing: -0.5,
+    letterSpacing: -0.6,
   },
   actionLink: { fontSize: 13, fontWeight: FONT.semibold },
 
@@ -718,10 +718,10 @@ const styles = StyleSheet.create({
     paddingBottom: 14,
   },
   sectionTitle: {
-    fontSize: 20,
+    fontSize: 26,
     fontWeight: FONT.extrabold,
     color: C.white,
-    letterSpacing: -0.5,
+    letterSpacing: -0.6,
   },
 
   // Category chips
