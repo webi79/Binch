@@ -27,13 +27,19 @@ export class BoundedTtlCache<V> {
     return entry.value;
   }
 
-  set(key: string, value: V): void {
+  /**
+   * @param ttlMs optionaler Per-Eintrag-TTL (überschreibt den Default). Nutzen
+   *   z.B. für negative Ergebnisse, die kürzer leben sollen als positive —
+   *   damit ein vorübergehender Upstream-Ausfall den Cache nicht für die volle
+   *   Default-TTL vergiftet.
+   */
+  set(key: string, value: V, ttlMs?: number): void {
     if (this.map.has(key)) {
       this.map.delete(key);
     } else if (this.map.size >= this.maxEntries) {
       const oldest = this.map.keys().next().value;
       if (oldest !== undefined) this.map.delete(oldest);
     }
-    this.map.set(key, { value, expiresAt: Date.now() + this.ttlMs });
+    this.map.set(key, { value, expiresAt: Date.now() + (ttlMs ?? this.ttlMs) });
   }
 }

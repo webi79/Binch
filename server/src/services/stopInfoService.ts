@@ -491,6 +491,11 @@ export function getHottestKeys(limit: number): { hafasId: string; board: StopBoa
  * Pfad „User klickt Marker → API muss schnell antworten" → Cache zwingend.
  */
 const RESOLVE_TTL_MS = 24 * 60 * 60 * 1000;
+// Negative Ergebnisse (null = „konnte nicht auflösen") NUR kurz cachen: ein
+// vorübergehender dbrest-/HAFAS-Ausfall (z.B. DB-seitiger Block) darf den
+// Cache sonst 24h lang mit Fehlschlägen vergiften — dann fände die App auch
+// nach der Erholung erst nach einem Server-Neustart wieder Stationen.
+const RESOLVE_NEG_TTL_MS = 5 * 60 * 1000;
 // Bounded LRU: Keyspace hängt an User-Marker-Taps (Koordinaten+Label) und
 // wächst sonst unbegrenzt über die Prozess-Laufzeit.
 const resolveCache = new BoundedTtlCache<string | null>(500, RESOLVE_TTL_MS);
@@ -648,7 +653,8 @@ export async function resolveHafasByCoord(
       clearTimeout(timer);
     }
   })().then((id) => {
-    resolveCache.set(key, id);
+    // Treffer 24h cachen (stabil), Fehlschlag nur kurz (siehe RESOLVE_NEG_TTL_MS).
+    resolveCache.set(key, id, id === null ? RESOLVE_NEG_TTL_MS : undefined);
     return id;
   }).finally(() => {
     resolveInflight.delete(key);
