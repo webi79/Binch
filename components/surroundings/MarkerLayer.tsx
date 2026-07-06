@@ -78,6 +78,17 @@ const MM_OFFSET_3_LEFT: [number, number] = [-56, 0];
 const MM_OFFSET_3_MID: [number, number] = [0, 0];
 const MM_OFFSET_3_RIGHT: [number, number] = [56, 0];
 
+// Die Icon-GLYPHEN laufen auf kleinerer icon-size (0.24/0.40/0.56) als die
+// BADGE-Kreise (0.30/0.50/0.70). MapLibre multipliziert icon-offset MIT
+// icon-size — mit demselben Offset landen Glyph und Badge daher NICHT
+// konzentrisch. Die Glyph-Offsets sind deshalb um den Faktor 1.25 (=0.50/0.40)
+// größer, sodass 28·0.50 = 35·0.40 = 14px → Icon exakt mittig im Kreis.
+const MM_ICON_OFFSET_2_LEFT: [number, number] = [-35, 0];
+const MM_ICON_OFFSET_2_RIGHT: [number, number] = [35, 0];
+const MM_ICON_OFFSET_3_LEFT: [number, number] = [-70, 0];
+const MM_ICON_OFFSET_3_MID: [number, number] = [0, 0];
+const MM_ICON_OFFSET_3_RIGHT: [number, number] = [70, 0];
+
 
 export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }: Props) {
   // Akzent fließt in alle „airport"-Marker (in MapLibre-Style-Expressions als
@@ -394,8 +405,8 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
           // Single-Mode: zentriert.
           "icon-offset": [
             "case",
-            ["==", ["get", "kindsCount"], 3], ["literal", MM_OFFSET_3_LEFT],
-            ["==", ["get", "kindsCount"], 2], ["literal", MM_OFFSET_2_LEFT],
+            ["==", ["get", "kindsCount"], 3], ["literal", MM_ICON_OFFSET_3_LEFT],
+            ["==", ["get", "kindsCount"], 2], ["literal", MM_ICON_OFFSET_2_LEFT],
             ["literal", [0, 0]],
           ],
           // Zoom-Skalierung. Single-Mode Icons sind etwas kleiner (passen
@@ -445,8 +456,8 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
           ],
           "icon-offset": [
             "case",
-            ["==", ["get", "kindsCount"], 3], ["literal", MM_OFFSET_3_MID],
-            ["literal", MM_OFFSET_2_RIGHT],
+            ["==", ["get", "kindsCount"], 3], ["literal", MM_ICON_OFFSET_3_MID],
+            ["literal", MM_ICON_OFFSET_2_RIGHT],
           ],
           "icon-size": [
             "interpolate", ["linear"], ["zoom"],
@@ -475,7 +486,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
             "ferry", "marker-cruise",
             "marker-bus",
           ],
-          "icon-offset": ["literal", MM_OFFSET_3_RIGHT],
+          "icon-offset": ["literal", MM_ICON_OFFSET_3_RIGHT],
           "icon-size": [
             "interpolate", ["linear"], ["zoom"],
             10, 0.24,
