@@ -11,7 +11,6 @@ import {
   ActivityIndicator,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { LinearGradient } from "expo-linear-gradient";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
 import Svg, { Circle, Path, Rect } from "react-native-svg";
@@ -217,14 +216,9 @@ function ProfileCard() {
           {isAuthed && user.avatarDataUrl ? (
             <Image source={{ uri: user.avatarDataUrl }} style={styles.avatar} />
           ) : isAuthed ? (
-            <LinearGradient
-              colors={[accent.solid, accent.dark]}
-              start={{ x: 0, y: 0 }}
-              end={{ x: 1, y: 1 }}
-              style={styles.avatar}
-            >
+            <View style={[styles.avatar, { backgroundColor: accent.solid, alignItems: "center", justifyContent: "center" }]}>
               <Text style={styles.avatarText}>{initials}</Text>
-            </LinearGradient>
+            </View>
           ) : (
             <View style={[styles.avatar, { backgroundColor: C.s2, borderWidth: 1, borderColor: C.border }]}>
               <User size={26} color={C.g2} strokeWidth={2} />
@@ -372,14 +366,9 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
           {user && user.avatarDataUrl ? (
             <Image source={{ uri: user.avatarDataUrl }} style={styles.avatarLarge} />
           ) : user ? (
-            <LinearGradient
-              colors={[accent.solid, accent.dark]}
-              start={{ x: 0, y: 0 }}
-              end={{ x: 1, y: 1 }}
-              style={styles.avatarLarge}
-            >
+            <View style={[styles.avatarLarge, { backgroundColor: accent.solid, alignItems: "center", justifyContent: "center" }]}>
               <Text style={styles.avatarLargeText}>{initials}</Text>
-            </LinearGradient>
+            </View>
           ) : (
             <View style={[styles.avatarLarge, { backgroundColor: C.s2, borderWidth: 1, borderColor: C.border }]}>
               <User size={36} color={C.g2} strokeWidth={2} />
@@ -523,9 +512,8 @@ function SettingsSubScreen({ onBack }: { onBack: () => void }) {
         })}
       </View>
 
-      {/* COLOR — 3 Akzent-Paletten zur Auswahl. Swatch = LinearGradient mit
-          den 3 Stops aus accent.gradient. Selected: schwarzer Kreis mit
-          mini Check-Icon im Swatch + accent-solid Footer. */}
+      {/* COLOR — Akzent-Paletten zur Auswahl. Swatch = flache Akzentfarbe
+          (a.solid). Selected: schwarzer Kreis mit Check-Icon + solid Footer. */}
       <StripeLabel text={t("settings.color")} />
       <View style={styles.themeRow}>
         {ACCENT_LIST.map((a) => {
@@ -540,19 +528,15 @@ function SettingsSubScreen({ onBack }: { onBack: () => void }) {
               style={[styles.themeCardOuter, { backgroundColor: active ? a.solid : "transparent" }]}
             >
               <View style={[styles.themeCardInner, { borderColor: active ? "transparent" : C.border }]}>
-                <LinearGradient
-                  colors={a.gradient}
-                  locations={[0, 0.52, 1]}
-                  start={{ x: 0, y: 0 }}
-                  end={{ x: 1, y: 1 }}
-                  style={styles.colorSwatch}
-                >
+                {/* Flache Swatch statt Verlauf — konsistent mit der flachen
+                    Akzent-Darstellung in der restlichen App (GradientFill). */}
+                <View style={[styles.colorSwatch, { backgroundColor: a.solid }]}>
                   {active && (
                     <View style={styles.colorCheck}>
                       <Check size={14} color={a.solid} strokeWidth={3} />
                     </View>
                   )}
-                </LinearGradient>
+                </View>
                 <View style={[styles.themeFooter, { backgroundColor: active ? a.solid : C.s2, justifyContent: "center" }]}>
                   <Text style={[styles.themeFooterText, { color: active ? a.textOnSolid : C.white }]}>
                     {t(`color.label.${a.id}`)}
