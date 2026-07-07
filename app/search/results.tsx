@@ -42,6 +42,7 @@ import { searchByMode } from "@/lib/api/client";
 import { ResultCard } from "@/components/results/ResultCard";
 import { RandomSearchLoader } from "@/components/results/search-loaders/RandomSearchLoader";
 import { useT } from "@/lib/i18n/useT";
+import { overlayCover, UNDERLAY_TRAVEL_FRAC } from "@/lib/nav/overlayCover";
 import { useSearchStore } from "@/stores/searchStore";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
@@ -127,8 +128,13 @@ export default function ResultsScreen() {
   // während UI-Thread-Worklets rendern wollen.
   const screenWidth = useWindowDimensions().width;
   const slideX = useSharedValue(screenWidth);
+  // slideX = eigener Slide-In der Results; overlayCover = Parallax, wenn ein
+  // Detail-Overlay DARÜBER reinslidet (verschiebt nur diesen Screen, nicht den
+  // ganzen Stack → leichter Baum, kein teures Re-Record des MainActivity-Trees).
   const slideStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: slideX.value }],
+    transform: [
+      { translateX: slideX.value + overlayCover.value * screenWidth * UNDERLAY_TRAVEL_FRAC },
+    ],
   }));
   useEffect(() => {
     // Slide-Start verzögern bis JS-Thread idle ist (= Loader fertig

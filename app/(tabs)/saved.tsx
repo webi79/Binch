@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { View, Text, ScrollView } from "react-native";
+import { View, Text, ScrollView, useWindowDimensions } from "react-native";
+import Animated, { useAnimatedStyle } from "react-native-reanimated";
 import type { SavedTrip } from "@/types/saved";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useIsFocused } from "@react-navigation/native";
@@ -13,6 +14,7 @@ import { AddTicketButton } from "@/components/saved/AddTicketButton";
 import { SegmentedToggle } from "@/components/ui/SegmentedToggle";
 import { SlidingPanels } from "@/components/ui/SlidingPanels";
 import { useAccent } from "@/lib/theme/accent";
+import { overlayCover, UNDERLAY_TRAVEL_FRAC } from "@/lib/nav/overlayCover";
 
 /**
  * Subscribe-only-when-focused. Subscribt nur an `useSearchStore` wenn
@@ -109,6 +111,13 @@ export default function SavedScreen() {
   const [showModal, setShowModal] = useState(false);
   const isFocused = useIsFocused();
 
+  // Parallax: dieser Screen wandert ein Stück mit, während das
+  // TicketDetailOverlay darüber reinslidet (nur DIESER Baum wird transformiert).
+  const { width: screenW } = useWindowDimensions();
+  const parallaxStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: overlayCover.value * screenW * UNDERLAY_TRAVEL_FRAC }],
+  }));
+
   // Native-Bottom-Tabs halten die Saved-Tab IMMER mounted (auch wenn der
   // User auf Home ist). Mit `useSearchStore((s) => s.savedTrips)` würde
   // diese Komponente bei JEDEM Save re-rendern — useMemo-Filter neu laufen
@@ -148,6 +157,7 @@ export default function SavedScreen() {
 
   return (
     <SafeAreaView className="flex-1 bg-[#1A1A1A]" edges={["top"]}>
+      <Animated.View style={[{ flex: 1 }, parallaxStyle]}>
       <View className="px-4 pt-6">
         <Text className="text-[26px] font-black text-white tracking-tight">
           Saved
@@ -253,6 +263,7 @@ export default function SavedScreen() {
           </ScrollView>
         )}
       </SlidingPanels>
+      </Animated.View>
 
       <AddTicketModal
         visible={showModal}
