@@ -259,10 +259,15 @@ async function fetchJourneys(
     if (Number.isFinite(targetMs)) {
       url.searchParams.set("departure", new Date(targetMs - 5 * 60_000).toISOString());
     } else {
-      url.searchParams.set("departure", `${date}T${initialDepartureTime(date)}`);
+      const d = date.slice(0, 10);
+      url.searchParams.set("departure", `${d}T${initialDepartureTime(d)}`);
     }
   } else {
-    url.searchParams.set("departure", `${date}T${initialDepartureTime(date)}`);
+    // `date` kommt als volle ISO (input.departDate, z.B. 2026-07-08T08:00:00.000Z)
+    // rein — hier brauchen wir aber NUR den Datumsteil, sonst entsteht
+    // `2026-07-08T08:00:00.000ZT05:00` → db-vendo-client wirft SyntaxError.
+    const d = date.slice(0, 10);
+    url.searchParams.set("departure", `${d}T${initialDepartureTime(d)}`);
   }
   url.searchParams.set("results", "10");
   url.searchParams.set("language", "de");
