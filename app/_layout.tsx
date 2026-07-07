@@ -28,7 +28,8 @@ import { BinchSplash } from "@/components/ui/BinchSplash";
 import { BinchAuthScreen } from "@/components/auth/BinchAuthScreen";
 import { AuthHydrator } from "@/components/auth/AuthHydrator";
 import { migrateTicketImagesToFiles } from "@/lib/saved/ticketImages";
-import Animated, { FadeOut } from "react-native-reanimated";
+import Animated, { FadeOut, useAnimatedStyle } from "react-native-reanimated";
+import { overlayCover, SCRIM_MAX_OPACITY } from "@/lib/nav/overlayCover";
 import { useState } from "react";
 
 // Transiente MapLibre-Tile-Errors („Software caused connection abort",
@@ -127,6 +128,13 @@ export default function RootLayout() {
     return () => clearTimeout(t);
   }, []);
 
+  // Unterlay-Schleier: dunkelt den darunterliegenden Screen ab, während ein
+  // horizontales Push-Overlay reinslidet (iOS-Tiefeneffekt). Nur Opacity einer
+  // Solid-Ebene = billiger Alpha-Blend, kein Transform des schweren Baums.
+  const scrimStyle = useAnimatedStyle(() => ({
+    opacity: overlayCover.value * SCRIM_MAX_OPACITY,
+  }));
+
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       {/* Splash liegt GANZ AUSSEN — über SafeAreaProvider und allen Tabs,
@@ -186,6 +194,15 @@ export default function RootLayout() {
                 }}
               />
             </Stack>
+            {/* Unterlay-Schleier: liegt ÜBER dem Stack, UNTER den Push-
+                Overlays (die weiter unten gerendert werden) — dunkelt den
+                darunterliegenden Screen ab, während ein Detail/Ticket-Overlay
+                reinslidet. pointerEvents none, damit Taps durchgehen wenn
+                unsichtbar. */}
+            <Animated.View
+              pointerEvents="none"
+              style={[StyleSheet.absoluteFill, { backgroundColor: "#000000" }, scrimStyle]}
+            />
             {/* StopDetailSheet wird hier registriert (nicht in den Tabs)
                 damit der Slide ÜBER der FloatingTabBar UND allen Tab-Pages
                 liegt — wie alle anderen Sheets im Root-Layout. */}

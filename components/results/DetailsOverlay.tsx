@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -47,6 +47,7 @@ import { formatTimeInZone } from "@/lib/time-format";
 import { useT } from "@/lib/i18n/useT";
 import { useSearchStore } from "@/stores/searchStore";
 import { haptic } from "@/lib/haptics";
+import { overlayCover } from "@/lib/nav/overlayCover";
 import { usePathname } from "expo-router";
 import {
   redirectUrl,
@@ -240,11 +241,27 @@ function DetailsContent({
         duration: 260,
         easing: Easing.out(Easing.cubic),
       });
+      // Unterlay-Schleier synchron im selben rAF einblenden.
+      overlayCover.value = withTiming(1, { duration: 260, easing: Easing.out(Easing.cubic) });
     });
     return () => cancelAnimationFrame(id);
   }, [translateX]);
 
   const [closing, setClosing] = useState(false);
+
+  // Schleier bei `hidden`-Wechsel (z.B. „auf Karte zeigen" → andere Route)
+  // ausblenden, damit der sichtbare Screen darunter nicht abgedunkelt hängt;
+  // beim Zurückkommen wieder rein. Erst-Mount übersprungen (Open-rAF macht das).
+  const coverMounted = useRef(false);
+  useEffect(() => {
+    if (!coverMounted.current) { coverMounted.current = true; return; }
+    overlayCover.value = withTiming(hidden ? 0 : 1, {
+      duration: 220,
+      easing: hidden ? Easing.in(Easing.cubic) : Easing.out(Easing.cubic),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hidden]);
+  useEffect(() => () => { overlayCover.value = 0; }, []);
   // Defer-Wrapper für den Unmount-Trigger: die letzte Frame der Slide-Out-
   // Animation soll sauber zu Ende paintet werden BEVOR React den DetailsContent-
   // Subtree unmountet (das Unmounten ist JS-Thread-Arbeit die sich mit der
@@ -263,6 +280,8 @@ function DetailsContent({
         if (finished) runOnJS(clearAfterFrame)();
       },
     );
+    // Schleier synchron zur Slide-Out ausblenden.
+    overlayCover.value = withTiming(0, { duration: 260, easing: Easing.in(Easing.cubic) });
   };
 
   useEffect(() => {

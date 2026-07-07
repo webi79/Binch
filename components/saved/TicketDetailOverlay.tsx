@@ -35,6 +35,7 @@ import { useT } from "@/lib/i18n/useT";
 import { useSearchStore } from "@/stores/searchStore";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
+import { overlayCover } from "@/lib/nav/overlayCover";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { TicketHead, Perforation, bookingRefFor } from "./TicketParts";
 
@@ -81,6 +82,8 @@ function TicketDetailSheet() {
         duration: 280,
         easing: Easing.out(Easing.cubic),
       });
+      // Unterlay-Schleier synchron einblenden.
+      overlayCover.value = withTiming(1, { duration: 280, easing: Easing.out(Easing.cubic) });
     });
     return () => {
       cancelAnimationFrame(id);
@@ -89,6 +92,7 @@ function TicketDetailSheet() {
   }, [translateX]);
 
   const [closing, setClosing] = useState(false);
+  useEffect(() => () => { overlayCover.value = 0; }, []);
   const animateClose = () => {
     if (closing) return;
     setClosing(true);
@@ -99,6 +103,8 @@ function TicketDetailSheet() {
         if (finished) runOnJS(clearSelectedTicket)();
       },
     );
+    // Schleier synchron zur Slide-Out ausblenden.
+    overlayCover.value = withTiming(0, { duration: 280, easing: Easing.in(Easing.cubic) });
   };
 
   useEffect(() => {
