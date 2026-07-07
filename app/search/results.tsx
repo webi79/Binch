@@ -42,7 +42,7 @@ import { searchByMode } from "@/lib/api/client";
 import { ResultCard } from "@/components/results/ResultCard";
 import { RandomSearchLoader } from "@/components/results/search-loaders/RandomSearchLoader";
 import { useT } from "@/lib/i18n/useT";
-import { overlayCover, UNDERLAY_TRAVEL_FRAC, PUSH_DURATION, PUSH_IN_EASING, PUSH_OUT_EASING } from "@/lib/nav/overlayCover";
+import { overlayCover, UNDERLAY_TRAVEL_FRAC, PUSH_DURATION, PUSH_IN_EASING, POP_DURATION, POP_EASING } from "@/lib/nav/overlayCover";
 import { useSearchStore } from "@/stores/searchStore";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
@@ -201,7 +201,7 @@ export default function ResultsScreen() {
       isClosingRef.current = true;
       slideX.value = withTiming(
         screenWidth,
-        { duration: PUSH_DURATION, easing: PUSH_OUT_EASING },
+        { duration: POP_DURATION, easing: POP_EASING },
         (finished) => {
           if (finished) {
             runOnJS(navigation.dispatch)(e.data.action);

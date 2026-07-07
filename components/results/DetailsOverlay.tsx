@@ -49,7 +49,8 @@ import {
   overlayCover,
   PUSH_DURATION,
   PUSH_IN_EASING,
-  PUSH_OUT_EASING,
+  POP_DURATION,
+  POP_EASING,
   COVER_DURATION,
   COVER_IN_EASING,
   COVER_OUT_EASING,
@@ -285,7 +286,7 @@ function DetailsContent({
       return () => cancelAnimationFrame(id);
     }
     // Schließen: raussliden (inkl. Schatten-Pad) + Parallax zurück — bleibt gemountet.
-    translateX.value = withTiming(screenWidth + 48, { duration: PUSH_DURATION, easing: PUSH_OUT_EASING });
+    translateX.value = withTiming(screenWidth + 48, { duration: POP_DURATION, easing: POP_EASING });
     overlayCover.value = withTiming(0, { duration: COVER_DURATION, easing: COVER_OUT_EASING });
     return undefined;
   }, [open, translateX, screenWidth]);

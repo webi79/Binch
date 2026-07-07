@@ -38,7 +38,8 @@ import {
   overlayCover,
   PUSH_DURATION,
   PUSH_IN_EASING,
-  PUSH_OUT_EASING,
+  POP_DURATION,
+  POP_EASING,
   COVER_DURATION,
   COVER_IN_EASING,
   COVER_OUT_EASING,
@@ -102,7 +103,7 @@ function TicketDetailSheet() {
     setClosing(true);
     translateX.value = withTiming(
       screenWidth,
-      { duration: PUSH_DURATION, easing: PUSH_OUT_EASING },
+      { duration: POP_DURATION, easing: POP_EASING },
       (finished) => {
         if (finished) runOnJS(clearSelectedTicket)();
       },

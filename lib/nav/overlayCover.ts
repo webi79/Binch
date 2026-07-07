@@ -1,26 +1,33 @@
 import { Easing, makeMutable } from "react-native-reanimated";
 
 /**
- * Gemeinsame Timing-Kurven für Slide + Parallax (Material-3 „emphasized").
- * Decelerate = starke Abbremsung zum Ende → weiche Landung, kein „Anschlagen
- * an die Kante". Accelerate = beschleunigt beim Rausfahren weg.
+ * Timing der horizontalen Push-Transitions — Werte NACHGEMESSEN an YouTubes
+ * Push (screenrecord → Frame-Analyse, 60 Samples/s, Juli 2026):
+ *
+ *   PUSH (hin):  Overlay ~400ms emphasized-decelerate — perzeptuell gelandet
+ *                bei ~300ms, danach langer butterweicher Kriech-Schwanz
+ *                (Android-System nutzt dieselbe Idee: 450ms
+ *                fast_out_extra_slow_in). Unterlay-Parallax ist bereits nach
+ *                ~100-150ms KOMPLETT fertig (Verhältnis ~1:3!) und der Weg
+ *                ist klein (~13% Screenbreite).
+ *   POP (zurück): schneller (~250ms), Ease-in-out mit WEICHER Landung (kein
+ *                pures Beschleunigen) — Unterlay ist nach ~130ms zuhause,
+ *                während das Overlay noch rausfährt.
  */
-export const PUSH_DURATION = 300;
+export const PUSH_DURATION = 400;
 export const PUSH_IN_EASING = Easing.bezier(0.05, 0.7, 0.1, 1);
-export const PUSH_OUT_EASING = Easing.bezier(0.3, 0, 0.8, 0.15);
+
+export const POP_DURATION = 260;
+export const POP_EASING = Easing.bezier(0.35, 0, 0.25, 1);
 
 /**
- * Eigenes Timing für den Unterlay-Parallax (overlayCover), YouTube-Feel:
- * Der Parallax soll FRÜHER zur Ruhe kommen als die Overlay-Slide — gleich-
- * zeitiges Ankommen wirkt komisch (das Unterlay „zappelt" noch, während das
- * Overlay schon steht). Deshalb kürzere Dauer (240 vs 300 ms) + moderate
- * Decelerate-Kurve: sanfter Start (kein Ruck wie bei der frontlastigen
- * emphasized-Kurve), weiches Ausrollen, sichtbar fertig bevor das Overlay
- * landet.
+ * Unterlay-Parallax: kurz + früh fertig (gemessen ~1/3 der Overlay-Dauer).
+ * Decelerate-Kurve: zügiger Start, weiches Ausrollen — bei dem kurzen Weg
+ * (13% Breite) wirkt das ruhig, nicht snappy.
  */
-export const COVER_DURATION = 240;
-export const COVER_IN_EASING = Easing.bezier(0.3, 0, 0.2, 1);
-export const COVER_OUT_EASING = Easing.bezier(0.3, 0, 0.2, 1);
+export const COVER_DURATION = 150;
+export const COVER_IN_EASING = Easing.bezier(0.25, 0, 0.2, 1);
+export const COVER_OUT_EASING = Easing.bezier(0.25, 0, 0.2, 1);
 
 /**
  * Geteilter Parallax-Fortschritt der horizontalen Push-Overlays.
@@ -32,5 +39,6 @@ export const COVER_OUT_EASING = Easing.bezier(0.3, 0, 0.2, 1);
  */
 export const overlayCover = makeMutable(0);
 
-/** Parallax-Weg des Unterlays als Bruchteil der Screen-Breite (negativ = links). */
-export const UNDERLAY_TRAVEL_FRAC = -0.22;
+/** Parallax-Weg des Unterlays als Bruchteil der Screen-Breite (negativ =
+ *  links). YouTube gemessen: ~13%. */
+export const UNDERLAY_TRAVEL_FRAC = -0.13;
