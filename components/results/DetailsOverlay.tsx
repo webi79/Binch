@@ -14,7 +14,6 @@ import {
 } from "react-native";
 import Animated, {
   cancelAnimation,
-  runOnJS,
   useAnimatedStyle,
   useSharedValue,
   withRepeat,
@@ -145,21 +144,13 @@ export function DetailsOverlay() {
   const clearSelectedResult = useSearchStore((s) => s.clearSelectedResult);
   const pending = useSearchStore((s) => s.selectedResultPending);
   const locale = useSearchStore((s) => s.locale);
-  // O(1) Set-Lookup statt ganzem savedTrips-Array: sonst kriegt der
-  // Overlay bei JEDEM Save eine neue Array-Ref → full re-render des
-  // großen DetailsContent-Trees. Mit boolean-Selector re-rendert nur,
-  // wenn sich der favored-Status des aktuellen Result ändert.
-  const favored = useSearchStore((s) => {
-    if (!s.selectedResult) return false;
-    return s.savedTripSignatures.has(tripSignature(s.selectedResult));
-  });
   // Actions als stable refs aus getState() — keine Subscription-Slots
   // belegen (siehe ResultCard-Kommentar).
   const toggleSavedTrip = useSearchStore.getState().toggleSavedTrip;
   const showSavedToast = useSearchStore.getState().showSavedToast;
   const openLegTimelineOverlay = useSearchStore.getState().openLegTimelineOverlay;
   // Direct-Trip-Flow vom Stop-Sheet (Bus-Tap): umgeht den Booking-Overlay
-  // komplett — wir rendern dann nichts, LegTimelineOverlay übernimmt direkt.
+  // komplett — LegTimelineOverlay übernimmt direkt, wir bleiben zu.
   const directTripResult = useSearchStore((s) => s.directTripResult);
   // Wo wurde das Overlay geöffnet? Wir behalten den State über Tab-Wechsel
   // hinweg — wenn der User aber auf einer anderen Route ist (z.B. „Show on
@@ -169,24 +160,52 @@ export function DetailsOverlay() {
   const pathname = usePathname();
   const context = useSearchStore((s) => s.selectedResultContext);
 
-  if (!result || directTripResult) return null;
-  // Wenn wir auf einer anderen Route sind (z.B. Map-Push obendrauf),
-  // verstecken wir den Sheet VISUELL statt zu unmounten — sonst feuert
-  // beim Zurückkommen die Slide-In-Animation neu und es laggt.
-  const hiddenForOtherRoute = context != null && pathname !== context.pathname;
+  // KEEP-MOUNTED: Sobald einmal ein Result gezeigt wurde, bleibt der schwere
+  // DetailsContent-Tree gemountet und wird beim nächsten Öffnen WIEDERVERWENDET
+  // (nur reconciled) statt neu gemountet. Grund: jede Lucide-Icon rendert als
+  // react-native-svg-View, die auf Fabric beim Unmount nicht sauber freigegeben
+  // wird (~23 Views pro Öffnen/Schließen geleakt → View-Baum wächst → progressive
+  // Ruckler). Ohne Re-Mount leaken wir nichts mehr und Re-Opens sind schneller.
+  //
+  // Die refs latchen das zuletzt gezeigte Result SYNCHRON im Render (kein Effekt-
+  // Delay → kein 1-Frame-Flash des alten Results beim Re-Open).
+  const lastResultRef = useRef(result);
+  const lastPassengersRef = useRef(passengers);
+  if (result) {
+    lastResultRef.current = result;
+    lastPassengersRef.current = passengers;
+  }
+  const displayResult = lastResultRef.current;
+
+  // favored bezieht sich aufs ANGEZEIGTE Result — bleibt live (auch beim Slide-
+  // Out), O(1) Set-Lookup statt ganzem savedTrips-Array (sonst full re-render
+  // des großen Trees bei jedem Save).
+  const favored = useSearchStore((s) => {
+    if (!displayResult) return false;
+    return s.savedTripSignatures.has(tripSignature(displayResult));
+  });
+
+  // Offen = ein Result ist selektiert und kein Direct-Trip-Flow läuft. Der
+  // Route-Detour („auf Karte zeigen") versteckt nur visuell (siehe unten).
+  const open = !!result && !directTripResult;
+  const hiddenForRoute = context != null && pathname !== context.pathname;
+
+  // Vor dem allerersten Öffnen: nichts rendern (null Overhead).
+  if (!displayResult) return null;
 
   return (
     <DetailsContent
-      result={result}
-      passengers={passengers}
-      pending={pending}
+      result={displayResult}
+      passengers={lastPassengersRef.current}
+      pending={open ? pending : false}
       clearSelectedResult={clearSelectedResult}
       locale={locale}
       favored={favored}
       toggleSavedTrip={toggleSavedTrip}
       showSavedToast={showSavedToast}
       openLegTimelineOverlay={openLegTimelineOverlay}
-      hidden={hiddenForOtherRoute}
+      open={open}
+      hiddenForRoute={hiddenForRoute}
     />
   );
 }
@@ -204,9 +223,12 @@ interface ContentProps {
   toggleSavedTrip: ReturnType<typeof useSearchStore.getState>["toggleSavedTrip"];
   showSavedToast: ReturnType<typeof useSearchStore.getState>["showSavedToast"];
   openLegTimelineOverlay: () => void;
-  /** Sheet komplett mounted lassen, nur visuell unsichtbar machen (für
-   *  Map-Push-Detour). Vermeidet Slide-In-Re-Animation beim Zurückkommen. */
-  hidden?: boolean;
+  /** Store-getriebene Sichtbarkeit: true = reinsliden, false = raussliden
+   *  (Tree bleibt gemountet). */
+  open: boolean;
+  /** Route-Detour („auf Karte zeigen" → andere Route): nur visuell verstecken
+   *  OHNE die Slide neu zu triggern, damit das Zurückkommen instant ist. */
+  hiddenForRoute: boolean;
 }
 
 function DetailsContent({
@@ -219,77 +241,77 @@ function DetailsContent({
   toggleSavedTrip,
   showSavedToast,
   openLegTimelineOverlay,
-  hidden,
+  open,
+  hiddenForRoute,
 }: ContentProps) {
   const t = useT();
   const accent = useAccent();
   const screenWidth = useWindowDimensions().width;
 
-  const translateX = useSharedValue(screenWidth);
+  // Geschlossen-Park-Position: +48px über den rechten Rand hinaus, damit der
+  // Elevation-Schatten des off-screen gemounteten Sheets (Keep-mounted) nicht
+  // am Bildschirmrand durchscheint.
+  const translateX = useSharedValue(screenWidth + 48);
   const slideStyle = useAnimatedStyle(() => ({
     transform: [{ translateX: translateX.value }],
+    // Unsichtbar sobald off-screen (translateX ≥ Breite) oder Route-Detour —
+    // kein Schatten-Durchscheinen im geparkten Zustand, kein Flash beim
+    // Reinsliden (off-screen ⇔ opacity 0).
+    opacity: hiddenForRoute || translateX.value >= screenWidth ? 0 : 1,
   }));
-  // Slide-In erst NACH dem ersten Paint starten — gibt React eine Frame Zeit
-  // den schweren Sub-Tree (ScrollView, Provider-Liste, useQuery-Setup etc.)
-  // zu mounten BEVOR die Animation läuft. Sonst stutter't der Slide weil
-  // JS-Thread durchs Mounten beschäftigt ist während die UI-Thread-Worklets
-  // rendern wollen. requestAnimationFrame = nächster Frame nach Paint.
+
+  // Sichtbarkeit store-getrieben (KEEP-MOUNTED): `open` true → reinsliden,
+  // false → raussliden. Der Tree bleibt gemountet, wir unmounten NICHT mehr —
+  // das ist der eigentliche Leak-Fix (react-native-svg gibt SVG-Views beim
+  // Unmount nicht frei). Slide-In erst NACH dem ersten Paint (rAF), damit React
+  // den schweren Sub-Tree committen kann bevor die Animation läuft — sonst
+  // stuttert der Slide. Der Parallax (overlayCover) läuft synchron im selben rAF.
   useEffect(() => {
-    const id = requestAnimationFrame(() => {
-      // Emphasized-Decelerate: bremst zum Ende stark ab → weiche Landung.
-      translateX.value = withTiming(0, { duration: PUSH_DURATION, easing: PUSH_IN_EASING });
-      // Parallax des Unterlays synchron im selben rAF.
-      overlayCover.value = withTiming(1, { duration: PUSH_DURATION, easing: PUSH_IN_EASING });
-    });
-    return () => cancelAnimationFrame(id);
-  }, [translateX]);
+    if (open) {
+      const id = requestAnimationFrame(() => {
+        // Emphasized-Decelerate: bremst zum Ende stark ab → weiche Landung.
+        translateX.value = withTiming(0, { duration: PUSH_DURATION, easing: PUSH_IN_EASING });
+        overlayCover.value = withTiming(1, { duration: PUSH_DURATION, easing: PUSH_IN_EASING });
+      });
+      return () => cancelAnimationFrame(id);
+    }
+    // Schließen: raussliden (inkl. Schatten-Pad) + Parallax zurück — bleibt gemountet.
+    translateX.value = withTiming(screenWidth + 48, { duration: PUSH_DURATION, easing: PUSH_OUT_EASING });
+    overlayCover.value = withTiming(0, { duration: PUSH_DURATION, easing: PUSH_OUT_EASING });
+    return undefined;
+  }, [open, translateX, screenWidth]);
 
-  const [closing, setClosing] = useState(false);
-
-  // Parallax bei `hidden`-Wechsel (z.B. „auf Karte zeigen" → andere Route)
-  // zurücknehmen, damit der sichtbare Screen darunter nicht verschoben hängt;
-  // beim Zurückkommen wieder rein. Erst-Mount übersprungen (Open-rAF macht das).
+  // Route-Detour („auf Karte zeigen" → andere Route): NUR den Parallax
+  // zurücknehmen/wiederherstellen, OHNE die Slide neu zu triggern (translateX
+  // bleibt bei 0 → Zurückkommen ist instant, kein Re-Slide-Lag). Das visuelle
+  // Verstecken macht die Render-Wurzel via opacity. Erst-Mount übersprungen.
   const coverMounted = useRef(false);
   useEffect(() => {
     if (!coverMounted.current) { coverMounted.current = true; return; }
-    overlayCover.value = withTiming(hidden ? 0 : 1, {
+    if (!open) return; // Schließen erledigt der Slide-Effekt oben
+    overlayCover.value = withTiming(hiddenForRoute ? 0 : 1, {
       duration: PUSH_DURATION,
-      easing: hidden ? PUSH_OUT_EASING : PUSH_IN_EASING,
+      easing: hiddenForRoute ? PUSH_OUT_EASING : PUSH_IN_EASING,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hidden]);
+  }, [hiddenForRoute]);
+
+  // Beim echten Unmount (App-Teardown / Fast-Refresh) Parallax neutralisieren.
   useEffect(() => () => { overlayCover.value = 0; }, []);
-  // Defer-Wrapper für den Unmount-Trigger: die letzte Frame der Slide-Out-
-  // Animation soll sauber zu Ende paintet werden BEVOR React den DetailsContent-
-  // Subtree unmountet (das Unmounten ist JS-Thread-Arbeit die sich mit der
-  // Animation kann's beißt). Eine rAF nach der Animation = Animation
-  // vollständig sichtbar, dann Unmount.
-  const clearAfterFrame = () => {
-    requestAnimationFrame(clearSelectedResult);
-  };
-  const animateClose = () => {
-    if (closing) return;
-    setClosing(true);
-    translateX.value = withTiming(
-      screenWidth,
-      { duration: PUSH_DURATION, easing: PUSH_OUT_EASING },
-      (finished) => {
-        if (finished) runOnJS(clearAfterFrame)();
-      },
-    );
-    // Parallax synchron zur Slide-Out zurückfahren.
-    overlayCover.value = withTiming(0, { duration: PUSH_DURATION, easing: PUSH_OUT_EASING });
-  };
+
+  // Schließen = Store-Flag löschen → `open` wird false → Slide-Out (oben).
+  const close = () => clearSelectedResult();
 
   useEffect(() => {
     if (Platform.OS !== "android") return;
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
-      animateClose();
+      if (!open) return false; // nicht offen → System-Back durchlassen
+      close();
       return true;
     });
     return () => sub.remove();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [open]);
 
   // Zwei-Phasen-Render gegen Mount-Lag während des Slide-In.
   const [contentReady, setContentReady] = useState(false);
@@ -432,7 +454,7 @@ function DetailsContent({
 
   function onClose() {
     haptic("button");
-    animateClose();
+    close();
   }
 
   function onToggleFav() {
@@ -449,13 +471,13 @@ function DetailsContent({
 
   return (
     <Animated.View
-      pointerEvents={hidden ? "none" : "auto"}
+      pointerEvents={open && !hiddenForRoute ? "auto" : "none"}
       style={[
         StyleSheet.absoluteFill,
         // Höher als StopDetailSheet (zIndex 100, elevation 16) damit der
         // Overlay GANZ VORNE liegt, wenn er via Departure-Tap aus dem
         // Surroundings-Sheet geöffnet wird.
-        { zIndex: 200, elevation: 24, opacity: hidden ? 0 : 1 },
+        { zIndex: 200, elevation: 24 },
         slideStyle,
       ]}
     >
