@@ -39,6 +39,7 @@ import {
   PUSH_DURATION,
   PUSH_IN_EASING,
   PUSH_OUT_EASING,
+  COVER_DURATION,
   COVER_IN_EASING,
   COVER_OUT_EASING,
 } from "@/lib/nav/overlayCover";
@@ -85,8 +86,8 @@ function TicketDetailSheet() {
   useEffect(() => {
     const id = requestAnimationFrame(() => {
       translateX.value = withTiming(0, { duration: PUSH_DURATION, easing: PUSH_IN_EASING });
-      // Parallax mit SANFTERER Kurve (sonst wirkt der kurze Weg zu snappy).
-      overlayCover.value = withTiming(1, { duration: PUSH_DURATION, easing: COVER_IN_EASING });
+      // Parallax: kürzer + sanfter — kommt VOR der Overlay-Landung zur Ruhe.
+      overlayCover.value = withTiming(1, { duration: COVER_DURATION, easing: COVER_IN_EASING });
     });
     return () => {
       cancelAnimationFrame(id);
@@ -106,8 +107,8 @@ function TicketDetailSheet() {
         if (finished) runOnJS(clearSelectedTicket)();
       },
     );
-    // Parallax synchron zur Slide-Out zurückfahren (sanfte Kurve).
-    overlayCover.value = withTiming(0, { duration: PUSH_DURATION, easing: COVER_OUT_EASING });
+    // Parallax synchron zur Slide-Out zurückfahren (kürzer + sanft).
+    overlayCover.value = withTiming(0, { duration: COVER_DURATION, easing: COVER_OUT_EASING });
   };
 
   useEffect(() => {
