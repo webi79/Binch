@@ -28,7 +28,7 @@ import { BinchSplash } from "@/components/ui/BinchSplash";
 import { BinchAuthScreen } from "@/components/auth/BinchAuthScreen";
 import { AuthHydrator } from "@/components/auth/AuthHydrator";
 import { migrateTicketImagesToFiles } from "@/lib/saved/ticketImages";
-import Animated, { FadeOut, useAnimatedStyle, useAnimatedReaction, runOnJS } from "react-native-reanimated";
+import Animated, { FadeOut, useAnimatedStyle } from "react-native-reanimated";
 import { underlayShift, UNDERLAY_TRAVEL_FRAC } from "@/lib/nav/pushParallax";
 import { useState } from "react";
 
@@ -136,17 +136,16 @@ export default function RootLayout() {
   }));
 
   // PERF: Die Verschiebung eines so schweren Subtrees (Ergebnisliste etc.)
-  // ist ohne Hardware-Layer pro Frame teuer (Fabric compositet neu → Ruckeln).
-  // Wir promoten den Stack auf einen GPU-Layer NUR während der Parallax aktiv
-  // ist (underlayShift > 0) — dann ist die Verschiebung ein reiner Blit. Im
-  // Ruhezustand (0) wieder aus, damit normales Listen-Scrollen nicht durch die
-  // Textur muss. useAnimatedReaction erkennt die Schwelle auf dem UI-Thread.
-  const [stackRasterize, setStackRasterize] = useState(false);
-  useAnimatedReaction(
-    () => underlayShift.value > 0.001,
-    (active, prev) => {
-      if (active !== prev) runOnJS(setStackRasterize)(active);
-    },
+  // ist ohne Hardware-Layer pro Frame teuer (Fabric compositet neu → Stottern).
+  // Wir promoten den Stack auf einen GPU-Layer, sobald ein Push-Overlay offen
+  // ist — dann ist die Parallax-Verschiebung ein reiner Blit. WICHTIG: aus dem
+  // Store abgeleitet (nicht via useAnimatedReaction/runOnJS), damit die Textur
+  // schon zum ÖFFNEN steht, BEVOR die Slide startet — sonst greift sie erst
+  // während der Animation (JS-Thread durch Mount blockiert) = Stottern.
+  // Im Ruhezustand (kein Overlay) aus, damit normales Scrollen nicht durch die
+  // Textur muss.
+  const pushOverlayOpen = useSearchStore(
+    (s) => s.selectedResult !== null || s.selectedTicket !== null,
   );
 
   return (
@@ -182,8 +181,8 @@ export default function RootLayout() {
             <Animated.View
               style={[{ flex: 1 }, stackParallaxStyle]}
               collapsable={false}
-              renderToHardwareTextureAndroid={stackRasterize}
-              shouldRasterizeIOS={stackRasterize}
+              renderToHardwareTextureAndroid={pushOverlayOpen}
+              shouldRasterizeIOS={pushOverlayOpen}
             >
             <Stack
               screenOptions={{
