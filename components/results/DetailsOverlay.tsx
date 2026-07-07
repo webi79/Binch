@@ -14,7 +14,6 @@ import {
 } from "react-native";
 import Animated, {
   cancelAnimation,
-  Easing,
   runOnJS,
   useAnimatedStyle,
   useSharedValue,
@@ -47,7 +46,7 @@ import { formatTimeInZone } from "@/lib/time-format";
 import { useT } from "@/lib/i18n/useT";
 import { useSearchStore } from "@/stores/searchStore";
 import { haptic } from "@/lib/haptics";
-import { overlayCover } from "@/lib/nav/overlayCover";
+import { overlayCover, PUSH_DURATION, PUSH_IN_EASING, PUSH_OUT_EASING } from "@/lib/nav/overlayCover";
 import { usePathname } from "expo-router";
 import {
   redirectUrl,
@@ -237,27 +236,25 @@ function DetailsContent({
   // rendern wollen. requestAnimationFrame = nächster Frame nach Paint.
   useEffect(() => {
     const id = requestAnimationFrame(() => {
-      translateX.value = withTiming(0, {
-        duration: 260,
-        easing: Easing.out(Easing.cubic),
-      });
-      // Unterlay-Schleier synchron im selben rAF einblenden.
-      overlayCover.value = withTiming(1, { duration: 260, easing: Easing.out(Easing.cubic) });
+      // Emphasized-Decelerate: bremst zum Ende stark ab → weiche Landung.
+      translateX.value = withTiming(0, { duration: PUSH_DURATION, easing: PUSH_IN_EASING });
+      // Parallax des Unterlays synchron im selben rAF.
+      overlayCover.value = withTiming(1, { duration: PUSH_DURATION, easing: PUSH_IN_EASING });
     });
     return () => cancelAnimationFrame(id);
   }, [translateX]);
 
   const [closing, setClosing] = useState(false);
 
-  // Schleier bei `hidden`-Wechsel (z.B. „auf Karte zeigen" → andere Route)
-  // ausblenden, damit der sichtbare Screen darunter nicht abgedunkelt hängt;
+  // Parallax bei `hidden`-Wechsel (z.B. „auf Karte zeigen" → andere Route)
+  // zurücknehmen, damit der sichtbare Screen darunter nicht verschoben hängt;
   // beim Zurückkommen wieder rein. Erst-Mount übersprungen (Open-rAF macht das).
   const coverMounted = useRef(false);
   useEffect(() => {
     if (!coverMounted.current) { coverMounted.current = true; return; }
     overlayCover.value = withTiming(hidden ? 0 : 1, {
-      duration: 220,
-      easing: hidden ? Easing.in(Easing.cubic) : Easing.out(Easing.cubic),
+      duration: PUSH_DURATION,
+      easing: hidden ? PUSH_OUT_EASING : PUSH_IN_EASING,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hidden]);
@@ -275,13 +272,13 @@ function DetailsContent({
     setClosing(true);
     translateX.value = withTiming(
       screenWidth,
-      { duration: 260, easing: Easing.in(Easing.cubic) },
+      { duration: PUSH_DURATION, easing: PUSH_OUT_EASING },
       (finished) => {
         if (finished) runOnJS(clearAfterFrame)();
       },
     );
-    // Schleier synchron zur Slide-Out ausblenden.
-    overlayCover.value = withTiming(0, { duration: 260, easing: Easing.in(Easing.cubic) });
+    // Parallax synchron zur Slide-Out zurückfahren.
+    overlayCover.value = withTiming(0, { duration: PUSH_DURATION, easing: PUSH_OUT_EASING });
   };
 
   useEffect(() => {

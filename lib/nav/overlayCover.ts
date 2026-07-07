@@ -1,4 +1,13 @@
-import { makeMutable } from "react-native-reanimated";
+import { Easing, makeMutable } from "react-native-reanimated";
+
+/**
+ * Gemeinsame Timing-Kurven für Slide + Parallax (Material-3 „emphasized").
+ * Decelerate = starke Abbremsung zum Ende → weiche Landung, kein „Anschlagen
+ * an die Kante". Accelerate = beschleunigt beim Rausfahren weg.
+ */
+export const PUSH_DURATION = 300;
+export const PUSH_IN_EASING = Easing.bezier(0.05, 0.7, 0.1, 1);
+export const PUSH_OUT_EASING = Easing.bezier(0.3, 0, 0.8, 0.15);
 
 /**
  * Geteilter Parallax-Fortschritt der horizontalen Push-Overlays.

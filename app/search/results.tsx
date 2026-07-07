@@ -42,7 +42,7 @@ import { searchByMode } from "@/lib/api/client";
 import { ResultCard } from "@/components/results/ResultCard";
 import { RandomSearchLoader } from "@/components/results/search-loaders/RandomSearchLoader";
 import { useT } from "@/lib/i18n/useT";
-import { overlayCover, UNDERLAY_TRAVEL_FRAC } from "@/lib/nav/overlayCover";
+import { overlayCover, UNDERLAY_TRAVEL_FRAC, PUSH_DURATION, PUSH_IN_EASING, PUSH_OUT_EASING } from "@/lib/nav/overlayCover";
 import { useSearchStore } from "@/stores/searchStore";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
@@ -150,7 +150,7 @@ export default function ResultsScreen() {
       started = true;
       slideX.value = withTiming(
         0,
-        { duration: 260, easing: Easing.out(Easing.cubic) },
+        { duration: PUSH_DURATION, easing: PUSH_IN_EASING },
         (finished) => {
           // Slide fertig → Loader-Animationen können losgehen (paused-flag
           // unten wird durch contentReady gesteuert).
@@ -201,7 +201,7 @@ export default function ResultsScreen() {
       isClosingRef.current = true;
       slideX.value = withTiming(
         screenWidth,
-        { duration: 260, easing: Easing.in(Easing.cubic) },
+        { duration: PUSH_DURATION, easing: PUSH_OUT_EASING },
         (finished) => {
           if (finished) {
             runOnJS(navigation.dispatch)(e.data.action);
