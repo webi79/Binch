@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   View,
   Text,
@@ -47,7 +47,6 @@ import { formatTimeInZone } from "@/lib/time-format";
 import { useT } from "@/lib/i18n/useT";
 import { useSearchStore } from "@/stores/searchStore";
 import { haptic } from "@/lib/haptics";
-import { underlayShift } from "@/lib/nav/pushParallax";
 import { usePathname } from "expo-router";
 import {
   redirectUrl,
@@ -241,28 +240,11 @@ function DetailsContent({
         duration: 260,
         easing: Easing.out(Easing.cubic),
       });
-      // Parallax GENAU im selben rAF starten wie die Overlay-Slide — synchron
-      // und erst NACH dem Mount des schweren Inhalts, sonst versetzt/springt es.
-      underlayShift.value = withTiming(1, { duration: 260, easing: Easing.out(Easing.cubic) });
     });
     return () => cancelAnimationFrame(id);
   }, [translateX]);
 
   const [closing, setClosing] = useState(false);
-
-  // Parallax bei `hidden`-Wechsel (z.B. „auf Karte zeigen" → andere Route,
-  // und zurück) nachziehen — der Erst-Mount ist übersprungen, den treibt das
-  // Open-rAF oben. Cleanup setzt hart auf 0 gegen nicht-animierte Unmounts.
-  const parallaxMounted = useRef(false);
-  useEffect(() => {
-    if (!parallaxMounted.current) { parallaxMounted.current = true; return; }
-    underlayShift.value = withTiming(hidden ? 0 : 1, {
-      duration: 220,
-      easing: hidden ? Easing.in(Easing.cubic) : Easing.out(Easing.cubic),
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hidden]);
-  useEffect(() => () => { underlayShift.value = 0; }, []);
   // Defer-Wrapper für den Unmount-Trigger: die letzte Frame der Slide-Out-
   // Animation soll sauber zu Ende paintet werden BEVOR React den DetailsContent-
   // Subtree unmountet (das Unmounten ist JS-Thread-Arbeit die sich mit der
@@ -281,8 +263,6 @@ function DetailsContent({
         if (finished) runOnJS(clearAfterFrame)();
       },
     );
-    // Parallax synchron zur Slide-Out zurückfahren.
-    underlayShift.value = withTiming(0, { duration: 260, easing: Easing.in(Easing.cubic) });
   };
 
   useEffect(() => {

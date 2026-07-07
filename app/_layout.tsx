@@ -5,7 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider, initialWindowMetrics } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
-import { AppState, LogBox, StyleSheet, useColorScheme, useWindowDimensions, View } from "react-native";
+import { AppState, LogBox, StyleSheet, useColorScheme, View } from "react-native";
 import { useSearchStore } from "@/stores/searchStore";
 import { useEffect, useMemo } from "react";
 import { SearchHeroOverlay } from "@/components/search/SearchHeroOverlay";
@@ -28,8 +28,7 @@ import { BinchSplash } from "@/components/ui/BinchSplash";
 import { BinchAuthScreen } from "@/components/auth/BinchAuthScreen";
 import { AuthHydrator } from "@/components/auth/AuthHydrator";
 import { migrateTicketImagesToFiles } from "@/lib/saved/ticketImages";
-import Animated, { FadeOut, useAnimatedStyle } from "react-native-reanimated";
-import { underlayShift, UNDERLAY_TRAVEL_FRAC } from "@/lib/nav/pushParallax";
+import Animated, { FadeOut } from "react-native-reanimated";
 import { useState } from "react";
 
 // Transiente MapLibre-Tile-Errors („Software caused connection abort",
@@ -128,26 +127,6 @@ export default function RootLayout() {
     return () => clearTimeout(t);
   }, []);
 
-  // Parallax: der darunterliegende Screen wandert ein Stück mit, während ein
-  // horizontales Push-Overlay (DetailsOverlay/TicketDetailOverlay) reinslidet.
-  const { width: screenW } = useWindowDimensions();
-  const stackParallaxStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: underlayShift.value * screenW * UNDERLAY_TRAVEL_FRAC }],
-  }));
-
-  // PERF: Die Verschiebung eines so schweren Subtrees (Ergebnisliste etc.)
-  // ist ohne Hardware-Layer pro Frame teuer (Fabric compositet neu → Stottern).
-  // Wir promoten den Stack auf einen GPU-Layer, sobald ein Push-Overlay offen
-  // ist — dann ist die Parallax-Verschiebung ein reiner Blit. WICHTIG: aus dem
-  // Store abgeleitet (nicht via useAnimatedReaction/runOnJS), damit die Textur
-  // schon zum ÖFFNEN steht, BEVOR die Slide startet — sonst greift sie erst
-  // während der Animation (JS-Thread durch Mount blockiert) = Stottern.
-  // Im Ruhezustand (kein Overlay) aus, damit normales Scrollen nicht durch die
-  // Textur muss.
-  const pushOverlayOpen = useSearchStore(
-    (s) => s.selectedResult !== null || s.selectedTicket !== null,
-  );
-
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       {/* Splash liegt GANZ AUSSEN — über SafeAreaProvider und allen Tabs,
@@ -174,16 +153,6 @@ export default function RootLayout() {
         <QueryClientProvider client={queryClient}>
           <View className={isDark ? "dark flex-1" : "flex-1"} style={{ flex: 1, backgroundColor: "#1A1A1A" }}>
             <StatusBar style={isDark ? "light" : "dark"} />
-            {/* Parallax-Wrapper: verschiebt den GESAMTEN Stack-Inhalt ein
-                Stück, während ein Push-Overlay darüber reinslidet. Die
-                Overlays selbst liegen außerhalb dieses Wrappers (Geschwister
-                unten) und sliden daher unbeeinflusst. */}
-            <Animated.View
-              style={[{ flex: 1 }, stackParallaxStyle]}
-              collapsable={false}
-              renderToHardwareTextureAndroid={pushOverlayOpen}
-              shouldRasterizeIOS={pushOverlayOpen}
-            >
             <Stack
               screenOptions={{
                 headerShown: false,
@@ -217,7 +186,6 @@ export default function RootLayout() {
                 }}
               />
             </Stack>
-            </Animated.View>
             {/* StopDetailSheet wird hier registriert (nicht in den Tabs)
                 damit der Slide ÜBER der FloatingTabBar UND allen Tab-Pages
                 liegt — wie alle anderen Sheets im Root-Layout. */}

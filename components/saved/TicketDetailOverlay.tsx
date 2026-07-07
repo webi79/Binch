@@ -35,7 +35,6 @@ import { useT } from "@/lib/i18n/useT";
 import { useSearchStore } from "@/stores/searchStore";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
-import { underlayShift } from "@/lib/nav/pushParallax";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { TicketHead, Perforation, bookingRefFor } from "./TicketParts";
 
@@ -82,8 +81,6 @@ function TicketDetailSheet() {
         duration: 280,
         easing: Easing.out(Easing.cubic),
       });
-      // Parallax synchron im selben rAF (nach dem Mount) starten.
-      underlayShift.value = withTiming(1, { duration: 280, easing: Easing.out(Easing.cubic) });
     });
     return () => {
       cancelAnimationFrame(id);
@@ -92,9 +89,6 @@ function TicketDetailSheet() {
   }, [translateX]);
 
   const [closing, setClosing] = useState(false);
-  // Cleanup als Sicherung gegen nicht-animierte Unmounts.
-  useEffect(() => () => { underlayShift.value = 0; }, []);
-
   const animateClose = () => {
     if (closing) return;
     setClosing(true);
@@ -105,8 +99,6 @@ function TicketDetailSheet() {
         if (finished) runOnJS(clearSelectedTicket)();
       },
     );
-    // Parallax synchron zur Slide-Out zurückfahren.
-    underlayShift.value = withTiming(0, { duration: 280, easing: Easing.in(Easing.cubic) });
   };
 
   useEffect(() => {
