@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -240,7 +240,15 @@ interface ContentProps {
   hiddenForRoute: boolean;
 }
 
-function DetailsContent({
+/**
+ * memo ist hier PFLICHT, kein Nice-to-have: Der Outer-Component subscribt
+ * u.a. usePathname() und re-rendert bei jedem Routen-/Tab-Wechsel. Seit
+ * keep-mounted hängt daran der komplette geparkte Details-Baum (hunderte
+ * Elemente inkl. SVG-Icons) — ohne memo würde JEDER Tab-Wechsel den
+ * unsichtbaren Baum voll re-rendern (= globale Ruckler). Alle Props sind
+ * primitiv oder stabile Refs, memo greift also zuverlässig.
+ */
+const DetailsContent = memo(function DetailsContent({
   result,
   passengers,
   pending,
@@ -396,7 +404,9 @@ function DetailsContent({
         lang: locale,
         searchPrice: result.price,
       }),
-    enabled: isFlight && !!bookingToken,
+    // `open` im Gate: geparkt (keep-mounted, zu) soll KEIN Query-Observer
+    // aktiv sein und nichts refetchen.
+    enabled: open && isFlight && !!bookingToken,
     staleTime: 5 * 60_000,
     retry: 1,
   });
@@ -663,7 +673,7 @@ function DetailsContent({
       </SafeAreaView>
     </Animated.View>
   );
-}
+});
 
 interface ProviderRow {
   name: string;
