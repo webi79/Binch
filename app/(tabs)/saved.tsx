@@ -113,35 +113,15 @@ export default function SavedScreen() {
 
   // Parallax: dieser Screen wandert ein Stück mit, während das
   // TicketDetailOverlay darüber reinslidet (nur DIESER Baum wird transformiert).
+  // BEWUSST ohne renderToHardwareTextureAndroid und ohne Store-Subscription:
+  // Der Layer-Flip erzwang ein 66ms-Record-View#draw() über den ganzen Tree
+  // (Perfetto), und die Subscription re-renderte bei jedem Ticket-Open den
+  // kompletten Tab (38 Text-Updates/Commit). Der reine Transform läuft auf
+  // dem UI-Thread und kostet React nichts — wie beim Results-Parallax.
   const { width: screenW } = useWindowDimensions();
   const parallaxStyle = useAnimatedStyle(() => ({
     transform: [{ translateX: overlayCover.value * screenW * UNDERLAY_TRAVEL_FRAC }],
   }));
-  // GPU-Layer NUR solange das Ticket-Overlay aktiv ist: ohne Layer wird der
-  // ganze Saved-Tree während des Parallax jeden Frame neu gezeichnet (Perfetto:
-  // ~14.7ms/Frame > 8.3ms-Budget @120Hz). Das Flag committet im SELBEN
-  // React-Update das das Overlay mountet — also BEVOR dessen Slide startet
-  // (Mid-Flight-Toggles verursachen selbst Stutter). Beim Schließen bleibt es
-  // bis clearSelectedTicket (nach Slide-Out) gesetzt. Dauerhaft an wäre
-  // schlecht: Scroll-Frames müssten die Full-Screen-Textur ständig neu hochladen.
-  const ticketOverlayActive = useFocusedStoreSnapshot(
-    isFocused,
-    (s) => s.selectedTicket !== null,
-  );
-  // Fallende Flanke verzögern: selectedTicket wird beim Schließen SOFORT
-  // gecleart (Slide-Out läuft danach noch ~260ms + Parallax). Die Layer darf
-  // erst NACH der Animation runter, sonst full-redraws mitten im Close.
-  // Steigende Flanke bleibt direkt (ticketOverlayActive || …) = im selben
-  // Commit wie der Overlay-Mount.
-  const [layerGrace, setLayerGrace] = useState(false);
-  useEffect(() => {
-    if (ticketOverlayActive) {
-      setLayerGrace(true);
-      return;
-    }
-    const id = setTimeout(() => setLayerGrace(false), 400);
-    return () => clearTimeout(id);
-  }, [ticketOverlayActive]);
 
   // Native-Bottom-Tabs halten die Saved-Tab IMMER mounted (auch wenn der
   // User auf Home ist). Mit `useSearchStore((s) => s.savedTrips)` würde
@@ -182,11 +162,7 @@ export default function SavedScreen() {
 
   return (
     <SafeAreaView className="flex-1 bg-[#1A1A1A]" edges={["top"]}>
-      <Animated.View
-        style={[{ flex: 1 }, parallaxStyle]}
-        renderToHardwareTextureAndroid={ticketOverlayActive || layerGrace}
-        collapsable={false}
-      >
+      <Animated.View style={[{ flex: 1 }, parallaxStyle]}>
       <View className="px-4 pt-6">
         <Text className="text-[26px] font-black text-white tracking-tight">
           Saved
