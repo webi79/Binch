@@ -45,7 +45,14 @@ import { formatTimeInZone } from "@/lib/time-format";
 import { useT } from "@/lib/i18n/useT";
 import { useSearchStore } from "@/stores/searchStore";
 import { haptic } from "@/lib/haptics";
-import { overlayCover, PUSH_DURATION, PUSH_IN_EASING, PUSH_OUT_EASING } from "@/lib/nav/overlayCover";
+import {
+  overlayCover,
+  PUSH_DURATION,
+  PUSH_IN_EASING,
+  PUSH_OUT_EASING,
+  COVER_IN_EASING,
+  COVER_OUT_EASING,
+} from "@/lib/nav/overlayCover";
 import { usePathname } from "expo-router";
 import {
   redirectUrl,
@@ -271,13 +278,14 @@ function DetailsContent({
       const id = requestAnimationFrame(() => {
         // Emphasized-Decelerate: bremst zum Ende stark ab → weiche Landung.
         translateX.value = withTiming(0, { duration: PUSH_DURATION, easing: PUSH_IN_EASING });
-        overlayCover.value = withTiming(1, { duration: PUSH_DURATION, easing: PUSH_IN_EASING });
+        // Parallax mit SANFTERER Kurve (sonst wirkt der kurze Weg zu snappy).
+        overlayCover.value = withTiming(1, { duration: PUSH_DURATION, easing: COVER_IN_EASING });
       });
       return () => cancelAnimationFrame(id);
     }
     // Schließen: raussliden (inkl. Schatten-Pad) + Parallax zurück — bleibt gemountet.
     translateX.value = withTiming(screenWidth + 48, { duration: PUSH_DURATION, easing: PUSH_OUT_EASING });
-    overlayCover.value = withTiming(0, { duration: PUSH_DURATION, easing: PUSH_OUT_EASING });
+    overlayCover.value = withTiming(0, { duration: PUSH_DURATION, easing: COVER_OUT_EASING });
     return undefined;
   }, [open, translateX, screenWidth]);
 
@@ -291,7 +299,7 @@ function DetailsContent({
     if (!open) return; // Schließen erledigt der Slide-Effekt oben
     overlayCover.value = withTiming(hiddenForRoute ? 0 : 1, {
       duration: PUSH_DURATION,
-      easing: hiddenForRoute ? PUSH_OUT_EASING : PUSH_IN_EASING,
+      easing: hiddenForRoute ? COVER_OUT_EASING : COVER_IN_EASING,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hiddenForRoute]);

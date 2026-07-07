@@ -34,7 +34,14 @@ import { useT } from "@/lib/i18n/useT";
 import { useSearchStore } from "@/stores/searchStore";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
-import { overlayCover, PUSH_DURATION, PUSH_IN_EASING, PUSH_OUT_EASING } from "@/lib/nav/overlayCover";
+import {
+  overlayCover,
+  PUSH_DURATION,
+  PUSH_IN_EASING,
+  PUSH_OUT_EASING,
+  COVER_IN_EASING,
+  COVER_OUT_EASING,
+} from "@/lib/nav/overlayCover";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { TicketHead, Perforation, bookingRefFor } from "./TicketParts";
 
@@ -78,8 +85,8 @@ function TicketDetailSheet() {
   useEffect(() => {
     const id = requestAnimationFrame(() => {
       translateX.value = withTiming(0, { duration: PUSH_DURATION, easing: PUSH_IN_EASING });
-      // Parallax des Unterlays synchron einblenden.
-      overlayCover.value = withTiming(1, { duration: PUSH_DURATION, easing: PUSH_IN_EASING });
+      // Parallax mit SANFTERER Kurve (sonst wirkt der kurze Weg zu snappy).
+      overlayCover.value = withTiming(1, { duration: PUSH_DURATION, easing: COVER_IN_EASING });
     });
     return () => {
       cancelAnimationFrame(id);
@@ -99,8 +106,8 @@ function TicketDetailSheet() {
         if (finished) runOnJS(clearSelectedTicket)();
       },
     );
-    // Parallax synchron zur Slide-Out zurückfahren.
-    overlayCover.value = withTiming(0, { duration: PUSH_DURATION, easing: PUSH_OUT_EASING });
+    // Parallax synchron zur Slide-Out zurückfahren (sanfte Kurve).
+    overlayCover.value = withTiming(0, { duration: PUSH_DURATION, easing: COVER_OUT_EASING });
   };
 
   useEffect(() => {
