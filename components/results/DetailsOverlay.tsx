@@ -47,6 +47,7 @@ import { formatTimeInZone } from "@/lib/time-format";
 import { useT } from "@/lib/i18n/useT";
 import { useSearchStore } from "@/stores/searchStore";
 import { haptic } from "@/lib/haptics";
+import { underlayShift } from "@/lib/nav/pushParallax";
 import { usePathname } from "expo-router";
 import {
   redirectUrl,
@@ -245,6 +246,21 @@ function DetailsContent({
   }, [translateX]);
 
   const [closing, setClosing] = useState(false);
+
+  // Parallax: den darunterliegenden Stack mitziehen, aber NUR solange das
+  // Overlay den Screen sichtbar abdeckt. `closing` (Slide-Out) und `hidden`
+  // (für andere Route weggeblendet, z.B. „auf Karte zeigen") nehmen den
+  // Parallax zurück, damit der sichtbare Screen darunter nie verschoben hängt.
+  // Cleanup setzt hart auf 0 für den Fall eines nicht-animierten Unmounts.
+  useEffect(() => {
+    const cover = !hidden && !closing;
+    underlayShift.value = withTiming(cover ? 1 : 0, {
+      duration: 260,
+      easing: cover ? Easing.out(Easing.cubic) : Easing.in(Easing.cubic),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hidden, closing]);
+  useEffect(() => () => { underlayShift.value = 0; }, []);
   // Defer-Wrapper für den Unmount-Trigger: die letzte Frame der Slide-Out-
   // Animation soll sauber zu Ende paintet werden BEVOR React den DetailsContent-
   // Subtree unmountet (das Unmounten ist JS-Thread-Arbeit die sich mit der

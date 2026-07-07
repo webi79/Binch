@@ -35,6 +35,7 @@ import { useT } from "@/lib/i18n/useT";
 import { useSearchStore } from "@/stores/searchStore";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
+import { underlayShift } from "@/lib/nav/pushParallax";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { TicketHead, Perforation, bookingRefFor } from "./TicketParts";
 
@@ -89,6 +90,18 @@ function TicketDetailSheet() {
   }, [translateX]);
 
   const [closing, setClosing] = useState(false);
+
+  // Parallax: den darunterliegenden Saved-Screen mitziehen, solange das
+  // Overlay ihn abdeckt; beim Slide-Out (closing) zurück an die Ausgangs-
+  // position. Cleanup als Sicherung gegen nicht-animierte Unmounts.
+  useEffect(() => {
+    underlayShift.value = withTiming(closing ? 0 : 1, {
+      duration: 280,
+      easing: closing ? Easing.in(Easing.cubic) : Easing.out(Easing.cubic),
+    });
+  }, [closing]);
+  useEffect(() => () => { underlayShift.value = 0; }, []);
+
   const animateClose = () => {
     if (closing) return;
     setClosing(true);
