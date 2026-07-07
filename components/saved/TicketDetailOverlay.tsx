@@ -5,7 +5,7 @@
  * Button. Wird am Root-Level (app/_layout.tsx) mit `selectedTicket !== null`
  * gemountet, ähnlich zum DetailsOverlay-Pattern.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -20,8 +20,6 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import Animated, {
-  cancelAnimation,
-  runOnJS,
   useAnimatedStyle,
   useSharedValue,
   withTiming,
@@ -62,65 +60,72 @@ const C = {
 
 export function TicketDetailOverlay() {
   const ticket = useSearchStore((s) => s.selectedTicket);
-  // Wenn nichts ausgewählt ist, gar nicht mounten — sonst läuft das
-  // Slide-Worklet im Hintergrund weiter und konkurriert mit Landing-Scroll.
-  if (!ticket) return null;
-  return <TicketDetailSheet />;
+  // KEEP-MOUNTED (Pattern wie DetailsOverlay): nach dem ersten Öffnen bleibt
+  // das Sheet gemountet und wird beim nächsten Öffnen wiederverwendet.
+  // Gründe (per Perfetto gemessen): (1) der Mount kostete ~66ms in einem
+  // Frame = sichtbarer Hänger bei jedem Öffnen; (2) react-native-svg leakt
+  // Views bei jedem Unmount auf Fabric. Das Ticket wird synchron in einem
+  // Ref gelatcht → kein Flash des alten Tickets beim Re-Open.
+  const lastTicketRef = useRef(ticket);
+  if (ticket) lastTicketRef.current = ticket;
+  const displayTicket = lastTicketRef.current;
+  if (!displayTicket) return null;
+  return <TicketDetailSheet ticket={displayTicket} open={!!ticket} />;
 }
 
-function TicketDetailSheet() {
+function TicketDetailSheet({
+  ticket,
+  open,
+}: {
+  ticket: NonNullable<ReturnType<typeof useSearchStore.getState>["selectedTicket"]>;
+  open: boolean;
+}) {
   const t = useT();
   const accent = useAccent();
-  const ticket = useSearchStore((s) => s.selectedTicket)!;
   const clearSelectedTicket = useSearchStore((s) => s.clearSelectedTicket);
   const screenWidth = useWindowDimensions().width;
 
-  const translateX = useSharedValue(screenWidth);
+  // Park-Position +48px: Elevation-Schatten (elevation 24) darf im
+  // geschlossenen Zustand nicht am rechten Rand durchscheinen.
+  const translateX = useSharedValue(screenWidth + 48);
   const slideStyle = useAnimatedStyle(() => ({
     transform: [{ translateX: translateX.value }],
+    // Off-screen ⇔ unsichtbar — kein Schatten-Bleed, kein Flash.
+    opacity: translateX.value >= screenWidth ? 0 : 1,
   }));
 
-  // Slide-In erst NACH dem ersten Paint starten — gibt React eine Frame Zeit
-  // den Subtree zu mounten BEVOR die Animation läuft. Sonst stuttert der
-  // Slide weil JS-Thread durch Mounting beschäftigt ist. Pattern matched
-  // DetailsOverlay.
+  // Sichtbarkeit store-getrieben: open → Slide-In (eine rAF nach dem Commit,
+  // damit React reconcilen kann bevor die Animation läuft), !open → Slide-Out.
+  // Kein Unmount mehr — der Tree bleibt stehen (Leak- & Mount-Hänger-Fix).
   useEffect(() => {
-    const id = requestAnimationFrame(() => {
-      translateX.value = withTiming(0, { duration: PUSH_DURATION, easing: PUSH_IN_EASING });
-      // Parallax: kürzer + sanfter — kommt VOR der Overlay-Landung zur Ruhe.
-      overlayCover.value = withTiming(1, { duration: COVER_DURATION, easing: COVER_IN_EASING });
-    });
-    return () => {
-      cancelAnimationFrame(id);
-      cancelAnimation(translateX);
-    };
-  }, [translateX]);
-
-  const [closing, setClosing] = useState(false);
-  useEffect(() => () => { overlayCover.value = 0; }, []);
-  const animateClose = () => {
-    if (closing) return;
-    setClosing(true);
-    translateX.value = withTiming(
-      screenWidth,
-      { duration: POP_DURATION, easing: POP_EASING },
-      (finished) => {
-        if (finished) runOnJS(clearSelectedTicket)();
-      },
-    );
-    // Parallax synchron zur Slide-Out zurückfahren (kürzer + sanft).
+    if (open) {
+      const id = requestAnimationFrame(() => {
+        translateX.value = withTiming(0, { duration: PUSH_DURATION, easing: PUSH_IN_EASING });
+        // Parallax: kürzer + sanfter — kommt VOR der Overlay-Landung zur Ruhe.
+        overlayCover.value = withTiming(1, { duration: COVER_DURATION, easing: COVER_IN_EASING });
+      });
+      return () => cancelAnimationFrame(id);
+    }
+    translateX.value = withTiming(screenWidth + 48, { duration: POP_DURATION, easing: POP_EASING });
     overlayCover.value = withTiming(0, { duration: COVER_DURATION, easing: COVER_OUT_EASING });
-  };
+    return undefined;
+  }, [open, translateX, screenWidth]);
+
+  useEffect(() => () => { overlayCover.value = 0; }, []);
+
+  // Schließen = Store-Flag löschen → open false → Slide-Out oben.
+  const animateClose = () => clearSelectedTicket();
 
   useEffect(() => {
     if (Platform.OS !== "android") return;
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      if (!open) return false;
       animateClose();
       return true;
     });
     return () => sub.remove();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [open]);
 
   const openPdf = () => {
     haptic("button");
@@ -131,11 +136,26 @@ function TicketDetailSheet() {
   // Fonts (kein font-stubbing-Problem mehr) und bietet Pinch-Zoom +
   // Page-Navigation out of the box.
   const [pdfOpen, setPdfOpen] = useState(false);
+  // Keep-mounted: beim Schließen offenes PDF-Modal mit zumachen, sonst
+  // wäre es beim nächsten Öffnen noch offen.
+  useEffect(() => {
+    if (!open) setPdfOpen(false);
+  }, [open]);
 
   const ticketCode = bookingRefFor(ticket);
 
   return (
-    <Animated.View style={[styles.root, slideStyle]}>
+    // renderToHardwareTextureAndroid: promotet das Sheet auf eine GPU-Layer.
+    // Per Perfetto gemessen: ohne Layer wird der komplette Screen JEDEN
+    // Animations-Frame neu gezeichnet (~14.7ms > 8.3ms-Budget bei 120Hz →
+    // jeder zweite Frame droppt). Als Textur ist der Frame ein Blit.
+    // Statisch an (kein Mid-Flight-Toggle — der verursachte früher selbst
+    // Stutter); Kosten: ~12MB GPU-Speicher solange gemountet.
+    <Animated.View
+      style={[styles.root, slideStyle]}
+      renderToHardwareTextureAndroid
+      collapsable={false}
+    >
       <SafeAreaView style={styles.safe} edges={["top"]}>
         <View style={styles.header}>
           <Pressable
