@@ -28,7 +28,7 @@ import { BinchSplash } from "@/components/ui/BinchSplash";
 import { BinchAuthScreen } from "@/components/auth/BinchAuthScreen";
 import { AuthHydrator } from "@/components/auth/AuthHydrator";
 import { migrateTicketImagesToFiles } from "@/lib/saved/ticketImages";
-import Animated, { FadeOut, useAnimatedStyle } from "react-native-reanimated";
+import Animated, { FadeOut, useAnimatedStyle, useAnimatedReaction, runOnJS } from "react-native-reanimated";
 import { underlayShift, UNDERLAY_TRAVEL_FRAC } from "@/lib/nav/pushParallax";
 import { useState } from "react";
 
@@ -135,6 +135,20 @@ export default function RootLayout() {
     transform: [{ translateX: underlayShift.value * screenW * UNDERLAY_TRAVEL_FRAC }],
   }));
 
+  // PERF: Die Verschiebung eines so schweren Subtrees (Ergebnisliste etc.)
+  // ist ohne Hardware-Layer pro Frame teuer (Fabric compositet neu → Ruckeln).
+  // Wir promoten den Stack auf einen GPU-Layer NUR während der Parallax aktiv
+  // ist (underlayShift > 0) — dann ist die Verschiebung ein reiner Blit. Im
+  // Ruhezustand (0) wieder aus, damit normales Listen-Scrollen nicht durch die
+  // Textur muss. useAnimatedReaction erkennt die Schwelle auf dem UI-Thread.
+  const [stackRasterize, setStackRasterize] = useState(false);
+  useAnimatedReaction(
+    () => underlayShift.value > 0.001,
+    (active, prev) => {
+      if (active !== prev) runOnJS(setStackRasterize)(active);
+    },
+  );
+
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       {/* Splash liegt GANZ AUSSEN — über SafeAreaProvider und allen Tabs,
@@ -165,7 +179,12 @@ export default function RootLayout() {
                 Stück, während ein Push-Overlay darüber reinslidet. Die
                 Overlays selbst liegen außerhalb dieses Wrappers (Geschwister
                 unten) und sliden daher unbeeinflusst. */}
-            <Animated.View style={[{ flex: 1 }, stackParallaxStyle]}>
+            <Animated.View
+              style={[{ flex: 1 }, stackParallaxStyle]}
+              collapsable={false}
+              renderToHardwareTextureAndroid={stackRasterize}
+              shouldRasterizeIOS={stackRasterize}
+            >
             <Stack
               screenOptions={{
                 headerShown: false,

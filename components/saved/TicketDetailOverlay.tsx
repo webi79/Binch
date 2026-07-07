@@ -82,6 +82,8 @@ function TicketDetailSheet() {
         duration: 280,
         easing: Easing.out(Easing.cubic),
       });
+      // Parallax synchron im selben rAF (nach dem Mount) starten.
+      underlayShift.value = withTiming(1, { duration: 280, easing: Easing.out(Easing.cubic) });
     });
     return () => {
       cancelAnimationFrame(id);
@@ -90,16 +92,7 @@ function TicketDetailSheet() {
   }, [translateX]);
 
   const [closing, setClosing] = useState(false);
-
-  // Parallax: den darunterliegenden Saved-Screen mitziehen, solange das
-  // Overlay ihn abdeckt; beim Slide-Out (closing) zurück an die Ausgangs-
-  // position. Cleanup als Sicherung gegen nicht-animierte Unmounts.
-  useEffect(() => {
-    underlayShift.value = withTiming(closing ? 0 : 1, {
-      duration: 280,
-      easing: closing ? Easing.in(Easing.cubic) : Easing.out(Easing.cubic),
-    });
-  }, [closing]);
+  // Cleanup als Sicherung gegen nicht-animierte Unmounts.
   useEffect(() => () => { underlayShift.value = 0; }, []);
 
   const animateClose = () => {
@@ -112,6 +105,8 @@ function TicketDetailSheet() {
         if (finished) runOnJS(clearSelectedTicket)();
       },
     );
+    // Parallax synchron zur Slide-Out zurückfahren.
+    underlayShift.value = withTiming(0, { duration: 280, easing: Easing.in(Easing.cubic) });
   };
 
   useEffect(() => {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -241,25 +241,27 @@ function DetailsContent({
         duration: 260,
         easing: Easing.out(Easing.cubic),
       });
+      // Parallax GENAU im selben rAF starten wie die Overlay-Slide — synchron
+      // und erst NACH dem Mount des schweren Inhalts, sonst versetzt/springt es.
+      underlayShift.value = withTiming(1, { duration: 260, easing: Easing.out(Easing.cubic) });
     });
     return () => cancelAnimationFrame(id);
   }, [translateX]);
 
   const [closing, setClosing] = useState(false);
 
-  // Parallax: den darunterliegenden Stack mitziehen, aber NUR solange das
-  // Overlay den Screen sichtbar abdeckt. `closing` (Slide-Out) und `hidden`
-  // (für andere Route weggeblendet, z.B. „auf Karte zeigen") nehmen den
-  // Parallax zurück, damit der sichtbare Screen darunter nie verschoben hängt.
-  // Cleanup setzt hart auf 0 für den Fall eines nicht-animierten Unmounts.
+  // Parallax bei `hidden`-Wechsel (z.B. „auf Karte zeigen" → andere Route,
+  // und zurück) nachziehen — der Erst-Mount ist übersprungen, den treibt das
+  // Open-rAF oben. Cleanup setzt hart auf 0 gegen nicht-animierte Unmounts.
+  const parallaxMounted = useRef(false);
   useEffect(() => {
-    const cover = !hidden && !closing;
-    underlayShift.value = withTiming(cover ? 1 : 0, {
-      duration: 260,
-      easing: cover ? Easing.out(Easing.cubic) : Easing.in(Easing.cubic),
+    if (!parallaxMounted.current) { parallaxMounted.current = true; return; }
+    underlayShift.value = withTiming(hidden ? 0 : 1, {
+      duration: 220,
+      easing: hidden ? Easing.in(Easing.cubic) : Easing.out(Easing.cubic),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hidden, closing]);
+  }, [hidden]);
   useEffect(() => () => { underlayShift.value = 0; }, []);
   // Defer-Wrapper für den Unmount-Trigger: die letzte Frame der Slide-Out-
   // Animation soll sauber zu Ende paintet werden BEVOR React den DetailsContent-
@@ -279,6 +281,8 @@ function DetailsContent({
         if (finished) runOnJS(clearAfterFrame)();
       },
     );
+    // Parallax synchron zur Slide-Out zurückfahren.
+    underlayShift.value = withTiming(0, { duration: 260, easing: Easing.in(Easing.cubic) });
   };
 
   useEffect(() => {
