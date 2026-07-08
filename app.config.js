@@ -48,6 +48,19 @@ module.exports = {
     },
     plugins: [
       "expo-router",
+      // usesCleartextTraffic: Release-Builds blocken sonst JEDES http:// —
+      // damit wäre der lokale Dev-Server (http://192.168.2.x:3000) im
+      // Release-Build unerreichbar und Perf-Tests im Release unmöglich.
+      // TODO: Sobald der Hetzner-Server mit HTTPS steht, auf false drehen
+      // (Prod soll nur noch https sprechen).
+      [
+        "expo-build-properties",
+        {
+          android: {
+            usesCleartextTraffic: true,
+          },
+        },
+      ],
       // Scroll-Judder-Fix: pinnt die Display-Rate am App-Window (Details im
       // Plugin). MUSS als Config-Plugin laufen — android/ ist gitignored
       // (CNG), direkte Edits dort erreichen EAS-Builds nie.
