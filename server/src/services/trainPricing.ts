@@ -120,7 +120,8 @@ export async function enrichTrainPrices(
   const byKey = new Map<string, { amount: number; currency: string; recon?: string }>();
   for (const j of journeys) {
     const leg = j.legs?.find((l) => l.line?.name);
-    const dep = leg?.departure ?? leg?.plannedDeparture;
+    // Planmäßige Abfahrt zum Matchen (MOTIS-Seite nutzt jetzt auch scheduled).
+    const dep = leg?.plannedDeparture ?? leg?.departure;
     if (!leg || !dep || j.price?.amount == null) continue;
     const key = `${normLine(leg.line?.name)}|${hhmm(dep)}`;
     if (!byKey.has(key)) {

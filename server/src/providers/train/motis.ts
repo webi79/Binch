@@ -115,15 +115,19 @@ function toStopovers(stops: MotisLegStop[] | undefined): StopoverInfo[] | undefi
   if (!stops || stops.length === 0) return undefined;
   return stops.map((s) => ({
     name: s.name,
-    arrival: s.arrival ?? s.scheduledArrival,
-    departure: s.departure ?? s.scheduledDeparture,
+    // Planmäßige Zeit zuerst (Fahrplanzeit) — NICHT die Echtzeit inkl.
+    // Verspätung; sonst zeigt die Timeline verwirrende „Ist"-Zeiten.
+    arrival: s.scheduledArrival ?? s.arrival,
+    departure: s.scheduledDeparture ?? s.departure,
     platform: s.track,
   }));
 }
 
 function toLeg(leg: MotisLeg): LegInfo {
-  const depart = leg.from.departure ?? leg.from.scheduledDeparture ?? leg.startTime ?? "";
-  const arrive = leg.to.arrival ?? leg.to.scheduledArrival ?? leg.endTime ?? "";
+  // Planmäßige (Fahrplan-)Zeit zuerst, Echtzeit nur als Fallback — die Card/
+  // Timeline soll die normale Abfahrt zeigen, nicht Soll+Verspätung.
+  const depart = leg.from.scheduledDeparture ?? leg.from.departure ?? leg.startTime ?? "";
+  const arrive = leg.to.scheduledArrival ?? leg.to.arrival ?? leg.endTime ?? "";
   const durationMinutes =
     depart && arrive ? Math.max(1, Math.round((Date.parse(arrive) - Date.parse(depart)) / 60_000)) : 0;
   const stopovers = toStopovers(leg.intermediateStops);
@@ -168,8 +172,8 @@ function toNormalized(
   // Headline = echte ZUG-Zeiten (erste Zug-Abfahrt → letzte Zug-Ankunft), nicht
   // it.startTime/endTime (die den Bahnsteig-Zugangsweg vom Koordinaten-Punkt
   // mit-einrechnen und die Abfahrt einige Minuten zu früh wirken lassen).
-  const departTime = first.from.departure ?? first.from.scheduledDeparture ?? first.startTime ?? it.startTime;
-  const arriveTime = last.to.arrival ?? last.to.scheduledArrival ?? last.endTime ?? it.endTime;
+  const departTime = first.from.scheduledDeparture ?? first.from.departure ?? first.startTime ?? it.startTime;
+  const arriveTime = last.to.scheduledArrival ?? last.to.arrival ?? last.endTime ?? it.endTime;
   const durationMinutes = Math.max(
     1,
     Math.round((Date.parse(arriveTime) - Date.parse(departTime)) / 60_000),
