@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { config } from "../../config.js";
 import { db } from "../../db/client.js";
-import { locations } from "../../db/schema.js";
+import { locations, type TravelMode } from "../../db/schema.js";
 import { BoundedTtlCache } from "../../util/boundedCache.js";
 import type {
   LegInfo,
@@ -259,59 +259,73 @@ function empty(start: number, raw: unknown): ProviderResult {
   return { results: [], raw, statusCode: 0, durationMs: Date.now() - start };
 }
 
-export const motisProvider: SearchProvider = {
-  name: "motis",
-  mode: "TRAIN",
-  isConfigured: () => config.MOTIS_ENABLED && !!config.MOTIS_BASE_URL,
+/**
+ * Factory: ein MOTIS-Provider je Travel-Mode. `transitModes` steuert, welche
+ * Verkehrsmittel MOTIS routet (RAIL für Züge, BUS/COACH für Busse). Alles
+ * andere (Auflösung, Cache, Normalisierung) ist geteilt.
+ */
+function makeMotisProvider(mode: TravelMode, transitModes: string, name: string): SearchProvider {
+  return {
+    name,
+    mode,
+    isConfigured: () => config.MOTIS_ENABLED && !!config.MOTIS_BASE_URL,
 
-  async search(input: ProviderSearchInput, signal?: AbortSignal): Promise<ProviderResult> {
-    const start = Date.now();
+    async search(input: ProviderSearchInput, signal?: AbortSignal): Promise<ProviderResult> {
+      const start = Date.now();
 
-    // Auflösung über unsere gespeicherten Koordinaten (Fallback: Label-Geocode).
-    let from: MotisPlace | null;
-    let to: MotisPlace | null;
-    try {
-      [from, to] = await Promise.all([
-        resolvePlace(input.origin, input.originLabel, signal),
-        resolvePlace(input.destination, input.destLabel, signal),
-      ]);
-    } catch (e) {
-      return empty(start, { error: "motis_resolve_failed", message: e instanceof Error ? e.message : String(e) });
-    }
-    if (!from || !to) {
-      return empty(start, { skipped: "motis resolve no match", origin: input.origin, destination: input.destination });
-    }
-
-    const time = input.departTime ?? input.departDate;
-    const bucket = Math.floor(Date.parse(time) / (10 * 60_000));
-    const cacheKey = `${from.id}|${to.id}|${bucket}`;
-
-    let itineraries = planCache.get(cacheKey);
-    const fromCache = itineraries !== undefined;
-    if (!itineraries) {
+      // Auflösung über unsere gespeicherten Koordinaten (Fallback: Label-Geocode).
+      let from: MotisPlace | null;
+      let to: MotisPlace | null;
       try {
-        const url =
-          `/v6/plan?fromPlace=${encodeURIComponent(from.id)}` +
-          `&toPlace=${encodeURIComponent(to.id)}` +
-          `&time=${encodeURIComponent(new Date(time).toISOString())}` +
-          `&transitModes=RAIL&numItineraries=6&detailedTransfers=false`;
-        const raw = (await motisFetch(url, signal)) as { itineraries?: MotisItinerary[] };
-        itineraries = raw.itineraries ?? [];
-        planCache.set(cacheKey, itineraries);
+        [from, to] = await Promise.all([
+          resolvePlace(input.origin, input.originLabel, signal),
+          resolvePlace(input.destination, input.destLabel, signal),
+        ]);
       } catch (e) {
-        return empty(start, { error: "motis_plan_failed", message: e instanceof Error ? e.message : String(e) });
+        return empty(start, { error: "motis_resolve_failed", message: e instanceof Error ? e.message : String(e) });
       }
-    }
+      if (!from || !to) {
+        return empty(start, { skipped: "motis resolve no match", origin: input.origin, destination: input.destination });
+      }
 
-    const results = itineraries
-      .map((it, i) => toNormalized(it, input, from!, to!, i))
-      .filter((r): r is NormalizedResult => r !== null);
+      const time = input.departTime ?? input.departDate;
+      const bucket = Math.floor(Date.parse(time) / (10 * 60_000));
+      // transitModes im Key: Bus- und Zug-Suche derselben Strecke dürfen sich
+      // den Plan-Cache NICHT teilen.
+      const cacheKey = `${transitModes}|${from.id}|${to.id}|${bucket}`;
 
-    return {
-      results,
-      raw: { source: "motis", from: from.id, to: to.id, count: results.length, planCached: fromCache },
-      statusCode: 200,
-      durationMs: Date.now() - start,
-    };
-  },
-};
+      let itineraries = planCache.get(cacheKey);
+      const fromCache = itineraries !== undefined;
+      if (!itineraries) {
+        try {
+          const url =
+            `/v6/plan?fromPlace=${encodeURIComponent(from.id)}` +
+            `&toPlace=${encodeURIComponent(to.id)}` +
+            `&time=${encodeURIComponent(new Date(time).toISOString())}` +
+            `&transitModes=${encodeURIComponent(transitModes)}&numItineraries=6&detailedTransfers=false`;
+          const raw = (await motisFetch(url, signal)) as { itineraries?: MotisItinerary[] };
+          itineraries = raw.itineraries ?? [];
+          planCache.set(cacheKey, itineraries);
+        } catch (e) {
+          return empty(start, { error: "motis_plan_failed", message: e instanceof Error ? e.message : String(e) });
+        }
+      }
+
+      const results = itineraries
+        .map((it, i) => toNormalized(it, input, from!, to!, i))
+        .filter((r): r is NormalizedResult => r !== null);
+
+      return {
+        results,
+        raw: { source: name, from: from.id, to: to.id, count: results.length, planCached: fromCache },
+        statusCode: 200,
+        durationMs: Date.now() - start,
+      };
+    },
+  };
+}
+
+/** Zug-Routing (RAIL: ICE/IC/RE/S-Bahn etc.). */
+export const motisProvider = makeMotisProvider("TRAIN", "RAIL", "motis");
+/** Bus-Routing (Regional- + Fernbusse aus GTFS — belebt BUS-Mode trotz DB-Block). */
+export const motisBusProvider = makeMotisProvider("BUS", "BUS,COACH", "motis-bus");

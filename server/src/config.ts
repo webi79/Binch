@@ -18,8 +18,13 @@ const schema = z.object({
   // MOTIS_BASE_URL auf die eigene Instanz flippen, sonst nichts ändern.
   MOTIS_BASE_URL: z.string().default("https://api.transitous.org/api"),
   // Provider an/aus schaltbar (falls Transitous mal zickt oder wir bewusst
-  // nur DB fahren wollen).
-  MOTIS_ENABLED: z.coerce.boolean().default(true),
+  // nur DB fahren wollen). Bewusst KEIN z.coerce.boolean() — das macht aus
+  // dem String "false" ein true (Boolean("false")===true). Nur "false"/"0"
+  // schalten ab, alles andere (inkl. unset → Default) lässt an.
+  MOTIS_ENABLED: z
+    .string()
+    .default("true")
+    .transform((v) => v !== "false" && v !== "0"),
 
   RAPIDAPI_KEY: z.string().optional(),
   // SearchAPI.io — primärer Google-Flights-Provider (zuverlässiger Scraper:

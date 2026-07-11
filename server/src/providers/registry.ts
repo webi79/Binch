@@ -6,7 +6,7 @@ import { skyscannerProvider } from "./flight/skyscanner.js";
 import { amadeusProvider } from "./flight/amadeus.js";
 import { trainlineProvider } from "./train/trainline.js";
 import { dbVendoProvider } from "./train/dbVendo.js";
-import { motisProvider } from "./train/motis.js";
+import { motisProvider, motisBusProvider } from "./train/motis.js";
 import { transitScheduleProvider } from "./train/transitSchedule.js";
 import { flixbusProvider } from "./bus/flixbus.js";
 import { busbudProvider } from "./bus/busbud.js";
@@ -26,11 +26,11 @@ const REGISTRY: Record<TravelMode, SearchProvider[]> = {
   // DB-Block, kein Rate-Limit), liefert Zeiten aber price=0. dbVendo bleibt
   // dahinter — liefert Preise, sobald DB den OPS_BLOCK wieder löst.
   TRAIN: [motisProvider, trainlineProvider, dbVendoProvider, transitScheduleProvider],
-  // dbVendo (HAFAS) ist intermodal und liefert auch Bus-Verbindungen — vor
-  // allem für regionale/Verbund-Strecken die FlixBus/Busbud gar nicht im
-  // Angebot haben. Reihenfolge: erst dbVendo (lokale ÖPNV-Strecken), dann
-  // FlixBus/Busbud (internationale/Fernbusse).
-  BUS: [dbVendoProvider, flixbusProvider, busbudProvider],
+  // motis-bus zuerst: Regional-/Fernbusse aus offenen GTFS-Daten (kein DB-
+  // Block) — belebt BUS-Mode, nachdem dbVendo (HAFAS) extern geblockt wird und
+  // FlixBus/Busbud ohne API-Key nicht laufen. dbVendo bleibt dahinter (liefert
+  // wieder ÖPNV-Bus-Strecken, sobald DB entblockt), dann FlixBus/Busbud.
+  BUS: [motisBusProvider, dbVendoProvider, flixbusProvider, busbudProvider],
   CRUISE: [cruisedirectProvider],
 };
 
