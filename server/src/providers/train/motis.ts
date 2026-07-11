@@ -3,6 +3,7 @@ import { config } from "../../config.js";
 import { db } from "../../db/client.js";
 import { locations, type TravelMode } from "../../db/schema.js";
 import { BoundedTtlCache } from "../../util/boundedCache.js";
+import { motisFetch, motisGeocode, type MotisPlace } from "../../services/motisClient.js";
 import type {
   LegInfo,
   NormalizedResult,
@@ -24,25 +25,13 @@ import type {
  * keine Fahrpreise → UI rendert "Tarif beim Anbieter", exakt wie
  * transitSchedule). Preise sind ein separater, späterer Enrichment-Layer.
  *
- * Guter-Bürger-Design gegenüber dem Volunteer-Dienst Transitous: harter
- * Geocode-Cache (stabil, 24h) + kurzer Plan-Cache (5 min) senken die Anzahl
- * teurer Routing-Calls; identifizierender User-Agent.
+ * HTTP-Client + Geocode liegen geteilt in services/motisClient (auch vom
+ * Stop-Board genutzt). Guter-Bürger-Design: Koordinaten-Cache (24h) + kurzer
+ * Plan-Cache (5 min) senken die Anzahl teurer Routing-Calls.
  */
-
-const UA = "binch-mobile/0.1 (train routing via MOTIS)";
-
-interface MotisPlace {
-  id: string;
-  name: string;
-  lat?: number;
-  lon?: number;
-  tz?: string;
-}
 
 // code → MOTIS-Place (bevorzugt aus unseren gespeicherten Koordinaten). Stabil → 24h.
 const coordCache = new BoundedTtlCache<MotisPlace | null>(2000, 24 * 60 * 60 * 1000);
-// Label → aufgelöster MOTIS-Stop (Fallback-Geocoding). Mapping ist stabil → 24h.
-const geocodeCache = new BoundedTtlCache<MotisPlace | null>(2000, 24 * 60 * 60 * 1000);
 // Plan-Response pro (from|to|10-Min-Bucket) → 5 min (schont Transitous, Routing
 // ist deren teuerster Endpoint; Ergebnisse sind für ein paar Minuten stabil).
 const planCache = new BoundedTtlCache<MotisItinerary[]>(500, 5 * 60 * 1000);
@@ -81,43 +70,6 @@ interface MotisItinerary {
   legs: MotisLeg[];
 }
 
-async function motisFetch(path: string, signal?: AbortSignal): Promise<unknown> {
-  const url = `${config.MOTIS_BASE_URL}${path}`;
-  const res = await fetch(url, {
-    headers: { accept: "application/json", "user-agent": UA },
-    signal,
-  });
-  if (!res.ok) throw new Error(`MOTIS ${res.status} ${res.statusText}`);
-  return res.json();
-}
-
-/** Freitext-Label → MOTIS-Stop (bevorzugt type STOP). Gecacht. */
-async function geocode(label: string, signal?: AbortSignal): Promise<MotisPlace | null> {
-  const key = label.trim().toLowerCase();
-  if (!key) return null;
-  const cached = geocodeCache.get(key);
-  if (cached !== undefined) return cached;
-
-  let place: MotisPlace | null = null;
-  try {
-    const raw = (await motisFetch(
-      `/v1/geocode?text=${encodeURIComponent(label)}`,
-      signal,
-    )) as Array<{ type?: string; id?: string; name?: string; lat?: number; lon?: number; tz?: string }>;
-    if (Array.isArray(raw) && raw.length > 0) {
-      const hit = raw.find((r) => r.type === "STOP") ?? raw[0];
-      if (hit?.id) {
-        place = { id: hit.id, name: hit.name ?? label, lat: hit.lat, lon: hit.lon, tz: hit.tz };
-      }
-    }
-  } catch {
-    // Geocode-Fehler nicht cachen (könnte transient sein) → früh raus.
-    return null;
-  }
-  geocodeCache.set(key, place);
-  return place;
-}
-
 /**
  * Binch-`code` → MOTIS-Place. Bevorzugt die in `locations` gespeicherten
  * Koordinaten (präzise, kein Geocode-Call, reused Asset) und gibt MOTIS ein
@@ -152,7 +104,7 @@ async function resolvePlace(
 
   // Kein Koordinaten-Treffer → Label-Geocoding als Fallback.
   if (!place && label) {
-    place = await geocode(label, signal);
+    place = await motisGeocode(label, signal);
   }
   coordCache.set(code, place);
   return place;

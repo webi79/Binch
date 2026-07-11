@@ -7,6 +7,7 @@ import { getStopBoard, resolveHafasByCoord, type StopBoardResponse, type StopBoa
 import { profileForStop, isAtRegionalProfile, type HafasProfileKey } from "../services/countryProfile.js";
 import { getFlightBoard } from "../services/flightInfoService.js";
 import { getScheduledStopBoard } from "../services/gtfsSchedule.js";
+import { getMotisStopBoard } from "../services/motisStops.js";
 
 /**
  * Liefert die nächsten Abfahrten/Ankünfte einer Haltestelle. Wird vom
@@ -107,6 +108,28 @@ function emptyResponse(label: string, code: string): StopBoardApiResponse {
   };
 }
 
+/**
+ * Fallback-Board aus MOTIS (offene GTFS-Daten + Echtzeit, kein DB-Kontakt).
+ * Greift, wenn der reguläre HAFAS/dbrest-Weg nichts liefert — insb. während DB
+ * db-vendo-client extern blockt. Liefert bei MOTIS-Fehltreffer das leere Result.
+ */
+async function motisFallback(
+  label: string,
+  code: string,
+  hafasId: string | null,
+  board: StopBoard,
+): Promise<StopBoardApiResponse> {
+  try {
+    const motis = await getMotisStopBoard(label, board);
+    if (motis && motis.results.length > 0) {
+      return { ...motis, stop: { code, label, hafasId } };
+    }
+  } catch {
+    /* fällt unten auf empty */
+  }
+  return emptyResponse(label, code);
+}
+
 /** Verarbeitet `airport:IATA`-Codes: holt Flugdaten via AeroDataBox. Liefert
  *  null wenn der Code kein Airport-Code ist (Fallback auf Train-Logik). */
 async function tryFlightBoard(code: string, board: StopBoard): Promise<StopBoardApiResponse | null> {
@@ -186,12 +209,13 @@ export async function stopsRoutes(app: FastifyInstance) {
       longitude: stop.longitude != null ? Number(stop.longitude) : null,
     });
     if (!profile) {
-      return emptyResponse(stop.label, parsed.data.code);
+      // Kein HAFAS-Profil (CH/NL/FR/…) → MOTIS deckt diese Länder via GTFS ab.
+      return motisFallback(stop.label, parsed.data.code, stop.hafasId, board);
     }
 
     const resolvedId = await resolveStopHafasId(stop, profile);
     if (!resolvedId) {
-      return emptyResponse(stop.label, parsed.data.code);
+      return motisFallback(stop.label, parsed.data.code, stop.hafasId, board);
     }
     try {
       const data = await getStopBoard(resolvedId, board, profile);
@@ -224,14 +248,18 @@ export async function stopsRoutes(app: FastifyInstance) {
           return p !== "bus" && p !== "taxi";
         });
       }
+      // dbrest/HAFAS lieferte nichts (z.B. DB-OPS_BLOCK) → MOTIS-Fallback.
+      if (results.length === 0) {
+        return motisFallback(stop.label, parsed.data.code, stop.hafasId, board);
+      }
       return {
         ...data,
         results,
         stop: { code: parsed.data.code, label: stop.label, hafasId: resolvedId },
       } satisfies StopBoardApiResponse;
     } catch (err) {
-      req.log.warn({ err, code: parsed.data.code }, `${board} upstream failed`);
-      return emptyResponse(stop.label, parsed.data.code);
+      req.log.warn({ err, code: parsed.data.code }, `${board} upstream failed → MOTIS-Fallback`);
+      return motisFallback(stop.label, parsed.data.code, stop.hafasId, board);
     }
   }
 
