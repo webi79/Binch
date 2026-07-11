@@ -11,6 +11,15 @@ const schema = z.object({
   // Self-hosted db-rest (Docker) — siehe docker-compose.yml.
   // Public Instanz https://v6.db.transport.rest ist unzuverlässig, deshalb default lokal.
   DBREST_BASE_URL: z.string().default("http://localhost:3001"),
+  // MOTIS-Routing-Backend (Zug-Verbindungen aus offenen GTFS-Daten, kein
+  // DB-Kontakt → unblockbar, kein Rate-Limit). Default = öffentliche
+  // Transitous-Instanz als ÜBERGANG (nur Dev/Low-Traffic — deren Policy
+  // ist FOSS/non-profit). Sobald die eigene MOTIS-Box auf Hetzner steht:
+  // MOTIS_BASE_URL auf die eigene Instanz flippen, sonst nichts ändern.
+  MOTIS_BASE_URL: z.string().default("https://api.transitous.org/api"),
+  // Provider an/aus schaltbar (falls Transitous mal zickt oder wir bewusst
+  // nur DB fahren wollen).
+  MOTIS_ENABLED: z.coerce.boolean().default(true),
 
   RAPIDAPI_KEY: z.string().optional(),
   // SearchAPI.io — primärer Google-Flights-Provider (zuverlässiger Scraper:

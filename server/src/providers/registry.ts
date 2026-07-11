@@ -6,6 +6,7 @@ import { skyscannerProvider } from "./flight/skyscanner.js";
 import { amadeusProvider } from "./flight/amadeus.js";
 import { trainlineProvider } from "./train/trainline.js";
 import { dbVendoProvider } from "./train/dbVendo.js";
+import { motisProvider } from "./train/motis.js";
 import { transitScheduleProvider } from "./train/transitSchedule.js";
 import { flixbusProvider } from "./bus/flixbus.js";
 import { busbudProvider } from "./bus/busbud.js";
@@ -21,7 +22,10 @@ const REGISTRY: Record<TravelMode, SearchProvider[]> = {
   // transitSchedule liefert NUR für Tram/U-Bahn-Origin bzw. GTFS-only-Länder
   // (NL/BE/CZ/GB/…) Schedule-Cards (price=0, "Tarif beim Anbieter"). Für
   // normale Bahnhöfe macht der Provider früh `empty()` und kostet nichts.
-  TRAIN: [trainlineProvider, dbVendoProvider, transitScheduleProvider],
+  // motis zuerst: verlässliche Zug-Verbindungen aus offenen GTFS-Daten (kein
+  // DB-Block, kein Rate-Limit), liefert Zeiten aber price=0. dbVendo bleibt
+  // dahinter — liefert Preise, sobald DB den OPS_BLOCK wieder löst.
+  TRAIN: [motisProvider, trainlineProvider, dbVendoProvider, transitScheduleProvider],
   // dbVendo (HAFAS) ist intermodal und liefert auch Bus-Verbindungen — vor
   // allem für regionale/Verbund-Strecken die FlixBus/Busbud gar nicht im
   // Angebot haben. Reihenfolge: erst dbVendo (lokale ÖPNV-Strecken), dann
