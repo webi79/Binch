@@ -17,6 +17,13 @@ const schema = z.object({
   // ist FOSS/non-profit). Sobald die eigene MOTIS-Box auf Hetzner steht:
   // MOTIS_BASE_URL auf die eigene Instanz flippen, sonst nichts ändern.
   MOTIS_BASE_URL: z.string().default("https://api.transitous.org/api"),
+  // dbweb-Sidecar (db-vendo-client, DB_PROFILE=dbweb → int.bahn.de). Liefert
+  // pro Zug-Verbindung PREIS + Recon-Token (für den bahn.de-Direkt-Buchungs-
+  // link). Anders als das db/dbnav-Profil NICHT geblockt (anderer Host), aber
+  // ~60 req/min limitiert → Enrichment ist best-effort + gecacht.
+  DBWEB_BASE_URL: z.string().default("http://localhost:3002"),
+  // bahn.de „Reise teilen" — Recon → vbid → Direkt-Buchungslink.
+  BAHN_TEILEN_URL: z.string().default("https://www.bahn.de/web/api/angebote/verbindung/teilen"),
   // Provider an/aus schaltbar (falls Transitous mal zickt oder wir bewusst
   // nur DB fahren wollen). Bewusst KEIN z.coerce.boolean() — das macht aus
   // dem String "false" ein true (Boolean("false")===true). Nur "false"/"0"

@@ -4,6 +4,7 @@ import { db } from "../../db/client.js";
 import { locations, type TravelMode } from "../../db/schema.js";
 import { BoundedTtlCache } from "../../util/boundedCache.js";
 import { motisFetch, motisGeocode, type MotisPlace } from "../../services/motisClient.js";
+import { buildBahnDeeplink } from "../../util/bahnDeeplink.js";
 import type {
   LegInfo,
   NormalizedResult,
@@ -157,6 +158,7 @@ function toNormalized(
   from: MotisPlace,
   to: MotisPlace,
   idx: number,
+  mode: TravelMode,
 ): NormalizedResult | null {
   const transit = it.legs.filter((l) => l.mode !== "WALK");
   if (transit.length === 0) return null; // reine Fußweg-"Verbindung" ignorieren
@@ -197,10 +199,19 @@ function toNormalized(
     legs: transit.map(toLeg),
     price: 0,
     currency: input.currency,
-    // Schedule-only, nicht buchbar → kein deepLink (wie transitSchedule). UI
-    // nutzt den Trip-Detail-Flow (LegTimelineOverlay). Booking-Deeplink/Preis
-    // kommt später als eigener Layer.
-    deepLink: "",
+    // deepLink = FALLBACK: vorausgefüllte bahn.de-Suche. Der Direkt-Buchungs-
+    // link (bahn.de/buchung/start?vbid) wird beim Tap aus dem bookingToken
+    // (Recon, via trainPricing-Enrichment) erzeugt — greift der nicht, landet
+    // der Redirect auf dieser Suche. Nur für Züge (bahn.de ist Bahn-zentriert).
+    deepLink:
+      mode === "TRAIN"
+        ? buildBahnDeeplink({
+            origin: { name: input.originLabel ?? from.name, lat: first.from.lat, lng: first.from.lon },
+            destination: { name: input.destLabel ?? to.name, lat: last.to.lat, lng: last.to.lon },
+            departTime,
+            originTz: first.from.tz ?? from.tz,
+          })
+        : "",
     // flightNumber dient als Linien-Kürzel (z.B. "ICE 1007").
     flightNumber: first.tripShortName || first.routeShortName || undefined,
     operatedBy: first.agencyName || undefined,
@@ -264,7 +275,7 @@ function makeMotisProvider(mode: TravelMode, transitModes: string, name: string)
       }
 
       const results = itineraries
-        .map((it, i) => toNormalized(it, input, from!, to!, i))
+        .map((it, i) => toNormalized(it, input, from!, to!, i, mode))
         .filter((r): r is NormalizedResult => r !== null);
 
       return {

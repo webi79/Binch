@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { consumeRedirectToken } from "../services/tokenService.js";
 import { resolveBookingUrl } from "../providers/flight/flightBookingDispatch.js";
+import { resolveBahnBookingUrl } from "../services/trainPricing.js";
 
 /** Defense-in-Depth: wir leiten ausschließlich auf http(s)-URLs weiter.
  *  Die Links kommen zwar server-seitig von Providern (kein direkter User-
@@ -30,6 +31,22 @@ export async function redirectRoutes(app: FastifyInstance) {
       consumed.bookingContext?.mode === "FLIGHT"
     ) {
       const direct = await resolveBookingUrl(consumed.bookingToken, consumed.bookingContext);
+      if (direct && isHttpUrl(direct)) return reply.redirect(direct, 302);
+    }
+
+    // Züge: Recon-Token → bahn.de „Reise teilen" → echter Direkt-Buchungslink
+    // (bahn.de/buchung/start?vbid). Fällt auf den deepLink (vorausgefüllte
+    // bahn.de-Suche) zurück, wenn teilen scheitert.
+    if (
+      consumed.bookingToken &&
+      consumed.bookingContext?.mode === "TRAIN"
+    ) {
+      const ctx = consumed.bookingContext as Record<string, unknown>;
+      const direct = await resolveBahnBookingUrl(consumed.bookingToken, {
+        startOrt: typeof ctx.originLabel === "string" ? ctx.originLabel : undefined,
+        zielOrt: typeof ctx.destLabel === "string" ? ctx.destLabel : undefined,
+        hinfahrtDatum: typeof ctx.departTime === "string" ? ctx.departTime : undefined,
+      });
       if (direct && isHttpUrl(direct)) return reply.redirect(direct, 302);
     }
 

@@ -18,6 +18,11 @@ export interface BookingContext {
   /** Suchpreis (it.price = Card-Preis) — Detail snappt den günstigsten
    *  geschätzten Anbieter darauf, damit Card- und Detail-Preis übereinstimmen. */
   searchPrice?: number;
+  /** Zug-Direkt-Buchungslink („Reise teilen"): Station-Namen + konkrete
+   *  Verbindungs-Abfahrt (hinfahrtDatum) für den teilen-Call. */
+  originLabel?: string;
+  destLabel?: string;
+  departTime?: string;
 }
 
 export interface IssueOptions {

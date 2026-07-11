@@ -42,6 +42,21 @@ services:
       DB_PROFILE: "db"
       USER_AGENT: "binch-mobile/0.1"
 
+  # Zweiter db-vendo-client mit "dbweb"-Profil (int.bahn.de). Liefert pro
+  # Zug-Verbindung PREIS + Recon-Token (für den bahn.de-Direkt-Buchungslink).
+  # Anderer Host als das geblockte app.services-bahn.de → NICHT gesperrt.
+  # binch-server nutzt ihn nur fürs Preis-Enrichment (best-effort, gecacht,
+  # ~60 req/min-Limit). Routing/Zeiten kommen weiter von MOTIS.
+  dbweb:
+    image: ghcr.io/public-transport/db-vendo-client:latest
+    restart: unless-stopped
+    ports:
+      - "3002:3000"
+    environment:
+      PORT: "3000"
+      DB_PROFILE: "dbweb"
+      USER_AGENT: "binch-mobile/0.1"
+
   # Backend-Server selbst als Container — vereint Restart-Logik (Docker
   # `restart: unless-stopped`) mit dem Rest des Stacks. Crash → Docker
   # startet automatisch neu. Reboot → Docker-Daemon startet beim Boot,
@@ -58,6 +73,8 @@ services:
         condition: service_healthy
       dbrest:
         condition: service_started
+      dbweb:
+        condition: service_started
     # `.env` enthält alle Standard-Secrets (RAPIDAPI_KEY, JWT_SECRET, ...).
     # Hostnamen-spezifische Werte werden unten in `environment:` überschrieben,
     # da die in-Container-Hostnamen nicht localhost sind sondern die Service-
@@ -69,6 +86,7 @@ services:
       DATABASE_URL: postgres://binch:binch@db:5432/binch
       # db-vendo läuft intern auf Port 3000 (nicht 3001 wie extern gemapped).
       DBREST_BASE_URL: http://dbrest:3000
+      DBWEB_BASE_URL: http://dbweb:3000
       NODE_ENV: production
       HOST: "0.0.0.0"
     # Memory-Cap als Schutz vor schleichenden Leaks. Wenn der Server

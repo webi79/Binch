@@ -3,6 +3,7 @@ import { db } from "../db/client.js";
 import { providerResponses, searchRequests, searchResults } from "../db/schema.js";
 import type { TravelMode } from "../db/schema.js";
 import { activeProvidersForMode, activeFallbackProvidersForMode } from "../providers/registry.js";
+import { enrichTrainPrices } from "./trainPricing.js";
 import type {
   LegInfo,
   NormalizedResult,
@@ -328,6 +329,13 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
   const outboundCandidates = deduped.filter((c) => c.result.direction !== "RETURN");
   const returnCandidates = deduped.filter((c) => c.result.direction === "RETURN");
 
+  // Zug-Preis-Enrichment: EIN int.bahn.de-Call setzt Preis + Recon-Token
+  // (bookingToken) auf die passenden MOTIS-Ergebnisse. Best-effort — schlägt
+  // er fehl (Drosselung/non-DE), bleiben die Verbindungen mit price=0.
+  if (input.mode === "TRAIN" && outboundCandidates.length > 0) {
+    await enrichTrainPrices(outboundCandidates.map((c) => c.result), input);
+  }
+
   const flatResults: ClientResult[] = [];
   if (outboundCandidates.length > 0) {
     const inserted = await db
@@ -377,6 +385,11 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
           returnDate: input.returnDate,
           passengers: input.passengers,
           currency: input.currency,
+          // Für den Zug-Direkt-Buchungslink („Reise teilen"): Station-Namen +
+          // die konkrete Verbindungs-Abfahrt als hinfahrtDatum.
+          originLabel: input.originLabel,
+          destLabel: input.destLabel,
+          departTime: row.departTime.toISOString(),
         },
       });
       flatResults.push({
