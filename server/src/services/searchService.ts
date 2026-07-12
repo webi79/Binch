@@ -114,6 +114,20 @@ const STALE_REFRESH_RATIO = 0.5;
 /** Hard-Limit: über diesem Alter ignorieren wir den Cache komplett. */
 const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 h
 
+/**
+ * Cache-Schema-Epoche. Suchergebnisse, die VOR diesem Zeitpunkt gecacht wurden,
+ * werden ignoriert (als wären sie abgelaufen) — nutzt die vorhandene
+ * `created_at`-Spalte, keine DB-Migration nötig.
+ *
+ * BEI JEDER ÄNDERUNG AN DER ERGEBNIS-STRUKTUR/ANREICHERUNG auf die aktuelle
+ * Deploy-Zeit hochsetzen (neue Felder, geändertes Label/Gleis/Preis-Enrichment,
+ * neue Normalisierung …). Alte Rows fallen dann automatisch raus → kein
+ * manuelles Cache-Leeren mehr.
+ *
+ * 2026-07-12T22:50Z: dbweb-Label/Gleis-Enrichment (ECE 190 statt DELFI IC 190).
+ */
+const RESULT_SCHEMA_EPOCH = new Date("2026-07-12T22:50:00Z");
+
 /** In-Flight-Map: Schlüssel = cacheKey, Wert = Promise des laufenden Calls. */
 const inFlight = new Map<string, Promise<SearchOutput>>();
 
@@ -160,6 +174,8 @@ async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
 
   const maxAge = Math.max(CACHE_TTL_BY_MODE[input.mode], CACHE_MAX_AGE_MS);
   const since = new Date(Date.now() - maxAge);
+  // Nie älter als die Schema-Epoche servieren → alte Ergebnis-Struktur fällt raus.
+  const effectiveSince = since > RESULT_SCHEMA_EPOCH ? since : RESULT_SCHEMA_EPOCH;
 
   const [match] = await db
     .select({ id: searchRequests.id, createdAt: searchRequests.createdAt })
@@ -175,7 +191,7 @@ async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
           : isNull(searchRequests.returnDate),
         eq(searchRequests.passengers, input.passengers),
         eq(searchRequests.currency, input.currency),
-        gte(searchRequests.createdAt, since),
+        gte(searchRequests.createdAt, effectiveSince),
       ),
     )
     .orderBy(desc(searchRequests.createdAt))
