@@ -660,16 +660,20 @@ const styles = StyleSheet.create({
     color: C.text,
     letterSpacing: -0.4,
   },
+  // Nur die Fahrplanzeit ist im Flow → die Zelle bleibt einzeilig hoch und der
+  // Timeline-Punkt (row alignItems:center) verrutscht NICHT bei Verspätung.
   timeLabelCol: { width: TIME_COL_W },
   // Verspätung: Fahrplanzeit ausgegraut durchgestrichen, Ist-Zeit rot darunter.
   timeLabelStruck: { color: "#8A8A90", textDecorationLine: "line-through" },
   timeLabelDelayed: {
+    position: "absolute",
+    top: "100%", // direkt UNTER die Fahrplanzeit, ohne Zellenhöhe zu ändern
+    left: 0,
     width: TIME_COL_W,
     fontSize: 15,
     fontWeight: "800",
     color: "#FF3B5C",
     letterSpacing: -0.4,
-    marginTop: 1,
   },
   dot: {
     width: DOT,
