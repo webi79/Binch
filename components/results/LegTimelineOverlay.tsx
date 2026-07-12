@@ -27,7 +27,7 @@ import { ChevronDown, Footprints, Clock, CircleDot, Map as MapIcon } from "lucid
 import { useRouter, usePathname } from "expo-router";
 import { useSearchStore } from "@/stores/searchStore";
 import { useT } from "@/lib/i18n/useT";
-import { formatTimeInZone } from "@/lib/time-format";
+import { formatTimeInZone, shiftIsoByMinutes } from "@/lib/time-format";
 import { LegInfo, SearchResult } from "@/types/search";
 import { buildRoutePlan } from "@/lib/routing/buildRoute";
 import { fetchTripPolylines } from "@/lib/api/client";
@@ -352,6 +352,11 @@ function LegTimelineSheet({ result, hidden }: { result: SearchResult; hidden?: b
                 <View key={`${leg.origin}-${idx}`}>
                   <StationRow
                     time={timeOf(leg.departTime, result.originTz)}
+                    delayed={
+                      (leg.departDelayMinutes ?? 0) > 0
+                        ? timeOf(shiftIsoByMinutes(leg.departTime, leg.departDelayMinutes!), result.originTz)
+                        : undefined
+                    }
                     name={leg.originLabel ?? leg.origin}
                     platform={leg.departPlatform}
                     terminal={isFirstLeg}
@@ -359,6 +364,11 @@ function LegTimelineSheet({ result, hidden }: { result: SearchResult; hidden?: b
                   <TransportSegment leg={leg} />
                   <StationRow
                     time={timeOf(leg.arriveTime, result.destinationTz)}
+                    delayed={
+                      (leg.arriveDelayMinutes ?? 0) > 0
+                        ? timeOf(shiftIsoByMinutes(leg.arriveTime, leg.arriveDelayMinutes!), result.destinationTz)
+                        : undefined
+                    }
                     name={leg.destLabel ?? leg.destination}
                     platform={leg.arrivePlatform}
                     terminal={isLastLeg}
@@ -423,11 +433,15 @@ function SummaryStat({
 
 function StationRow({
   time,
+  delayed,
   name,
   platform,
   terminal,
 }: {
   time: string;
+  /** Ist-Zeit bei Verspätung — dann wird `time` durchgestrichen und `delayed`
+   *  rot darunter gesetzt. */
+  delayed?: string;
   name: string;
   platform?: string;
   terminal?: boolean;
@@ -435,7 +449,14 @@ function StationRow({
   const accent = useAccent();
   return (
     <View style={styles.row}>
-      <Text style={styles.timeLabel}>{time}</Text>
+      {delayed ? (
+        <View style={styles.timeLabelCol}>
+          <Text style={[styles.timeLabel, styles.timeLabelStruck]}>{time}</Text>
+          <Text style={styles.timeLabelDelayed}>{delayed}</Text>
+        </View>
+      ) : (
+        <Text style={styles.timeLabel}>{time}</Text>
+      )}
       <View style={[styles.dot, { borderColor: accent.solid }, terminal && { backgroundColor: accent.solid }]} />
       <View style={styles.stationBody}>
         <Text style={styles.stationName} numberOfLines={1}>
@@ -638,6 +659,17 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: C.text,
     letterSpacing: -0.4,
+  },
+  timeLabelCol: { width: TIME_COL_W },
+  // Verspätung: Fahrplanzeit ausgegraut durchgestrichen, Ist-Zeit rot darunter.
+  timeLabelStruck: { color: "#8A8A90", textDecorationLine: "line-through" },
+  timeLabelDelayed: {
+    width: TIME_COL_W,
+    fontSize: 15,
+    fontWeight: "800",
+    color: "#FF3B5C",
+    letterSpacing: -0.4,
+    marginTop: 1,
   },
   dot: {
     width: DOT,

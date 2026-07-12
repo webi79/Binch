@@ -42,6 +42,8 @@ export interface LegInfo {
   destLng?: number;
   departTime: string;
   arriveTime: string;
+  departDelayMinutes?: number;
+  arriveDelayMinutes?: number;
   durationMinutes: number;
   departPlatform?: string;
   arrivePlatform?: string;

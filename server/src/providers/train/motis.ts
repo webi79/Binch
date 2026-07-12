@@ -163,6 +163,8 @@ function toLeg(leg: MotisLeg): LegInfo {
     destLng: leg.to.lon,
     departTime: depart,
     arriveTime: arrive,
+    departDelayMinutes: delayMinutes(leg.from.scheduledDeparture, leg.from.departure, leg.realTime),
+    arriveDelayMinutes: delayMinutes(leg.to.scheduledArrival, leg.to.arrival, leg.realTime),
     durationMinutes,
     departPlatform: leg.from.track,
     arrivePlatform: leg.to.track,

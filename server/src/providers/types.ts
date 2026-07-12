@@ -45,6 +45,10 @@ export interface LegInfo {
   destLng?: number;
   departTime: string;
   arriveTime: string;
+  /** Echtzeit-Verspätung in Minuten für die Timeline (durchgestrichene Soll-
+   *  Zeit + Ist-Zeit). departTime/arriveTime bleiben SOLL. */
+  departDelayMinutes?: number;
+  arriveDelayMinutes?: number;
   durationMinutes: number;
   departPlatform?: string;
   arrivePlatform?: string;
