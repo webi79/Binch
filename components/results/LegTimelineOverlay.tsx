@@ -715,7 +715,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: SIDE_PAD,
     paddingBottom: 8,
   },
-  timeCol: { width: TIME_COL_W, paddingTop: 4 },
+  // Fahrtzeit vertikal auf die Mitte des Balkens (Segment-Höhe) statt oben.
+  timeCol: { width: TIME_COL_W, justifyContent: "center" },
   durationLabel: { fontSize: 12, color: C.sub, fontWeight: "600" },
   dotSpacer: { width: DOT, position: "relative" },
   segmentBody: { flex: 1 },
