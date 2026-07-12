@@ -74,11 +74,14 @@ function toItem(st: MotisStopTime, board: StopBoard, idx: number): StopBoardItem
       ? Math.round((Date.parse(actualTime) - Date.parse(planned)) / 60_000)
       : null;
 
-  // displayName ist MOTIS' fertiges Anzeige-Label und trägt die echte LINIE
-  // (S7, M8, U5, "FEX (21941)") — NICHT tripShortName, das ist die nackte
-  // Fahrtnummer (7141) und für ein Abfahrts-Board falsch.
-  const line =
-    st.displayName || st.routeShortName || st.tripShortName || st.routeLongName || st.mode;
+  // Fernverkehr: die Zugnummer gehört dazu (ICE 1007) → tripShortName.
+  // Nahverkehr: nur die Liniennummer (RB59/S7/U5) → routeShortName; NICHT
+  // displayName, das die interne Fahrtnummer anhängt ("RB59 (90320)").
+  const isLongDist =
+    st.mode === "HIGHSPEED_RAIL" || st.mode === "LONG_DISTANCE" || st.mode === "NIGHT_RAIL";
+  const line = isLongDist
+    ? st.tripShortName || st.displayName || st.routeShortName || st.mode
+    : st.routeShortName || st.displayName || st.tripShortName || st.mode;
 
   return {
     id: st.tripId || `${line}:${plannedTime}:${idx}`,
@@ -91,6 +94,31 @@ function toItem(st: MotisStopTime, board: StopBoard, idx: number): StopBoardItem
     platform: p.track ?? p.scheduledTrack ?? null,
     cancelled: !!(p.cancelled || st.cancelled || st.tripCancelled),
   };
+}
+
+/** Richtung normalisieren fürs Dedup-Matching über Feeds hinweg
+ *  ("Soest, Bahnhof" ↔ "Soest Bahnhof", "Dortmund Hbf" ↔ "Dortmund Hauptbahnhof"). */
+function normDir(s: string): string {
+  return s.toLowerCase().replace(/hauptbahnhof/g, "hbf").replace(/[^a-z0-9]/g, "");
+}
+
+/**
+ * MOTIS aggregiert mehrere GTFS-Feeds (z.B. Bundes-Feed de-DELFI + Verbund-Feed
+ * de-VBN), die dieselbe Fahrt beide enthalten → jede Abfahrt doppelt (mit
+ * abweichender Schreibweise + Fahrtnummer). Dedup über Linie + Abfahrtsminute +
+ * normalisierte Richtung; bei Kollision gewinnt der Eintrag mit mehr Info
+ * (Echtzeit > Gleis).
+ */
+function dedupeBoard(items: StopBoardItem[]): StopBoardItem[] {
+  const info = (x: StopBoardItem) => (x.actualTime ? 2 : 0) + (x.platform ? 1 : 0);
+  const byKey = new Map<string, StopBoardItem>();
+  for (const it of items) {
+    const line = it.line.toLowerCase().replace(/\s+/g, "");
+    const key = `${line}|${it.plannedTime.slice(0, 16)}|${normDir(it.direction)}`;
+    const prev = byKey.get(key);
+    if (!prev || info(it) > info(prev)) byKey.set(key, it);
+  }
+  return [...byKey.values()].sort((a, b) => a.plannedTime.localeCompare(b.plannedTime));
 }
 
 /**
@@ -106,9 +134,10 @@ export async function getMotisStopBoard(
   const stop = await motisGeocode(label);
   if (!stop) return null;
 
+  // Doppelt so viele roh holen — der Feed-Dedup halbiert die Liste grob.
   const url =
     `/v6/stoptimes?stopId=${encodeURIComponent(stop.id)}` +
-    `&n=${limit}${board === "arrivals" ? "&arriveBy=true" : ""}`;
+    `&n=${Math.min(limit * 2, 60)}${board === "arrivals" ? "&arriveBy=true" : ""}`;
   let raw: { stopTimes?: MotisStopTime[] };
   try {
     raw = (await motisFetch(url)) as { stopTimes?: MotisStopTime[] };
@@ -116,9 +145,10 @@ export async function getMotisStopBoard(
     return null;
   }
 
-  const results = (raw.stopTimes ?? [])
+  const mapped = (raw.stopTimes ?? [])
     .map((st, i) => toItem(st, board, i))
     .filter((r): r is StopBoardItem => r !== null);
+  const results = dedupeBoard(mapped).slice(0, limit);
 
   const now = Date.now();
   return {
