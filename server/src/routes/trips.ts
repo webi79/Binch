@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { config } from "../config.js";
+import { getMotisTripPolyline } from "../services/motisClient.js";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import { profileForStop, type HafasProfileKey } from "../services/countryProfile.js";
@@ -74,6 +75,11 @@ const querySchema = z.object({
 });
 
 async function fetchTripPolyline(tripId: string): Promise<[number, number][] | null> {
+  // MOTIS-tripIds (Format YYYYMMDD_HH:MM_<feed>_<num>) → Geometrie direkt von
+  // MOTIS (precision-6-Polyline). dbrest ist für Zug-Trips eh geblockt.
+  if (/^\d{8}_\d{2}:\d{2}_/.test(tripId)) {
+    return getMotisTripPolyline(tripId);
+  }
   const url = `${config.DBREST_BASE_URL}/trips/${encodeURIComponent(tripId)}?polyline=true&stopovers=false`;
   try {
     const res = await fetch(url, { headers: { Accept: "application/json" } });
