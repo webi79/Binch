@@ -30,9 +30,21 @@ interface DbwebJourney {
     line?: { name?: string };
     departure?: string;
     plannedDeparture?: string;
+    arrival?: string;
+    plannedArrival?: string;
+    departurePlatform?: string;
+    plannedDeparturePlatform?: string;
+    arrivalPlatform?: string;
+    plannedArrivalPlatform?: string;
   }>;
   price?: { amount?: number; currency?: string } | null;
   refreshToken?: string;
+}
+
+/** Minuten-im-Tag aus "HH:MM" (mit Mitternachts-Wrap fürs Diff). */
+function hhmmToMin(s: string): number {
+  const [h, m] = s.split(":").map(Number);
+  return (h || 0) * 60 + (m || 0);
 }
 
 async function evaFor(code: string): Promise<string | null> {
@@ -55,10 +67,6 @@ async function evaFor(code: string): Promise<string | null> {
   return eva;
 }
 
-/** Linien-Kürzel normalisieren fürs Matching ("ICE 1007" ↔ "ICE1007"). */
-function normLine(s: string | undefined): string {
-  return (s ?? "").toLowerCase().replace(/\s+/g, "");
-}
 /** Lokale HH:MM aus ISO (Matching-Schlüssel-Teil). */
 function hhmm(iso: string | undefined, tz?: string): string {
   if (!iso) return "";
@@ -116,32 +124,61 @@ export async function enrichTrainPrices(
     return; // int.bahn.de gedrosselt/aus → kein Preis, Verbindungen bleiben
   }
 
-  // Match-Map: normLine(erste Linie) + Abfahrts-HH:MM → {price, recon}.
-  const byKey = new Map<string, { amount: number; currency: string; recon?: string }>();
-  for (const j of journeys) {
-    const leg = j.legs?.find((l) => l.line?.name);
-    // Planmäßige Abfahrt zum Matchen (MOTIS-Seite nutzt jetzt auch scheduled).
-    const dep = leg?.plannedDeparture ?? leg?.departure;
-    if (!leg || !dep || j.price?.amount == null) continue;
-    const key = `${normLine(leg.line?.name)}|${hhmm(dep)}`;
-    if (!byKey.has(key)) {
-      byKey.set(key, {
-        amount: j.price.amount,
-        currency: j.price.currency ?? "EUR",
-        recon: j.refreshToken,
-      });
-    }
+  // Match-Map: NUR Abfahrts-HH:MM → bahn.de-Wahrheit. NICHT über den Linien-
+  // Namen matchen — MOTIS/DELFI und bahn.de benennen denselben Zug oft anders
+  // (DELFI "IC 190" ↔ bahn.de "ECE 190"), was den Match sonst zerstört (kein
+  // Preis, kein Label/Gleis-Fix). Die Abfahrtsminute ist pro Strecke eindeutig.
+  interface DbwebMatch {
+    amount?: number;
+    currency: string;
+    recon?: string;
+    lineName?: string;
+    depPlatform?: string;
+    arrPlatform?: string;
+    arrHHmm: string;
   }
-  if (byKey.size === 0) return;
+  const byDep = new Map<string, DbwebMatch>();
+  for (const j of journeys) {
+    const first = j.legs?.find((l) => l.line?.name) ?? j.legs?.[0];
+    const dep = first?.plannedDeparture ?? first?.departure;
+    if (!first || !dep) continue;
+    const last = j.legs?.[j.legs.length - 1];
+    const arr = last?.plannedArrival ?? last?.arrival;
+    const k = hhmm(dep);
+    if (byDep.has(k)) continue;
+    byDep.set(k, {
+      amount: j.price?.amount ?? undefined,
+      currency: j.price?.currency ?? "EUR",
+      recon: j.refreshToken,
+      lineName: first.line?.name,
+      depPlatform: first.departurePlatform ?? first.plannedDeparturePlatform,
+      arrPlatform: last?.arrivalPlatform ?? last?.plannedArrivalPlatform,
+      arrHHmm: arr ? hhmm(arr) : "",
+    });
+  }
+  if (byDep.size === 0) return;
 
   for (const r of results) {
-    const key = `${normLine(r.flightNumber)}|${hhmm(r.departTime, r.originTz)}`;
-    const match = byKey.get(key);
-    if (match) {
-      r.price = match.amount;
-      r.currency = match.currency;
-      if (match.recon) r.bookingToken = match.recon;
+    const m = byDep.get(hhmm(r.departTime, r.originTz));
+    if (!m) continue;
+    // Sicherheits-Check: Ankunft grob gleich → wirklich derselbe Zug (schützt
+    // vor dem theoretischen Fall zweier Züge mit identischer Abfahrtsminute).
+    if (m.arrHHmm) {
+      const d = Math.abs(hhmmToMin(m.arrHHmm) - hhmmToMin(hhmm(r.arriveTime, r.destinationTz)));
+      if (Math.min(d, 1440 - d) > 20) continue;
     }
+    // bahn.de ist authoritative für Buchung/Label/Gleis — DELFI überschreiben.
+    if (m.amount != null) {
+      r.price = m.amount;
+      r.currency = m.currency;
+    }
+    if (m.recon) r.bookingToken = m.recon;
+    if (m.lineName) {
+      r.flightNumber = m.lineName;
+      if (r.legs?.[0]) r.legs[0].line = m.lineName;
+    }
+    if (m.depPlatform && r.legs?.[0]) r.legs[0].departPlatform = m.depPlatform;
+    if (m.arrPlatform && r.legs?.length) r.legs[r.legs.length - 1]!.arrivePlatform = m.arrPlatform;
   }
 }
 
