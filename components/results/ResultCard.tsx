@@ -12,7 +12,8 @@ import Animated, {
 import { SearchResult, TravelMode } from "@/types/search";
 import { useSearchStore } from "@/stores/searchStore";
 import { useT } from "@/lib/i18n/useT";
-import { formatTimeInZone, formatDateInZone } from "@/lib/time-format";
+import { formatTimeInZone, formatDateInZone, shiftIsoByMinutes } from "@/lib/time-format";
+import { DelayedTime } from "@/components/results/DelayedTime";
 import { redirectUrl, fetchTripPolylines, fetchFlightBookingOptions } from "@/lib/api/client";
 import { useAccent } from "@/lib/theme/accent";
 import { useQueryClient } from "@tanstack/react-query";
@@ -210,6 +211,15 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
   const arriveStr = formatTimeInZone(result.arriveTime, result.destinationTz);
   const dateStr = formatDateInZone(result.departTime, result.originTz);
   const arriveDateStr = formatDateInZone(result.arriveTime, result.destinationTz);
+  // Verspätung: neue Ist-Zeit = Soll + delayMinutes (zonen-korrekt formatiert).
+  const departDelayedStr =
+    (result.departDelayMinutes ?? 0) > 0
+      ? formatTimeInZone(shiftIsoByMinutes(result.departTime, result.departDelayMinutes!), result.originTz)
+      : undefined;
+  const arriveDelayedStr =
+    (result.arriveDelayMinutes ?? 0) > 0
+      ? formatTimeInZone(shiftIsoByMinutes(result.arriveTime, result.arriveDelayMinutes!), result.destinationTz)
+      : undefined;
   const isDirect = result.stops === 0;
   const stopVia = !isDirect && result.stopLabels?.length ? result.stopLabels[0] : null;
   const stopLabel = isDirect
@@ -270,7 +280,7 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
           {result.dateOnly ? (
             <Text style={styles.timeBig}>—</Text>
           ) : (
-            <Text style={styles.timeBig}>{departStr}</Text>
+            <DelayedTime scheduled={departStr} delayed={departDelayedStr} style={styles.timeBig} />
           )}
         </View>
         <View style={styles.timeCenter}>
@@ -288,7 +298,7 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
           {result.dateOnly ? (
             <Text style={styles.timeBig}>—</Text>
           ) : (
-            <Text style={styles.timeBig}>{arriveStr}</Text>
+            <DelayedTime scheduled={arriveStr} delayed={arriveDelayedStr} style={styles.timeBig} align="flex-end" />
           )}
         </View>
       </View>

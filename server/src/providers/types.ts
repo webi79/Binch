@@ -71,6 +71,11 @@ export interface NormalizedResult {
   destLabel?: string;
   departTime: string;
   arriveTime: string;
+  /** Echtzeit-Verspätung in Minuten (Ist − Soll) für die Anzeige „Fahrplanzeit
+   *  durchgestrichen + neue Zeit klein drüber". Nur gesetzt wenn > 0 und
+   *  Realtime-Daten vorliegen. departTime/arriveTime bleiben die SOLL-Zeit. */
+  departDelayMinutes?: number;
+  arriveDelayMinutes?: number;
   originTz?: string;
   destinationTz?: string;
   dateOnly?: boolean;

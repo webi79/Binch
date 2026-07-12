@@ -69,8 +69,12 @@ export interface SearchResult {
   destination: string;
   originLabel: string;
   destLabel: string;
-  departTime: string; // ISO datetime (UTC)
-  arriveTime: string; // ISO datetime (UTC)
+  departTime: string; // ISO datetime (UTC) — SOLL (Fahrplanzeit)
+  arriveTime: string; // ISO datetime (UTC) — SOLL (Fahrplanzeit)
+  /** Echtzeit-Verspätung in Minuten. Wenn > 0: UI zeigt die neue Ist-Zeit
+   *  (= departTime + delay) klein und streicht die SOLL-Zeit rot durch. */
+  departDelayMinutes?: number;
+  arriveDelayMinutes?: number;
   originTz?: string; // IANA timezone for departure wall-clock time
   destinationTz?: string; // IANA timezone for arrival wall-clock time
   dateOnly?: boolean; // true = only the calendar date is real, time is unknown

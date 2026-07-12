@@ -35,6 +35,8 @@ export interface ClientResult {
   destLabel?: string;
   departTime: string;
   arriveTime: string;
+  departDelayMinutes?: number;
+  arriveDelayMinutes?: number;
   originTz?: string;
   destinationTz?: string;
   dateOnly?: boolean;
@@ -404,6 +406,10 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
         destLabel: row.destLabel ?? undefined,
         departTime: row.departTime.toISOString(),
         arriveTime: row.arriveTime.toISOString(),
+        // Verspätung NICHT persistiert (realtime) → nur in der Live-Antwort aus
+        // dem Candidate; Cache-Hits zeigen dann keinen veralteten Delay.
+        departDelayMinutes: candidate?.departDelayMinutes,
+        arriveDelayMinutes: candidate?.arriveDelayMinutes,
         originTz: row.originTz ?? undefined,
         destinationTz: row.destinationTz ?? undefined,
         dateOnly: row.dateOnly,

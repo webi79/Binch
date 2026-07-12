@@ -123,6 +123,13 @@ function toStopovers(stops: MotisLegStop[] | undefined): StopoverInfo[] | undefi
   }));
 }
 
+/** Verspätung in Minuten (Ist − Soll), nur wenn Realtime + echte Verspätung. */
+function delayMinutes(scheduled?: string, actual?: string, realTime?: boolean): number | undefined {
+  if (!realTime || !scheduled || !actual) return undefined;
+  const d = Math.round((Date.parse(actual) - Date.parse(scheduled)) / 60_000);
+  return d > 0 ? d : undefined;
+}
+
 function toLeg(leg: MotisLeg): LegInfo {
   // Planmäßige (Fahrplan-)Zeit zuerst, Echtzeit nur als Fallback — die Card/
   // Timeline soll die normale Abfahrt zeigen, nicht Soll+Verspätung.
@@ -192,6 +199,8 @@ function toNormalized(
     destLabel: input.destLabel ?? to.name,
     departTime,
     arriveTime,
+    departDelayMinutes: delayMinutes(first.from.scheduledDeparture, first.from.departure, first.realTime),
+    arriveDelayMinutes: delayMinutes(last.to.scheduledArrival, last.to.arrival, last.realTime),
     originTz: first.from.tz ?? from.tz,
     destinationTz: last.to.tz ?? to.tz,
     dateOnly: false,

@@ -41,7 +41,8 @@ import {
 } from "lucide-react-native";
 import { format, parseISO } from "date-fns";
 import { de, enGB, es, fr } from "date-fns/locale";
-import { formatTimeInZone } from "@/lib/time-format";
+import { formatTimeInZone, shiftIsoByMinutes } from "@/lib/time-format";
+import { DelayedTime } from "@/components/results/DelayedTime";
 import { useT } from "@/lib/i18n/useT";
 import { useSearchStore } from "@/stores/searchStore";
 import { haptic } from "@/lib/haptics";
@@ -380,6 +381,15 @@ const DetailsContent = memo(function DetailsContent({
       return "";
     }
   })();
+  // Verspätung: neue Ist-Zeit klein über der durchgestrichenen Fahrplanzeit.
+  const departDelayedStr =
+    (result.departDelayMinutes ?? 0) > 0
+      ? formatTimeInZone(shiftIsoByMinutes(result.departTime, result.departDelayMinutes!), result.originTz)
+      : undefined;
+  const arriveDelayedStr =
+    (result.arriveDelayMinutes ?? 0) > 0
+      ? formatTimeInZone(shiftIsoByMinutes(result.arriveTime, result.arriveDelayMinutes!), result.destinationTz)
+      : undefined;
 
   const originName = result.originLabel?.split(",")[0]?.trim() || displayCode(result.origin) || result.origin;
   const destName = result.destLabel?.split(",")[0]?.trim() || displayCode(result.destination) || result.destination;
@@ -574,10 +584,15 @@ const DetailsContent = memo(function DetailsContent({
                     und arrive sind beide dieselbe Planzeit, würde sonst
                     "16:15 → 16:15" anzeigen. Stattdessen Em-Dash bis das echte
                     Result da ist. */}
-                <Text style={styles.trainTime} numberOfLines={1}>
-                  {departTime} <Text style={styles.trainTimeDash}>→</Text>{" "}
-                  {pending ? "—" : arriveTime}
-                </Text>
+                <View style={styles.trainTimeRow}>
+                  <DelayedTime scheduled={departTime} delayed={departDelayedStr} style={styles.trainTime} />
+                  <Text style={styles.trainTimeDash}> → </Text>
+                  <DelayedTime
+                    scheduled={pending ? "—" : arriveTime}
+                    delayed={pending ? undefined : arriveDelayedStr}
+                    style={styles.trainTime}
+                  />
+                </View>
                 {stopVia ? (
                   <Text style={styles.trainVia} numberOfLines={1}>
                     via {stopVia}
@@ -1057,7 +1072,8 @@ const styles = StyleSheet.create({
     letterSpacing: -0.5,
     lineHeight: 24,
   },
-  trainTimeDash: { color: C.sub },
+  trainTimeRow: { flexDirection: "row", alignItems: "center" },
+  trainTimeDash: { color: C.sub, fontSize: 22, fontWeight: "700" },
   trainVia: { fontSize: 13, color: C.sub, marginTop: 3, fontWeight: "500" },
   stopsText: { fontSize: 13, fontWeight: "700", color: C.alert },
   stopsTextDirect: { fontSize: 13, fontWeight: "700" },

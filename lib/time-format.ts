@@ -9,6 +9,12 @@
 
 import { formatInTimeZone } from "date-fns-tz";
 
+/** Verschiebt eine ISO-UTC-Zeit um `minutes` und gibt wieder ISO-UTC zurück.
+ *  Für die Ist-Zeit-Anzeige bei Verspätung (Soll-Zeit + delayMinutes). */
+export function shiftIsoByMinutes(isoUtc: string, minutes: number): string {
+  return new Date(new Date(isoUtc).getTime() + minutes * 60_000).toISOString();
+}
+
 export function formatTimeInZone(
   isoUtc: string,
   tz: string | undefined,
