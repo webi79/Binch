@@ -815,9 +815,11 @@ function ProviderCard({
   async function onBook() {
     if (!provider.url) return;
     haptic("important");
+    // KEIN canOpenURL-Gate: für http(s) liefert es auf Android (queries-
+    // Restriktion) manchmal fälschlich false → Button täte dann still gar
+    // nichts. openURL direkt versuchen, Fehler schlucken.
     try {
-      const ok = await Linking.canOpenURL(provider.url);
-      if (ok) Linking.openURL(provider.url);
+      await Linking.openURL(provider.url);
     } catch {
       /* ignore */
     }

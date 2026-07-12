@@ -170,6 +170,10 @@ export async function resolveBahnBookingUrl(
         hinfahrtDatum: ctx.hinfahrtDatum ?? "",
         hinfahrtRecon: recon,
       }),
+      // KRITISCH: Timeout, sonst hängt der /redirect-Request (und damit der
+      // In-App-Browser) unbegrenzt, wenn bahn.de langsam ist → „Deeplink geht
+      // nicht auf". Bei Timeout → null → Redirect fällt auf den Such-Deeplink.
+      signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) return null;
     const data = (await res.json()) as { vbid?: string };
