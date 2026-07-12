@@ -123,6 +123,20 @@ function toStopovers(stops: MotisLegStop[] | undefined): StopoverInfo[] | undefi
   }));
 }
 
+/**
+ * Linien-/Zug-Label: Fernverkehr nutzt die Zugnummer (tripShortName „ICE 523"),
+ * Nahverkehr die Liniennummer (routeShortName „RE1") — NICHT die interne
+ * Fahrtnummer (tripShortName ist bei Nahverkehr „026848", routeShortName bei
+ * Fernverkehr eine nackte „41"). Genau umgekehrte Priorität je Verkehrsart.
+ */
+function lineLabel(leg: MotisLeg): string | undefined {
+  const longDist =
+    leg.mode === "HIGHSPEED_RAIL" || leg.mode === "LONG_DISTANCE" || leg.mode === "NIGHT_RAIL";
+  const primary = longDist ? leg.tripShortName : leg.routeShortName;
+  const secondary = longDist ? leg.routeShortName : leg.tripShortName;
+  return primary || secondary || undefined;
+}
+
 /** Verspätung in Minuten (Ist − Soll), nur wenn Realtime + echte Verspätung. */
 function delayMinutes(scheduled?: string, actual?: string, realTime?: boolean): number | undefined {
   if (!realTime || !scheduled || !actual) return undefined;
@@ -152,7 +166,7 @@ function toLeg(leg: MotisLeg): LegInfo {
     durationMinutes,
     departPlatform: leg.from.track,
     arrivePlatform: leg.to.track,
-    line: leg.tripShortName || leg.routeShortName || undefined,
+    line: lineLabel(leg),
     product: leg.mode,
     fahrtNr: leg.tripShortName || undefined,
     direction: leg.headsign || undefined,
@@ -225,8 +239,8 @@ function toNormalized(
             originTz: first.from.tz ?? from.tz,
           })
         : "",
-    // flightNumber dient als Linien-Kürzel (z.B. "ICE 1007").
-    flightNumber: first.tripShortName || first.routeShortName || undefined,
+    // flightNumber dient als Linien-Kürzel: Fern "ICE 523", Nah "RE1".
+    flightNumber: lineLabel(first),
     operatedBy: first.agencyName || undefined,
   };
 }
