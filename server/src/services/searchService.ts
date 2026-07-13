@@ -126,8 +126,10 @@ const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 h
  *
  * 2026-07-12T22:50Z: dbweb-Label/Gleis-Enrichment (ECE 190 statt DELFI IC 190).
  * 2026-07-13T13:15Z: dbweb-ROUTE-Ersetzung (ganze Route von bahn.de statt MOTIS).
+ * 2026-07-13T18:00Z: Zug-transitModes um Nahverkehr erweitert (SUBURBAN/TRAM/
+ *   SUBWAY) → Ziele wie Zürich Brunau lieferten vorher 0 Ergebnisse (gecacht).
  */
-const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T13:15:00Z");
+const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T18:00:00Z");
 
 /** In-Flight-Map: Schlüssel = cacheKey, Wert = Promise des laufenden Calls. */
 const inFlight = new Map<string, Promise<SearchOutput>>();

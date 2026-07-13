@@ -318,6 +318,15 @@ function makeMotisProvider(mode: TravelMode, transitModes: string, name: string)
 }
 
 /** Zug-Routing (RAIL: ICE/IC/RE/S-Bahn etc.). */
-export const motisProvider = makeMotisProvider("TRAIN", "RAIL", "motis");
+// RAIL allein reicht NICHT: viele Ziele (v.a. lokale/kleine Halte, Schweizer
+// SZU-/Nebennetz-Stops wie Zürich Brunau) sind nur über Nahverkehr erreichbar,
+// und beim Koordinaten-Routing muss MOTIS den Zugangs-Leg (Tram/U-Bahn/S-Bahn)
+// mitfahren. Ohne diese Modi → "keine Verbindung gefunden". Bus bewusst NICHT
+// dabei (das ist der eigene Bus-Tab), aber alle Schienen-/Urban-Rail-Modi.
+export const motisProvider = makeMotisProvider(
+  "TRAIN",
+  "RAIL,SUBURBAN,TRAM,SUBWAY",
+  "motis",
+);
 /** Bus-Routing (Regional- + Fernbusse aus GTFS — belebt BUS-Mode trotz DB-Block). */
 export const motisBusProvider = makeMotisProvider("BUS", "BUS,COACH", "motis-bus");
