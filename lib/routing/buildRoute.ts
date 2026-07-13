@@ -128,6 +128,10 @@ export function buildRoutePlan(result: SearchResult): RoutePlan | null {
         fromIndex,
         toIndex,
         coords,
+        // Fußwege sind seit dem Walk-Fix echte Legs. Ohne dieses Flag zeichnete
+        // die Karte einen 12-Minuten-Fußmarsch als durchgezogene Linie —
+        // ununterscheidbar von einer Zugfahrt.
+        walking: leg.walking,
       });
     }
   }

@@ -88,6 +88,7 @@ const LINE_SRC = "route-line-src";
 const WP_SRC = "route-waypoints-src";
 const LINE_SHADOW_ID = "route-line-shadow";
 const LINE_MAIN_ID = "route-line-main";
+const LINE_WALK_ID = "route-line-walk";
 const WP_RING_ID = "route-wp-ring";
 const WP_BG_ID = "route-wp-bg";
 const WP_LABEL_ID = "route-wp-label";
@@ -123,7 +124,7 @@ export const RouteLayer = memo(function RouteLayer({ waypoints, legs, mode }: Pr
         return {
           type: "Feature" as const,
           geometry: { type: "LineString" as const, coordinates: coords },
-          properties: { hasPolyline: coords !== straight },
+          properties: { hasPolyline: coords !== straight, walking: !!leg.walking },
         };
       }),
     }),
@@ -173,15 +174,33 @@ export const RouteLayer = memo(function RouteLayer({ waypoints, legs, mode }: Pr
           "line-opacity": 0.7,
         }}
       />
+      {/* Fahrt-Etappen: durchgezogen. `line-dasharray` ist in MapLibre NICHT
+          datengetrieben — deshalb zwei Layer mit Filter statt einer Expression. */}
       <Layer
         id={LINE_MAIN_ID}
         type="line"
         source={LINE_SRC}
+        filter={["!=", ["get", "walking"], true]}
         layout={{ "line-cap": "round", "line-join": "round" }}
         paint={{
           "line-color": LIME,
           "line-width": 4,
           ...(dashed ? { "line-dasharray": [2, 2] } : {}),
+        }}
+      />
+      {/* Fußweg-Etappen: gestrichelt + dünner. Ohne eigenen Layer sähe ein
+          12-Minuten-Fußmarsch aus wie eine Zugfahrt. */}
+      <Layer
+        id={LINE_WALK_ID}
+        type="line"
+        source={LINE_SRC}
+        filter={["==", ["get", "walking"], true]}
+        layout={{ "line-cap": "round", "line-join": "round" }}
+        paint={{
+          "line-color": LIME,
+          "line-width": 3,
+          "line-opacity": 0.75,
+          "line-dasharray": [1, 2],
         }}
       />
 

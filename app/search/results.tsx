@@ -80,19 +80,37 @@ const MODE_ICON: Record<TravelMode, LucideIcon> = {
 // nachgeladen.
 const PAGE_SIZE = 20;
 
-const priceForSort = (p: number) => (p > 0 ? p : Number.POSITIVE_INFINITY);
+/**
+ * Preislose Treffer (Zug ohne bahn.de-Anreicherung → price 0) hinten einsortieren.
+ *
+ * WICHTIG: kein `Infinity`. Zwei preislose Treffer ergäben `Infinity - Infinity`
+ * = NaN, und ein Comparator, der NaN liefert, ist undefiniertes Verhalten — die
+ * Reihenfolge kann beliebig verwürfelt werden. Genau das träfe die Zug-Liste, in
+ * der aktuell ALLE Preise 0 sind: das serverseitige Ranking nach
+ * Verbindungsqualität wäre dahin. Mit einem endlichen Wert vergleichen sie
+ * gleich (0) → der stabile Array.sort erhält die Server-Reihenfolge.
+ */
+const priceForSort = (p: number) => (p > 0 ? p : Number.MAX_SAFE_INTEGER);
 
 function sortResults(list: SearchResult[], sort: SortKey): SearchResult[] {
   const copy = [...list];
+  // Gleichstand → frühere Abfahrt zuerst. Ohne Tiebreak entschiede allein die
+  // (zufällige) Eingangsreihenfolge.
+  const byDeparture = (a: SearchResult, b: SearchResult) =>
+    Date.parse(a.departTime) - Date.parse(b.departTime);
+  const byPrice = (a: SearchResult, b: SearchResult) =>
+    priceForSort(a.price) - priceForSort(b.price);
+
   switch (sort) {
     case "fastest":
-      return copy.sort((a, b) => a.durationMinutes - b.durationMinutes);
+      return copy.sort((a, b) => a.durationMinutes - b.durationMinutes || byDeparture(a, b));
+    // Preis-Sortierungen bewusst OHNE weiteren Tiebreak: bei Gleichstand (alle
+    // Zug-Preise 0) bleibt so die Server-Reihenfolge nach Verbindungsqualität
+    // erhalten — das ist die sinnvollste Anzeige, solange es keine Preise gibt.
     case "direct":
-      return copy
-        .filter((r) => r.stops === 0)
-        .sort((a, b) => priceForSort(a.price) - priceForSort(b.price));
+      return copy.filter((r) => r.stops === 0).sort(byPrice);
     default:
-      return copy.sort((a, b) => priceForSort(a.price) - priceForSort(b.price));
+      return copy.sort(byPrice);
   }
 }
 

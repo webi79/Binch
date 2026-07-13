@@ -102,9 +102,13 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
   async function onShare() {
     haptic("button");
     try {
+      // Preis nur nennen, wenn es einen gibt — Zug-Treffer ohne bahn.de-
+      // Anreicherung haben price 0 und verschickten sonst „EUR 0".
+      const pricePart =
+        result.price > 0 ? ` · ${result.currency} ${result.price.toFixed(0)}` : "";
       await Share.share({
         title: `${result.originLabel} → ${result.destLabel}`,
-        message: `${result.provider} · ${result.currency} ${result.price.toFixed(0)} — ${bookUrl}`,
+        message: `${result.provider}${pricePart} — ${bookUrl}`,
         url: bookUrl,
       });
     } catch {
@@ -341,7 +345,7 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
               <Text style={styles.priceCurrency}>  {currencyCode(result.currency)}</Text>
             </Text>
           ) : (
-            <Text style={styles.priceUnknownText}>Tarif beim Anbieter</Text>
+            <Text style={styles.priceUnknownText}>{t("results.price.provider")}</Text>
           )}
         </View>
         <RippleTouch onPress={onSelect} style={styles.cta}>

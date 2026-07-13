@@ -442,7 +442,12 @@ const DetailsContent = memo(function DetailsContent({
   const providerList: ProviderRow[] = (() => {
     if (isFlight && remoteOptions.length > 0) {
       const rows = remoteOptions.map((o) => toProviderRow(o, bookUrl));
-      rows.sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity));
+      // Kein Infinity: zwei preislose Anbieter ergäben `Infinity - Infinity` = NaN,
+      // und ein NaN-Comparator sortiert undefiniert (Reihenfolge beliebig).
+      // Endlicher Wert → preislose vergleichen gleich, der stabile Sort erhält
+      // die Anbieter-Reihenfolge.
+      const price = (p?: number) => (p != null ? p : Number.MAX_SAFE_INTEGER);
+      rows.sort((a, b) => price(a.price) - price(b.price));
       if (rows.length > 1 && rows[0]!.price !== undefined) rows[0]!.recommended = true;
       return rows;
     }

@@ -388,6 +388,8 @@ export interface RouteLegGeometry {
   toIndex: number;
   /** Echte Schienen-/Straßen-Coords nach Polyline-Fetch — sonst undefined (= gerade Linie). */
   coords?: [number, number][];
+  /** Fußweg-Etappe → auf der Karte gestrichelt, nicht wie eine Fahrt. */
+  walking?: boolean;
 }
 
 export interface RoutePlan {
