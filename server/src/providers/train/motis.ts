@@ -40,7 +40,12 @@ import type {
 const coordCache = new BoundedTtlCache<MotisPlace | null>(2000, 24 * 60 * 60 * 1000);
 // Plan-Response pro (from|to|10-Min-Bucket) → 5 min (schont Transitous, Routing
 // ist deren teuerster Endpoint; Ergebnisse sind für ein paar Minuten stabil).
-const planCache = new BoundedTtlCache<MotisItinerary[]>(500, 5 * 60 * 1000);
+interface CachedPlan {
+  itineraries: MotisItinerary[];
+  /** MOTIS-Cursor für die nächste Seite („später") — an den Client durchgereicht. */
+  nextPageCursor?: string;
+}
+const planCache = new BoundedTtlCache<CachedPlan>(500, 5 * 60 * 1000);
 
 interface MotisLegStop {
   name?: string;
@@ -176,6 +181,49 @@ function delayMinutes(scheduled?: string, actual?: string, realTime?: boolean): 
 /** Stationsnamen vergleichbar machen (Kleinbuchstaben, nur Alphanumerisches). */
 function normStationName(s: string): string {
   return s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+/**
+ * Ab welchem Zeitpunkt suchen wir?
+ *
+ * Vorher stand hier schlicht `input.departTime ?? input.departDate`. Für ein
+ * reines Datum ergab das `2026-07-16T00:00:00Z` — Mitternacht UTC. Zwei Fehler:
+ *   - Suche für HEUTE lieferte längst abgefahrene Verbindungen (ab 00:00,
+ *     obwohl es 19 Uhr ist).
+ *   - Suche für morgen lieferte nur die ersten Verbindungen ab Mitternacht,
+ *     also ausschließlich Nachtzüge — die Tages-ICEs sah der User nie.
+ *
+ * Jetzt: heute → ab JETZT (wie die DB). Künftiges Datum → ab DEFAULT_HOUR, weil
+ * die App (noch) keinen Uhrzeit-Picker hat und 00:00 nur Nachtzüge zeigen würde.
+ * Weiter in den Tag kommt der User über die Pagination („später", nextPageCursor).
+ *
+ * Ein großes `searchWindow` wäre der elegantere Weg, ist auf der öffentlichen
+ * Transitous-Instanz aber unbezahlbar: 3 h → 6,5 s, 12 h → 16,5 s, 24 h → 39 s
+ * (bei nur ~0,6 s echter Routing-Zeit — der Rest ist Payload/Last). Erst ein
+ * self-hosted MOTIS macht Tagesfenster praktikabel.
+ *
+ * Der Reisetag wird in Europe/Berlin abgegrenzt (Kernmarkt; CH/AT/FR/ES liegen
+ * in derselben Zone).
+ */
+const DAY_TZ = "Europe/Berlin";
+const DEFAULT_HOUR = 8;
+
+function searchStartFor(input: ProviderSearchInput): string {
+  // Surroundings-Departure-Tap: exakter Zeitpunkt.
+  if (input.departTime) return new Date(input.departTime).toISOString();
+
+  // Tagesbeginn des Reisedatums in DAY_TZ. Trick: den Zonen-Offset an diesem
+  // Datum aus der Differenz von UTC- und Zonen-Formatierung ableiten.
+  const midnightUtc = new Date(`${input.departDate.slice(0, 10)}T00:00:00Z`);
+  const offsetMs =
+    new Date(midnightUtc.toLocaleString("en-US", { timeZone: "UTC" })).getTime() -
+    new Date(midnightUtc.toLocaleString("en-US", { timeZone: DAY_TZ })).getTime();
+  const dayStart = midnightUtc.getTime() + offsetMs;
+
+  const now = Date.now();
+  const defaultStart = dayStart + DEFAULT_HOUR * 3600_000;
+  // Heute (bzw. Datum liegt schon an) → ab jetzt. Sonst ab DEFAULT_HOUR.
+  return new Date(Math.max(defaultStart, now)).toISOString();
 }
 
 function toLeg(leg: MotisLeg): LegInfo {
@@ -389,38 +437,52 @@ function makeMotisProvider(mode: TravelMode, transitModes: string, name: string)
         return empty(start, { skipped: "motis resolve no match", origin: input.origin, destination: input.destination });
       }
 
-      const time = input.departTime ?? input.departDate;
+      const time = searchStartFor(input);
+      // Blättert der User („später"), gibt MOTIS den Zeitpunkt über den Cursor
+      // vor — dann ist `time` irrelevant und darf NICHT in den Cache-Key.
+      const cursor = input.paginationToken;
       const bucket = Math.floor(Date.parse(time) / (10 * 60_000));
       // transitModes im Key: Bus- und Zug-Suche derselben Strecke dürfen sich
       // den Plan-Cache NICHT teilen.
-      const cacheKey = `${transitModes}|${from.id}|${to.id}|${bucket}`;
+      const cacheKey = cursor
+        ? `${transitModes}|${from.id}|${to.id}|cursor:${cursor}`
+        : `${transitModes}|${from.id}|${to.id}|${bucket}`;
 
-      let itineraries = planCache.get(cacheKey);
-      const fromCache = itineraries !== undefined;
-      if (!itineraries) {
+      let cached = planCache.get(cacheKey);
+      const fromCache = cached !== undefined;
+      if (!cached) {
         try {
           const url =
             `/v6/plan?fromPlace=${encodeURIComponent(from.id)}` +
             `&toPlace=${encodeURIComponent(to.id)}` +
-            `&time=${encodeURIComponent(new Date(time).toISOString())}` +
+            (cursor
+              ? `&pageCursor=${encodeURIComponent(cursor)}`
+              : `&time=${encodeURIComponent(time)}`) +
             // maxTransfers=5 kappt absurde Pareto-Odysseen (6+ Umstiege quer
             // durchs Regionalnetz), die die DB nie zeigt — legitime grenz-
             // überschreitende+lokale Routen brauchen max. ~3-4 Umstiege.
             `&transitModes=${encodeURIComponent(transitModes)}&numItineraries=6&maxTransfers=5&detailedTransfers=false`;
-          const raw = (await motisFetch(url, signal)) as { itineraries?: MotisItinerary[] };
-          itineraries = raw.itineraries ?? [];
-          planCache.set(cacheKey, itineraries);
+          const raw = (await motisFetch(url, signal)) as {
+            itineraries?: MotisItinerary[];
+            nextPageCursor?: string;
+          };
+          cached = { itineraries: raw.itineraries ?? [], nextPageCursor: raw.nextPageCursor };
+          planCache.set(cacheKey, cached);
         } catch (e) {
           return empty(start, { error: "motis_plan_failed", message: e instanceof Error ? e.message : String(e) });
         }
       }
 
-      const results = itineraries
+      const results = cached.itineraries
         .map((it, i) => toNormalized(it, input, from!, to!, i, mode))
         .filter((r): r is NormalizedResult => r !== null);
 
       return {
         results,
+        // „Später"-Blättern: der Client schickt den Cursor beim nächsten Call
+        // zurück. So kommt der User billig durch den Tag, ohne dass wir ein
+        // teures 24h-Fenster anfragen müssen.
+        paginationToken: cached.nextPageCursor,
         raw: { source: name, from: from.id, to: to.id, count: results.length, planCached: fromCache },
         statusCode: 200,
         durationMs: Date.now() - start,

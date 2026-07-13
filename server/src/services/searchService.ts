@@ -136,11 +136,13 @@ const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 h
  *   log. Bus in den Zug-Modi (wie DB Navigator). Stop-ID nur noch bei
  *   kanonischem Geocode-Treffer (sonst Koordinate) → keine Phantom-Fußwege
  *   zwischen Referenzdaten-Dubletten mehr. Linien-Platzhalter „0" gefixt.
+ * 2026-07-13T21:40Z: Suchzeitpunkt gefixt (heute → ab jetzt statt ab Mitternacht;
+ *   künftiges Datum → ab 08:00 statt nur Nachtzüge) + „Später"-Pagination.
  *
  * WICHTIG: Wert nie in die Zukunft setzen (== aktuelle Deploy-Zeit), sonst
  * qualifiziert keine frisch geschriebene Row → Cache komplett aus.
  */
-const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T21:21:00Z");
+const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T21:40:00Z");
 
 /** In-Flight-Map: Schlüssel = cacheKey, Wert = Promise des laufenden Calls. */
 const inFlight = new Map<string, Promise<SearchOutput>>();
@@ -265,11 +267,12 @@ async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
     });
   }
 
-  sortResults(out, input.mode);
+  const fresh = dropDeparted(out);
+  sortResults(fresh, input.mode);
 
   return {
     output: {
-      results: out,
+      results: fresh,
       source: "cache",
       fetchedAt: match.createdAt.toISOString(),
     },
@@ -506,10 +509,11 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
     });
   }
 
-  sortResults(flatResults, input.mode);
+  const liveResults = dropDeparted(flatResults);
+  sortResults(liveResults, input.mode);
 
   return {
-    results: flatResults,
+    results: liveResults,
     source: "live",
     fetchedAt: new Date().toISOString(),
     paginationToken,
@@ -608,6 +612,20 @@ export async function runSearch(input: SearchInput): Promise<SearchOutput> {
  * (Regionalzug-Kette mit 4-6 Umstiegen), die MOTIS als früheste-Ankunft-
  * Alternative mitliefert.
  */
+/**
+ * Schon abgefahrene Verbindungen gehören nicht in die Liste. Nötig, weil der
+ * Postgres-Cache Zug-Ergebnisse bis zu 4 h lang ausliefert — ohne diesen Filter
+ * stehen dort Züge, die längst weg sind. `dateOnly` (Kreuzfahrten ohne Uhrzeit)
+ * bleibt unangetastet. Kleine Karenz, damit ein gerade abfahrender Zug nicht
+ * mitten im Blättern verschwindet.
+ */
+const DEPARTED_GRACE_MS = 2 * 60_000;
+
+function dropDeparted<T extends { departTime: string; dateOnly?: boolean }>(rows: T[]): T[] {
+  const cutoff = Date.now() - DEPARTED_GRACE_MS;
+  return rows.filter((r) => r.dateOnly || Date.parse(r.departTime) >= cutoff);
+}
+
 const TRANSFER_PENALTY_MIN = 20;
 
 /**
