@@ -41,6 +41,41 @@ function pathLen(coords: [number, number][]): number {
   return len;
 }
 
+/** Index des Polyline-Punkts, der `p` am nächsten liegt. */
+function nearestIdx(coords: [number, number][], p: [number, number]): number {
+  let best = 0;
+  let bestD = Infinity;
+  for (let i = 0; i < coords.length; i++) {
+    const d = segLen(coords[i]!, p);
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/**
+ * Schneidet die volle Trip-Polyline auf das gefahrene Teilstück zwischen
+ * `from` und `to` zu. Nötig, weil `/api/trips/polyline` die GESAMTE Fahrt
+ * liefert (z.B. den ganzen ICE München→Hamburg, obwohl das Leg nur Köln→Hamburg
+ * ist; oder die ganze Ringlinie, obwohl der User nur Petrischule→Justus-Liebig-
+ * Platz fährt). Ohne Clip zeichnet die Karte weit über das Segment hinaus / die
+ * ganze Runde. Reihenfolge egal fürs Zeichnen → wir slicen min..max.
+ */
+function clipToSegment(
+  coords: [number, number][],
+  from: [number, number],
+  to: [number, number],
+): [number, number][] {
+  const fi = nearestIdx(coords, from);
+  const ti = nearestIdx(coords, to);
+  const a = Math.min(fi, ti);
+  const b = Math.max(fi, ti);
+  if (b - a < 1) return coords; // kein sinnvolles Teilstück → volle Linie
+  return coords.slice(a, b + 1);
+}
+
 interface Props {
   waypoints: RouteWaypoint[];
   /** Pro Leg ein Geometry-Block — kann echte Polyline-Coords enthalten. */
@@ -76,9 +111,13 @@ export const RouteLayer = memo(function RouteLayer({ waypoints, legs, mode }: Pr
         // als die Luftlinie). Sonst (Rufbus-Zickzack o.ä.) → saubere Gerade.
         let coords = straight;
         if (leg.coords && leg.coords.length > 1) {
+          // Erst aufs gefahrene Teilstück (from→to) zuschneiden, DANN die
+          // Plausibilität an der Luftlinie messen (auf dem Segment, nicht der
+          // ganzen Fahrt — sonst würde ein langer Trip fälschlich verworfen).
+          const clipped = clipToSegment(leg.coords, straight[0]!, straight[1]!);
           const direct = segLen(straight[0]!, straight[1]!);
-          if (direct === 0 || pathLen(leg.coords) / direct <= MAX_POLY_RATIO) {
-            coords = leg.coords;
+          if (direct === 0 || pathLen(clipped) / direct <= MAX_POLY_RATIO) {
+            coords = clipped;
           }
         }
         return {
