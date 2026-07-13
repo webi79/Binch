@@ -2,7 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { config } from "../config.js";
-import { getMotisTripPolyline } from "../services/motisClient.js";
+import { getMotisTripPolyline, motisFetch } from "../services/motisClient.js";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import { profileForStop, type HafasProfileKey } from "../services/countryProfile.js";
@@ -187,10 +187,99 @@ function productToMode(product: string | undefined): "TRAIN" | "BUS" {
  *  Methode (PARAMETER-Fehler bei stv, fehlende Implementierung bei manchen).
  *  Falls's da fehlschlägt, fallen wir auf oebb zurück — die hat National-
  *  Trip-Daten und kennt die Trip-IDs aller österreichischen Züge. */
+/** Ein Halt aus einem MOTIS-/v6/trip-Leg. */
+interface MotisTripStop {
+  name?: string;
+  stopId?: string;
+  lat?: number;
+  lon?: number;
+  arrival?: string;
+  scheduledArrival?: string;
+  departure?: string;
+  scheduledDeparture?: string;
+  track?: string;
+  scheduledTrack?: string;
+}
+interface MotisTripLeg {
+  mode?: string;
+  tripShortName?: string;
+  routeShortName?: string;
+  headsign?: string;
+  from?: MotisTripStop;
+  to?: MotisTripStop;
+  intermediateStops?: MotisTripStop[];
+}
+
+function motisStopToStopover(s: MotisTripStop): DbTripStopover {
+  return {
+    stop: { id: s.stopId, name: s.name, location: { latitude: s.lat, longitude: s.lon } },
+    // Planzeit zuerst (konsistent mit Suche/Board), Ist nur als Fallback.
+    arrival: s.scheduledArrival ?? s.arrival,
+    plannedArrival: s.scheduledArrival,
+    departure: s.scheduledDeparture ?? s.departure,
+    plannedDeparture: s.scheduledDeparture,
+    arrivalPlatform: s.scheduledTrack ?? s.track,
+    departurePlatform: s.scheduledTrack ?? s.track,
+  };
+}
+
+/**
+ * MOTIS-Trip (`/v6/trip`) → dieselbe Trip-Body-Struktur wie dbrest, damit die
+ * bestehende Slice-/Match-Logik in fetchTripDetail unverändert läuft. Nötig,
+ * weil die Abfahrtstafeln (Surroundings) MOTIS-tripIds liefern und dbrest
+ * (db-Profil) geblockt ist.
+ */
+async function motisTripToBody(tripId: string): Promise<DbTripBody | null> {
+  let raw: { legs?: MotisTripLeg[] };
+  try {
+    raw = (await motisFetch(`/v6/trip?tripId=${encodeURIComponent(tripId)}`)) as {
+      legs?: MotisTripLeg[];
+    };
+  } catch {
+    return null;
+  }
+  const leg = (raw.legs ?? []).find((l) => l.mode && l.mode !== "WALK");
+  if (!leg?.from || !leg.to) return null;
+  const stopovers: DbTripStopover[] = [
+    motisStopToStopover(leg.from),
+    ...(leg.intermediateStops ?? []).map(motisStopToStopover),
+    motisStopToStopover(leg.to),
+  ];
+  const longDist =
+    leg.mode === "HIGHSPEED_RAIL" || leg.mode === "LONG_DISTANCE" || leg.mode === "NIGHT_RAIL";
+  const lineName =
+    (longDist ? leg.tripShortName || leg.routeShortName : leg.routeShortName || leg.tripShortName) ||
+    undefined;
+  return {
+    id: tripId,
+    origin: {
+      id: leg.from.stopId,
+      name: leg.from.name,
+      location: { latitude: leg.from.lat, longitude: leg.from.lon },
+    },
+    destination: {
+      id: leg.to.stopId,
+      name: leg.to.name,
+      location: { latitude: leg.to.lat, longitude: leg.to.lon },
+    },
+    departure: leg.from.scheduledDeparture ?? leg.from.departure,
+    plannedDeparture: leg.from.scheduledDeparture,
+    arrival: leg.to.scheduledArrival ?? leg.to.arrival,
+    plannedArrival: leg.to.scheduledArrival,
+    line: { name: lineName, product: leg.mode, fahrtNr: leg.tripShortName },
+    direction: leg.headsign,
+    stopovers,
+  };
+}
+
 async function fetchTripBody(
   profile: HafasProfileKey,
   tripId: string,
 ): Promise<DbTripBody | null> {
+  // MOTIS-tripIds (Format YYYYMMDD_HH:MM_<feed>_<num>) → MOTIS statt dbrest.
+  if (/^\d{8}_\d{2}:\d{2}_/.test(tripId)) {
+    return motisTripToBody(tripId);
+  }
   if (profile === "db") {
     const url = `${config.DBREST_BASE_URL}/trips/${encodeURIComponent(tripId)}?stopovers=true&polyline=false&remarks=false`;
     try {
