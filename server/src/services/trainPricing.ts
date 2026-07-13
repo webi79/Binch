@@ -3,7 +3,7 @@ import { config } from "../config.js";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import { BoundedTtlCache } from "../util/boundedCache.js";
-import type { NormalizedResult } from "../providers/types.js";
+import type { LegInfo, NormalizedResult, StopoverInfo } from "../providers/types.js";
 
 /**
  * Zug-Preis-Enrichment + Direkt-Buchungslink über int.bahn.de (dbweb-Profil,
@@ -25,18 +25,49 @@ const evaCache = new BoundedTtlCache<string | null>(2000, 24 * 60 * 60 * 1000);
 // (fromEva|toEva|departISO-Bucket) → dbweb-Journeys. 5 min (schont int.bahn.de).
 const journeyCache = new BoundedTtlCache<DbwebJourney[]>(500, 5 * 60 * 1000);
 
+interface DbwebLine {
+  name?: string;
+  fahrtNr?: string;
+  product?: string;
+  productName?: string;
+  id?: string;
+  operator?: { name?: string } | null;
+}
+interface DbwebStop {
+  id?: string;
+  name?: string;
+  location?: { latitude?: number; longitude?: number };
+}
+interface DbwebStopover {
+  stop?: DbwebStop;
+  arrival?: string;
+  plannedArrival?: string;
+  departure?: string;
+  plannedDeparture?: string;
+  arrivalPlatform?: string;
+  plannedArrivalPlatform?: string;
+  departurePlatform?: string;
+  plannedDeparturePlatform?: string;
+}
+interface DbwebLeg {
+  line?: DbwebLine;
+  origin?: DbwebStop;
+  destination?: DbwebStop;
+  departure?: string;
+  plannedDeparture?: string;
+  arrival?: string;
+  plannedArrival?: string;
+  departurePlatform?: string;
+  plannedDeparturePlatform?: string;
+  arrivalPlatform?: string;
+  plannedArrivalPlatform?: string;
+  direction?: string;
+  tripId?: string;
+  walking?: boolean;
+  stopovers?: DbwebStopover[];
+}
 interface DbwebJourney {
-  legs?: Array<{
-    line?: { name?: string };
-    departure?: string;
-    plannedDeparture?: string;
-    arrival?: string;
-    plannedArrival?: string;
-    departurePlatform?: string;
-    plannedDeparturePlatform?: string;
-    arrivalPlatform?: string;
-    plannedArrivalPlatform?: string;
-  }>;
+  legs?: DbwebLeg[];
   price?: { amount?: number; currency?: string } | null;
   refreshToken?: string;
 }
@@ -95,7 +126,10 @@ async function fetchDbwebJourneys(
   const dep = new Date(departure).toISOString().slice(0, 16);
   const url =
     `${config.DBWEB_BASE_URL}/journeys?from=${encodeURIComponent(fromEva)}` +
-    `&to=${encodeURIComponent(toEva)}&departure=${encodeURIComponent(dep)}&results=6`;
+    `&to=${encodeURIComponent(toEva)}&departure=${encodeURIComponent(dep)}&results=6` +
+    // stopovers=true: wir zeigen die dbweb-Route inkl. Zwischenhalten in der
+    // Timeline an (nicht mehr nur Preis-Enrichment).
+    `&stopovers=true`;
   const res = await fetch(url, { headers: { accept: "application/json" } });
   if (!res.ok) throw new Error(`dbweb ${res.status}`);
   const data = (await res.json()) as { journeys?: DbwebJourney[] };
@@ -104,56 +138,175 @@ async function fetchDbwebJourneys(
   return journeys;
 }
 
+/** Sauberes Linien-Label aus dem dbweb-line-Objekt: bevorzugt `name` (ICE 513,
+ *  Bus X61, FLX 1238), aber wenn `name` eine nackte Zug-Nummer ist (Regional,
+ *  z.B. "81077"), zieh die Linie aus der `id` ("re45-81077" → "RE45"). */
+function cleanLineLabel(line?: DbwebLine): string | undefined {
+  const name = line?.name?.trim();
+  if (name && /[a-zA-Z]/.test(name)) return name;
+  const idPart = (line?.id ?? "").split("-")[0] ?? "";
+  if (/^[a-z]{1,4}\d+$/i.test(idPart)) return idPart.toUpperCase();
+  if (name && line?.productName) return `${line.productName} ${name}`;
+  return name || undefined;
+}
+
+/** dbweb-Produkt → MOTIS-Mode-Vokabular, damit der Client die Linien-Farbe
+ *  konsistent zu MOTIS-Routen rendert. */
+function dbwebProductToMode(p?: string): string {
+  switch (p) {
+    case "nationalExpress": return "HIGHSPEED_RAIL";
+    case "national": return "LONG_DISTANCE";
+    case "regionalExpress": return "REGIONAL_RAIL";
+    case "regional": return "REGIONAL_RAIL";
+    case "suburban": return "SUBURBAN";
+    case "bus": return "BUS";
+    case "tram": return "TRAM";
+    case "subway": return "SUBWAY";
+    case "ferry": return "FERRY";
+    default: return p ?? "REGIONAL_RAIL";
+  }
+}
+
+function iso(s?: string): string | undefined {
+  if (!s) return undefined;
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? new Date(t).toISOString() : undefined;
+}
+/** Verspätung in Minuten (Ist − Soll), nur wenn echte Verspätung. */
+function legDelay(planned?: string, actual?: string): number | undefined {
+  if (!planned || !actual) return undefined;
+  const d = Math.round((Date.parse(actual) - Date.parse(planned)) / 60_000);
+  return d > 0 ? d : undefined;
+}
+
+interface DbwebRoute {
+  legs: LegInfo[];
+  stops: number;
+  stopLabels: string[];
+  departTime: string;
+  arriveTime: string;
+  durationMinutes: number;
+  flightNumber?: string;
+  operatedBy?: string;
+  departDelayMinutes?: number;
+  arriveDelayMinutes?: number;
+}
+
+/** Baut aus einer dbweb-Journey die vollständige Anzeige-Route (nur Transit-
+ *  Legs; Fußwege raus, wie bei MOTIS). null wenn unbrauchbar. */
+function buildDbwebRoute(j: DbwebJourney): DbwebRoute | null {
+  const transit = (j.legs ?? []).filter((l) => l.line && !l.walking);
+  const first = transit[0];
+  const last = transit[transit.length - 1];
+  const departTime = iso(first?.plannedDeparture ?? first?.departure);
+  const arriveTime = iso(last?.plannedArrival ?? last?.arrival);
+  if (!first || !last || !departTime || !arriveTime) return null;
+
+  const legs: LegInfo[] = [];
+  for (const seg of transit) {
+    const d = iso(seg.plannedDeparture ?? seg.departure);
+    const a = iso(seg.plannedArrival ?? seg.arrival);
+    if (!d || !a) continue;
+    // dbweb-stopovers enthalten ALLE Halte inkl. Start/Ziel → nur die Mitte.
+    const stopovers: StopoverInfo[] = (seg.stopovers ?? [])
+      .slice(1, -1)
+      .map((s) => ({
+        name: s.stop?.name,
+        arrival: iso(s.plannedArrival ?? s.arrival),
+        departure: iso(s.plannedDeparture ?? s.departure),
+        platform:
+          s.plannedArrivalPlatform ?? s.arrivalPlatform ?? s.plannedDeparturePlatform ?? s.departurePlatform,
+      }))
+      .filter((s) => !!s.name);
+    legs.push({
+      origin: seg.origin?.id ?? seg.origin?.name ?? "",
+      destination: seg.destination?.id ?? seg.destination?.name ?? "",
+      originLabel: seg.origin?.name,
+      destLabel: seg.destination?.name,
+      originLat: seg.origin?.location?.latitude,
+      originLng: seg.origin?.location?.longitude,
+      destLat: seg.destination?.location?.latitude,
+      destLng: seg.destination?.location?.longitude,
+      departTime: d,
+      arriveTime: a,
+      departDelayMinutes: legDelay(seg.plannedDeparture, seg.departure),
+      arriveDelayMinutes: legDelay(seg.plannedArrival, seg.arrival),
+      durationMinutes: Math.max(1, Math.round((Date.parse(a) - Date.parse(d)) / 60_000)),
+      departPlatform: seg.plannedDeparturePlatform ?? seg.departurePlatform,
+      arrivePlatform: seg.plannedArrivalPlatform ?? seg.arrivalPlatform,
+      line: cleanLineLabel(seg.line),
+      product: dbwebProductToMode(seg.line?.product),
+      fahrtNr: seg.line?.fahrtNr,
+      direction: seg.direction,
+      walking: false,
+      stops: stopovers.length,
+      stopovers: stopovers.length > 0 ? stopovers : undefined,
+      tripId: seg.tripId,
+    });
+  }
+  if (legs.length === 0) return null;
+
+  const stopLabels = transit
+    .slice(0, -1)
+    .map((l) => l.destination?.name)
+    .filter((x): x is string => !!x);
+  const operatedBy =
+    first.line?.operator?.name ??
+    (first.line?.product === "national" || first.line?.product === "nationalExpress"
+      ? "DB Fernverkehr"
+      : first.line?.productName);
+
+  return {
+    legs,
+    stops: Math.max(0, transit.length - 1),
+    stopLabels,
+    departTime,
+    arriveTime,
+    durationMinutes: Math.max(1, Math.round((Date.parse(arriveTime) - Date.parse(departTime)) / 60_000)),
+    flightNumber: cleanLineLabel(first.line),
+    operatedBy,
+    departDelayMinutes: legDelay(first.plannedDeparture, first.departure),
+    arriveDelayMinutes: legDelay(last.plannedArrival, last.arrival),
+  };
+}
+
 /**
- * Setzt `price` + `bookingToken` (Recon) auf die passenden Zug-Ergebnisse.
- * Mutiert die übergebenen NormalizedResults. Best-effort: bei fehlender EVA /
- * dbweb-Fehler bleibt alles wie es war (price=0).
+ * Reichert MOTIS-Zug-Ergebnisse mit bahn.de-Daten (dbweb) an. Wo eine dbweb-
+ * Verbindung nach Abfahrtszeit matcht, wird die Route KOMPLETT durch bahn.des
+ * Route ersetzt (Legs, Zeiten, Gleise, Label, Preis, Recon) — so deckt sich die
+ * Anzeige mit dem, was der Deeplink bucht. MOTIS bleibt Fallback für
+ * Verbindungen, die dbweb nicht liefert (bzw. wenn int.bahn.de drosselt).
+ * Mutiert die NormalizedResults in-place. Best-effort (Fehler → alles bleibt).
  */
-export async function enrichTrainPrices(
+export async function enrichTrainResults(
   results: NormalizedResult[],
-  input: { origin: string; destination: string; departDate: string },
+  input: { origin: string; destination: string; departDate: string; passengers?: number },
 ): Promise<void> {
   if (results.length === 0) return;
   const [fromEva, toEva] = await Promise.all([evaFor(input.origin), evaFor(input.destination)]);
-  if (!fromEva || !toEva) return; // z.B. non-DE Stop ohne EVA → kein Preis
+  if (!fromEva || !toEva) return; // non-DE Stop ohne EVA → keine dbweb-Daten
 
   let journeys: DbwebJourney[];
   try {
     journeys = await fetchDbwebJourneys(fromEva, toEva, input.departDate);
   } catch {
-    return; // int.bahn.de gedrosselt/aus → kein Preis, Verbindungen bleiben
+    return; // int.bahn.de gedrosselt/aus → MOTIS-Route/Kein-Preis bleiben
   }
 
-  // Match-Map: NUR Abfahrts-HH:MM → bahn.de-Wahrheit. NICHT über den Linien-
-  // Namen matchen — MOTIS/DELFI und bahn.de benennen denselben Zug oft anders
-  // (DELFI "IC 190" ↔ bahn.de "ECE 190"), was den Match sonst zerstört (kein
-  // Preis, kein Label/Gleis-Fix). Die Abfahrtsminute ist pro Strecke eindeutig.
-  interface DbwebMatch {
-    amount?: number;
-    currency: string;
-    recon?: string;
-    lineName?: string;
-    depPlatform?: string;
-    arrPlatform?: string;
-    arrHHmm: string;
-  }
-  const byDep = new Map<string, DbwebMatch>();
+  const pax = Math.max(1, input.passengers ?? 1);
+  // dbweb-Route je Abfahrts-HH:MM (NICHT über Label matchen — das weicht ab).
+  const byDep = new Map<string, { route: DbwebRoute; price?: number; currency: string; recon?: string }>();
   for (const j of journeys) {
-    const first = j.legs?.find((l) => l.line?.name) ?? j.legs?.[0];
-    const dep = first?.plannedDeparture ?? first?.departure;
-    if (!first || !dep) continue;
-    const last = j.legs?.[j.legs.length - 1];
-    const arr = last?.plannedArrival ?? last?.arrival;
-    const k = hhmm(dep);
+    const route = buildDbwebRoute(j);
+    if (!route) continue;
+    const k = hhmm(route.departTime);
     if (byDep.has(k)) continue;
+    const amount = j.price?.amount;
     byDep.set(k, {
-      amount: j.price?.amount ?? undefined,
+      route,
+      price: typeof amount === "number" && amount > 0 ? Math.round(amount * pax * 100) / 100 : undefined,
       currency: j.price?.currency ?? "EUR",
       recon: j.refreshToken,
-      lineName: first.line?.name,
-      depPlatform: first.departurePlatform ?? first.plannedDeparturePlatform,
-      arrPlatform: last?.arrivalPlatform ?? last?.plannedArrivalPlatform,
-      arrHHmm: arr ? hhmm(arr) : "",
     });
   }
   if (byDep.size === 0) return;
@@ -161,24 +314,27 @@ export async function enrichTrainPrices(
   for (const r of results) {
     const m = byDep.get(hhmm(r.departTime, r.originTz));
     if (!m) continue;
-    // Sicherheits-Check: Ankunft grob gleich → wirklich derselbe Zug (schützt
-    // vor dem theoretischen Fall zweier Züge mit identischer Abfahrtsminute).
-    if (m.arrHHmm) {
-      const d = Math.abs(hhmmToMin(m.arrHHmm) - hhmmToMin(hhmm(r.arriveTime, r.destinationTz)));
-      if (Math.min(d, 1440 - d) > 20) continue;
-    }
-    // bahn.de ist authoritative für Buchung/Label/Gleis — DELFI überschreiben.
-    if (m.amount != null) {
-      r.price = m.amount;
+    // Ankunfts-Gegencheck: gleicher Zug (schützt vor identischer Abfahrtsminute).
+    const rd = Math.abs(hhmmToMin(hhmm(m.route.arriveTime)) - hhmmToMin(hhmm(r.arriveTime, r.destinationTz)));
+    if (Math.min(rd, 1440 - rd) > 25) continue;
+
+    // Route KOMPLETT durch bahn.de ersetzen — Identität (id/redirectToken) und
+    // deepLink (bahn.de-Suche, gleiche Zeit) bleiben.
+    r.legs = m.route.legs;
+    r.stops = m.route.stops;
+    r.stopLabels = m.route.stopLabels;
+    r.departTime = m.route.departTime;
+    r.arriveTime = m.route.arriveTime;
+    r.durationMinutes = m.route.durationMinutes;
+    r.flightNumber = m.route.flightNumber;
+    if (m.route.operatedBy) r.operatedBy = m.route.operatedBy;
+    r.departDelayMinutes = m.route.departDelayMinutes;
+    r.arriveDelayMinutes = m.route.arriveDelayMinutes;
+    if (m.price != null) {
+      r.price = m.price;
       r.currency = m.currency;
     }
     if (m.recon) r.bookingToken = m.recon;
-    if (m.lineName) {
-      r.flightNumber = m.lineName;
-      if (r.legs?.[0]) r.legs[0].line = m.lineName;
-    }
-    if (m.depPlatform && r.legs?.[0]) r.legs[0].departPlatform = m.depPlatform;
-    if (m.arrPlatform && r.legs?.length) r.legs[r.legs.length - 1]!.arrivePlatform = m.arrPlatform;
   }
 }
 

@@ -3,7 +3,7 @@ import { db } from "../db/client.js";
 import { providerResponses, searchRequests, searchResults } from "../db/schema.js";
 import type { TravelMode } from "../db/schema.js";
 import { activeProvidersForMode, activeFallbackProvidersForMode } from "../providers/registry.js";
-import { enrichTrainPrices } from "./trainPricing.js";
+import { enrichTrainResults } from "./trainPricing.js";
 import type {
   LegInfo,
   NormalizedResult,
@@ -125,8 +125,9 @@ const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 h
  * manuelles Cache-Leeren mehr.
  *
  * 2026-07-12T22:50Z: dbweb-Label/Gleis-Enrichment (ECE 190 statt DELFI IC 190).
+ * 2026-07-13T13:15Z: dbweb-ROUTE-Ersetzung (ganze Route von bahn.de statt MOTIS).
  */
-const RESULT_SCHEMA_EPOCH = new Date("2026-07-12T22:50:00Z");
+const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T13:15:00Z");
 
 /** In-Flight-Map: Schlüssel = cacheKey, Wert = Promise des laufenden Calls. */
 const inFlight = new Map<string, Promise<SearchOutput>>();
@@ -347,11 +348,11 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
   const outboundCandidates = deduped.filter((c) => c.result.direction !== "RETURN");
   const returnCandidates = deduped.filter((c) => c.result.direction === "RETURN");
 
-  // Zug-Preis-Enrichment: EIN int.bahn.de-Call setzt Preis + Recon-Token
-  // (bookingToken) auf die passenden MOTIS-Ergebnisse. Best-effort — schlägt
-  // er fehl (Drosselung/non-DE), bleiben die Verbindungen mit price=0.
+  // Zug-Enrichment: EIN int.bahn.de-Call ersetzt bei Match die MOTIS-Route
+  // komplett durch bahn.des Route (Legs/Gleise/Label/Preis/Recon) → Anzeige =
+  // Buchung. Best-effort — bei Drosselung/non-DE bleiben die MOTIS-Routen.
   if (input.mode === "TRAIN" && outboundCandidates.length > 0) {
-    await enrichTrainPrices(outboundCandidates.map((c) => c.result), input);
+    await enrichTrainResults(outboundCandidates.map((c) => c.result), input);
   }
 
   const flatResults: ClientResult[] = [];

@@ -76,11 +76,14 @@ const querySchema = z.object({
 
 async function fetchTripPolyline(tripId: string): Promise<[number, number][] | null> {
   // MOTIS-tripIds (Format YYYYMMDD_HH:MM_<feed>_<num>) → Geometrie direkt von
-  // MOTIS (precision-6-Polyline). dbrest ist für Zug-Trips eh geblockt.
+  // MOTIS (precision-6-Polyline).
   if (/^\d{8}_\d{2}:\d{2}_/.test(tripId)) {
     return getMotisTripPolyline(tripId);
   }
-  const url = `${config.DBREST_BASE_URL}/trips/${encodeURIComponent(tripId)}?polyline=true&stopovers=false`;
+  // HAFAS-tripIds (2|#VN#...) kommen von dbweb (bahn.de-Routen) → gegen den
+  // dbweb-Sidecar (int.bahn.de, UNBLOCKIERT), NICHT den geblockten db-Container.
+  // Response-Format identisch (GeoJSON features[].geometry.coordinates=[lng,lat]).
+  const url = `${config.DBWEB_BASE_URL}/trips/${encodeURIComponent(tripId)}?polyline=true&stopovers=false`;
   try {
     const res = await fetch(url, { headers: { Accept: "application/json" } });
     if (!res.ok) return null;
