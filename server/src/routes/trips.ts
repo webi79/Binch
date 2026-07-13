@@ -469,7 +469,39 @@ async function fetchTripDetail(
       if (bestIdx >= 0) startIdx = bestIdx;
     }
   }
-  const slicedStops = rawStops.slice(startIdx);
+  // END-Slice auf die Board-Richtung: bei RINGLINIEN (Start=Ende, z.B. C1 in
+  // Werl: Bahnhof→…→Justus-Liebig-Platz→…→Bahnhof) und generell wenn der
+  // Headsign NICHT die Endstation ist, ist der operative letzte Halt (Werl
+  // Bahnhof) ein ANDERER Ort als wohin der User laut Board fährt (Justus-
+  // Liebig-Platz). Ohne End-Slice zeigte der Header das Richtungs-Label, aber
+  // die Ziel-Koordinaten wären die der Endstation → Marker an falscher Stelle.
+  // Wir suchen die Board-Richtungs-Haltestelle AB dem User-Halt und schneiden
+  // dort ab. Gleiche Token-Match-Logik wie beim Start-Slice.
+  let endIdx = rawStops.length - 1;
+  let endMatched = false;
+  if (boardDirection?.trim()) {
+    const wanted = new Set(tokenize(boardDirection));
+    if (wanted.size > 0) {
+      let bestIdx = -1;
+      let bestOverlap = 0;
+      for (let i = startIdx + 1; i < rawStops.length; i++) {
+        const name = rawStops[i]!.stop?.name;
+        if (!name) continue;
+        let overlap = 0;
+        for (const tok of tokenize(name)) if (wanted.has(tok)) overlap++;
+        const required = Math.min(2, wanted.size);
+        if (overlap >= required && overlap > bestOverlap) {
+          bestOverlap = overlap;
+          bestIdx = i;
+        }
+      }
+      if (bestIdx > startIdx) {
+        endIdx = bestIdx;
+        endMatched = true;
+      }
+    }
+  }
+  const slicedStops = rawStops.slice(startIdx, endIdx + 1);
   if (slicedStops.length === 0) return null;
 
   const firstStop = slicedStops[0]!;
@@ -528,10 +560,19 @@ async function fetchTripDetail(
   // den Bus nach Headsign aus, das soll konsistent in der Trip-Detail-Header
   // sein. Stop-Liste selbst zeigt unverändert ALLE realen Stops bis zum
   // technischen Endhalt.
-  // Reihenfolge: 1. Board-Direction (das was der User auf der getappten Card
-  // gesehen hat — höchste Konsistenz), 2. trip.direction (HAFAS-Headsign),
-  // 3. lastStop.stop.name, 4. trip.destination.name.
-  const destinationName = (boardDirection?.trim() || trip.direction?.trim() || lastStop.stop?.name || trip.destination?.name) ?? "";
+  // WICHTIG: Label MUSS zu den Ziel-Koordinaten (lastStop) passen, sonst sitzt
+  // der Marker falsch. Wenn der End-Slice die Board-Richtungs-Haltestelle
+  // gefunden hat, ist lastStop genau dieser Halt → Board-Direction als Label ok
+  // (schöner, ohne „Werl,"-Präfix). Wenn NICHT gefunden, ist lastStop die echte
+  // Endstation → dann deren Namen nehmen (nicht den Headsign, der woanders
+  // liegt), damit Label und Koordinaten konsistent bleiben.
+  const destinationName =
+    (endMatched ? boardDirection?.trim() : undefined) ??
+    lastStop.stop?.name ??
+    trip.direction?.trim() ??
+    trip.destination?.name ??
+    boardDirection?.trim() ??
+    "";
   const originLat = firstStop.stop?.location?.latitude ?? trip.origin?.location?.latitude;
   const originLng = firstStop.stop?.location?.longitude ?? trip.origin?.location?.longitude;
   const destLat = lastStop.stop?.location?.latitude ?? trip.destination?.location?.latitude;
