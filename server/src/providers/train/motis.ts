@@ -315,7 +315,10 @@ function makeMotisProvider(mode: TravelMode, transitModes: string, name: string)
             `/v6/plan?fromPlace=${encodeURIComponent(from.id)}` +
             `&toPlace=${encodeURIComponent(to.id)}` +
             `&time=${encodeURIComponent(new Date(time).toISOString())}` +
-            `&transitModes=${encodeURIComponent(transitModes)}&numItineraries=6&detailedTransfers=false`;
+            // maxTransfers=5 kappt absurde Pareto-Odysseen (6+ Umstiege quer
+            // durchs Regionalnetz), die die DB nie zeigt — legitime grenz-
+            // überschreitende+lokale Routen brauchen max. ~3-4 Umstiege.
+            `&transitModes=${encodeURIComponent(transitModes)}&numItineraries=6&maxTransfers=5&detailedTransfers=false`;
           const raw = (await motisFetch(url, signal)) as { itineraries?: MotisItinerary[] };
           itineraries = raw.itineraries ?? [];
           planCache.set(cacheKey, itineraries);

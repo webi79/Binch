@@ -128,10 +128,14 @@ const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 h
  * 2026-07-13T13:15Z: dbweb-ROUTE-Ersetzung (ganze Route von bahn.de statt MOTIS).
  * 2026-07-13T18:00Z: Zug-transitModes um Nahverkehr erweitert (SUBURBAN/TRAM/
  *   SUBWAY) → Ziele wie Zürich Brunau lieferten vorher 0 Ergebnisse (gecacht).
- * 2026-07-13T19:00Z: Routing an exakte MOTIS-Stop-ID statt Koordinate → Route
- *   endet am gewählten Halt (Brunau) statt am Nachbar-Stop (Saalsporthalle).
+ * 2026-07-13T18:08Z: Routing an exakte MOTIS-Stop-ID statt Koordinate (Route
+ *   endet am gewählten Halt statt Nachbar-Stop) + DB-nahes Ranking
+ *   (Verbindungsqualität statt Preis) + maxTransfers=5 + Zug-Dedup.
+ *
+ * WICHTIG: Wert nie in die Zukunft setzen (== aktuelle Deploy-Zeit), sonst
+ * qualifiziert keine frisch geschriebene Row → Cache komplett aus.
  */
-const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T19:00:00Z");
+const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T18:08:00Z");
 
 /** In-Flight-Map: Schlüssel = cacheKey, Wert = Promise des laufenden Calls. */
 const inFlight = new Map<string, Promise<SearchOutput>>();
@@ -256,7 +260,7 @@ async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
     });
   }
 
-  out.sort((a, b) => a.price - b.price);
+  sortResults(out, input.mode);
 
   return {
     output: {
@@ -497,7 +501,7 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
     });
   }
 
-  flatResults.sort((a, b) => a.price - b.price);
+  sortResults(flatResults, input.mode);
 
   return {
     results: flatResults,
@@ -592,6 +596,45 @@ export async function runSearch(input: SearchInput): Promise<SearchOutput> {
 }
 
 /**
+ * Umstiegsstrafe (Minuten) fürs Zug-Ranking. Die DB-Reiseauskunft bevorzugt
+ * spürbar umstiegsarme Verbindungen: eine Route mit einem Umstieg mehr muss
+ * ~20 min schneller sein, um überhaupt höher zu ranken. Genau das trennt die
+ * „gute" Verbindung (IC direkt / IC + eine S-Bahn) von der Pareto-Odyssee
+ * (Regionalzug-Kette mit 4-6 Umstiegen), die MOTIS als früheste-Ankunft-
+ * Alternative mitliefert.
+ */
+const TRANSFER_PENALTY_MIN = 20;
+
+/**
+ * „Verbindungsqualität" à la DB: Reisezeit + Umstiegsstrafe. Kleiner = besser.
+ */
+function connectionScore(r: { durationMinutes: number; stops: number }): number {
+  return r.durationMinutes + TRANSFER_PENALTY_MIN * Math.max(0, r.stops);
+}
+
+/**
+ * Ergebnis-Sortierung je Modus (in-place). Züge werden nach Verbindungsqualität
+ * sortiert (DB-nah — MOTIS liefert nur Routing, keine brauchbaren Preise, und
+ * die DB sortiert selbst nicht nach Preis), alle anderen Modi nach Preis.
+ * Gleichstand → frühere Abfahrt zuerst.
+ */
+function sortResults<
+  T extends { price: number; durationMinutes: number; stops: number; departTime: string },
+>(results: T[], mode: TravelMode): void {
+  if (mode === "TRAIN") {
+    results.sort(
+      (a, b) =>
+        connectionScore(a) - connectionScore(b) ||
+        Date.parse(a.departTime) - Date.parse(b.departTime),
+    );
+  } else {
+    results.sort(
+      (a, b) => a.price - b.price || Date.parse(a.departTime) - Date.parse(b.departTime),
+    );
+  }
+}
+
+/**
  * Dedupe across providers: same physical journey returned by multiple APIs is collapsed
  * to a single entry. We keep the cheapest variant.
  */
@@ -600,7 +643,15 @@ function dedupe(candidates: Candidate[], mode: TravelMode): Candidate[] {
   for (const c of candidates) {
     const key = fingerprint(c.result, mode);
     const existing = map.get(key);
-    if (!existing || c.result.price < existing.result.price) {
+    // Züge: bei gleichem Fingerprint die qualitativ beste Variante behalten
+    // (weniger Umstiege / schneller) — Preise sind bei MOTIS-only 0 und taugen
+    // nicht als Tiebreak. Andere Modi: die günstigste.
+    const better =
+      !existing ||
+      (mode === "TRAIN"
+        ? connectionScore(c.result) < connectionScore(existing.result)
+        : c.result.price < existing.result.price);
+    if (better) {
       map.set(key, c);
     }
   }
@@ -612,6 +663,15 @@ function fingerprint(r: NormalizedResult, mode: TravelMode): string {
   const arr = roundToMinute(r.arriveTime);
   const route = `${r.origin}->${r.destination}`;
 
+  if (mode === "TRAIN") {
+    // Fast-Duplikate kollabieren: dieselbe IC 198 ab derselben Minute einmal
+    // mit einem und einmal mit drei Zürcher Tram-Umstiegen ist EINE Verbindung
+    // — die DB zeigt pro Abfahrt genau die beste Variante. Darum nur erster Zug
+    // + Abfahrt + Strecke im Key (NICHT Ankunft/Stops, sonst bleiben die
+    // Varianten getrennt); dedupe() behält die beste Verbindungsqualität.
+    const first = (r.flightNumber ?? r.operatedBy ?? "").toUpperCase();
+    return `train:${first}|${dep}|${route}`;
+  }
   if (mode === "FLIGHT" && r.flightNumber) {
     // ANKUNFT + STOPS gehören in den Fingerprint, sonst kollabieren völlig
     // verschiedene Umsteigeverbindungen mit demselben ERSTEN Flug auf einen
