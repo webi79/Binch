@@ -139,10 +139,13 @@ const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 h
  * 2026-07-13T21:40Z: Suchzeitpunkt gefixt (heute → ab jetzt statt ab Mitternacht;
  *   künftiges Datum → ab 08:00 statt nur Nachtzüge) + „Später"-Pagination.
  *
+ * 2026-07-13T21:58Z: Uhrzeit aus dem Picker wird durchgereicht (war weggeworfen)
+ *   → alte Rows stammen aus der Mitternachts-Ära und zeigen Nachtzüge.
+ *
  * WICHTIG: Wert nie in die Zukunft setzen (== aktuelle Deploy-Zeit), sonst
  * qualifiziert keine frisch geschriebene Row → Cache komplett aus.
  */
-const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T21:40:00Z");
+const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T21:58:00Z");
 
 /** In-Flight-Map: Schlüssel = cacheKey, Wert = Promise des laufenden Calls. */
 const inFlight = new Map<string, Promise<SearchOutput>>();
@@ -178,11 +181,6 @@ async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
   // Lieber live fetchen als falsche Klassenpreise liefern.
   if (input.travelClass) return null;
 
-  // departTime (Surroundings-Departure-Tap) verschiebt das dbVendo-Such-
-  // fenster, wird aber ebenfalls nicht in der DB-Tabelle unterschieden —
-  // ein Cache-Hit könnte Ergebnisse eines anderen Zeitfensters liefern.
-  if (input.departTime) return null;
-
   // Round-Trip: Rückfahrt-Treffer werden nicht persistiert (kein `direction`
   // im Schema). Ein Cache-Hit würde nur die Hinfahrten liefern, was den
   // Round-Trip kaputtmacht. Lieber live fetchen.
@@ -202,6 +200,14 @@ async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
         eq(searchRequests.origin, input.origin),
         eq(searchRequests.destination, input.destination),
         eq(searchRequests.departDate, input.departDate),
+        // Die gewählte Uhrzeit ist Teil der Such-Identität: eine 08:00-Suche
+        // darf NICHT aus dem Cache einer 18:00-Suche derselben Strecke bedient
+        // werden. Früher wurde bei gesetzter departTime der Cache komplett
+        // übersprungen — seit der Picker die Uhrzeit liefert, wäre damit jede
+        // Suche ungecacht gewesen.
+        input.departTime
+          ? eq(searchRequests.departTime, new Date(input.departTime))
+          : isNull(searchRequests.departTime),
         input.returnDate
           ? eq(searchRequests.returnDate, input.returnDate)
           : isNull(searchRequests.returnDate),
@@ -295,6 +301,8 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
       originLabel: input.originLabel,
       destLabel: input.destLabel,
       departDate: input.departDate,
+      // Uhrzeit gehört zur Cache-Identität (siehe loadFromCache).
+      departTime: input.departTime ? new Date(input.departTime) : null,
       returnDate: input.returnDate,
       passengers: input.passengers,
       currency: input.currency,
@@ -567,7 +575,43 @@ function triggerBackgroundRefresh(input: SearchInput, key: string) {
   refreshFn();
 }
 
-export async function runSearch(input: SearchInput): Promise<SearchOutput> {
+/**
+ * Modi, deren Provider den exakten Abfahrts-Wunsch auswerten (MOTIS/dbVendo).
+ * Flüge und Kreuzfahrten suchen tagesweise — ihre Provider LESEN `departTime`
+ * gar nicht. Nähme man die Uhrzeit trotzdem in die Cache-Identität, zersplitterte
+ * sie deren Cache je gewählter Minute: gleiche Ergebnisse, aber jedes Mal ein
+ * frischer Provider-Call — bei Google-Flights direkt verbrannte Quota.
+ */
+const MODES_USING_DEPART_TIME = new Set<TravelMode>(["TRAIN", "BUS"]);
+
+/**
+ * Die im Picker gewählte Uhrzeit soll in JEDER Kategorie zählen. Bei Zug/Bus ist
+ * sie der Suchzeitpunkt (der Provider startet dort). Flüge/Kreuzfahrten liefern
+ * immer den ganzen Tag — dort wirkt sie als FILTER auf die Ergebnisse. Das
+ * geschieht bewusst NACH dem Cache: der bleibt tagesweise und teilt sich über
+ * alle Uhrzeiten (sonst kostete jede Minute einen frischen Provider-Call — bei
+ * Google-Flights direkt Quota). `dateOnly` (Kreuzfahrten ohne Uhrzeit) bleibt.
+ */
+function applyRequestedTime(out: SearchOutput, rawInput: SearchInput): SearchOutput {
+  if (!rawInput.departTime || MODES_USING_DEPART_TIME.has(rawInput.mode)) return out;
+  const from = Date.parse(rawInput.departTime);
+  if (!Number.isFinite(from)) return out;
+  const results = out.results.filter((r) => r.dateOnly || Date.parse(r.departTime) >= from);
+  // Nie in eine leere Liste filtern — dann lieber den ganzen Tag zeigen, als
+  // dem User zu suggerieren, es gäbe an dem Tag gar nichts.
+  return results.length > 0 ? { ...out, results } : out;
+}
+
+export async function runSearch(rawInput: SearchInput): Promise<SearchOutput> {
+  const out = await runSearchUncut(rawInput);
+  return applyRequestedTime(out, rawInput);
+}
+
+async function runSearchUncut(rawInput: SearchInput): Promise<SearchOutput> {
+  const input: SearchInput = MODES_USING_DEPART_TIME.has(rawInput.mode)
+    ? rawInput
+    : { ...rawInput, departTime: undefined };
+
   const key = cacheKey(input);
   const ttl = CACHE_TTL_BY_MODE[input.mode];
 

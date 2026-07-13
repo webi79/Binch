@@ -238,6 +238,7 @@ export default function ResultsScreen() {
     originLabel?: string;
     destLabel?: string;
     departDate: string;
+    departTime?: string;
     returnDate?: string;
     tripType?: string;
     passengers?: string;
@@ -251,6 +252,11 @@ export default function ResultsScreen() {
   const originLabel = p.originLabel ?? origin;
   const destLabel = p.destLabel ?? destination;
   const departDate = p.departDate ?? "";
+  // Uhrzeit aus dem Datums-/Zeit-Picker (UTC-ISO). Muss in JEDEN Query-Key und
+  // jeden Suchaufruf — sonst sucht der Server ab einer Default-Zeit statt ab
+  // dem gewünschten Zeitpunkt, und zwei Suchen derselben Strecke zu
+  // verschiedenen Uhrzeiten würden sich gegenseitig aus dem Cache bedienen.
+  const departTime = p.departTime ?? "";
   const returnDate = p.returnDate ?? "";
   const passengers = Number(p.passengers ?? "1");
   const currency = p.currency ?? "EUR";
@@ -263,7 +269,7 @@ export default function ResultsScreen() {
 
 
   const { data, isLoading, isFetching, isError, error, refetch, isRefetching } = useQuery<SearchResponse>({
-    queryKey: ["search", mode, origin, destination, departDate, returnDate, passengers, currency, travelClass],
+    queryKey: ["search", mode, origin, destination, departDate, departTime, returnDate, passengers, currency, travelClass],
     queryFn: () => {
       const opt = forceFreshRef.current ? { nocache: true } : undefined;
       forceFreshRef.current = false;
@@ -275,6 +281,7 @@ export default function ResultsScreen() {
           originLabel,
           destLabel,
           departDate,
+          ...(departTime ? { departTime } : {}),
           returnDate: returnDate || undefined,
           passengers,
           currency,
@@ -377,8 +384,8 @@ export default function ResultsScreen() {
   // OHNE dass die User-Anzahl die Kosten skaliert.
   const queryClient = useQueryClient();
   const queryKey = useMemo(
-    () => ["search", mode, origin, destination, departDate, returnDate, passengers, currency, travelClass],
-    [mode, origin, destination, departDate, returnDate, passengers, currency, travelClass],
+    () => ["search", mode, origin, destination, departDate, departTime, returnDate, passengers, currency, travelClass],
+    [mode, origin, destination, departDate, departTime, returnDate, passengers, currency, travelClass],
   );
 
   useEffect(() => {
@@ -397,6 +404,7 @@ export default function ResultsScreen() {
           originLabel,
           destLabel,
           departDate,
+          ...(departTime ? { departTime } : {}),
           returnDate: returnDate || undefined,
           passengers,
           currency,
@@ -417,7 +425,7 @@ export default function ResultsScreen() {
       clearInterval(id);
       sub.remove();
     };
-  }, [mode, origin, destination, originLabel, destLabel, departDate, returnDate, passengers, currency, travelClass, queryKey, queryClient]);
+  }, [mode, origin, destination, originLabel, destLabel, departDate, departTime, returnDate, passengers, currency, travelClass, queryKey, queryClient]);
 
   // Hin- oder Rückreise-Ansicht. Nur für Train/Bus relevant — Flüge bekommen
   // keine separaten Rück-Treffer (SerpAPI/Google Flights pre-bundled die schon
@@ -483,6 +491,7 @@ export default function ResultsScreen() {
           originLabel,
           destLabel,
           departDate,
+          ...(departTime ? { departTime } : {}),
           returnDate: returnDate || undefined,
           passengers,
           currency,

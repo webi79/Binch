@@ -26,6 +26,10 @@ export const searchRequests = pgTable(
     originLabel: text("origin_label"),
     destLabel: text("dest_label"),
     departDate: date("depart_date").notNull(),
+    /** Exakter Abfahrts-Wunsch (der User wählt im Picker Datum UND Uhrzeit).
+     *  Muss Teil der Cache-Identität sein — sonst bediente eine 08:00-Suche
+     *  die 18:00-Suche derselben Strecke aus dem Cache. */
+    departTime: timestamp("depart_time", { withTimezone: true }),
     returnDate: date("return_date"),
     passengers: integer("passengers").notNull().default(1),
     currency: varchar("currency", { length: 8 }).notNull().default("EUR"),

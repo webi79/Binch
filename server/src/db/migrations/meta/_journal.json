@@ -85,6 +85,13 @@
       "when": 1779039402302,
       "tag": "0011_gray_phalanx",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1783979365208,
+      "tag": "0012_vengeful_magneto",
+      "breakpoints": true
     }
   ]
 }

@@ -293,6 +293,12 @@ export function SearchHero({ mode }: Props) {
     haptic("important");
     const departIso = format(departDate, "yyyy-MM-dd");
     const returnIso = isRoundtrip && returnDate ? format(returnDate, "yyyy-MM-dd") : "";
+    // Der Picker liefert Datum UND Uhrzeit (DatePickerHost baut
+    // `new Date(y, m, d, hour, minute)`). Die Uhrzeit wurde hier bisher
+    // weggeworfen — der Server suchte dann ab einer Default-Zeit statt ab dem
+    // gewünschten Zeitpunkt. Als UTC-ISO mitgeben; `departDate` bleibt daneben
+    // bestehen (Cache-Key, Anzeige).
+    const departTimeIso = departDate.toISOString();
     addRecentSearch({
       mode,
       origin: { code: origin.code, label: origin.label },
@@ -320,6 +326,7 @@ export function SearchHero({ mode }: Props) {
           originLabel: origin.label,
           destLabel: destination.label,
           departDate: departIso,
+          departTime: departTimeIso,
           returnDate: returnIso,
           tripType,
           passengers: String(pax),
@@ -330,7 +337,10 @@ export function SearchHero({ mode }: Props) {
     }, 280);
   }
 
-  const formatDate = (d: Date) => format(d, "EEE, d MMM", { locale: dateLocale });
+  // Uhrzeit mit anzeigen — sie wird im Picker gewählt und wirkt sich echt auf die
+  // Suche aus (Zug/Bus: Suchzeitpunkt, Flug/Cruise: Filter). Ohne sichtbare Zeit
+  // wirkte der Picker wirkungslos.
+  const formatDate = (d: Date) => format(d, "EEE, d MMM · HH:mm", { locale: dateLocale });
 
   return (
     <View style={styles.container}>
