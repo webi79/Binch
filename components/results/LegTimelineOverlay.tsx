@@ -348,31 +348,45 @@ function LegTimelineSheet({ result, hidden }: { result: SearchResult; hidden?: b
                     ),
                   )
                 : 0;
+              // Ein Fußweg ZWISCHEN zwei Fahrten braucht keine eigenen
+              // Stationszeilen: seine Endpunkte sind exakt die Ankunfts- bzw.
+              // Abfahrtsstation der Nachbar-Legs, die ihre Zeilen ohnehin
+              // rendern. Ohne diese Regel steht dieselbe Station viermal da
+              //   09:44 Buchs SG / 09:58 Buchs SG / 10:00 Buchs Bhf / 10:00 Buchs Bhf
+              // statt zweimal. An den REISE-ENDEN muss der Fußweg seine Zeile
+              // dagegen zeigen — dort hat er keinen Nachbarn (Start „Zürich HB“,
+              // Ziel „Zürich Brunau“).
+              const showOrigin = !leg.walking || isFirstLeg;
+              const showDest = !leg.walking || isLastLeg;
               return (
                 <View key={`${leg.origin}-${idx}`}>
-                  <StationRow
-                    time={timeOf(leg.departTime, result.originTz)}
-                    delayed={
-                      (leg.departDelayMinutes ?? 0) > 0
-                        ? timeOf(shiftIsoByMinutes(leg.departTime, leg.departDelayMinutes!), result.originTz)
-                        : undefined
-                    }
-                    name={leg.originLabel ?? leg.origin}
-                    platform={leg.departPlatform}
-                    terminal={isFirstLeg}
-                  />
+                  {showOrigin ? (
+                    <StationRow
+                      time={timeOf(leg.departTime, result.originTz)}
+                      delayed={
+                        (leg.departDelayMinutes ?? 0) > 0
+                          ? timeOf(shiftIsoByMinutes(leg.departTime, leg.departDelayMinutes!), result.originTz)
+                          : undefined
+                      }
+                      name={leg.originLabel ?? leg.origin}
+                      platform={leg.departPlatform}
+                      terminal={isFirstLeg}
+                    />
+                  ) : null}
                   <TransportSegment leg={leg} />
-                  <StationRow
-                    time={timeOf(leg.arriveTime, result.destinationTz)}
-                    delayed={
-                      (leg.arriveDelayMinutes ?? 0) > 0
-                        ? timeOf(shiftIsoByMinutes(leg.arriveTime, leg.arriveDelayMinutes!), result.destinationTz)
-                        : undefined
-                    }
-                    name={leg.destLabel ?? leg.destination}
-                    platform={leg.arrivePlatform}
-                    terminal={isLastLeg}
-                  />
+                  {showDest ? (
+                    <StationRow
+                      time={timeOf(leg.arriveTime, result.destinationTz)}
+                      delayed={
+                        (leg.arriveDelayMinutes ?? 0) > 0
+                          ? timeOf(shiftIsoByMinutes(leg.arriveTime, leg.arriveDelayMinutes!), result.destinationTz)
+                          : undefined
+                      }
+                      name={leg.destLabel ?? leg.destination}
+                      platform={leg.arrivePlatform}
+                      terminal={isLastLeg}
+                    />
+                  ) : null}
                   {/* Grenzt ein Fußweg-Leg an, ist DER bereits der Umstieg —
                       ein zusätzlicher „Umstieg 0 Min"-Block wäre nur Rauschen. */}
                   {next && !leg.walking && !next.walking ? (
