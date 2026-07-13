@@ -3,7 +3,12 @@ import { config } from "../../config.js";
 import { db } from "../../db/client.js";
 import { locations, type TravelMode } from "../../db/schema.js";
 import { BoundedTtlCache } from "../../util/boundedCache.js";
-import { motisFetch, motisGeocode, type MotisPlace } from "../../services/motisClient.js";
+import {
+  motisFetch,
+  motisGeocode,
+  motisGeocodeNearestStop,
+  type MotisPlace,
+} from "../../services/motisClient.js";
 import { buildBahnDeeplink } from "../../util/bahnDeeplink.js";
 import type {
   LegInfo,
@@ -72,11 +77,16 @@ interface MotisItinerary {
 }
 
 /**
- * Binch-`code` → MOTIS-Place. Bevorzugt die in `locations` gespeicherten
- * Koordinaten (präzise, kein Geocode-Call, reused Asset) und gibt MOTIS ein
- * `lat,lng`-Tupel als `fromPlace`. Nur wenn keine Koordinaten vorliegen,
- * fällt es auf Label-Geocoding zurück. (Die HAFAS-ID selbst taugt nicht als
- * MOTIS-ID — anderer Namespace; die daneben liegenden Koordinaten schon.)
+ * Binch-`code` → MOTIS-Place. Bevorzugt die **exakte MOTIS-Stop-ID** (via
+ * Label-Geocode, disambiguiert über die gespeicherte Koordinate), damit die
+ * Route genau am gewählten Halt endet. Routet man nur an eine Koordinate,
+ * snappt MOTIS auf den nächstgelegenen Halt — bei eng benachbarten Stops
+ * (Zürich Brunau vs. Saalsporthalle) landet die Fahrt am falschen Ort.
+ *
+ * Fallback-Kette: exakte Stop-ID (Geocode + Koordinaten-Nähe) → gespeicherte
+ * Koordinate als `lat,lng` → reines Label-Geocode. So gibt es nie 0 Ergebnisse
+ * nur weil der Geocode danebengreift. (Die HAFAS-ID taugt nicht als MOTIS-ID —
+ * anderer Namespace.)
  */
 async function resolvePlace(
   code: string,
@@ -86,27 +96,38 @@ async function resolvePlace(
   const cached = coordCache.get(code);
   if (cached !== undefined) return cached;
 
-  let place: MotisPlace | null = null;
+  let lat = NaN;
+  let lng = NaN;
+  let dbLabel: string | undefined;
   try {
     const hit = await db
       .select({ lat: locations.latitude, lng: locations.longitude, label: locations.label })
       .from(locations)
       .where(eq(locations.code, code))
       .limit(1);
-    const lat = hit[0]?.lat != null ? Number(hit[0].lat) : NaN;
-    const lng = hit[0]?.lng != null ? Number(hit[0].lng) : NaN;
-    if (Number.isFinite(lat) && Number.isFinite(lng)) {
-      // MOTIS akzeptiert `latitude,longitude` direkt als fromPlace/toPlace.
-      place = { id: `${lat},${lng}`, name: hit[0]?.label ?? label ?? code };
-    }
+    lat = hit[0]?.lat != null ? Number(hit[0].lat) : NaN;
+    lng = hit[0]?.lng != null ? Number(hit[0].lng) : NaN;
+    dbLabel = hit[0]?.label ?? undefined;
   } catch {
-    // DB-Fehler → nicht cachen, unten auf Geocode fallen.
+    // DB-Fehler → unten auf Geocode/Koordinate fallen.
   }
 
-  // Kein Koordinaten-Treffer → Label-Geocoding als Fallback.
-  if (!place && label) {
-    place = await motisGeocode(label, signal);
+  const name = dbLabel ?? label;
+  let place: MotisPlace | null = null;
+
+  // 1) Exakte Stop-ID: Label geocoden, den STOP nächst unserer Koordinate nehmen.
+  if (name && Number.isFinite(lat) && Number.isFinite(lng)) {
+    place = await motisGeocodeNearestStop(name, lat, lng, 400, signal);
   }
+  // 2) Sonst Koordinate direkt (MOTIS akzeptiert `lat,lng` als fromPlace/toPlace).
+  if (!place && Number.isFinite(lat) && Number.isFinite(lng)) {
+    place = { id: `${lat},${lng}`, name: name ?? code };
+  }
+  // 3) Gar keine Koordinate → reines Label-Geocode.
+  if (!place && name) {
+    place = await motisGeocode(name, signal);
+  }
+
   coordCache.set(code, place);
   return place;
 }

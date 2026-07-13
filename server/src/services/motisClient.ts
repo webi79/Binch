@@ -123,3 +123,47 @@ export async function motisGeocode(label: string, signal?: AbortSignal): Promise
   geocodeCache.set(key, place);
   return place;
 }
+
+/**
+ * Wie {@link motisGeocode}, aber wählt unter den STOP-Treffern den, der einer
+ * bekannten Referenz-Koordinate am nächsten liegt. Nötig, weil das Routing an
+ * eine reine Koordinate MOTIS auf den *nächstgelegenen* Halt snappen lässt —
+ * bei eng benachbarten Stops (z.B. Zürich Brunau vs. Saalsporthalle) landet man
+ * dann am falschen Halt. Mit der exakten Stop-ID endet die Route genau am
+ * gewählten Ort. Gibt `null`, wenn kein STOP innerhalb `maxMeters` liegt →
+ * Aufrufer fällt auf Koordinaten-Routing zurück (nie 0 Ergebnisse durch einen
+ * Fehlgriff).
+ */
+export async function motisGeocodeNearestStop(
+  label: string,
+  refLat: number,
+  refLng: number,
+  maxMeters = 400,
+  signal?: AbortSignal,
+): Promise<MotisPlace | null> {
+  if (!label.trim()) return null;
+  let raw: Array<{ type?: string; id?: string; name?: string; lat?: number; lon?: number; tz?: string }>;
+  try {
+    raw = (await motisFetch(
+      `/v1/geocode?text=${encodeURIComponent(label)}`,
+      signal,
+    )) as typeof raw;
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(raw)) return null;
+  const cos = Math.cos((refLat * Math.PI) / 180);
+  let best: MotisPlace | null = null;
+  let bestM = Infinity;
+  for (const r of raw) {
+    if (r.type !== "STOP" || !r.id || r.lat == null || r.lon == null) continue;
+    const dy = (r.lat - refLat) * 111_000;
+    const dx = (r.lon - refLng) * 111_000 * cos;
+    const m = Math.sqrt(dx * dx + dy * dy);
+    if (m < bestM) {
+      bestM = m;
+      best = { id: r.id, name: r.name ?? label, lat: r.lat, lon: r.lon, tz: r.tz };
+    }
+  }
+  return bestM <= maxMeters ? best : null;
+}
