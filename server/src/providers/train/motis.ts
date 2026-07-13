@@ -239,37 +239,45 @@ const STATION_ABBR: Record<string, string> = {
   bf: "bahnhof",
 };
 
-/** Stationsnamen vergleichbar machen: Kleinbuchstaben, Abkürzungen aufgelöst. */
-function normStationName(s: string): string {
+/** Stationsname → normalisierte WORT-Liste (Abkürzungen aufgelöst). */
+function stationTokens(s: string): string[] {
   return s
     .toLowerCase()
     .split(/[^\p{L}\p{N}]+/u)
     .filter(Boolean)
-    .map((tok) => STATION_ABBR[tok] ?? tok)
-    .join("");
+    .map((tok) => STATION_ABBR[tok] ?? tok);
 }
 
 /**
  * Meinen die beiden Namen denselben Bahnhof?
  *
- * Neben der Gleichheit erlauben wir nur vorangestellte PRÄFIXE — Feeds hängen
- * gern Verkehrsmittel-Marker davor („S+U Berlin Hauptbahnhof" = „Berlin Hbf").
- * Ein angehängtes SUFFIX dagegen ändert die Bedeutung: „Wien Hauptbahnhof Ost"
- * ist NICHT „Wien Hbf". Genau diese Verwechslung hat uns zum falschen Knoten
- * geroutet (Feed ohne Gleisdaten → Gleis fehlte am Start).
+ * Erlaubt ist nur ein vorangestelltes PRÄFIX — Feeds hängen gern Verkehrsmittel-
+ * Marker davor („S+U Berlin Hauptbahnhof" = „Berlin Hbf"). Ein angehängtes
+ * SUFFIX ändert dagegen die Bedeutung: „Wien Hauptbahnhof Ost" ist NICHT „Wien
+ * Hbf" — diese Verwechslung hat uns schon zum falschen Knoten geroutet (Feed
+ * ohne Gleisdaten → Gleis fehlte am Start).
  *
- * Deshalb endsWith statt includes:
- *   „suberlinhauptbahnhof".endsWith("berlinhauptbahnhof")  → true  (gleich)
- *   „wienhauptbahnhofost".endsWith("wienhauptbahnhof")     → false (anders)
- *   „zürichbahnhofstrassehauptbahnhof" vs „zürichhauptbahnhof" → false
+ * Verglichen wird auf WORT-Ebene, nicht auf dem zusammengeklebten String: sonst
+ * matchte „Neustadt".endsWith("Stadt") — zwei völlig verschiedene Bahnhöfe, und
+ * ein echter Fußweg dorthin wäre verschwunden.
+ *
+ *   ["s","u","berlin","hauptbahnhof"] ⊃ ["berlin","hauptbahnhof"]  → true (Suffix)
+ *   ["wien","hauptbahnhof","ost"]     vs ["wien","hauptbahnhof"]   → false (Präfix)
+ *   ["zürich","bahnhofstrasse","hauptbahnhof"] vs ["zürich","hauptbahnhof"] → false
  *     (echte Tram-Haltestelle nebenan — der Fußweg dorthin muss bleiben)
  */
 function sameStation(a?: string, b?: string): boolean {
   if (!a || !b) return false;
-  const x = normStationName(a);
-  const y = normStationName(b);
-  if (x.length < 4 || y.length < 4) return false;
-  return x === y || x.endsWith(y) || y.endsWith(x);
+  const x = stationTokens(a);
+  const y = stationTokens(b);
+  if (x.length === 0 || y.length === 0) return false;
+
+  // Der kürzere Name muss ein WORT-SUFFIX des längeren sein (= nur Präfixe
+  // dazugekommen). Ein einzelnes Allerweltswort („Bahnhof") reicht dafür nicht.
+  const [short, long] = x.length <= y.length ? [x, y] : [y, x];
+  if (short.length < 2 && long.length !== short.length) return false;
+  const tail = long.slice(long.length - short.length);
+  return short.every((tok, i) => tok === tail[i]);
 }
 
 /**
@@ -297,22 +305,38 @@ function sameStation(a?: string, b?: string): boolean {
 const DAY_TZ = "Europe/Berlin";
 const DEFAULT_HOUR = 8;
 
-function searchStartFor(input: ProviderSearchInput): string {
-  // Surroundings-Departure-Tap: exakter Zeitpunkt.
-  if (input.departTime) return new Date(input.departTime).toISOString();
-
-  // Tagesbeginn des Reisedatums in DAY_TZ. Trick: den Zonen-Offset an diesem
-  // Datum aus der Differenz von UTC- und Zonen-Formatierung ableiten.
-  const midnightUtc = new Date(`${input.departDate.slice(0, 10)}T00:00:00Z`);
+/** Tagesbeginn (00:00 Ortszeit) des Datums in DAY_TZ, als UTC-Millis. Trick: den
+ *  Zonen-Offset an diesem Datum aus der Differenz von UTC- und Zonen-
+ *  Formatierung ableiten. */
+function dayStartMs(date: string): number {
+  const midnightUtc = new Date(`${date.slice(0, 10)}T00:00:00Z`);
   const offsetMs =
     new Date(midnightUtc.toLocaleString("en-US", { timeZone: "UTC" })).getTime() -
     new Date(midnightUtc.toLocaleString("en-US", { timeZone: DAY_TZ })).getTime();
-  const dayStart = midnightUtc.getTime() + offsetMs;
+  return midnightUtc.getTime() + offsetMs;
+}
 
+/** Suchzeitpunkt für einen Reisetag (ohne explizite Uhrzeit). */
+function startForDate(date: string): string {
+  const dayStart = dayStartMs(date);
+  const dayEnd = dayStart + 24 * 3600_000;
   const now = Date.now();
-  const defaultStart = dayStart + DEFAULT_HOUR * 3600_000;
-  // Heute (bzw. Datum liegt schon an) → ab jetzt. Sonst ab DEFAULT_HOUR.
-  return new Date(Math.max(defaultStart, now)).toISOString();
+
+  // Der Reisetag läuft bereits (= heute) → ab JETZT, wie die DB. NICHT ab
+  // DEFAULT_HOUR: eine Suche um 06:00 für heute hätte sonst erst ab 08:00
+  // gesucht und die noch fahrenden Frühzüge verschluckt.
+  if (now >= dayStart && now < dayEnd) return new Date(now).toISOString();
+
+  // Künftiger Tag → ab DEFAULT_HOUR (00:00 zeigte nur Nachtzüge). Liegt der Tag
+  // in der Vergangenheit (sollte der Picker verhindern), ebenso — dann bekommt
+  // der User wenigstens den Fahrplan des Tages statt Verbindungen von heute.
+  return new Date(dayStart + DEFAULT_HOUR * 3600_000).toISOString();
+}
+
+function searchStartFor(input: ProviderSearchInput): string {
+  // Uhrzeit aus dem Picker (bzw. Surroundings-Departure-Tap): exakter Zeitpunkt.
+  if (input.departTime) return new Date(input.departTime).toISOString();
+  return startForDate(input.departDate);
 }
 
 function toLeg(leg: MotisLeg): LegInfo {
@@ -478,8 +502,13 @@ function toNormalized(
     arriveDelayMinutes: delayMinutes(last.to.scheduledArrival, last.to.arrival, last.realTime),
     // Zeitzone der REISE-Endpunkte: departTime/arriveTime beziehen sich seit dem
     // Fußweg-Fix auf sie, nicht mehr auf den ersten/letzten Zug-Halt.
-    originTz: journeyFrom.tz ?? from.tz,
-    destinationTz: journeyTo.tz ?? to.tz,
+    // Beginnt die Reise mit einem Fußweg, ist der Startknoten beim Koordinaten-
+    // Routing ein synthetisches „START" OHNE tz — und die per Koordinate
+    // aufgelöste MotisPlace hat auch keine. Ohne den Zug-Leg als Rückfall
+    // stünde hier `undefined`, und der Client würde die Zeiten in GERÄTE-Zeit
+    // rendern statt in Ortszeit (auf Auslandsstrecken sichtbar falsch).
+    originTz: journeyFrom.tz ?? first.from.tz ?? from.tz,
+    destinationTz: journeyTo.tz ?? last.to.tz ?? to.tz,
     dateOnly: false,
     durationMinutes,
     stops: Math.max(0, transit.length - 1),
@@ -545,53 +574,93 @@ function makeMotisProvider(mode: TravelMode, transitModes: string, name: string)
         return empty(start, { skipped: "motis resolve no match", origin: input.origin, destination: input.destination });
       }
 
-      const time = searchStartFor(input);
-      // Blättert der User („später"), gibt MOTIS den Zeitpunkt über den Cursor
-      // vor — dann ist `time` irrelevant und darf NICHT in den Cache-Key.
-      const cursor = input.paginationToken;
-      const bucket = Math.floor(Date.parse(time) / (10 * 60_000));
-      // transitModes im Key: Bus- und Zug-Suche derselben Strecke dürfen sich
-      // den Plan-Cache NICHT teilen.
-      const cacheKey = cursor
-        ? `${transitModes}|${from.id}|${to.id}|cursor:${cursor}`
-        : `${transitModes}|${from.id}|${to.id}|${bucket}`;
+      // Ein MOTIS-Plan (mit Cache). Wird für Hin- UND Rückfahrt benutzt.
+      const plan = async (
+        a: MotisPlace,
+        b: MotisPlace,
+        time: string,
+        cursor?: string,
+      ): Promise<CachedPlan> => {
+        // Blättert der User („später"), gibt MOTIS den Zeitpunkt über den Cursor
+        // vor — dann ist `time` irrelevant und darf NICHT in den Cache-Key.
+        const bucket = Math.floor(Date.parse(time) / (10 * 60_000));
+        // transitModes im Key: Bus- und Zug-Suche derselben Strecke dürfen sich
+        // den Plan-Cache NICHT teilen.
+        const key = cursor
+          ? `${transitModes}|${a.id}|${b.id}|cursor:${cursor}`
+          : `${transitModes}|${a.id}|${b.id}|${bucket}`;
+        const hit = planCache.get(key);
+        if (hit) return hit;
 
-      let cached = planCache.get(cacheKey);
-      const fromCache = cached !== undefined;
-      if (!cached) {
-        try {
-          const url =
-            `/v6/plan?fromPlace=${encodeURIComponent(from.id)}` +
-            `&toPlace=${encodeURIComponent(to.id)}` +
-            (cursor
-              ? `&pageCursor=${encodeURIComponent(cursor)}`
-              : `&time=${encodeURIComponent(time)}`) +
-            // maxTransfers=5 kappt absurde Pareto-Odysseen (6+ Umstiege quer
-            // durchs Regionalnetz), die die DB nie zeigt — legitime grenz-
-            // überschreitende+lokale Routen brauchen max. ~3-4 Umstiege.
-            `&transitModes=${encodeURIComponent(transitModes)}&numItineraries=6&maxTransfers=5&detailedTransfers=false`;
-          const raw = (await motisFetch(url, signal)) as {
-            itineraries?: MotisItinerary[];
-            nextPageCursor?: string;
-          };
-          cached = { itineraries: raw.itineraries ?? [], nextPageCursor: raw.nextPageCursor };
-          planCache.set(cacheKey, cached);
-        } catch (e) {
-          return empty(start, { error: "motis_plan_failed", message: e instanceof Error ? e.message : String(e) });
+        const url =
+          `/v6/plan?fromPlace=${encodeURIComponent(a.id)}` +
+          `&toPlace=${encodeURIComponent(b.id)}` +
+          (cursor
+            ? `&pageCursor=${encodeURIComponent(cursor)}`
+            : `&time=${encodeURIComponent(time)}`) +
+          // maxTransfers=5 kappt absurde Pareto-Odysseen (6+ Umstiege quer
+          // durchs Regionalnetz), die die DB nie zeigt — legitime grenz-
+          // überschreitende+lokale Routen brauchen max. ~3-4 Umstiege.
+          `&transitModes=${encodeURIComponent(transitModes)}&numItineraries=6&maxTransfers=5&detailedTransfers=false`;
+        const raw = (await motisFetch(url, signal)) as {
+          itineraries?: MotisItinerary[];
+          nextPageCursor?: string;
+        };
+        const fresh: CachedPlan = {
+          itineraries: raw.itineraries ?? [],
+          nextPageCursor: raw.nextPageCursor,
+        };
+        planCache.set(key, fresh);
+        return fresh;
+      };
+
+      let outbound: CachedPlan;
+      // Rückfahrt: bisher las NUR dbVendo `returnDate` — und der ist von der DB
+      // geblockt. „Hin & Rück" lieferte damit gar keine Rückfahrt, der
+      // Richtungs-Umschalter erschien nie. Jetzt routet MOTIS die Gegenrichtung
+      // gleich mit (nur bei der ersten Seite — beim „Später"-Blättern gilt der
+      // Cursor der Hinfahrt).
+      let inbound: CachedPlan | null = null;
+      try {
+        const cursor = input.paginationToken;
+        outbound = await plan(from, to, searchStartFor(input), cursor);
+        if (input.returnDate && !cursor) {
+          inbound = await plan(to, from, startForDate(input.returnDate));
         }
+      } catch (e) {
+        return empty(start, { error: "motis_plan_failed", message: e instanceof Error ? e.message : String(e) });
       }
 
-      const results = dropReferenceDuplicates(cached.itineraries)
+      const results = dropReferenceDuplicates(outbound.itineraries)
         .map((it, i) => toNormalized(it, input, from!, to!, i, mode))
         .filter((r): r is NormalizedResult => r !== null);
+
+      if (inbound) {
+        // Für die Rückfahrt sind Start/Ziel vertauscht — sonst trüge sie die
+        // Labels der Hinfahrt.
+        const back: ProviderSearchInput = {
+          ...input,
+          origin: input.destination,
+          destination: input.origin,
+          originLabel: input.destLabel,
+          destLabel: input.originLabel,
+          departDate: input.returnDate!,
+          departTime: undefined,
+        };
+        const returnResults = dropReferenceDuplicates(inbound.itineraries)
+          .map((it, i) => toNormalized(it, back, to!, from!, i, mode))
+          .filter((r): r is NormalizedResult => r !== null)
+          .map((r) => ({ ...r, direction: "RETURN" as const }));
+        results.push(...returnResults);
+      }
 
       return {
         results,
         // „Später"-Blättern: der Client schickt den Cursor beim nächsten Call
         // zurück. So kommt der User billig durch den Tag, ohne dass wir ein
         // teures 24h-Fenster anfragen müssen.
-        paginationToken: cached.nextPageCursor,
-        raw: { source: name, from: from.id, to: to.id, count: results.length, planCached: fromCache },
+        paginationToken: outbound.nextPageCursor,
+        raw: { source: name, from: from.id, to: to.id, count: results.length },
         statusCode: 200,
         durationMs: Date.now() - start,
       };

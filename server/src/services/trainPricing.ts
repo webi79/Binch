@@ -124,9 +124,12 @@ async function fetchDbwebJourneys(
 
   // dbweb will Lokalzeit-ISO ohne Offset.
   const dep = new Date(departure).toISOString().slice(0, 16);
+  // results=10 statt 6: unsere MOTIS-Treffer spannen ein Zeitfenster auf (mehrere
+  // Abfahrten). Liefert dbweb weniger Verbindungen als das Fenster breit ist,
+  // bleiben die späteren Treffer ohne Preis/Route. Kostet trotzdem nur EINEN Call.
   const url =
     `${config.DBWEB_BASE_URL}/journeys?from=${encodeURIComponent(fromEva)}` +
-    `&to=${encodeURIComponent(toEva)}&departure=${encodeURIComponent(dep)}&results=6` +
+    `&to=${encodeURIComponent(toEva)}&departure=${encodeURIComponent(dep)}&results=10` +
     // stopovers=true: wir zeigen die dbweb-Route inkl. Zwischenhalten in der
     // Timeline an (nicht mehr nur Preis-Enrichment).
     `&stopovers=true`;
@@ -331,9 +334,26 @@ export async function enrichTrainResults(
   const [fromEva, toEva] = await Promise.all([evaFor(input.origin), evaFor(input.destination)]);
   if (!fromEva || !toEva) return; // non-DE Stop ohne EVA → keine dbweb-Daten
 
+  // Die dbweb-Suche MUSS am selben Zeitfenster hängen wie die MOTIS-Ergebnisse,
+  // die sie anreichern soll. Vorher stand hier `input.departDate` — ein reines
+  // Datum, also Mitternacht: dbweb lieferte Nachtzüge, MOTIS die Verbindungen ab
+  // der gewählten Uhrzeit. Die Fenster überlappten nicht, nichts matchte, und die
+  // Anreicherung fiel still aus (keine Preise, keine bahn.de-Route).
+  //
+  // Anker ist die FRÜHESTE Zugabfahrt unter unseren Ergebnissen (minus eine
+  // Minute, damit sie selbst noch im Fenster liegt). Damit kann das Fenster
+  // gar nicht mehr auseinanderlaufen — egal woher der Suchzeitpunkt kam.
+  const earliest = results
+    .map((r) => Date.parse(trainAnchors(r).dep))
+    .filter((t) => Number.isFinite(t))
+    .sort((a, b) => a - b)[0];
+  const anchor = earliest
+    ? new Date(earliest - 60_000).toISOString()
+    : input.departDate;
+
   let journeys: DbwebJourney[];
   try {
-    journeys = await fetchDbwebJourneys(fromEva, toEva, input.departDate);
+    journeys = await fetchDbwebJourneys(fromEva, toEva, anchor);
   } catch {
     return; // int.bahn.de gedrosselt/aus → MOTIS-Route/Kein-Preis bleiben
   }
@@ -360,11 +380,15 @@ export async function enrichTrainResults(
 
   for (const r of results) {
     const anchors = trainAnchors(r);
-    const m = byDep.get(hhmm(anchors.dep, r.originTz));
+    // BEIDE Seiten im selben Zeitzonen-Rahmen (dbwebs, also Europe/Berlin)
+    // formatieren. Nähme man hier die originTz/destinationTz des Ergebnisses,
+    // verglichen wir bei abweichendem Offset Äpfel mit Birnen und das Matching
+    // liefe still ins Leere.
+    const m = byDep.get(hhmm(anchors.dep));
     if (!m) continue;
     // Ankunfts-Gegencheck: gleicher Zug (schützt vor identischer Abfahrtsminute).
     const rd = Math.abs(
-      hhmmToMin(hhmm(m.route.trainArriveTime)) - hhmmToMin(hhmm(anchors.arr, r.destinationTz)),
+      hhmmToMin(hhmm(m.route.trainArriveTime)) - hhmmToMin(hhmm(anchors.arr)),
     );
     if (Math.min(rd, 1440 - rd) > 25) continue;
 

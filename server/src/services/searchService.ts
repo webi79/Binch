@@ -147,7 +147,7 @@ const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 h
  * WICHTIG: Wert nie in die Zukunft setzen (== aktuelle Deploy-Zeit), sonst
  * qualifiziert keine frisch geschriebene Row → Cache komplett aus.
  */
-const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T22:41:00Z");
+const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T23:04:00Z");
 
 /** In-Flight-Map: Schlüssel = cacheKey, Wert = Promise des laufenden Calls. */
 const inFlight = new Map<string, Promise<SearchOutput>>();
@@ -371,7 +371,7 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
   // (noch) nicht — das DB-Schema hat keine `direction`-Spalte, und der
   // Round-Trip-Cache ist eh deaktiviert (siehe loadFromCache). Rück-Treffer
   // bekommen keinen redirectToken; der Client nutzt für sie deepLink direkt.
-  const outboundCandidates = deduped.filter((c) => c.result.direction !== "RETURN");
+  let outboundCandidates = deduped.filter((c) => c.result.direction !== "RETURN");
   const returnCandidates = deduped.filter((c) => c.result.direction === "RETURN");
 
   // Zug-Enrichment: EIN int.bahn.de-Call ersetzt bei Match die MOTIS-Route
@@ -379,6 +379,12 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
   // Buchung. Best-effort — bei Drosselung/non-DE bleiben die MOTIS-Routen.
   if (input.mode === "TRAIN" && outboundCandidates.length > 0) {
     await enrichTrainResults(outboundCandidates.map((c) => c.result), input);
+    // NOCHMAL deduplizieren: Das Enrichment ersetzt Label und Route durch die
+    // von bahn.de. Zwei MOTIS-Varianten desselben Zuges (z.B. „IC 63" aus DELFI
+    // und „RJX 63" aus dem Referenz-Feed) überleben den ersten Dedup, weil ihre
+    // Labels sich unterscheiden — nach der Ersetzung sind sie identisch und
+    // stünden doppelt in der Liste.
+    outboundCandidates = dedupe(outboundCandidates, input.mode);
   }
 
   const flatResults: ClientResult[] = [];
