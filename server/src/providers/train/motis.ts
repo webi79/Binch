@@ -120,8 +120,9 @@ async function resolvePlace(
     place = await motisGeocodeNearestStop(name, lat, lng, 400, signal);
   }
   // 2) Sonst Koordinate direkt (MOTIS akzeptiert `lat,lng` als fromPlace/toPlace).
+  //    lat/lon mitgeben — Aufrufer (Deeplink) brauchen sie als Fallback.
   if (!place && Number.isFinite(lat) && Number.isFinite(lng)) {
-    place = { id: `${lat},${lng}`, name: name ?? code };
+    place = { id: `${lat},${lng}`, name: name ?? code, lat, lon: lng };
   }
   // 3) Gar keine Koordinate → reines Label-Geocode.
   if (!place && name) {
@@ -282,6 +283,10 @@ function toNormalized(
   // steht am jeweiligen Leg in der Timeline.
   const startsWithWalk = journeyLegs[0]?.mode === "WALK";
 
+  // Echte Endpunkte der Reise (können Fußweg-Enden sein) — für Deeplink + TZ.
+  const journeyFrom = journeyLegs[0]!.from;
+  const journeyTo = journeyLegs[journeyLegs.length - 1]!.to;
+
   // Umstiegs-Stationen = Ziel jedes Transit-Legs außer dem letzten.
   const transferLabels = transit
     .slice(0, -1)
@@ -315,8 +320,10 @@ function toNormalized(
     // Ankunft am Ziel verschiebt sich sehr wohl mit dem letzten Fahrzeug —
     // auch wenn danach noch ein Fußweg kommt.
     arriveDelayMinutes: delayMinutes(last.to.scheduledArrival, last.to.arrival, last.realTime),
-    originTz: first.from.tz ?? from.tz,
-    destinationTz: last.to.tz ?? to.tz,
+    // Zeitzone der REISE-Endpunkte: departTime/arriveTime beziehen sich seit dem
+    // Fußweg-Fix auf sie, nicht mehr auf den ersten/letzten Zug-Halt.
+    originTz: journeyFrom.tz ?? from.tz,
+    destinationTz: journeyTo.tz ?? to.tz,
     dateOnly: false,
     durationMinutes,
     stops: Math.max(0, transit.length - 1),
@@ -330,13 +337,17 @@ function toNormalized(
     // link (bahn.de/buchung/start?vbid) wird beim Tap aus dem bookingToken
     // (Recon, via trainPricing-Enrichment) erzeugt — greift der nicht, landet
     // der Redirect auf dieser Suche. Nur für Züge (bahn.de ist Bahn-zentriert).
+    // Endpunkte der REISE, nicht des ersten/letzten Zug-Legs: bei einem
+    // Zugangs-Fußweg wäre `first.from` eine Tram-Haltestelle — der Deeplink
+    // hätte dann den Namen des gewählten Bahnhofs, aber dessen Koordinaten.
+    // bahn.de löst nach Koordinate auf → falscher Startort.
     deepLink:
       mode === "TRAIN"
         ? buildBahnDeeplink({
-            origin: { name: input.originLabel ?? from.name, lat: first.from.lat, lng: first.from.lon },
-            destination: { name: input.destLabel ?? to.name, lat: last.to.lat, lng: last.to.lon },
+            origin: { name: input.originLabel ?? from.name, lat: journeyFrom.lat, lng: journeyFrom.lon },
+            destination: { name: input.destLabel ?? to.name, lat: journeyTo.lat, lng: journeyTo.lon },
             departTime,
-            originTz: first.from.tz ?? from.tz,
+            originTz: journeyFrom.tz ?? from.tz,
           })
         : "",
     // flightNumber dient als Linien-Kürzel: Fern "ICE 523", Nah "RE1".

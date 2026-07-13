@@ -503,9 +503,10 @@ function TransportSegment({ leg }: { leg: SyntheticLeg }) {
             <View style={[styles.walkBadge, { backgroundColor: accent.subtle }]}>
               <Footprints size={16} color={accent.solid} strokeWidth={2.2} />
             </View>
+            {/* Dauer steht bereits in der Zeitspalte links (wie bei allen Legs) —
+                hier nicht nochmal wiederholen. */}
             <View style={{ flex: 1 }}>
               <Text style={styles.transferTitle}>{t("details.walk")}</Text>
-              <Text style={styles.transferMeta}>{formatDuration(leg.durationMinutes)}</Text>
             </View>
           </View>
         </View>

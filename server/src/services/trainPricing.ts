@@ -185,6 +185,10 @@ interface DbwebRoute {
   stopLabels: string[];
   departTime: string;
   arriveTime: string;
+  /** Abfahrt des ERSTEN ZUGES (ohne Zugangs-Fußweg) — nur zum Matchen. */
+  trainDepartTime: string;
+  /** Ankunft des LETZTEN ZUGES (ohne Abgangs-Fußweg) — nur zum Matchen. */
+  trainArriveTime: string;
   durationMinutes: number;
   flightNumber?: string;
   operatedBy?: string;
@@ -192,18 +196,41 @@ interface DbwebRoute {
   arriveDelayMinutes?: number;
 }
 
-/** Baut aus einer dbweb-Journey die vollständige Anzeige-Route (nur Transit-
- *  Legs; Fußwege raus, wie bei MOTIS). null wenn unbrauchbar. */
+/** Baut aus einer dbweb-Journey die vollständige Anzeige-Route. Fußwege gehören
+ *  DAZU (wie in motis.ts): ließe man sie weg, endete die Route sichtbar am
+ *  letzten Fahrzeug-Halt statt am Ziel und die Dauer wäre gelogen. null wenn
+ *  unbrauchbar. */
 function buildDbwebRoute(j: DbwebJourney): DbwebRoute | null {
-  const transit = (j.legs ?? []).filter((l) => l.line && !l.walking);
+  const all = (j.legs ?? []).filter((l) => l.line || l.walking);
+  const transit = all.filter((l) => l.line && !l.walking);
   const first = transit[0];
   const last = transit[transit.length - 1];
-  const departTime = iso(first?.plannedDeparture ?? first?.departure);
-  const arriveTime = iso(last?.plannedArrival ?? last?.arrival);
-  if (!first || !last || !departTime || !arriveTime) return null;
+  if (!first || !last) return null;
+
+  // Fußwege mitnehmen, 0-Minuten-Stubs raus.
+  const journey = all.filter((l) => {
+    if (!l.walking) return true;
+    const d = iso(l.plannedDeparture ?? l.departure);
+    const a = iso(l.plannedArrival ?? l.arrival);
+    if (!d || !a) return false;
+    return Math.round((Date.parse(a) - Date.parse(d)) / 60_000) >= 1;
+  });
+  const jFirst = journey[0];
+  const jLast = journey[journey.length - 1];
+
+  // Anzeige-Zeiten = ganze Reise inkl. Fußwege.
+  const departTime = iso(jFirst?.plannedDeparture ?? jFirst?.departure);
+  const arriveTime = iso(jLast?.plannedArrival ?? jLast?.arrival);
+  // Matching-Anker = erste Zugabfahrt / letzte Zugankunft. Der REISEBEGINN taugt
+  // dafür nicht: MOTIS und bahn.de routen Fußwege unterschiedlich, der Reisebeginn
+  // weicht dann um Minuten ab und das Matching (auf die Minute) liefe ins Leere.
+  // Die Zugabfahrt dagegen ist auf beiden Seiten dieselbe Fahrplan-Tatsache.
+  const trainDepartTime = iso(first.plannedDeparture ?? first.departure);
+  const trainArriveTime = iso(last.plannedArrival ?? last.arrival);
+  if (!departTime || !arriveTime || !trainDepartTime || !trainArriveTime) return null;
 
   const legs: LegInfo[] = [];
-  for (const seg of transit) {
+  for (const seg of journey) {
     const d = iso(seg.plannedDeparture ?? seg.departure);
     const a = iso(seg.plannedArrival ?? seg.arrival);
     if (!d || !a) continue;
@@ -238,7 +265,7 @@ function buildDbwebRoute(j: DbwebJourney): DbwebRoute | null {
       product: dbwebProductToMode(seg.line?.product),
       fahrtNr: seg.line?.fahrtNr,
       direction: seg.direction,
-      walking: false,
+      walking: !!seg.walking,
       stops: stopovers.length,
       stopovers: stopovers.length > 0 ? stopovers : undefined,
       tripId: seg.tripId,
@@ -262,11 +289,29 @@ function buildDbwebRoute(j: DbwebJourney): DbwebRoute | null {
     stopLabels,
     departTime,
     arriveTime,
+    trainDepartTime,
+    trainArriveTime,
     durationMinutes: Math.max(1, Math.round((Date.parse(arriveTime) - Date.parse(departTime)) / 60_000)),
     flightNumber: cleanLineLabel(first.line),
     operatedBy,
-    departDelayMinutes: legDelay(first.plannedDeparture, first.departure),
+    // Startet die Reise mit einem Fußweg, ist die Abfahrt am Ursprung nicht
+    // verspätet — die Zug-Verspätung steht am jeweiligen Leg (wie in motis.ts).
+    departDelayMinutes: jFirst?.walking
+      ? undefined
+      : legDelay(first.plannedDeparture, first.departure),
     arriveDelayMinutes: legDelay(last.plannedArrival, last.arrival),
+  };
+}
+
+/** Abfahrt des ersten bzw. Ankunft des letzten FAHRZEUG-Legs eines Ergebnisses —
+ *  der Matching-Anker gegen dbweb (Fußwege bleiben außen vor). */
+function trainAnchors(r: NormalizedResult): { dep: string; arr: string } {
+  const legs = r.legs ?? [];
+  const firstTransit = legs.find((l) => !l.walking);
+  const lastTransit = [...legs].reverse().find((l) => !l.walking);
+  return {
+    dep: firstTransit?.departTime ?? r.departTime,
+    arr: lastTransit?.arriveTime ?? r.arriveTime,
   };
 }
 
@@ -294,12 +339,14 @@ export async function enrichTrainResults(
   }
 
   const pax = Math.max(1, input.passengers ?? 1);
-  // dbweb-Route je Abfahrts-HH:MM (NICHT über Label matchen — das weicht ab).
+  // dbweb-Route je ZUG-Abfahrts-HH:MM (NICHT über Label matchen — das weicht ab;
+  // und NICHT über den Reisebeginn — der hängt am Fußweg-Routing, das bei MOTIS
+  // und bahn.de auseinandergeht).
   const byDep = new Map<string, { route: DbwebRoute; price?: number; currency: string; recon?: string }>();
   for (const j of journeys) {
     const route = buildDbwebRoute(j);
     if (!route) continue;
-    const k = hhmm(route.departTime);
+    const k = hhmm(route.trainDepartTime);
     if (byDep.has(k)) continue;
     const amount = j.price?.amount;
     byDep.set(k, {
@@ -312,10 +359,13 @@ export async function enrichTrainResults(
   if (byDep.size === 0) return;
 
   for (const r of results) {
-    const m = byDep.get(hhmm(r.departTime, r.originTz));
+    const anchors = trainAnchors(r);
+    const m = byDep.get(hhmm(anchors.dep, r.originTz));
     if (!m) continue;
     // Ankunfts-Gegencheck: gleicher Zug (schützt vor identischer Abfahrtsminute).
-    const rd = Math.abs(hhmmToMin(hhmm(m.route.arriveTime)) - hhmmToMin(hhmm(r.arriveTime, r.destinationTz)));
+    const rd = Math.abs(
+      hhmmToMin(hhmm(m.route.trainArriveTime)) - hhmmToMin(hhmm(anchors.arr, r.destinationTz)),
+    );
     if (Math.min(rd, 1440 - rd) > 25) continue;
 
     // Route KOMPLETT durch bahn.de ersetzen — Identität (id/redirectToken) und

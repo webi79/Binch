@@ -140,7 +140,7 @@ const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 h
  * WICHTIG: Wert nie in die Zukunft setzen (== aktuelle Deploy-Zeit), sonst
  * qualifiziert keine frisch geschriebene Row → Cache komplett aus.
  */
-const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T21:06:00Z");
+const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T21:21:00Z");
 
 /** In-Flight-Map: Schlüssel = cacheKey, Wert = Promise des laufenden Calls. */
 const inFlight = new Map<string, Promise<SearchOutput>>();
@@ -611,10 +611,37 @@ export async function runSearch(input: SearchInput): Promise<SearchOutput> {
 const TRANSFER_PENALTY_MIN = 20;
 
 /**
- * „Verbindungsqualität" à la DB: Reisezeit + Umstiegsstrafe. Kleiner = besser.
+ * Zusatzgewicht für Gehminuten. Gehen ist anstrengender als Sitzen — Reise-
+ * auskünfte gewichten Fußwege daher schwerer als Fahrzeit (üblich: Faktor
+ * 1.5-2). Die Gehzeit steckt schon voll in `durationMinutes`; dieser Aufschlag
+ * macht daraus effektiv Faktor 1.5. Ohne ihn läge eine Verbindung mit 19 min
+ * Fußweg gleichauf mit einer gleich langen, in der man durchsitzt.
  */
-function connectionScore(r: { durationMinutes: number; stops: number }): number {
-  return r.durationMinutes + TRANSFER_PENALTY_MIN * Math.max(0, r.stops);
+const WALK_EXTRA_WEIGHT = 0.5;
+
+/**
+ * „Verbindungsqualität" à la DB: Reisezeit + Umstiegsstrafe + Geh-Aufschlag.
+ * Kleiner = besser.
+ *
+ * Die Umstiegsstrafe wird an der Reiselänge skaliert: 20 min sind bei einer
+ * 4-Stunden-Fernfahrt richtig (verpasster Anschluss kostet viel), bei einer
+ * 21-Minuten-Stadtfahrt aber absurd — dort verdrängte sie sonst die schnellere
+ * S-Bahn-Verbindung zugunsten einer langsamen, umstiegsfreien Tram.
+ */
+function connectionScore(r: {
+  durationMinutes: number;
+  stops: number;
+  legs?: LegInfo[] | null;
+}): number {
+  const walkMin = (r.legs ?? [])
+    .filter((l) => l.walking)
+    .reduce((sum, l) => sum + (l.durationMinutes || 0), 0);
+  const perTransfer = Math.min(TRANSFER_PENALTY_MIN, 0.15 * r.durationMinutes);
+  return (
+    r.durationMinutes +
+    perTransfer * Math.max(0, r.stops) +
+    WALK_EXTRA_WEIGHT * walkMin
+  );
 }
 
 /**
@@ -674,8 +701,15 @@ function fingerprint(r: NormalizedResult, mode: TravelMode): string {
     // — die DB zeigt pro Abfahrt genau die beste Variante. Darum nur erster Zug
     // + Abfahrt + Strecke im Key (NICHT Ankunft/Stops, sonst bleiben die
     // Varianten getrennt); dedupe() behält die beste Verbindungsqualität.
+    //
+    // Anker ist die Abfahrt des ersten ZUGES, nicht der Reisebeginn: seit
+    // Fußwege Teil der Reise sind, schwankt der Reisebeginn mit dem
+    // Fußweg-Routing — derselbe Zug bekäme sonst je Variante einen anderen Key
+    // und würde nicht mehr dedupliziert.
+    const firstTransit = r.legs?.find((l) => !l.walking);
+    const trainDep = roundToMinute(firstTransit?.departTime ?? r.departTime);
     const first = (r.flightNumber ?? r.operatedBy ?? "").toUpperCase();
-    return `train:${first}|${dep}|${route}`;
+    return `train:${first}|${trainDep}|${route}`;
   }
   if (mode === "FLIGHT" && r.flightNumber) {
     // ANKUNFT + STOPS gehören in den Fingerprint, sonst kollabieren völlig
