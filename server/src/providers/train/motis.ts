@@ -58,6 +58,8 @@ interface MotisLegStop {
   scheduledArrival?: string;
   scheduledDeparture?: string;
   track?: string;
+  /** Fahrplan-Gleis. MOTIS füllt mal nur `track`, mal beides — beide lesen. */
+  scheduledTrack?: string;
 }
 interface MotisLeg {
   mode: string;
@@ -72,6 +74,8 @@ interface MotisLeg {
   agencyName?: string;
   realTime?: boolean;
   tripId?: string;
+  /** Herkunfts-Feed, z.B. "de_DELFI.gtfs.zip/..." — siehe dropReferenceDuplicates. */
+  source?: string;
   intermediateStops?: MotisLegStop[];
 }
 interface MotisItinerary {
@@ -79,6 +83,49 @@ interface MotisItinerary {
   endTime: string;
   transfers?: number;
   legs: MotisLeg[];
+}
+
+/**
+ * Transitous speist neben den operativen Fahrplänen (de_DELFI, ÖBB, SBB …) auch
+ * einen REFERENZDATEN-Feed ein (`at_Railway-Current-Reference-Data`). Der bildet
+ * dieselben Fahrten nochmal ab, aber schlechter:
+ *   - keine Gleise (München Hbf ohne „Gl. 11"),
+ *   - eigene Bahnhofs-Knoten mit abweichenden Namen („München Hauptbahnhof"),
+ *     was uns die Phantom-Fußwege und den falschen Geocode eingebracht hat.
+ * Landet so eine Dublette im Ranking oben, fehlt dem User das Gleis.
+ *
+ * Also: Referenz-Variante verwerfen, WENN dieselbe Fahrt (gleiche Abfahrt +
+ * Ankunft) auch aus einem operativen Feed vorliegt. Gibt es sie NUR dort, bleibt
+ * sie — so geht keine Verbindung verloren.
+ */
+function isReferenceLeg(leg: MotisLeg): boolean {
+  return /reference-data/i.test(leg.source ?? "");
+}
+
+function dropReferenceDuplicates(itineraries: MotisItinerary[]): MotisItinerary[] {
+  const tripKey = (it: MotisItinerary): string | null => {
+    const transit = it.legs.filter((l) => l.mode !== "WALK");
+    const first = transit[0];
+    const last = transit[transit.length - 1];
+    if (!first || !last) return null;
+    const dep = first.from.scheduledDeparture ?? first.from.departure ?? "";
+    const arr = last.to.scheduledArrival ?? last.to.arrival ?? "";
+    return dep && arr ? `${dep}|${arr}` : null;
+  };
+
+  const operational = new Set<string>();
+  for (const it of itineraries) {
+    const isRef = it.legs.some((l) => l.mode !== "WALK" && isReferenceLeg(l));
+    const k = tripKey(it);
+    if (!isRef && k) operational.add(k);
+  }
+
+  return itineraries.filter((it) => {
+    const isRef = it.legs.some((l) => l.mode !== "WALK" && isReferenceLeg(l));
+    if (!isRef) return true;
+    const k = tripKey(it);
+    return !k || !operational.has(k);
+  });
 }
 
 /**
@@ -146,7 +193,7 @@ function toStopovers(stops: MotisLegStop[] | undefined): StopoverInfo[] | undefi
     // Verspätung; sonst zeigt die Timeline verwirrende „Ist"-Zeiten.
     arrival: s.scheduledArrival ?? s.arrival,
     departure: s.scheduledDeparture ?? s.departure,
-    platform: s.track,
+    platform: s.track ?? s.scheduledTrack,
   }));
 }
 
@@ -203,21 +250,26 @@ function normStationName(s: string): string {
 }
 
 /**
- * Meinen die beiden Namen denselben Bahnhof? Zusätzlich zur Gleichheit erlauben
- * wir Enthaltensein, weil Feeds gern Präfixe dranhängen („S+U Berlin
- * Hauptbahnhof" ⊃ „Berlin Hbf").
+ * Meinen die beiden Namen denselben Bahnhof?
  *
- * Bewusst NUR zusammenhängende Teilstrings: „Zürich HB" (zürichhauptbahnhof)
- * steckt NICHT in „Zürich, Bahnhofstrasse/HB" (zürichbahnhofstrassehauptbahnhof)
- * — das ist eine echte Tram-Haltestelle nebenan, der Fußweg dorthin ist real und
- * muss bleiben. Eine Token-Teilmenge würde hier fälschlich matchen.
+ * Neben der Gleichheit erlauben wir nur vorangestellte PRÄFIXE — Feeds hängen
+ * gern Verkehrsmittel-Marker davor („S+U Berlin Hauptbahnhof" = „Berlin Hbf").
+ * Ein angehängtes SUFFIX dagegen ändert die Bedeutung: „Wien Hauptbahnhof Ost"
+ * ist NICHT „Wien Hbf". Genau diese Verwechslung hat uns zum falschen Knoten
+ * geroutet (Feed ohne Gleisdaten → Gleis fehlte am Start).
+ *
+ * Deshalb endsWith statt includes:
+ *   „suberlinhauptbahnhof".endsWith("berlinhauptbahnhof")  → true  (gleich)
+ *   „wienhauptbahnhofost".endsWith("wienhauptbahnhof")     → false (anders)
+ *   „zürichbahnhofstrassehauptbahnhof" vs „zürichhauptbahnhof" → false
+ *     (echte Tram-Haltestelle nebenan — der Fußweg dorthin muss bleiben)
  */
 function sameStation(a?: string, b?: string): boolean {
   if (!a || !b) return false;
   const x = normStationName(a);
   const y = normStationName(b);
   if (x.length < 4 || y.length < 4) return false;
-  return x === y || x.includes(y) || y.includes(x);
+  return x === y || x.endsWith(y) || y.endsWith(x);
 }
 
 /**
@@ -285,8 +337,8 @@ function toLeg(leg: MotisLeg): LegInfo {
     departDelayMinutes: delayMinutes(leg.from.scheduledDeparture, leg.from.departure, leg.realTime),
     arriveDelayMinutes: delayMinutes(leg.to.scheduledArrival, leg.to.arrival, leg.realTime),
     durationMinutes,
-    departPlatform: leg.from.track,
-    arrivePlatform: leg.to.track,
+    departPlatform: leg.from.track ?? leg.from.scheduledTrack,
+    arrivePlatform: leg.to.track ?? leg.to.scheduledTrack,
     line: lineLabel(leg),
     product: leg.mode,
     fahrtNr: leg.tripShortName || undefined,
@@ -529,7 +581,7 @@ function makeMotisProvider(mode: TravelMode, transitModes: string, name: string)
         }
       }
 
-      const results = cached.itineraries
+      const results = dropReferenceDuplicates(cached.itineraries)
         .map((it, i) => toNormalized(it, input, from!, to!, i, mode))
         .filter((r): r is NormalizedResult => r !== null);
 

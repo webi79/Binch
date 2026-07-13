@@ -124,9 +124,23 @@ export async function motisGeocode(label: string, signal?: AbortSignal): Promise
   return place;
 }
 
-/** Namen vergleichbar machen: Kleinbuchstaben, alles Nicht-Alphanumerische raus. */
+/** Bahnhofs-Abkürzungen, die dieselbe Station meinen (als ganzes Wort ersetzen —
+ *  sonst würde „Bahnhofstrasse" verstümmelt). */
+const STATION_ABBR: Record<string, string> = {
+  hbf: "hauptbahnhof",
+  hb: "hauptbahnhof",
+  bhf: "bahnhof",
+  bf: "bahnhof",
+};
+
+/** Namen vergleichbar machen: Kleinbuchstaben, Abkürzungen aufgelöst. */
 function normName(s: string): string {
-  return s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+  return s
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean)
+    .map((tok) => STATION_ABBR[tok] ?? tok)
+    .join("");
 }
 
 /**
@@ -182,14 +196,13 @@ export async function motisGeocodeNearestStop(
     if (r.type !== "STOP" || !r.id || !r.name || r.lat == null || r.lon == null) continue;
     if (isReferenceFeed(r.id)) continue;
 
-    // Name muss der gewählte Ort sein — sonst landen wir auf einem Nachbar-Halt
-    // („Zürich, Sihlquai/HB" für „Zürich HB").
-    const got = normName(r.name);
-    const nameMatches =
-      got === want ||
-      ((got.includes(want) || want.includes(got)) &&
-        Math.min(got.length, want.length) / Math.max(got.length, want.length) >= 0.8);
-    if (!nameMatches) continue;
+    // Name muss EXAKT der gewählte Ort sein (Abkürzungen aufgelöst). Bewusst
+    // keine Teilstring-Toleranz: „Wien Hbf" hätte sonst auf „Wien Hauptbahnhof
+    // OST" gematcht — ein anderer Halt, aus einem Feed ohne Gleisdaten. Wir
+    // routeten dorthin, und dem User fehlte am Start das Gleis. Ein falsches
+    // Routing-Ziel ist der teuerste Fehler hier; im Zweifel lieber `null` →
+    // Koordinaten-Routing, bei dem MOTIS selbst den bedienten Halt trifft.
+    if (normName(r.name) !== want) continue;
 
     const dy = (r.lat - refLat) * 111_000;
     const dx = (r.lon - refLng) * 111_000 * cos;
