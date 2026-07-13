@@ -33,6 +33,24 @@ const schema = z.object({
     .default("true")
     .transform((v) => v !== "false" && v !== "0"),
 
+  /**
+   * db-vendo als SUCH-Provider (Zug + Bus). Default AUS.
+   *
+   * Die DB blockt db-vendo-client extern (Akamai/OPS_BLOCKED) — der Provider
+   * lieferte über 3 h Messung 0 Treffer bei 72 Aufrufen, klopfte also nur
+   * nutzlos gegen die gesperrte API. MOTIS deckt Zug UND Bus inzwischen
+   * vollständig ab (inkl. Rückfahrt und Zugangs-Fußwegen).
+   *
+   * Betrifft nur die SUCHE. Der dbrest-Sidecar bleibt für Trip-Details,
+   * Live-Positionen und Stop-Infos in Betrieb (eigene Endpoints).
+   *
+   * Sobald die DB uns wieder durchlässt: DBVENDO_SEARCH_ENABLED=true.
+   */
+  DBVENDO_SEARCH_ENABLED: z
+    .string()
+    .default("false")
+    .transform((v) => v !== "false" && v !== "0"),
+
   RAPIDAPI_KEY: z.string().optional(),
   // SearchAPI.io — primärer Google-Flights-Provider (zuverlässiger Scraper:
   // volle Provider-Listen + günstige Tarife). google-flights2 (RAPIDAPI_KEY)

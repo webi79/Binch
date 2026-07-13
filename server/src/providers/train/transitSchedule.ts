@@ -11,6 +11,7 @@ import {
   getScheduledStopBoard,
   getScheduledTripStops,
 } from "../../services/gtfsSchedule.js";
+import { config } from "../../config.js";
 import { dbVendoProvider } from "./dbVendo.js";
 import type {
   LegInfo,
@@ -44,7 +45,11 @@ import type {
 export const transitScheduleProvider: SearchProvider = {
   name: "transit-schedule",
   mode: "TRAIN",
-  isConfigured: () => true,
+  // Dieser Provider ist ein dbVendo-WRAPPER („zum nächsten Bahnhof laufen, dann
+  // dbVendo suchen") — ohne dbVendo liefert er nichts. Und funktional ist er
+  // überflüssig geworden: MOTIS routet Zugangs-Fußwege inzwischen selbst.
+  // Hängt daher am selben Schalter.
+  isConfigured: () => config.DBVENDO_SEARCH_ENABLED && Boolean(config.DBREST_BASE_URL),
 
   async search(input, signal): Promise<ProviderResult> {
     const start = Date.now();

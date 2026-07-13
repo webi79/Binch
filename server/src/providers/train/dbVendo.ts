@@ -93,7 +93,10 @@ export const dbVendoProvider: SearchProvider = {
   mode: "TRAIN",
 
   isConfigured() {
-    return Boolean(config.DBREST_BASE_URL);
+    // DBVENDO_SEARCH_ENABLED ist Default AUS: die DB blockt db-vendo-client
+    // extern (OPS_BLOCKED) — 0 Treffer bei 72 Aufrufen. Der dbrest-Sidecar
+    // bleibt für Trip-Details/Live-Positionen/Stop-Infos in Betrieb.
+    return config.DBVENDO_SEARCH_ENABLED && Boolean(config.DBREST_BASE_URL);
   },
 
   async search(input: ProviderSearchInput, signal?: AbortSignal): Promise<ProviderResult> {
