@@ -678,6 +678,17 @@ function dropDeparted<T extends { departTime: string; dateOnly?: boolean }>(rows
   return rows.filter((r) => r.dateOnly || Date.parse(r.departTime) >= cutoff);
 }
 
+/**
+ * `price === 0` heißt „kein Preis bekannt" (MOTIS liefert keine Tarife), NICHT
+ * „geschenkt". Im Dedup wäre ein preisloser Treffer sonst billiger als jeder
+ * echte Preis und würde den bepreisten VERDRÄNGEN — bei gleicher Verbindung aus
+ * zwei Providern (MOTIS-Bus 0 € vs. FlixBus 25 €) verlöre der User den Preis.
+ * Auch in der Preis-Sortierung gehören preislose Treffer ans Ende.
+ */
+function effectivePrice(r: { price: number }): number {
+  return r.price > 0 ? r.price : Number.MAX_SAFE_INTEGER;
+}
+
 const TRANSFER_PENALTY_MIN = 20;
 
 /**
@@ -730,8 +741,12 @@ function sortResults<
         Date.parse(a.departTime) - Date.parse(b.departTime),
     );
   } else {
+    // effectivePrice: preislose Treffer (price 0 = „Tarif unbekannt") gehören ans
+    // ENDE, nicht als vermeintlich Günstigste an die Spitze.
     results.sort(
-      (a, b) => a.price - b.price || Date.parse(a.departTime) - Date.parse(b.departTime),
+      (a, b) =>
+        effectivePrice(a) - effectivePrice(b) ||
+        Date.parse(a.departTime) - Date.parse(b.departTime),
     );
   }
 }
@@ -752,7 +767,7 @@ function dedupe(candidates: Candidate[], mode: TravelMode): Candidate[] {
       !existing ||
       (mode === "TRAIN"
         ? connectionScore(c.result) < connectionScore(existing.result)
-        : c.result.price < existing.result.price);
+        : effectivePrice(c.result) < effectivePrice(existing.result));
     if (better) {
       map.set(key, c);
     }

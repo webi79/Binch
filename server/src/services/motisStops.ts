@@ -77,11 +77,20 @@ function toItem(st: MotisStopTime, board: StopBoard, idx: number): StopBoardItem
   // Fernverkehr: die Zugnummer gehört dazu (ICE 1007) → tripShortName.
   // Nahverkehr: nur die Liniennummer (RB59/S7/U5) → routeShortName; NICHT
   // displayName, das die interne Fahrtnummer anhängt ("RB59 (90320)").
+  //
+  // "0" ist bei manchen Feeds ein Platzhalter-Linienname — und truthy, würde also
+  // den echten Namen verdrängen und in der Abfahrtstafel als Linie „0" stehen.
+  // (Echte numerische Linien wie Tram „7"/„13" bleiben gültig.) Denselben Bug
+  // gab es im Such-Provider, siehe lineLabel() in providers/train/motis.ts.
+  const clean = (s?: string) => {
+    const v = s?.trim();
+    return v && v !== "0" ? v : undefined;
+  };
   const isLongDist =
     st.mode === "HIGHSPEED_RAIL" || st.mode === "LONG_DISTANCE" || st.mode === "NIGHT_RAIL";
   const line = isLongDist
-    ? st.tripShortName || st.displayName || st.routeShortName || st.mode
-    : st.routeShortName || st.displayName || st.tripShortName || st.mode;
+    ? clean(st.tripShortName) ?? clean(st.displayName) ?? clean(st.routeShortName) ?? st.mode
+    : clean(st.routeShortName) ?? clean(st.displayName) ?? clean(st.tripShortName) ?? st.mode;
 
   return {
     id: st.tripId || `${line}:${plannedTime}:${idx}`,

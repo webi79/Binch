@@ -198,7 +198,7 @@ async function resolveOptions(
     if (!prev || op < pp) byName.set(k, t);
   }
   const providers = Array.from(byName.values())
-    .sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity))
+    .sort((a, b) => (a.price ?? Number.MAX_SAFE_INTEGER) - (b.price ?? Number.MAX_SAFE_INTEGER))
     .slice(0, MAX_RESOLVE);
 
   return Promise.all(
@@ -262,7 +262,7 @@ export async function getSearchApiRoundTripBookingOptions(
   if (!rdata || rdata.error) return [];
   const returns = [...(rdata.best_flights ?? []), ...(rdata.other_flights ?? [])]
     .filter((r) => r.booking_token)
-    .sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity));
+    .sort((a, b) => (a.price ?? Number.MAX_SAFE_INTEGER) - (b.price ?? Number.MAX_SAFE_INTEGER));
   const cheapest = returns[0];
   if (!cheapest?.booking_token) return [];
 

@@ -337,7 +337,9 @@ export async function getFlightBookingOptions(
     // (Pro-Plan) → alle parallel; 10min-Cache → kein Re-Resolve beim erneuten
     // Öffnen. MAX_RESOLVE deckelt nur pathologisch viele Anbieter. Deeplink NICHT
     // umschreiben (signierte Base64-Tokens → URL-Round-Trip korrumpiert sie).
-    providers.sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity));
+    // Kein Infinity als Platzhalter: zwei preislose Anbieter ergäben
+    // `Infinity - Infinity` = NaN, und ein NaN-Comparator sortiert undefiniert.
+    providers.sort((a, b) => (a.price ?? Number.MAX_SAFE_INTEGER) - (b.price ?? Number.MAX_SAFE_INTEGER));
     const toResolve = providers.slice(0, MAX_RESOLVE);
     const want = (ctx.currency ?? "EUR").toUpperCase();
 
