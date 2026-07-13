@@ -152,6 +152,29 @@ npm run web        # Web (Metro)
 - Die hardcoded WLAN-IP `192.168.2.84` muss vom Phone/Simulator erreichbar sein. Bei IP-Wechsel `app.json` updaten.
 - Voice-Input braucht einen Dev-Client-Build — funktioniert nicht in Expo Go.
 
+### WSL2: KEIN `--tunnel` nötig
+
+Der Dev-Server läuft in WSL2 (NAT), dessen IP (`172.30.x.x`) das Handy nicht
+erreicht — Expo würde genau die advertisen, darum griff man früher zu
+`--tunnel` (ngrok reißt ständig ab: „Tunnel connection has been closed").
+
+Der Weg über den Windows-Host ist bereits eingerichtet: Portproxy
+`0.0.0.0:8081 → WSL:8081` (+ `:3000`) und Firewall-Regel „Expo Metro". Metro ist
+damit unter `192.168.2.84:8081` im WLAN erreichbar. `npm start` setzt deshalb
+`REACT_NATIVE_PACKAGER_HOSTNAME=192.168.2.84` — Expo nennt dem Handy die
+Windows-IP statt der WSL-IP. **Also immer `npm start`, nie `--tunnel`.**
+
+Andere IP: `REACT_NATIVE_PACKAGER_HOSTNAME=<ip> npm start`.
+
+Nach WSL-Neustart kann die WSL-IP wechseln → Portproxy zeigt ins Leere (Handy
+verbindet nicht mehr). Dann neu setzen (PowerShell als Admin):
+
+```powershell
+$ip = (wsl hostname -I).Split()[0]
+netsh interface portproxy set v4tov4 listenport=8081 listenaddress=0.0.0.0 connectport=8081 connectaddress=$ip
+netsh interface portproxy set v4tov4 listenport=3000 listenaddress=0.0.0.0 connectport=3000 connectaddress=$ip
+```
+
 ## Was fehlt noch?
 
 Offene Aufgaben, Stubs und Infrastruktur-Lücken stehen in [`TODO.md`](./TODO.md).
