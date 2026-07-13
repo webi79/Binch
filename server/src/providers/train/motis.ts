@@ -178,9 +178,46 @@ function delayMinutes(scheduled?: string, actual?: string, realTime?: boolean): 
   return d > 0 ? d : undefined;
 }
 
-/** Stationsnamen vergleichbar machen (Kleinbuchstaben, nur Alphanumerisches). */
+/**
+ * Bahnhofs-Abkürzungen, die dieselbe Station meinen. Nötig, weil die Feeds
+ * denselben Bahnhof unterschiedlich benennen („München Hbf" vs. „München
+ * Hauptbahnhof", „Zürich HB"). Ohne Auflösung hielten wir die zwei Knoten für
+ * verschiedene Orte und zeigten einen Fußweg von München Hbf nach München Hbf.
+ * Nur als ganzes WORT ersetzen — sonst würde „Bahnhofstrasse" mitverstümmelt.
+ */
+const STATION_ABBR: Record<string, string> = {
+  hbf: "hauptbahnhof",
+  hb: "hauptbahnhof",
+  bhf: "bahnhof",
+  bf: "bahnhof",
+};
+
+/** Stationsnamen vergleichbar machen: Kleinbuchstaben, Abkürzungen aufgelöst. */
 function normStationName(s: string): string {
-  return s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+  return s
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean)
+    .map((tok) => STATION_ABBR[tok] ?? tok)
+    .join("");
+}
+
+/**
+ * Meinen die beiden Namen denselben Bahnhof? Zusätzlich zur Gleichheit erlauben
+ * wir Enthaltensein, weil Feeds gern Präfixe dranhängen („S+U Berlin
+ * Hauptbahnhof" ⊃ „Berlin Hbf").
+ *
+ * Bewusst NUR zusammenhängende Teilstrings: „Zürich HB" (zürichhauptbahnhof)
+ * steckt NICHT in „Zürich, Bahnhofstrasse/HB" (zürichbahnhofstrassehauptbahnhof)
+ * — das ist eine echte Tram-Haltestelle nebenan, der Fußweg dorthin ist real und
+ * muss bleiben. Eine Token-Teilmenge würde hier fälschlich matchen.
+ */
+function sameStation(a?: string, b?: string): boolean {
+  if (!a || !b) return false;
+  const x = normStationName(a);
+  const y = normStationName(b);
+  if (x.length < 4 || y.length < 4) return false;
+  return x === y || x.includes(y) || y.includes(x);
 }
 
 /**
@@ -284,34 +321,41 @@ function toNormalized(
   // Darum: Fußweg-Legs mitliefern und die Zeiten daraus ziehen — die
   // DB-Reiseauskunft zeigt sie ebenso als „Fußweg X Min".
   //
-  // 0-Minuten-Stubs raus (MOTIS hängt an Umstiegen gern Null-Wege an).
-  const journeyLegs = it.legs.filter(
-    (l) => l.mode !== "WALK" || Math.round((l.duration ?? 0) / 60) >= 1,
-  );
+  // Nicht jeder WALK ist eine Etappe:
+  //   - 0-Minuten-Stubs (MOTIS hängt an Umstiegen gern Null-Wege an),
+  //   - Wege von einer Haltestelle ZU SICH SELBST („Waffenplatzstrasse →
+  //     Waffenplatzstrasse", 1 min) — das ist ein Bahnsteig-/Steigwechsel.
+  // Beides wäre in der Timeline nur Rauschen; die DB zeigt dort schlicht den
+  // Umstieg. Fällt so ein Weg weg, rendert der Client wieder den „Umstieg"-Block.
+  const journeyLegs = it.legs.filter((l) => {
+    if (l.mode !== "WALK") return true;
+    if (Math.round((l.duration ?? 0) / 60) < 1) return false;
+    if (sameStation(l.from?.name, l.to?.name)) return false;
+    return true;
+  });
 
   // ABER: Routen wir über eine Koordinate (weil der Geocoder für große Bahnhöfe
   // keinen kanonischen Knoten hergibt), hängt MOTIS vorn/hinten einen künstlichen
-  // Zugangsweg vom Koordinatenpunkt zum Bahnsteig an — „München Hbf → 6 min zu
-  // Fuß → München Hbf". Das ist kein Reiseabschnitt, sondern ein Artefakt; die DB
-  // zeigt sowas auch nicht (die sagt „ab 08:00, Gleis 21"). Solche Fußwege ZUM
-  // EIGENEN Bahnhof werfen wir raus. Ein Fußweg zwischen VERSCHIEDENEN Stationen
-  // (Billoweg → Brunau) bleibt selbstverständlich drin.
-  const sameStation = (a?: string, b?: string) =>
-    !!a && !!b && normStationName(a) === normStationName(b);
-  if (
-    journeyLegs[0]?.mode === "WALK" &&
-    sameStation(journeyLegs[0].to?.name, input.originLabel ?? from.name)
-  ) {
-    journeyLegs.shift();
-  }
+  // Zugangsweg zum Bahnsteig an — und weil die Feeds denselben Bahnhof
+  // verschieden benennen, sieht das aus wie eine echte Etappe:
+  //   09:10 München Hbf → 🚶3min → 09:13 München Hauptbahnhof → RJX 63
+  // Beides ist derselbe Bahnhof. Die DB zeigt schlicht „ab 09:13" — und die
+  // Abfahrt/Dauer stimmten bei uns dadurch auch nicht (09:10/4h31 statt
+  // 09:13/4h19). Solche Fußwege ZUM EIGENEN Bahnhof fliegen raus; ein Fußweg zu
+  // einer ANDEREN Station (Billoweg → Brunau) bleibt drin.
+  const originName = input.originLabel ?? from.name;
+  const destName = input.destLabel ?? to.name;
+  const droppedAccessWalk =
+    journeyLegs[0]?.mode === "WALK" && sameStation(journeyLegs[0].to?.name, originName);
+  if (droppedAccessWalk) journeyLegs.shift();
+
   const lastLegIdx = journeyLegs.length - 1;
-  if (
+  const droppedEgressWalk =
     lastLegIdx > 0 &&
     journeyLegs[lastLegIdx]?.mode === "WALK" &&
-    sameStation(journeyLegs[lastLegIdx]!.from?.name, input.destLabel ?? to.name)
-  ) {
-    journeyLegs.pop();
-  }
+    sameStation(journeyLegs[lastLegIdx]!.from?.name, destName);
+  if (droppedEgressWalk) journeyLegs.pop();
+
   if (journeyLegs.length === 0) return null;
 
   // Zeiten aus den verbleibenden Legs (inkl. echter Fußwege).
@@ -341,17 +385,29 @@ function toNormalized(
     .map((l) => l.to.name)
     .filter((n): n is string => !!n);
 
-  // Beim Koordinaten-Routing nennt MOTIS die Endpunkte "START"/"END" — das sind
-  // keine Stationsnamen. Mit dem vom User gewählten Label ersetzen, sonst steht
-  // in der Timeline "END" statt "Zürich Brunau".
+  // Endpunkt-Beschriftung auf das vom User gewählte Label ziehen. Drei Fälle:
+  //   - Koordinaten-Routing → MOTIS nennt die Endpunkte "START"/"END".
+  //   - Feed-Alias → der Zug startet laut Feed an „München Hauptbahnhof",
+  //     gewählt wurde „München Hbf". Die DB zeigt den gewählten Namen.
+  //   - sonst (echte andere Station, z.B. Tram-Halt nach Fußweg) → unangetastet.
   const mappedLegs = journeyLegs.map(toLeg);
   const firstMapped = mappedLegs[0];
   const lastMapped = mappedLegs[mappedLegs.length - 1];
-  if (firstMapped && (!firstMapped.originLabel || firstMapped.originLabel === "START")) {
-    firstMapped.originLabel = input.originLabel ?? from.name;
+  if (
+    firstMapped &&
+    (!firstMapped.originLabel ||
+      firstMapped.originLabel === "START" ||
+      sameStation(firstMapped.originLabel, originName))
+  ) {
+    firstMapped.originLabel = originName;
   }
-  if (lastMapped && (!lastMapped.destLabel || lastMapped.destLabel === "END")) {
-    lastMapped.destLabel = input.destLabel ?? to.name;
+  if (
+    lastMapped &&
+    (!lastMapped.destLabel ||
+      lastMapped.destLabel === "END" ||
+      sameStation(lastMapped.destLabel, destName))
+  ) {
+    lastMapped.destLabel = destName;
   }
 
   return {

@@ -141,11 +141,13 @@ const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 h
  *
  * 2026-07-13T21:58Z: Uhrzeit aus dem Picker wird durchgereicht (war weggeworfen)
  *   → alte Rows stammen aus der Mitternachts-Ära und zeigen Nachtzüge.
+ * 2026-07-13T22:23Z: Feed-Alias-Fußwege raus (München Hbf → „München Hauptbahnhof“)
+ *   + Selbst-Fußwege (Bahnsteigwechsel). Abfahrt/Dauer stimmten dadurch nicht.
  *
  * WICHTIG: Wert nie in die Zukunft setzen (== aktuelle Deploy-Zeit), sonst
  * qualifiziert keine frisch geschriebene Row → Cache komplett aus.
  */
-const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T21:58:00Z");
+const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T22:23:00Z");
 
 /** In-Flight-Map: Schlüssel = cacheKey, Wert = Promise des laufenden Calls. */
 const inFlight = new Map<string, Promise<SearchOutput>>();
