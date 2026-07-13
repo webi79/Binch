@@ -131,11 +131,16 @@ const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 h
  * 2026-07-13T18:08Z: Routing an exakte MOTIS-Stop-ID statt Koordinate (Route
  *   endet am gewählten Halt statt Nachbar-Stop) + DB-nahes Ranking
  *   (Verbindungsqualität statt Preis) + maxTransfers=5 + Zug-Dedup.
+ * 2026-07-13T21:06Z: Fußwege sind jetzt Teil der Reise (Zeiten/Dauer/Legs) —
+ *   vorher endeten Routen sichtbar am falschen Halt („Billoweg") und die Dauer
+ *   log. Bus in den Zug-Modi (wie DB Navigator). Stop-ID nur noch bei
+ *   kanonischem Geocode-Treffer (sonst Koordinate) → keine Phantom-Fußwege
+ *   zwischen Referenzdaten-Dubletten mehr. Linien-Platzhalter „0" gefixt.
  *
  * WICHTIG: Wert nie in die Zukunft setzen (== aktuelle Deploy-Zeit), sonst
  * qualifiziert keine frisch geschriebene Row → Cache komplett aus.
  */
-const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T18:08:00Z");
+const RESULT_SCHEMA_EPOCH = new Date("2026-07-13T21:06:00Z");
 
 /** In-Flight-Map: Schlüssel = cacheKey, Wert = Promise des laufenden Calls. */
 const inFlight = new Map<string, Promise<SearchOutput>>();

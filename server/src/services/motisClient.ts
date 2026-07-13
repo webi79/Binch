@@ -124,15 +124,35 @@ export async function motisGeocode(label: string, signal?: AbortSignal): Promise
   return place;
 }
 
+/** Namen vergleichbar machen: Kleinbuchstaben, alles Nicht-Alphanumerische raus. */
+function normName(s: string): string {
+  return s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+}
+
 /**
- * Wie {@link motisGeocode}, aber wählt unter den STOP-Treffern den, der einer
- * bekannten Referenz-Koordinate am nächsten liegt. Nötig, weil das Routing an
- * eine reine Koordinate MOTIS auf den *nächstgelegenen* Halt snappen lässt —
- * bei eng benachbarten Stops (z.B. Zürich Brunau vs. Saalsporthalle) landet man
- * dann am falschen Halt. Mit der exakten Stop-ID endet die Route genau am
- * gewählten Ort. Gibt `null`, wenn kein STOP innerhalb `maxMeters` liegt →
- * Aufrufer fällt auf Koordinaten-Routing zurück (nie 0 Ergebnisse durch einen
- * Fehlgriff).
+ * Feeds, die nur REFERENZDATEN enthalten (europaweite Bahnhofs-Dubletten), nicht
+ * den operativen Fahrplan. Der Transitous-Geocoder liefert die gern als ersten
+ * STOP-Treffer — sie liegen 100-200 m neben dem echten Bahnhof und werden von
+ * MOTIS als eigener Knoten behandelt. Routet man dorthin, baut MOTIS einen
+ * absurden Fußweg zwischen zwei gleichnamigen Knoten ein („München Hauptbahnhof
+ * → 8 min zu Fuß → München Hbf"). Also nie als Routing-Endpunkt verwenden.
+ */
+function isReferenceFeed(id: string): boolean {
+  return /reference-data/i.test(id.split("_")[0] ?? "");
+}
+
+/**
+ * Wie {@link motisGeocode}, aber sucht den STOP, der WIRKLICH der gewählte Ort
+ * ist: gleicher Name UND nah an der bekannten Koordinate UND aus einem operativen
+ * Feed. Nur dann routen wir an die exakte Stop-ID — die Route endet dann genau am
+ * gewählten Halt (z.B. Zürich Brunau statt am Nachbar-Stop Saalsporthalle).
+ *
+ * Gibt bewusst `null` zurück, sobald einer der Punkte nicht zweifelsfrei ist —
+ * dann routet der Aufrufer über die Koordinate. Das ist der sichere Weg: MOTIS
+ * snappt selbst auf den tatsächlich bedienten Halt. Nötig, weil der Geocoder für
+ * große Bahnhöfe (München Hbf, Zürich HB) den kanonischen Knoten GAR NICHT
+ * herausgibt — dort kämen sonst nur Referenz-Dubletten oder Tram-Halte in der
+ * Nähe („Zürich, Sihlquai/HB") heraus.
  */
 export async function motisGeocodeNearestStop(
   label: string,
@@ -152,17 +172,31 @@ export async function motisGeocodeNearestStop(
     return null;
   }
   if (!Array.isArray(raw)) return null;
+
+  const want = normName(label);
   const cos = Math.cos((refLat * Math.PI) / 180);
   let best: MotisPlace | null = null;
   let bestM = Infinity;
+
   for (const r of raw) {
-    if (r.type !== "STOP" || !r.id || r.lat == null || r.lon == null) continue;
+    if (r.type !== "STOP" || !r.id || !r.name || r.lat == null || r.lon == null) continue;
+    if (isReferenceFeed(r.id)) continue;
+
+    // Name muss der gewählte Ort sein — sonst landen wir auf einem Nachbar-Halt
+    // („Zürich, Sihlquai/HB" für „Zürich HB").
+    const got = normName(r.name);
+    const nameMatches =
+      got === want ||
+      ((got.includes(want) || want.includes(got)) &&
+        Math.min(got.length, want.length) / Math.max(got.length, want.length) >= 0.8);
+    if (!nameMatches) continue;
+
     const dy = (r.lat - refLat) * 111_000;
     const dx = (r.lon - refLng) * 111_000 * cos;
     const m = Math.sqrt(dx * dx + dy * dy);
     if (m < bestM) {
       bestM = m;
-      best = { id: r.id, name: r.name ?? label, lat: r.lat, lon: r.lon, tz: r.tz };
+      best = { id: r.id, name: r.name, lat: r.lat, lon: r.lon, tz: r.tz };
     }
   }
   return bestM <= maxMeters ? best : null;

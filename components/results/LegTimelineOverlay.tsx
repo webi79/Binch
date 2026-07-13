@@ -373,7 +373,9 @@ function LegTimelineSheet({ result, hidden }: { result: SearchResult; hidden?: b
                     platform={leg.arrivePlatform}
                     terminal={isLastLeg}
                   />
-                  {next ? (
+                  {/* Grenzt ein Fußweg-Leg an, ist DER bereits der Umstieg —
+                      ein zusätzlicher „Umstieg 0 Min"-Block wäre nur Rauschen. */}
+                  {next && !leg.walking && !next.walking ? (
                     <TransferSegment
                       minutes={transferMin}
                       isFlight={leg.product === "flight"}
@@ -482,6 +484,35 @@ function TransportSegment({ leg }: { leg: SyntheticLeg }) {
   const accent = useAccent();
   const t = useT();
   const [open, setOpen] = useState(false);
+
+  // Fußweg-Leg (MOTIS: „Tram bis Nachbarhalt, dann 12 min zu Fuß ans Ziel").
+  // Ohne eigenen Zweig fiele hier nur ein Segment ohne Linien-Pille raus und die
+  // Reise sähe aus, als endete sie am letzten Fahrzeug-Halt. Die DB zeigt den
+  // Fußweg explizit — wir jetzt auch.
+  if (leg.walking) {
+    return (
+      <View style={styles.segment}>
+        <View style={styles.timeCol}>
+          <Text style={styles.durationLabel}>{formatDuration(leg.durationMinutes)}</Text>
+        </View>
+        <View style={styles.dotSpacer}>
+          <DottedLine />
+        </View>
+        <View style={styles.segmentBody}>
+          <View style={styles.transferCard}>
+            <View style={[styles.walkBadge, { backgroundColor: accent.subtle }]}>
+              <Footprints size={16} color={accent.solid} strokeWidth={2.2} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.transferTitle}>{t("details.walk")}</Text>
+              <Text style={styles.transferMeta}>{formatDuration(leg.durationMinutes)}</Text>
+            </View>
+          </View>
+        </View>
+      </View>
+    );
+  }
+
   const lineLabel = leg.line ?? productLabel(leg.product) ?? "";
   const lineColor = productColor(leg.product);
   const stops = leg.stops ?? 0;

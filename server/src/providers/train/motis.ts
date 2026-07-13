@@ -153,9 +153,16 @@ function toStopovers(stops: MotisLegStop[] | undefined): StopoverInfo[] | undefi
 function lineLabel(leg: MotisLeg): string | undefined {
   const longDist =
     leg.mode === "HIGHSPEED_RAIL" || leg.mode === "LONG_DISTANCE" || leg.mode === "NIGHT_RAIL";
-  const primary = longDist ? leg.tripShortName : leg.routeShortName;
-  const secondary = longDist ? leg.routeShortName : leg.tripShortName;
-  return primary || secondary || undefined;
+  // Manche Feeds setzen "0" als Platzhalter-Liniennamen. Das ist truthy und hat
+  // sonst den echten Namen verdrängt → in der Timeline stand eine Linie „0".
+  // (Echte numerische Linien wie Tram „7"/„13" bleiben natürlich gültig.)
+  const clean = (s?: string) => {
+    const v = s?.trim();
+    return v && v !== "0" ? v : undefined;
+  };
+  const primary = longDist ? clean(leg.tripShortName) : clean(leg.routeShortName);
+  const secondary = longDist ? clean(leg.routeShortName) : clean(leg.tripShortName);
+  return primary ?? secondary;
 }
 
 /** Verspätung in Minuten (Ist − Soll), nur wenn Realtime + echte Verspätung. */
@@ -163,6 +170,11 @@ function delayMinutes(scheduled?: string, actual?: string, realTime?: boolean): 
   if (!realTime || !scheduled || !actual) return undefined;
   const d = Math.round((Date.parse(actual) - Date.parse(scheduled)) / 60_000);
   return d > 0 ? d : undefined;
+}
+
+/** Stationsnamen vergleichbar machen (Kleinbuchstaben, nur Alphanumerisches). */
+function normStationName(s: string): string {
+  return s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
 }
 
 function toLeg(leg: MotisLeg): LegInfo {
@@ -213,20 +225,81 @@ function toNormalized(
 
   const first = transit[0]!;
   const last = transit[transit.length - 1]!;
-  // Headline = echte ZUG-Zeiten (erste Zug-Abfahrt → letzte Zug-Ankunft), nicht
-  // it.startTime/endTime (die den Bahnsteig-Zugangsweg vom Koordinaten-Punkt
-  // mit-einrechnen und die Abfahrt einige Minuten zu früh wirken lassen).
-  const departTime = first.from.scheduledDeparture ?? first.from.departure ?? first.startTime ?? it.startTime;
-  const arriveTime = last.to.scheduledArrival ?? last.to.arrival ?? last.endTime ?? it.endTime;
+
+  // Fußwege sind ECHTE Reise-Bestandteile, keine Deko: MOTIS routet regelmäßig
+  // „7 min Fußweg → Tram bis Nachbarhalt → 12 min Fußweg ans Ziel". Zählt man
+  // nur die Fahrzeug-Legs, dann
+  //   - ist die Verbindung angeblich 10 statt 30 min lang,
+  //   - liegt die Abfahrt zu spät (der Zugangsweg zum Halt fehlt) und
+  //   - endet die Route sichtbar am falschen Stop („Billoweg" statt Brunau).
+  // Darum: Fußweg-Legs mitliefern und die Zeiten daraus ziehen — die
+  // DB-Reiseauskunft zeigt sie ebenso als „Fußweg X Min".
+  //
+  // 0-Minuten-Stubs raus (MOTIS hängt an Umstiegen gern Null-Wege an).
+  const journeyLegs = it.legs.filter(
+    (l) => l.mode !== "WALK" || Math.round((l.duration ?? 0) / 60) >= 1,
+  );
+
+  // ABER: Routen wir über eine Koordinate (weil der Geocoder für große Bahnhöfe
+  // keinen kanonischen Knoten hergibt), hängt MOTIS vorn/hinten einen künstlichen
+  // Zugangsweg vom Koordinatenpunkt zum Bahnsteig an — „München Hbf → 6 min zu
+  // Fuß → München Hbf". Das ist kein Reiseabschnitt, sondern ein Artefakt; die DB
+  // zeigt sowas auch nicht (die sagt „ab 08:00, Gleis 21"). Solche Fußwege ZUM
+  // EIGENEN Bahnhof werfen wir raus. Ein Fußweg zwischen VERSCHIEDENEN Stationen
+  // (Billoweg → Brunau) bleibt selbstverständlich drin.
+  const sameStation = (a?: string, b?: string) =>
+    !!a && !!b && normStationName(a) === normStationName(b);
+  if (
+    journeyLegs[0]?.mode === "WALK" &&
+    sameStation(journeyLegs[0].to?.name, input.originLabel ?? from.name)
+  ) {
+    journeyLegs.shift();
+  }
+  const lastLegIdx = journeyLegs.length - 1;
+  if (
+    lastLegIdx > 0 &&
+    journeyLegs[lastLegIdx]?.mode === "WALK" &&
+    sameStation(journeyLegs[lastLegIdx]!.from?.name, input.destLabel ?? to.name)
+  ) {
+    journeyLegs.pop();
+  }
+  if (journeyLegs.length === 0) return null;
+
+  // Zeiten aus den verbleibenden Legs (inkl. echter Fußwege).
+  const legStart = (l: MotisLeg) =>
+    l.from.scheduledDeparture ?? l.from.departure ?? l.startTime ?? it.startTime;
+  const legEnd = (l: MotisLeg) =>
+    l.to.scheduledArrival ?? l.to.arrival ?? l.endTime ?? it.endTime;
+  const departTime = legStart(journeyLegs[0]!);
+  const arriveTime = legEnd(journeyLegs[journeyLegs.length - 1]!);
   const durationMinutes = Math.max(
     1,
     Math.round((Date.parse(arriveTime) - Date.parse(departTime)) / 60_000),
   );
+
+  // Startet die Reise mit einem (echten) Fußweg, ist die Abfahrt am Ursprung
+  // NICHT verspätet — man geht ja trotzdem los. Die Verspätung des Fahrzeugs
+  // steht am jeweiligen Leg in der Timeline.
+  const startsWithWalk = journeyLegs[0]?.mode === "WALK";
+
   // Umstiegs-Stationen = Ziel jedes Transit-Legs außer dem letzten.
   const transferLabels = transit
     .slice(0, -1)
     .map((l) => l.to.name)
     .filter((n): n is string => !!n);
+
+  // Beim Koordinaten-Routing nennt MOTIS die Endpunkte "START"/"END" — das sind
+  // keine Stationsnamen. Mit dem vom User gewählten Label ersetzen, sonst steht
+  // in der Timeline "END" statt "Zürich Brunau".
+  const mappedLegs = journeyLegs.map(toLeg);
+  const firstMapped = mappedLegs[0];
+  const lastMapped = mappedLegs[mappedLegs.length - 1];
+  if (firstMapped && (!firstMapped.originLabel || firstMapped.originLabel === "START")) {
+    firstMapped.originLabel = input.originLabel ?? from.name;
+  }
+  if (lastMapped && (!lastMapped.destLabel || lastMapped.destLabel === "END")) {
+    lastMapped.destLabel = input.destLabel ?? to.name;
+  }
 
   return {
     externalId: `motis:${input.origin}:${input.destination}:${it.startTime}:${idx}`,
@@ -236,7 +309,11 @@ function toNormalized(
     destLabel: input.destLabel ?? to.name,
     departTime,
     arriveTime,
-    departDelayMinutes: delayMinutes(first.from.scheduledDeparture, first.from.departure, first.realTime),
+    departDelayMinutes: startsWithWalk
+      ? 0
+      : delayMinutes(first.from.scheduledDeparture, first.from.departure, first.realTime),
+    // Ankunft am Ziel verschiebt sich sehr wohl mit dem letzten Fahrzeug —
+    // auch wenn danach noch ein Fußweg kommt.
     arriveDelayMinutes: delayMinutes(last.to.scheduledArrival, last.to.arrival, last.realTime),
     originTz: first.from.tz ?? from.tz,
     destinationTz: last.to.tz ?? to.tz,
@@ -244,9 +321,9 @@ function toNormalized(
     durationMinutes,
     stops: Math.max(0, transit.length - 1),
     stopLabels: transferLabels,
-    // Nur Zug-Segmente (wie transitSchedule) — Zugangs-/Umstiegs-Fußwege
-    // lassen wir aus der Card-Timeline raus.
-    legs: transit.map(toLeg),
+    // Inkl. Fußweg-Legs — sonst endet die Timeline am letzten Fahrzeug-Halt
+    // statt am gewählten Ziel (siehe Kommentar oben).
+    legs: mappedLegs,
     price: 0,
     currency: input.currency,
     // deepLink = FALLBACK: vorausgefüllte bahn.de-Suche. Der Direkt-Buchungs-
@@ -343,13 +420,16 @@ function makeMotisProvider(mode: TravelMode, transitModes: string, name: string)
 
 /** Zug-Routing (RAIL: ICE/IC/RE/S-Bahn etc.). */
 // RAIL allein reicht NICHT: viele Ziele (v.a. lokale/kleine Halte, Schweizer
-// SZU-/Nebennetz-Stops wie Zürich Brunau) sind nur über Nahverkehr erreichbar,
-// und beim Koordinaten-Routing muss MOTIS den Zugangs-Leg (Tram/U-Bahn/S-Bahn)
-// mitfahren. Ohne diese Modi → "keine Verbindung gefunden". Bus bewusst NICHT
-// dabei (das ist der eigene Bus-Tab), aber alle Schienen-/Urban-Rail-Modi.
+// SZU-/Nebennetz-Stops wie Zürich Brunau) sind nur über Nahverkehr erreichbar.
+// Ohne die Nahverkehrs-Modi → "keine Verbindung gefunden".
+//
+// BUS gehört ebenfalls dazu: der DB Navigator nimmt für die letzte Meile
+// selbstverständlich Tram UND Bus mit rein. Ließen wir Bus weg, fehlten genau
+// die Verbindungen, die die DB zeigt. (Der Bus-TAB ist etwas anderes — der
+// sucht Fernbusse, siehe motisBusProvider mit BUS,COACH.)
 export const motisProvider = makeMotisProvider(
   "TRAIN",
-  "RAIL,SUBURBAN,TRAM,SUBWAY",
+  "RAIL,SUBURBAN,TRAM,SUBWAY,BUS",
   "motis",
 );
 /** Bus-Routing (Regional- + Fernbusse aus GTFS — belebt BUS-Mode trotz DB-Block). */
