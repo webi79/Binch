@@ -13,7 +13,7 @@ import { db } from "./client.js";
 import { locations } from "./schema.js";
 import type { LocationType } from "./schema.js";
 import { AIRPORTS } from "../data/airports.js";
-import { CITIES, CRUISE_PORTS } from "../data/cities.js";
+import { CITIES, CRUISE_PORTS, BUS_STATIONS } from "../data/cities.js";
 
 interface Row {
   code: string;
@@ -21,6 +21,11 @@ interface Row {
   city: string;
   country: string;
   type: LocationType;
+  /** Nur die Fernbus-Bahnhöfe bringen eigene Koordinaten mit — damit
+   *  resolveMotisPlace den echten ZOB trifft statt per Label zu raten.
+   *  Drizzle bildet die numeric-Spalten auf `string` ab. */
+  latitude?: string;
+  longitude?: string;
 }
 
 function buildRows(): Row[] {
@@ -43,6 +48,18 @@ function buildRows(): Row[] {
       city: c.city,
       country: c.country,
       type: "ALL",
+    });
+  }
+
+  for (const b of BUS_STATIONS) {
+    rows.push({
+      code: b.code,
+      label: b.name,
+      city: b.city,
+      country: b.country,
+      type: "BUS",
+      latitude: String(b.latitude),
+      longitude: String(b.longitude),
     });
   }
 
@@ -76,6 +93,10 @@ async function main() {
           city: sql`excluded.city`,
           country: sql`excluded.country`,
           type: sql`excluded.type`,
+          // COALESCE: Vorhandene Koordinaten (aus dem GTFS-Refresh) NICHT mit
+          // NULL überschreiben, nur fehlende ergänzen.
+          latitude: sql`COALESCE(excluded.latitude, ${locations.latitude})`,
+          longitude: sql`COALESCE(excluded.longitude, ${locations.longitude})`,
         },
       });
     console.log(`[seed]   ${Math.min(i + CHUNK, rows.length)} / ${rows.length}`);

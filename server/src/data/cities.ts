@@ -751,3 +751,45 @@ export const CRUISE_PORTS: CruisePortSeed[] = [
   { code: "PORT-PSI", name: "Port Said", city: "Port Said", country: "Egypt" },
   { code: "PORT-ALY", name: "Alexandria Port", city: "Alexandria", country: "Egypt" },
 ];
+
+/**
+ * Fernbus-Bahnhöfe (ZOBs) der wichtigsten Städte — die kuratierten
+ * BUS-Vorschläge, die die App im Bus-Tab anbietet (`lib/data/popularLocations.ts`).
+ *
+ * Warum EIGENE Codes statt der GTFS-Stop-IDs der ZOBs:
+ * Der FlixBus-Provider überspringt jeden Code, der wie eine ÖPNV-Stop-ID aussieht
+ * (`looksLikeTransitStopId` — `gtfs:`/`sta:`/numerische HAFAS-EVA), weil er dafür
+ * garantiert keine Trips hat. Mit einer GTFS-ID als Vorschlag liefe FlixBus also
+ * nie — ausgerechnet für die Fernbus-Suche.
+ *
+ * Warum sie hier stehen müssen: Die Codes existierten NUR im Client. In der
+ * `locations`-Tabelle fehlten sie, `/api/locations/by-codes` meldete
+ * `exists:false`, und `validatePersistedCodes` warf sie auf die Blacklist — die
+ * Vorschläge im Bus-Tab verschwanden also stillschweigend.
+ *
+ * Die Koordinaten sind die des echten ZOB (nicht des Stadtzentrums): damit
+ * resolveMotisPlace den richtigen Halt trifft, statt über Label-Geocoding zu
+ * raten. Wer sie ändert, prüft sie bitte gegen den echten Busbahnhof — ein
+ * plausibel aussehender falscher Ort ist die gefährlichste Sorte Fehler.
+ */
+export interface BusStationSeed {
+  code: string;
+  name: string;
+  city: string;
+  country: string;
+  latitude: number;
+  longitude: number;
+}
+
+export const BUS_STATIONS: BusStationSeed[] = [
+  { code: "DE-BER-B", name: "Berlin ZOB", city: "Berlin", country: "Germany", latitude: 52.5067, longitude: 13.2776 },
+  { code: "DE-MUC-B", name: "München ZOB", city: "München", country: "Germany", latitude: 48.1431, longitude: 11.5474 },
+  { code: "DE-FRA-B", name: "Frankfurt (am Hbf)", city: "Frankfurt", country: "Germany", latitude: 50.1067, longitude: 8.6638 },
+  { code: "DE-HAM-B", name: "Hamburg ZOB", city: "Hamburg", country: "Germany", latitude: 53.5528, longitude: 10.0066 },
+  { code: "DE-CGN-B", name: "Köln (am Hbf)", city: "Köln", country: "Germany", latitude: 50.943, longitude: 6.9587 },
+  { code: "AT-VIE-B", name: "Wien Erdberg", city: "Wien", country: "Austria", latitude: 48.1934, longitude: 16.4146 },
+  { code: "CZ-PRG-B", name: "Prag UAN Florenc", city: "Praha", country: "Czech Republic", latitude: 50.0893, longitude: 14.4404 },
+  { code: "PL-WAW-B", name: "Warschau Zachodnia", city: "Warszawa", country: "Poland", latitude: 52.2196, longitude: 20.9714 },
+  { code: "FR-PAR-B", name: "Paris Bercy", city: "Paris", country: "France", latitude: 48.839, longitude: 2.3825 },
+  { code: "NL-AMS-B", name: "Amsterdam Sloterdijk", city: "Amsterdam", country: "Netherlands", latitude: 52.3892, longitude: 4.8378 },
+];
