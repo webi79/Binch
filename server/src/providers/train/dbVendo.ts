@@ -355,6 +355,11 @@ async function resolveStationId(
   // Für non-DE: stored hafasId nur als Hint nehmen, aber via Label-Lookup
   // (mit allWordsMatch-Filter) gegen DB-HAFAS verifizieren/auflösen. Für DE
   // kürzen wir ab und nehmen die stored ID direkt.
+  //
+  // Findet der Label-Lookup nichts, greifen wir am Ende doch auf die gespeicherte
+  // ID zurück — besser ein unsicherer Treffer als gar keiner.
+  let storedFallback: string | null = null;
+
   const stadaMatch = code.match(/^sta:(\d{7})$/);
   if (stadaMatch && stadaMatch[1]) {
     const dbHit = await db
@@ -368,6 +373,7 @@ async function resolveStationId(
     if (country === "Germany" && storedHafasId) {
       return storedHafasId;
     }
+    storedFallback = storedHafasId;
     // Non-DE: Label-Lookup fallthrough unten ist robuster. Wir hängen aber
     // die stored ID als zusätzlichen Candidate dran (falls Label nicht in
     // HAFAS findbar ist).
@@ -388,11 +394,31 @@ async function resolveStationId(
   // wir hafas_id beim Import in der DB gespeichert. DB-Lookup statt Live-Call.
   if (code.startsWith("gtfs:")) {
     const dbHit = await db
-      .select({ hafasId: locations.hafasId, type: locations.type })
+      .select({
+        hafasId: locations.hafasId,
+        type: locations.type,
+        country: locations.country,
+      })
       .from(locations)
       .where(eq(locations.code, code))
       .limit(1);
-    if (dbHit[0]?.hafasId) return dbHit[0].hafasId;
+    const stored = dbHit[0]?.hafasId ?? null;
+
+    // NUR für deutsche Stops die gespeicherte ID blind übernehmen. Im Ausland
+    // stammt sie aus dem dortigen Feed und ist NICHT DBs Nummer — DB kennt sie
+    // dann nicht und liefert null Verbindungen.
+    //
+    // Gemessen an Basel Bad Bf: ein DEUTSCHER Bahnhof auf Schweizer Boden, mit
+    // zwei Identitäten. Unser Eintrag stammt aus dem CH-Feed und trägt 8500090
+    // (die SBB-Nummer); DB kennt ihn als 8000026. Ergebnis: db-vendo lieferte 0,
+    // die Suche fiel auf MOTIS zurück — ohne Preise und deutlich langsamer.
+    //
+    // Für Auslands-Stops also denselben Weg wie bei sta:-Codes gehen: über den
+    // NAMEN gegen DBs eigene Ortssuche auflösen (die liefert 8000026), und die
+    // gespeicherte ID nur als letzten Rückfall behalten.
+    if (dbHit[0]?.country === "Germany" && stored) return stored;
+    storedFallback = stored;
+
     if (dbHit[0]?.type === "BUS") allowBusStops = true;
     // Kein hafas_id beim Import → fällt durch zum Live-Lookup via Name.
   }
@@ -519,7 +545,7 @@ async function resolveStationId(
       return first.id;
     }
   }
-  return null;
+  return storedFallback;
 }
 
 /** Lowercase + Diakritika-Entfernung für robusten Name-Vergleich.
