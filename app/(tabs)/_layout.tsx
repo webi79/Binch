@@ -69,7 +69,11 @@ export default function TabsLayout() {
         labeled={true}
         tabLabelStyle={{ fontSize: 0 }}
         hapticFeedbackEnabled
-        disablePageAnimations
+        // disablePageAnimations war AN — der Tab-Wechsel war damit ein harter
+        // Schnitt: Der alte Screen verschwand im selben Frame, in dem der neue
+        // stand. Keine Inhalts-Animation kann das glätten, sie läuft dem Schnitt
+        // nur hinterher. Jetzt übernimmt der native Seitenübergang (Crossfade),
+        // und unsere Welle setzt darauf auf.
         translucent={false}
         scrollEdgeAppearance="opaque"
       >

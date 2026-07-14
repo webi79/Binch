@@ -31,12 +31,27 @@ import Animated, {
  * an YouTube nachgemessen): zügig an, langer weicher Auslauf.
  */
 export const MOTION = {
-  rise: 12,
-  duration: 360,
-  stagger: 60,
-  /** Ab hier kein weiterer Versatz — sonst wartet das 20. Element 1,2 s. */
-  maxSteps: 6,
-  easing: Easing.bezier(0.05, 0.7, 0.1, 1),
+  /** Weg nach oben. Klein halten — Elemente sollen sich SETZEN, nicht
+   *  hereinfliegen. */
+  rise: 10,
+  /** Erste Fassung lief mit 360 ms und wirkte gehetzt. „Smooth" heißt hier vor
+   *  allem: Zeit lassen. 550 ms ist noch weit unter der Schwelle, ab der
+   *  Bewegung als Warten empfunden wird (Kontextwechsel dürfen 600-800 ms). */
+  duration: 550,
+  /** Versatz je Element. Größer = die Welle ist deutlicher lesbar. */
+  stagger: 90,
+  /** Ab hier kein weiterer Versatz — sonst wartet das 20. Element ewig. */
+  maxSteps: 5,
+  /**
+   * easeOutCubic statt der Push-Kurve (0.05, 0.7, 0.1, 1).
+   *
+   * Die Push-Kurve ist „emphasized decelerate": Sie SCHIESST los und bremst
+   * dann. Für eine 400-ms-Seitentransition, die Tempo signalisieren soll, ist
+   * das richtig — für ein Element, das sich beiläufig setzen soll, liest es sich
+   * als Zucken. Hier soll nichts schießen; der Anstieg ist sanft, das Ausrollen
+   * lang.
+   */
+  easing: Easing.bezier(0.33, 1, 0.68, 1),
 } as const;
 
 export function staggerDelay(index: number): number {

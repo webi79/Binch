@@ -518,10 +518,12 @@ export default function HomeScreen() {
         contentContainerStyle={[styles.scrollContent, { paddingTop: insets.top + 8 }]}
         showsVerticalScrollIndicator={false}
       >
+          {/* Der Header animiert NICHT mit. Dauerhafte Chrome-Elemente (Logo,
+              Titel, Tab-Bar) sollen stehen — wandern sie mit, sieht es aus, als
+              fiele die ganze Seite von oben herein, statt dass sich der Inhalt
+              setzt. Die Welle beginnt darunter. */}
+          <Header />
           <Reveal index={0}>
-            <Header />
-          </Reveal>
-          <Reveal index={1}>
             <SearchBar
               style={[styles.searchBarSpacing, { borderWidth: 1.5, borderColor: "rgba(255,255,255,0.14)" }]}
               onPress={() => router.navigate("/assistant")}
@@ -530,12 +532,12 @@ export default function HomeScreen() {
               }
             />
           </Reveal>
-          <Reveal index={2}>
+          <Reveal index={1}>
             <TransportTabs />
           </Reveal>
 
           {recentSearches.length > 0 && (
-            <Reveal index={3} style={styles.recentSection}>
+            <Reveal index={2} style={styles.recentSection}>
               <SectionHeaderSmall
                 title={t("home.recent.title")}
                 onViewAll={() => {
@@ -589,7 +591,7 @@ export default function HomeScreen() {
               spürbare Frame-Drops im ScrollView verursachte. Ohne
               LinearTransition snappt die Höhe direkt — kaum sichtbarer
               Verlust, viel smoother Scroll. */}
-          <Reveal index={4}>
+          <Reveal index={3}>
             <View style={styles.popularHeader}>
               <Text style={styles.sectionTitle}>{t("home.destinations.title")}</Text>
               <Pressable hitSlop={8}>

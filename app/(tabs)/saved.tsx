@@ -165,14 +165,13 @@ export default function SavedScreen() {
     <ScreenEntrance>
     <SafeAreaView className="flex-1 bg-[#1A1A1A]" edges={["top"]}>
       <Animated.View style={[{ flex: 1 }, parallaxStyle]}>
-      <Reveal index={0}>
+      {/* Titel = Chrome, bleibt stehen (siehe Home). */}
       <View className="px-4 pt-6">
         <Text className="text-[26px] font-black text-white tracking-tight">
           Saved
         </Text>
       </View>
-      </Reveal>
-      <Reveal index={1}>
+      <Reveal index={0}>
       <View className="px-4 pt-4 pb-4">
         <SegmentedToggle
           items={[
