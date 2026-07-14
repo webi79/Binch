@@ -20,6 +20,17 @@ import { SpeechBubble, PaperPlane, SCENE_W, useLoaderPaused } from "./SearchScen
 
 const SCENE_H = 250;
 
+/**
+ * Hebt die ganze Szene an. Der Loader zentriert die Szene vertikal
+ * (`justifyContent: "center"`), und Margins zählen dabei mit — unten Luft heißt
+ * also: Inhalt rutscht um die HÄLFTE davon nach oben.
+ *
+ * Nötig, weil die Sprechblase über Bo Platz braucht und ihn dadurch unter die
+ * optische Mitte drückt. Eine Zahl, ein Effekt — wenn Bo jetzt zu HOCH sitzt,
+ * hier kleiner machen.
+ */
+const BOTTOM_LIFT = 34;
+
 interface Props {
   name?: string;
   destLabel: string;
@@ -68,17 +79,19 @@ export function GreetingScene({ name, destLabel }: Props) {
     ? t("loader.greeting.named").replace("{name}", name)
     : t("loader.greeting");
   return (
-    <View style={{ width: SCENE_W, height: SCENE_H }}>
-      {/* Sprechblase und Bo stapeln sich jetzt in einer Spalte, statt beide
-          absolut positioniert zu sein (Blase top:0, Bo fest bei top:92).
-          Absolut hieß: Wird die Blase kürzer als erwartet, klafft darunter eine
-          Lücke und die Blasenspitze zeigt ins Leere — genau das war zu sehen,
-          Bo hing ~35 px unter seiner eigenen Sprechblase.
+    <View style={{ width: SCENE_W, height: SCENE_H, marginBottom: BOTTOM_LIFT * 2 }}>
+      {/* Bo ist der Blickfang — er gehört auf die Mitte, nicht die Sprechblase.
+          Darum hängt die Gruppe UNTEN (bottom-verankert) und die Blase wächst
+          nach OBEN aus ihr heraus.
 
-          Mit den neuen Übersetzungen wäre es schlimmer geworden: „Accroche-toi —
-          direction Lisbonne!" bricht anders um als der deutsche Satz, die
-          Blasenhöhe variiert also je Sprache. Eine Spalte hält Bo IMMER direkt
-          unter der Spitze, egal wie hoch die Blase wird. */}
+          Vorher war der Stapel top-verankert: Die Blase wuchs nach unten und
+          schob Bo vor sich her — je länger der Text, desto tiefer saß er. Genau
+          deshalb wirkte er nur in DIESER Szene zu tief (die anderen haben keine
+          Sprechblase über ihm). Und mit den Übersetzungen wäre es je nach Sprache
+          unterschiedlich schlimm geworden: „Accroche-toi — direction Lisbonne!"
+          bricht anders um als der deutsche Satz.
+
+          Jetzt steht Bo fest, egal wie hoch die Blase wird. */}
       <View style={styles.stack}>
         <SpeechBubble maxWidth={250}>
           <Text style={styles.bubbleTxt}>
@@ -108,12 +121,13 @@ export function GreetingScene({ name, destLabel }: Props) {
 const styles = StyleSheet.create({
   stack: {
     position: "absolute",
-    top: 0,
+    // Bottom-verankert: Bo (letztes Kind) sitzt fest über der Routen-Linie, die
+    // Blase wächst nach oben. Damit hängt Bos Höhe NICHT mehr an der Textlänge.
+    bottom: 44,
     left: 0,
     right: 0,
     alignItems: "center",
-    // Kleiner, fester Abstand zwischen Blasenspitze und Bos Kopf — sie gehören
-    // zusammen. Vorher ergab er sich zufällig aus zwei absoluten Positionen.
+    // Fester Abstand Blasenspitze → Bos Kopf. Sie gehören zusammen.
     gap: 6,
   },
   bubbleTxt: {
