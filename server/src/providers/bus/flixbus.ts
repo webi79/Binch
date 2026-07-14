@@ -2,6 +2,8 @@ import { config } from "../../config.js";
 import { BoundedTtlCache } from "../../util/boundedCache.js";
 import { normStationName } from "../../util/stationName.js";
 import { resolveMotisPlace } from "../../services/motisPlaces.js";
+import { buildShopLink, isoToDmy } from "./flixbusLink.js";
+import { searchFlixbusViaRapid } from "./flixbusRapid.js";
 import type {
   SearchProvider,
   ProviderSearchInput,
@@ -240,11 +242,10 @@ export const flixbusProvider: SearchProvider = {
   name: "flixbus",
   mode: "BUS",
 
-  // Kein Key mehr nötig — FlixBus' eigene API ist offen.
-  // Während eines Cooldowns (429/403) melden wir uns bewusst als "nicht
-  // konfiguriert" ab, statt sinnlos gegen die Sperre zu laufen.
+  // Kein Key nötig — FlixBus' eigene API ist offen. Auch während eines Cooldowns
+  // bleiben wir aktiv: dann übernimmt der RapidAPI-Notfallpfad (siehe search()).
   isConfigured() {
-    return Date.now() >= blockedUntil;
+    return true;
   },
 
   async search(input: ProviderSearchInput, signal?: AbortSignal): Promise<ProviderResult> {
@@ -259,52 +260,79 @@ export const flixbusProvider: SearchProvider = {
       };
     }
 
-    let fromId: string | null;
-    let toId: string | null;
-    try {
-      fromId = await resolveFlixCityId(input.origin, input.originLabel, signal);
-      toId = await resolveFlixCityId(input.destination, input.destLabel, signal);
-    } catch (e) {
-      if (e instanceof FlixbusApiError) {
-        noteRateLimit(e.statusCode);
-        return {
-          results: [],
-          raw: { error: "flixbus_api_error", message: e.apiMessage, statusCode: e.statusCode },
-          statusCode: e.statusCode,
-          durationMs: Date.now() - start,
-        };
-      }
-      throw e;
-    }
-    if (!fromId || !toId) {
-      return {
-        results: [],
-        raw: { skipped: "could not resolve flixbus city", origin: input.origin, destination: input.destination },
-        statusCode: 0,
-        durationMs: Date.now() - start,
-      };
-    }
-
     // Zeitzonen der Endpunkte — dieselbe geteilte Auflösung wie beim Zug-Provider
     // (24h-Cache). Ohne sie rendert der Client die UTC-Zeit in der GERÄTE-Zone;
-    // für einen Bus in Spanien wäre das schlicht falsch.
+    // für einen Bus in Spanien wäre das schlicht falsch. BEIDE Pfade brauchen sie:
+    // der Notfallpfad muss aus der Ortszeit des Wrappers erst korrektes UTC
+    // rechnen (siehe flixbusRapid.ts).
     const [fromPlace, toPlace] = await Promise.all([
       resolveMotisPlace(input.origin, input.originLabel, signal).catch(() => null),
       resolveMotisPlace(input.destination, input.destLabel, signal).catch(() => null),
     ]);
     const tz = { origin: fromPlace?.tz, destination: toPlace?.tz };
 
-    const [outbound, returnLeg] = await Promise.all([
-      fetchFlixTrips(fromId, toId, input.departDate, input, signal),
-      input.returnDate
-        ? fetchFlixTrips(toId, fromId, input.returnDate, input, signal)
-        : Promise.resolve(null),
-    ]);
+    /** Notfallpfad: bezahlter RapidAPI-Zugang mit bekanntem Kontingent. */
+    const fallback = async (reason: string): Promise<ProviderResult> => {
+      const results = await searchFlixbusViaRapid(input, tz, signal);
+      if (!results) {
+        return {
+          results: [],
+          raw: { error: "flixbus_unavailable", reason },
+          statusCode: 0,
+          durationMs: Date.now() - start,
+        };
+      }
+      return {
+        results,
+        raw: { source: "rapidapi_fallback", reason, count: results.length },
+        statusCode: 200,
+        durationMs: Date.now() - start,
+      };
+    };
+
+    // Sperrt uns die offene API gerade aus? Dann gar nicht erst anklopfen.
+    if (Date.now() < blockedUntil) return fallback("cooldown");
+
+    let fromId: string | null;
+    let toId: string | null;
+    let outbound: FlixFetch;
+    let returnLeg: FlixFetch | null;
+    try {
+      fromId = await resolveFlixCityId(input.origin, input.originLabel, signal);
+      toId = await resolveFlixCityId(input.destination, input.destLabel, signal);
+      if (!fromId || !toId) {
+        return {
+          results: [],
+          raw: { skipped: "could not resolve flixbus city", origin: input.origin, destination: input.destination },
+          statusCode: 0,
+          durationMs: Date.now() - start,
+        };
+      }
+
+      [outbound, returnLeg] = await Promise.all([
+        fetchFlixTrips(fromId, toId, input.departDate, input, signal),
+        input.returnDate
+          ? fetchFlixTrips(toId, fromId, input.returnDate, input, signal)
+          : Promise.resolve(null),
+      ]);
+    } catch (e) {
+      // JEDER Fehler führt auf den Notfallpfad, nicht nur ein HTTP-Status.
+      // Vorher fingen wir hier nur FlixbusApiError ab — ein Netzwerkfehler (DNS,
+      // Timeout, Verbindungsabbruch) lässt `fetch` aber WERFEN, flog also durch
+      // und riss den Provider mit, statt umzuschalten. Im Test mit unerreichbarem
+      // Host sprang der Fallback deshalb nicht an. Genau dann braucht man ihn.
+      if (e instanceof FlixbusApiError) noteRateLimit(e.statusCode);
+      return fallback(e instanceof Error ? e.message : "unknown error");
+    }
     const durationMs = Date.now() - start;
 
+    // NUR bei einem FEHLER auf den Notfallpfad. Eine LEERE Antwort ist kein
+    // Fehler: Beide Wege fragen dieselbe Quelle — wenn die offene API sagt „auf
+    // dieser Strecke fährt nichts", würde RapidAPI dasselbe sagen und wir hätten
+    // einen Call aus dem Kontingent für nichts verbrannt.
     if (!outbound.ok) {
       noteRateLimit(outbound.statusCode);
-      return { results: [], raw: outbound.raw, statusCode: outbound.statusCode, durationMs };
+      return fallback(`trips ${outbound.statusCode}`);
     }
 
     const outboundResults = parseTrips(outbound.raw, input, tz, {
@@ -363,7 +391,13 @@ function parseTrips(
   const stationName = (id?: string) => (id ? stations[id]?.name : undefined);
 
   const out: NormalizedResult[] = [];
-  const deepLink = buildShopLink(link, input);
+  const deepLink = buildShopLink({
+    fromCityId: link.fromCityId,
+    toCityId: link.toCityId,
+    rideDate: link.rideDate,
+    passengers: input.passengers,
+    currency: input.currency,
+  });
 
   for (const group of r.trips ?? []) {
     for (const trip of Object.values(group.results ?? {})) {
@@ -440,37 +474,4 @@ function toIso(value: string | undefined): string | null {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-/** "2026-05-15" → "15.05.2026" */
-function isoToDmy(iso: string): string {
-  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (!m) return iso;
-  return `${m[3]}.${m[2]}.${m[1]}`;
-}
 
-/**
- * Buchungslink in den FlixBus-Shop.
- *
- * Vorbelegt mit Städten, Datum, Personenzahl und der WÄHRUNG DER APP — vorher
- * kam der Link ungefiltert aus der API und trug deren Vorgaben (`currency=EUR`,
- * `_locale=en`), passte also weder zur eingestellten Währung noch zur Sprache.
- *
- * `_locale` lassen wir bewusst WEG: Dann wählt der Shop die Sprache nach der
- * Gerätesprache des Users. Setzten wir sie fest, müssten wir die App-Sprache bis
- * hierher durchreichen und hätten sie im Cache-Key — für ein reines Anzeigedetail.
- *
- * Eine konkrete FAHRT lässt sich nicht verlinken: Der Shop akzeptiert keinen
- * Trip-Parameter (die `uid` der API ist nur intern). Es bleibt die Tagessuche.
- */
-function buildShopLink(link: LinkContext, input: ProviderSearchInput): string {
-  const params = new URLSearchParams({
-    departureCity: link.fromCityId,
-    arrivalCity: link.toCityId,
-    rideDate: isoToDmy(link.rideDate),
-    adult: String(input.passengers),
-    children: "0",
-    bike_slot: "0",
-    currency: input.currency,
-  });
-  if (config.FLIXBUS_AFFILIATE_ID) params.set("partner", config.FLIXBUS_AFFILIATE_ID);
-  return `https://shop.flixbus.com/search?${params.toString()}`;
-}
