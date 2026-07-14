@@ -204,7 +204,26 @@ export function Reveal({ children, index = 0, waveBase = 0, style }: RevealProps
     transform: [{ translateY: (1 - progress.value) * MOTION.rise }],
   }));
 
-  return <Animated.View style={[style, animatedStyle]}>{children}</Animated.View>;
+  return (
+    // needsOffscreenAlphaCompositing: React Native schaltet korrektes
+    // Alpha-Compositing auf Android AB (ReactViewGroup.hasOverlappingRendering()
+    // liefert per Default false — aus Performance-Gründen). Ohne das Flag zeichnet
+    // Android beim Faden JEDES KIND EINZELN mit dem aktuellen Alpha, statt die
+    // Karte erst fertig zu komponieren und dann als Ganzes zu faden.
+    //
+    // Sichtbar wird das überall dort, wo sich halbtransparente Kinder
+    // überlagern — bei den Destination-Karten liegt ein schwarzer Verlauf über
+    // dem Bild. Der wurde während des Fades getrennt vom Bild gedimmt und
+    // komponierte erst bei opacity 1 wieder richtig: Der Tiefeneffekt „sprang"
+    // am Ende rein, statt mit der Karte zu kommen.
+    //
+    // Kostet nur WÄHREND des Fades einen Offscreen-Buffer: Android legt ihn nur
+    // an, wenn alpha != 1. Kein dauerhafter Hardware-Layer (der hat an anderer
+    // Stelle schon mal 66 ms Record-View#draw gekostet, siehe Saved-Parallax).
+    <Animated.View needsOffscreenAlphaCompositing style={[style, animatedStyle]}>
+      {children}
+    </Animated.View>
+  );
 }
 
 /**
