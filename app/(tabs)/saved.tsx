@@ -13,6 +13,7 @@ import { EmptyState } from "@/components/saved/EmptyState";
 import { AddTicketButton } from "@/components/saved/AddTicketButton";
 import { SegmentedToggle } from "@/components/ui/SegmentedToggle";
 import { RevealScrollView, ScreenEntrance, ScrollReveal } from "@/lib/motion";
+import { GUTTER } from "@/lib/theme/spacing";
 import { SlidingPanels } from "@/components/ui/SlidingPanels";
 import { useAccent } from "@/lib/theme/accent";
 import { overlayCover, UNDERLAY_TRAVEL_FRAC } from "@/lib/nav/overlayCover";
@@ -60,7 +61,7 @@ type Tab = "trips" | "tickets";
  */
 function SkeletonCard() {
   return (
-    <View className="mx-4 mb-3">
+    <View className="mx-5 mb-3">
       <View
         style={{
           height: 132,
@@ -166,13 +167,13 @@ export default function SavedScreen() {
     <SafeAreaView className="flex-1 bg-[#1A1A1A]" edges={["top"]}>
       <Animated.View style={[{ flex: 1 }, parallaxStyle]}>
       {/* Titel = Chrome, bleibt stehen (siehe Home). */}
-      <View className="px-4 pt-6">
+      <View className="px-5 pt-6">
         <Text className="text-[26px] font-black text-white tracking-tight">
           Saved
         </Text>
       </View>
       <ScrollReveal index={0}>
-      <View className="px-4 pt-4 pb-4">
+      <View className="px-5 pt-4 pb-4">
         <SegmentedToggle
           items={[
             { id: "trips", label: t("saved.tab.trips") },
@@ -213,7 +214,7 @@ export default function SavedScreen() {
         ) : (
           <RevealScrollView
             className="flex-1"
-            contentContainerStyle={{ paddingBottom: 98, paddingHorizontal: 16 }}
+            contentContainerStyle={{ paddingBottom: 98, paddingHorizontal: GUTTER }}
             showsVerticalScrollIndicator={false}
           >
             {/* Die Karten laufen in derselben Welle weiter wie der Umschalter

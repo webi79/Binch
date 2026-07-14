@@ -12,6 +12,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { RevealScrollView, ScreenEntrance, ScrollReveal } from "@/lib/motion";
+import { GUTTER, SPACE } from "@/lib/theme/spacing";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
 import Svg, { Circle, Path, Rect } from "react-native-svg";
@@ -145,7 +146,7 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
       {/* Spacer matching the hidden "Bereiche" label slot in the design */}
       <View style={{ height: 30 }} />
 
-      <View style={{ paddingHorizontal: 16 }}>
+      <View style={{ paddingHorizontal: GUTTER }}>
         {tiles.map((tile, idx) => (
           <ScrollReveal key={tile.id} index={1 + idx} style={{ marginBottom: idx < tiles.length - 1 ? 8 : 0 }}>
             <SectionCard
@@ -684,7 +685,7 @@ function SettingsSubScreen({ onBack }: { onBack: () => void }) {
 
       {/* SAVED TOAST POSITION */}
       <StripeLabel text={t("settings.toast.section")} />
-      <View style={{ paddingHorizontal: 16 }}>
+      <View style={{ paddingHorizontal: GUTTER }}>
         <Text style={styles.toastDesc}>{t("settings.toast.desc")}</Text>
         <View style={styles.toastSegment}>
           {(["top", "bottom"] as const).map((pos) => {
@@ -1015,14 +1016,14 @@ const styles = StyleSheet.create({
 
   /* — profile card — */
   profileCard: {
-    marginHorizontal: 16,
+    marginHorizontal: GUTTER,
     marginTop: 12,
     backgroundColor: C.s1,
     borderRadius: 22,
     overflow: "hidden",
   },
   profileTopRow: {
-    paddingHorizontal: 18,
+    paddingHorizontal: SPACE.lg,
     paddingTop: 16,
     paddingBottom: 18,
     flexDirection: "row",
@@ -1082,7 +1083,7 @@ const styles = StyleSheet.create({
   sectionCard: {
     backgroundColor: C.s1,
     borderRadius: 20,
-    paddingHorizontal: 18,
+    paddingHorizontal: SPACE.lg,
     paddingTop: 20,
     paddingBottom: 16,
     minHeight: 120,
@@ -1101,9 +1102,9 @@ const styles = StyleSheet.create({
   sectionCardDesc: { fontSize: 12, color: C.g2, marginTop: 5, lineHeight: 17 },
 
   /* — divider, sign-out, version — */
-  divider: { height: 1, backgroundColor: C.border, marginHorizontal: 16, marginTop: 16 },
+  divider: { height: 1, backgroundColor: C.border, marginHorizontal: GUTTER, marginTop: 16 },
   signOut: {
-    marginHorizontal: 16,
+    marginHorizontal: GUTTER,
     marginTop: 12,
     backgroundColor: "rgba(255,69,58,0.05)",
     borderRadius: 16,
@@ -1115,7 +1116,7 @@ const styles = StyleSheet.create({
   },
   signOutText: { fontSize: 15, fontWeight: "600", color: C.red },
   signIn: {
-    marginHorizontal: 16,
+    marginHorizontal: GUTTER,
     marginTop: 12,
     backgroundColor: "rgba(127,234,77,0.05)",
     borderRadius: 16,
@@ -1139,7 +1140,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingHorizontal: 16,
+    paddingHorizontal: GUTTER,
     paddingTop: 10,
     paddingBottom: 6,
   },
@@ -1159,7 +1160,7 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     color: C.g3,
     letterSpacing: 0.88,
-    paddingHorizontal: 20,
+    paddingHorizontal: GUTTER,
     paddingTop: 18,
     paddingBottom: 8,
   },
@@ -1167,7 +1168,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
-    paddingHorizontal: 20,
+    paddingHorizontal: GUTTER,
     paddingTop: 20,
     paddingBottom: 8,
   },
@@ -1183,7 +1184,7 @@ const styles = StyleSheet.create({
   group: {
     backgroundColor: C.s1,
     borderRadius: 16,
-    marginHorizontal: 16,
+    marginHorizontal: GUTTER,
     overflow: "hidden",
   },
   row: {
@@ -1213,7 +1214,7 @@ const styles = StyleSheet.create({
   // (Lime-Glow um die ausgewählte Card).
   themeCardOuter: { flex: 1, borderRadius: 18, padding: 4 },
   themeCardInner: { borderRadius: 14, overflow: "hidden", borderWidth: 1 },
-  themeFooter: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 13, paddingVertical: 10 },
+  themeFooter: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: SPACE.md, paddingVertical: 10 },
   themeFooterText: { fontSize: 14, fontWeight: "700" },
   // Color-Swatch im Color-Picker: 54px hoher Gradient-Block mit Check-Badge.
   colorSwatch: { height: 54, alignItems: "center", justifyContent: "center" },
@@ -1233,7 +1234,7 @@ const styles = StyleSheet.create({
   themePreviewBlock: { width: "90%", height: 24, borderRadius: 6 },
   themeLabelRow: {
     backgroundColor: C.s1,
-    paddingHorizontal: 10,
+    paddingHorizontal: SPACE.sm,
     paddingVertical: 8,
     flexDirection: "row",
     alignItems: "center",
@@ -1247,7 +1248,7 @@ const styles = StyleSheet.create({
   /* — currency pills — */
   currencyRow: { paddingHorizontal: 16, gap: 8 },
   currencyPill: {
-    paddingHorizontal: 18,
+    paddingHorizontal: SPACE.lg,
     paddingVertical: 10,
     borderRadius: 9999,
     borderWidth: 1.5,

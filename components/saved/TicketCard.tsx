@@ -11,6 +11,7 @@ import { de, enGB, es, fr } from "date-fns/locale";
 import { showAlert } from "@/lib/alert";
 import { Ticket } from "@/types/saved";
 import { useT } from "@/lib/i18n/useT";
+import { GUTTER, SPACE } from "@/lib/theme/spacing";
 import { useSearchStore } from "@/stores/searchStore";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
@@ -158,7 +159,7 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
 }
 
 const styles = StyleSheet.create({
-  wrap: { marginHorizontal: 16, marginBottom: 8 },
+  wrap: { marginHorizontal: GUTTER, marginBottom: 8 },
   headerRow: {
     paddingHorizontal: 8,
     paddingTop: 6,
@@ -179,7 +180,7 @@ const styles = StyleSheet.create({
     overflow: "hidden",
   },
 
-  countdown: { paddingHorizontal: 18, paddingTop: 20, paddingBottom: 18 },
+  countdown: { paddingHorizontal: SPACE.lg, paddingTop: 20, paddingBottom: 18 },
   countdownTop: {
     flexDirection: "row",
     justifyContent: "space-between",

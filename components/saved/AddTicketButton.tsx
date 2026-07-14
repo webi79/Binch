@@ -2,6 +2,7 @@ import { View, Text, Pressable, StyleSheet } from "react-native";
 import Svg, { Line, Polyline } from "react-native-svg";
 import { useAccent } from "@/lib/theme/accent";
 import { useT } from "@/lib/i18n/useT";
+import { GUTTER, SPACE } from "@/lib/theme/spacing";
 
 // App-Farben (Akzent kommt live aus useAccent()):
 const SURFACE = "#242425"; // Ticket-Fläche — = C.surface (wie TicketCard)
@@ -92,7 +93,7 @@ const styles = StyleSheet.create({
     borderRadius: 18,
     minHeight: 72,
     overflow: "visible",
-    marginHorizontal: 16,
+    marginHorizontal: GUTTER,
     marginBottom: 14,
   },
   stub: {
@@ -129,8 +130,8 @@ const styles = StyleSheet.create({
     flex: 1,
     flexDirection: "row",
     alignItems: "center",
-    paddingLeft: 20,
-    paddingRight: 18,
+    paddingLeft: SPACE.xl,
+    paddingRight: SPACE.lg,
   },
   title: {
     fontSize: 17,

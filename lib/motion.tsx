@@ -43,6 +43,17 @@ export const MOTION = {
    *  allem: Zeit lassen. 550 ms ist noch weit unter der Schwelle, ab der
    *  Bewegung als Warten empfunden wird (Kontextwechsel dürfen 600-800 ms). */
   duration: 550,
+  /**
+   * Für große Flächen (bildschirmhohe Bild-Karten).
+   *
+   * Große Elemente müssen sich LANGSAMER bewegen als kleine — sonst wirken sie
+   * hektisch. Das ist kein Geschmack: Eine große Fläche legt auf dem Schirm mehr
+   * Weg pro Pixel Wahrnehmung zurück, und das Auge liest gleiche Dauer bei
+   * größerer Fläche als höheres Tempo. Material nennt das „größere Elemente
+   * bewegen sich träger"; hier heißt es schlicht: die Destination-Karten
+   * bekommen mehr Zeit als die Chips darüber.
+   */
+  durationLarge: 780,
   /** Abstand zwischen den ERSTEN beiden Elementen. Danach klingt er ab. */
   stagger: 90,
   /**
@@ -184,6 +195,8 @@ interface RevealProps {
    * Farbe.
    */
   scrim?: string;
+  /** Große Fläche → mehr Zeit (siehe MOTION.durationLarge). */
+  large?: boolean;
   style?: StyleProp<ViewStyle>;
 }
 
@@ -194,7 +207,14 @@ interface RevealProps {
  * Muss unter einem {@link ScreenEntrance} hängen — dann läuft die Welle bei
  * JEDEM Fokus des Screens neu, nicht nur beim ersten Mount.
  */
-export function Reveal({ children, index = 0, waveBase = 0, scrim, style }: RevealProps) {
+export function Reveal({
+  children,
+  index = 0,
+  waveBase = 0,
+  scrim,
+  large = false,
+  style,
+}: RevealProps) {
   const { generation, focusedAt } = useContext(EntranceContext);
   const reduceMotion = useReduceMotion();
   const progress = useSharedValue(0);
@@ -212,9 +232,12 @@ export function Reveal({ children, index = 0, waveBase = 0, scrim, style }: Reve
     progress.value = 0;
     progress.value = withDelay(
       staggerDelay(step),
-      withTiming(1, { duration: MOTION.duration, easing: MOTION.easing }),
+      withTiming(1, {
+        duration: large ? MOTION.durationLarge : MOTION.duration,
+        easing: MOTION.easing,
+      }),
     );
-  }, [generation, focusedAt, index, waveBase, reduceMotion, progress]);
+  }, [generation, focusedAt, index, waveBase, large, reduceMotion, progress]);
 
   const animatedStyle = useAnimatedStyle(() => ({
     // Mit Vorhang bleibt die View selbst opak — der Vorhang erledigt das Faden.
@@ -324,10 +347,11 @@ export function ScrollReveal({
   index = 0,
   waveBase = 0,
   scrim,
+  large = false,
   style,
 }: RevealProps) {
   return (
-    <Reveal index={index} waveBase={waveBase} scrim={scrim} style={style}>
+    <Reveal index={index} waveBase={waveBase} scrim={scrim} large={large} style={style}>
       {children}
     </Reveal>
   );

@@ -35,6 +35,7 @@ import Animated, {
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
 import { RevealScrollView, ScreenEntrance, ScrollReveal } from "@/lib/motion";
+import { GUTTER, SPACE } from "@/lib/theme/spacing";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { RecentCard } from "@/components/home/RecentCard";
@@ -657,6 +658,7 @@ export default function HomeScreen() {
               index={wave.destinationCards}
               waveBase={wave.destinationCards}
               scrim={C.bg}
+              large
             >
               <DestinationCard d={d} />
             </ScrollReveal>
@@ -683,7 +685,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingHorizontal: 22,
+    paddingHorizontal: GUTTER,
     paddingTop: 8,
     paddingBottom: 14,
   },
@@ -710,13 +712,13 @@ const styles = StyleSheet.create({
   },
 
   // SearchBar spacing
-  searchBarSpacing: { marginHorizontal: 22, marginBottom: 12 },
+  searchBarSpacing: { marginHorizontal: GUTTER, marginBottom: 12 },
 
   // Transport tabs
   tabsRow: {
     flexDirection: "row",
     gap: 8,
-    paddingHorizontal: 22,
+    paddingHorizontal: GUTTER,
     paddingBottom: 8,
   },
   tab: {
@@ -738,7 +740,7 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     alignItems: "baseline",
     marginBottom: 12,
-    paddingHorizontal: 22,
+    paddingHorizontal: GUTTER,
   },
   sectionTitleSmall: {
     fontSize: 26,
@@ -754,7 +756,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     gap: 4,
     paddingVertical: 12,
-    marginHorizontal: 20,
+    marginHorizontal: GUTTER,
     marginTop: 4,
     marginBottom: 8,
     borderRadius: 16,
@@ -766,7 +768,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "baseline",
-    paddingHorizontal: 22,
+    paddingHorizontal: GUTTER,
     paddingTop: 20,
     paddingBottom: 14,
   },
@@ -781,7 +783,7 @@ const styles = StyleSheet.create({
   chipsRow: {
     flexDirection: "row",
     gap: 8,
-    paddingHorizontal: 22,
+    paddingHorizontal: GUTTER,
     paddingTop: 4,
     paddingBottom: 4,
   },
@@ -789,7 +791,7 @@ const styles = StyleSheet.create({
     flex: 1,
     borderRadius: 9999,
     paddingVertical: 10,
-    paddingHorizontal: 6,
+    paddingHorizontal: SPACE.sm,
     alignItems: "center",
     justifyContent: "center",
     overflow: "hidden",
@@ -798,7 +800,7 @@ const styles = StyleSheet.create({
 
   // Destination card
   card: {
-    marginHorizontal: 22,
+    marginHorizontal: GUTTER,
     marginBottom: 16,
     borderRadius: 28,
     overflow: "hidden",
@@ -828,7 +830,7 @@ const styles = StyleSheet.create({
     alignSelf: "flex-start",
     borderRadius: 9999,
     paddingVertical: 4,
-    paddingHorizontal: 9,
+    paddingHorizontal: SPACE.sm,
     marginBottom: 8,
     overflow: "hidden",
   },
@@ -854,7 +856,7 @@ const styles = StyleSheet.create({
   cta: {
     borderRadius: 9999,
     paddingVertical: 12,
-    paddingHorizontal: 18,
+    paddingHorizontal: SPACE.lg,
     overflow: "hidden",
   },
   ctaText: { fontSize: 13, fontWeight: FONT.bold, color: C.black, letterSpacing: -0.13 },

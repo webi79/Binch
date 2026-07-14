@@ -52,6 +52,7 @@ import { SlidingPanels } from "@/components/ui/SlidingPanels";
 import { tripSignature } from "@/lib/results/signature";
 import { useAccent } from "@/lib/theme/accent";
 import { MOTION, revealEntering } from "@/lib/motion";
+import { GUTTER } from "@/lib/theme/spacing";
 
 type SortKey = "cheapest" | "fastest" | "direct";
 
@@ -1070,7 +1071,7 @@ const styles = StyleSheet.create({
   routePanel: {
     backgroundColor: C.card,
     borderRadius: 24,
-    marginHorizontal: 16,
+    marginHorizontal: GUTTER,
     marginTop: 12,
     padding: 16,
     gap: 14,
@@ -1131,7 +1132,7 @@ const styles = StyleSheet.create({
 
   // Hin/Rück-Toggle — visuell wie im Saved-Tab (Reise/Tickets-Segment):
   // dunkler Pill-Container, aktive Pille mit Lime-Background.
-  dirToggleWrap: { paddingHorizontal: 16, paddingTop: 12 },
+  dirToggleWrap: { paddingHorizontal: GUTTER, paddingTop: 12 },
   dirToggle: {
     flexDirection: "row",
     backgroundColor: "#242425",
@@ -1152,7 +1153,7 @@ const styles = StyleSheet.create({
   tabsRow: {
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 20,
+    paddingHorizontal: GUTTER,
     paddingTop: 18,
     paddingBottom: 12,
     gap: 22,
@@ -1176,7 +1177,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
 
-  listContent: { paddingHorizontal: 16, paddingTop: 4, paddingBottom: 110 },
+  listContent: { paddingHorizontal: GUTTER, paddingTop: 4, paddingBottom: 110 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
   errorWrap: {
     flex: 1,
@@ -1208,7 +1209,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
-    paddingHorizontal: 22,
+    paddingHorizontal: GUTTER,
     paddingVertical: 12,
     borderRadius: 9999,
     overflow: "hidden",
