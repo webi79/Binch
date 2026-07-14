@@ -242,6 +242,9 @@ export function ScrollReveal({ children, index = 0, style }: RevealProps) {
   const progress = useSharedValue(0);
   /** Stößt die Sichtbarkeitsprüfung einmal an, ohne dass gescrollt wurde. */
   const pulse = useSharedValue(0);
+  /** Erst wenn onLayout gefeuert hat, existiert die native View — vorher reißt
+   *  measure() die App um. */
+  const laidOut = useSharedValue(false);
   /**
    * Wartet dieses Element noch auf SEINE ERSTE Prüfung?
    *
@@ -273,19 +276,46 @@ export function ScrollReveal({ children, index = 0, style }: RevealProps) {
   // ELTERNELEMENT. Eine Karte, die in einer Sektion steckt, meldete damit eine
   // Position nahe 0 und würde sofort einblenden, egal wo sie auf dem Schirm
   // steht. measure() gibt die echte Bildschirmposition (pageY).
+  //
+  // ABER: measure() STÜRZT AB, wenn die View noch nicht im nativen Baum hängt —
+  // nicht „gibt null zurück", sondern reißt die App mit einer C++-Exception um
+  // („Value is null, expected an Object"). Ich hatte angenommen, ein Frame
+  // Verzögerung (requestAnimationFrame) reiche aus. Beim App-Start reicht es
+  // nicht.
+  //
+  // Zwei Sicherungen:
+  //   1. Gemessen wird erst, wenn onLayout gefeuert hat — dann existiert die
+  //      native View garantiert. Das onLayout stößt die Prüfung auch gleich an.
+  //   2. try/catch drumherum. Ein fehlgeschlagenes Messen darf höchstens
+  //      bedeuten, dass ein Element sichtbar bleibt — niemals, dass die App
+  //      abstürzt.
   useAnimatedReaction(
     () => (ctx ? ctx.scrollY.value : 0) + pulse.value,
     () => {
       if (reduceMotion || progress.value !== 0) return;
-      if (!ctx) {
-        // Keine RevealScrollView drumherum → verhält sich wie Reveal.
+
+      const reveal = (delay: number) => {
         progress.value = withDelay(
-          staggerDelay(index),
+          delay,
           withTiming(1, { duration: MOTION.duration, easing: MOTION.easing }),
         );
+      };
+
+      if (!ctx) {
+        // Keine RevealScrollView drumherum → verhält sich wie Reveal.
+        reveal(staggerDelay(index));
         return;
       }
-      const m = measure(ref);
+      if (!laidOut.value) return;
+
+      let m: ReturnType<typeof measure> = null;
+      try {
+        m = measure(ref);
+      } catch {
+        // View (noch) nicht messbar → lieber sichtbar machen als hängen lassen.
+        reveal(0);
+        return;
+      }
       if (!m) return;
 
       // Noch unterhalb des Bildschirms → warten. Aber merken, dass die erste
@@ -298,10 +328,7 @@ export function ScrollReveal({ children, index = 0, style }: RevealProps) {
 
       const delay = pending.value ? staggerDelay(index) : 0;
       pending.value = false;
-      progress.value = withDelay(
-        delay,
-        withTiming(1, { duration: MOTION.duration, easing: MOTION.easing }),
-      );
+      reveal(delay);
     },
     [index, reduceMotion, ctx],
   );
@@ -312,7 +339,14 @@ export function ScrollReveal({ children, index = 0, style }: RevealProps) {
   }));
 
   return (
-    <Animated.View ref={ref} style={[style, animatedStyle]}>
+    <Animated.View
+      ref={ref}
+      style={[style, animatedStyle]}
+      onLayout={() => {
+        laidOut.value = true;
+        pulse.value = pulse.value + 1;
+      }}
+    >
       {children}
     </Animated.View>
   );
