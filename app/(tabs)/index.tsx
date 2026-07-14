@@ -489,6 +489,43 @@ export default function HomeScreen() {
   );
   const canExpand = recentSearches.length > RECENT_COLLAPSED;
 
+  /**
+   * Die Welle muss von OBEN NACH UNTEN durchlaufen — sonst ist es keine.
+   *
+   * Vorher waren die Indizes hart hingeschrieben, und sie kollidierten: Die
+   * Recent-Karten liefen auf 3, 4, 5 — die Destinations-Überschrift stand
+   * ebenfalls auf 3, die Kategorie-Chips auf 4. Mit zwei Recent-Karten blendeten
+   * Überschrift und Chips also GLEICHZEITIG mit den Karten darüber ein, die
+   * Welle sprang zurück nach oben. Genau das ließ Home unruhig wirken, während
+   * Settings (saubere Folge 0-1-2-3-4) als eine einzige Bewegung las.
+   *
+   * Darum hier ein durchlaufender Zähler statt fester Zahlen: Die Reihenfolge
+   * folgt der Reihenfolge im Baum und bleibt richtig, auch wenn eine Sektion
+   * fehlt (keine Recents) oder wächst.
+   */
+  const wave = (() => {
+    let n = 0;
+    const searchBar = n++;
+    const transportTabs = n++;
+    const recentsHeader = recentSearches.length > 0 ? n++ : -1;
+    const recentCards = n;
+    if (recentSearches.length > 0) {
+      n += Math.min(visibleRecents.length, RECENT_COLLAPSED);
+    }
+    const destinationsHeader = n++;
+    const categoryChips = n++;
+    const destinationCards = n;
+    return {
+      searchBar,
+      transportTabs,
+      recentsHeader,
+      recentCards,
+      destinationsHeader,
+      categoryChips,
+      destinationCards,
+    };
+  })();
+
   return (
     // ScreenEntrance: Die Sektionen blenden bei JEDEM Fokus dieses Tabs
     // gestaffelt ein, nicht nur beim ersten Mount — die Tabs bleiben gemountet,
@@ -506,7 +543,7 @@ export default function HomeScreen() {
               fiele die ganze Seite von oben herein, statt dass sich der Inhalt
               setzt. Die Welle beginnt darunter. */}
           <Header />
-          <ScrollReveal index={0}>
+          <ScrollReveal index={wave.searchBar}>
             <SearchBar
               style={[styles.searchBarSpacing, { borderWidth: 1.5, borderColor: "rgba(255,255,255,0.14)" }]}
               onPress={() => router.navigate("/assistant")}
@@ -515,7 +552,7 @@ export default function HomeScreen() {
               }
             />
           </ScrollReveal>
-          <ScrollReveal index={1}>
+          <ScrollReveal index={wave.transportTabs}>
             <TransportTabs />
           </ScrollReveal>
 
@@ -524,7 +561,7 @@ export default function HomeScreen() {
             // doppelt ein (der Block als Ganzes und jede Karte einzeln). Der
             // Container bleibt statisch, nur Kopf und Karten kommen in der Welle.
             <View style={styles.recentSection}>
-              <ScrollReveal index={2}>
+              <ScrollReveal index={wave.recentsHeader}>
                 <SectionHeaderSmall
                   title={t("home.recent.title")}
                   onViewAll={() => {
@@ -536,9 +573,9 @@ export default function HomeScreen() {
               {visibleRecents.map((s, idx) =>
                 idx < RECENT_COLLAPSED ? (
                   // Einzeln statt als Block — wie die Kacheln in den
-                  // Einstellungen. Der Index läuft hinter dem Sektionskopf (2)
+                  // Einstellungen. Der Index läuft hinter dem Sektionskopf
                   // weiter, damit die Welle durchgeht.
-                  <ScrollReveal key={s.id} index={3 + idx}>
+                  <ScrollReveal key={s.id} index={wave.recentCards + idx}>
                     <RecentCard search={s} />
                   </ScrollReveal>
                 ) : (
@@ -584,7 +621,7 @@ export default function HomeScreen() {
               spürbare Frame-Drops im ScrollView verursachte. Ohne
               LinearTransition snappt die Höhe direkt — kaum sichtbarer
               Verlust, viel smoother Scroll. */}
-          <ScrollReveal index={3}>
+          <ScrollReveal index={wave.destinationsHeader}>
             <View style={styles.popularHeader}>
               <Text style={styles.sectionTitle}>{t("home.destinations.title")}</Text>
               <Pressable hitSlop={8}>
@@ -593,7 +630,7 @@ export default function HomeScreen() {
             </View>
           </ScrollReveal>
 
-          <ScrollReveal index={4}>
+          <ScrollReveal index={wave.categoryChips}>
             <CategoryChips value={category} onChange={setCategory} />
             <View style={{ height: 14 }} />
           </ScrollReveal>
@@ -609,7 +646,11 @@ export default function HomeScreen() {
               App. (Der alte Slide steckte in SlideInRight/SlideInLeft; wenn du
               die Richtungs-Geste vermisst, hole ich sie zurück.) */}
           {destinations.map((d, i) => (
-            <ScrollReveal key={`${category}-${d.id}`} index={5 + i} waveBase={5}>
+            <ScrollReveal
+              key={`${category}-${d.id}`}
+              index={wave.destinationCards + i}
+              waveBase={wave.destinationCards}
+            >
               <DestinationCard d={d} />
             </ScrollReveal>
           ))}
