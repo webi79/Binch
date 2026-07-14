@@ -27,7 +27,7 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import Animated, {
   FadeIn,
-  FadeInDown,
+  FadeOut,
   LinearTransition,
   cancelAnimation,
   useAnimatedStyle,
@@ -51,6 +51,7 @@ import { SegmentedToggle } from "@/components/ui/SegmentedToggle";
 import { SlidingPanels } from "@/components/ui/SlidingPanels";
 import { tripSignature } from "@/lib/results/signature";
 import { useAccent } from "@/lib/theme/accent";
+import { MOTION, revealEntering } from "@/lib/motion";
 
 type SortKey = "cheapest" | "fastest" | "direct";
 
@@ -691,7 +692,15 @@ export default function ResultsScreen() {
         // hartes Pop. Identisches Pattern wie DetailsOverlay's
         // contentReady-gated ScrollView.
         !contentReady ? null : (
-        <Animated.View entering={FadeIn.duration(220)} style={{ flex: 1 }}>
+        // exiting: Der Loader verschwand bisher HART — Boo war da, im nächsten
+        // Frame stand die Liste. Genau dieser Schnitt liest sich als „Aufploppen",
+        // egal wie sauber die Liste danach einblendet. Jetzt blendet er aus,
+        // während die Karten von unten hochwandern: eine Bewegung, keine zwei.
+        <Animated.View
+          entering={FadeIn.duration(220)}
+          exiting={FadeOut.duration(MOTION.duration / 2)}
+          style={{ flex: 1 }}
+        >
         <RandomSearchLoader
           originLabel={originLabel}
           destLabel={destLabel}
@@ -965,7 +974,10 @@ function ResultsListView({
   const renderItem = useCallback(
     ({ item, index }: { item: SearchResult; index: number }) =>
       enteringEnabledRef.current ? (
-        <Animated.View entering={FadeInDown.delay(Math.min(index, 7) * 50).duration(320)}>
+        // Dieselbe Welle wie in den Tabs (lib/motion.tsx) — vorher hatte der
+        // Ergebnis-Screen ein eigenes Timing (50ms Versatz, 320ms, großer
+        // FadeInDown-Weg) und fühlte sich dadurch an wie eine andere App.
+        <Animated.View entering={revealEntering(index)}>
           <ResultCard result={item} passengers={passengers} />
         </Animated.View>
       ) : (

@@ -12,6 +12,7 @@ import { AddTicketModal } from "@/components/saved/AddTicketModal";
 import { EmptyState } from "@/components/saved/EmptyState";
 import { AddTicketButton } from "@/components/saved/AddTicketButton";
 import { SegmentedToggle } from "@/components/ui/SegmentedToggle";
+import { Reveal, ScreenEntrance } from "@/lib/motion";
 import { SlidingPanels } from "@/components/ui/SlidingPanels";
 import { useAccent } from "@/lib/theme/accent";
 import { overlayCover, UNDERLAY_TRAVEL_FRAC } from "@/lib/nav/overlayCover";
@@ -161,13 +162,17 @@ export default function SavedScreen() {
   const ticketCountLine = t(ticketCountKey).replace("{count}", String(tickets.length));
 
   return (
+    <ScreenEntrance>
     <SafeAreaView className="flex-1 bg-[#1A1A1A]" edges={["top"]}>
       <Animated.View style={[{ flex: 1 }, parallaxStyle]}>
+      <Reveal index={0}>
       <View className="px-4 pt-6">
         <Text className="text-[26px] font-black text-white tracking-tight">
           Saved
         </Text>
       </View>
+      </Reveal>
+      <Reveal index={1}>
       <View className="px-4 pt-4 pb-4">
         <SegmentedToggle
           items={[
@@ -180,6 +185,7 @@ export default function SavedScreen() {
           segmentHeight={36}
         />
       </View>
+      </Reveal>
 
       {/* Pager-Style Slide — beide Panels in EINEM breiten Container, der
           als Ganzes translateX'd wird. Wirkt wie eine durchgehende
@@ -276,5 +282,6 @@ export default function SavedScreen() {
         onAdd={addTicket}
       />
     </SafeAreaView>
+    </ScreenEntrance>
   );
 }

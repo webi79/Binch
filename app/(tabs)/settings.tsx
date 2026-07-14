@@ -11,6 +11,7 @@ import {
   ActivityIndicator,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { Reveal, ScreenEntrance } from "@/lib/motion";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
 import Svg, { Circle, Path, Rect } from "react-native-svg";
@@ -74,6 +75,7 @@ export default function SettingsScreen() {
   };
 
   return (
+    <ScreenEntrance>
     <SafeAreaView style={styles.safe} edges={["top"]}>
       <ScrollView
         contentContainerStyle={{ paddingBottom: 90 }}
@@ -85,6 +87,7 @@ export default function SettingsScreen() {
         {sub === "support" && <SupportSubScreen onBack={back} />}
       </ScrollView>
     </SafeAreaView>
+    </ScreenEntrance>
   );
 }
 
@@ -357,6 +360,7 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
     <View>
       <BackHeader title={t("settings.tile.details")} onBack={onBack} />
 
+      <Reveal index={0}>
       <View style={styles.avatarLargeOuter}>
         <Pressable
           onPress={user ? onPickPhoto : () => { haptic("button"); openAuth(); }}
@@ -404,6 +408,9 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
         )}
       </View>
 
+      </Reveal>
+
+      <Reveal index={1}>
       <SLabel text={t("settings.personal")} />
       <Group>
         <Row
@@ -421,6 +428,9 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
         />
       </Group>
 
+      </Reveal>
+
+      <Reveal index={2}>
       <SLabel text={t("settings.security")} />
       <Group>
         <Row
@@ -436,6 +446,7 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
           isLast
         />
       </Group>
+      </Reveal>
     </View>
   );
 }

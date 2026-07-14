@@ -37,6 +37,7 @@ import Animated, {
 } from "react-native-reanimated";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
+import { Reveal, ScreenEntrance } from "@/lib/motion";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { RecentCard } from "@/components/home/RecentCard";
@@ -506,6 +507,10 @@ export default function HomeScreen() {
   const canExpand = recentSearches.length > RECENT_COLLAPSED;
 
   return (
+    // ScreenEntrance: Die Sektionen blenden bei JEDEM Fokus dieses Tabs
+    // gestaffelt ein, nicht nur beim ersten Mount — die Tabs bleiben gemountet,
+    // ein mount-basiertes `entering` würde beim Wechsel nie feuern.
+    <ScreenEntrance>
     <View style={styles.root}>
       <StatusBar barStyle="light-content" backgroundColor="transparent" translucent />
       <ScrollView
@@ -513,18 +518,24 @@ export default function HomeScreen() {
         contentContainerStyle={[styles.scrollContent, { paddingTop: insets.top + 8 }]}
         showsVerticalScrollIndicator={false}
       >
-          <Header />
-          <SearchBar
-            style={[styles.searchBarSpacing, { borderWidth: 1.5, borderColor: "rgba(255,255,255,0.14)" }]}
-            onPress={() => router.navigate("/assistant")}
-            onMicPress={() =>
-              router.navigate({ pathname: "/assistant", params: { autoVoice: "1" } })
-            }
-          />
-          <TransportTabs />
+          <Reveal index={0}>
+            <Header />
+          </Reveal>
+          <Reveal index={1}>
+            <SearchBar
+              style={[styles.searchBarSpacing, { borderWidth: 1.5, borderColor: "rgba(255,255,255,0.14)" }]}
+              onPress={() => router.navigate("/assistant")}
+              onMicPress={() =>
+                router.navigate({ pathname: "/assistant", params: { autoVoice: "1" } })
+              }
+            />
+          </Reveal>
+          <Reveal index={2}>
+            <TransportTabs />
+          </Reveal>
 
           {recentSearches.length > 0 && (
-            <View style={styles.recentSection}>
+            <Reveal index={3} style={styles.recentSection}>
               <SectionHeaderSmall
                 title={t("home.recent.title")}
                 onViewAll={() => {
@@ -568,7 +579,7 @@ export default function HomeScreen() {
                   )}
                 </RippleTouch>
               )}
-            </View>
+            </Reveal>
           )}
 
           {/* Plain View statt Animated.View+LinearTransition — die Layout-
@@ -578,7 +589,7 @@ export default function HomeScreen() {
               spürbare Frame-Drops im ScrollView verursachte. Ohne
               LinearTransition snappt die Höhe direkt — kaum sichtbarer
               Verlust, viel smoother Scroll. */}
-          <View>
+          <Reveal index={4}>
             <View style={styles.popularHeader}>
               <Text style={styles.sectionTitle}>{t("home.destinations.title")}</Text>
               <Pressable hitSlop={8}>
@@ -608,9 +619,10 @@ export default function HomeScreen() {
                 ))}
               </View>
             )}
-          </View>
+          </Reveal>
       </ScrollView>
     </View>
+    </ScreenEntrance>
   );
 }
 
