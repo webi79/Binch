@@ -242,31 +242,30 @@ export function Reveal({
   const animatedStyle = useAnimatedStyle(() => ({
     // Mit Vorhang bleibt die View selbst opak — der Vorhang erledigt das Faden.
     opacity: scrim ? 1 : progress.value,
-    transform: [{ translateY: (1 - progress.value) * MOTION.rise }],
+    // Große Flächen FADEN, sie wandern nicht: Ein 10-px-Weg ist an einem Chip
+    // eine Geste, an einer bildschirmhohen Karte ein Ruck — und er zwingt Android,
+    // die ganze Fläche pro Frame neu zu komponieren. Kleine Elemente bewegen sich,
+    // große setzen sich einfach.
+    transform: [{ translateY: large ? 0 : (1 - progress.value) * MOTION.rise }],
   }));
 
   const scrimStyle = useAnimatedStyle(() => ({ opacity: 1 - progress.value }));
 
   return (
-    // needsOffscreenAlphaCompositing: React Native schaltet korrektes
-    // Alpha-Compositing auf Android AB (ReactViewGroup.hasOverlappingRendering()
-    // liefert per Default false — aus Performance-Gründen). Ohne das Flag zeichnet
-    // Android beim Faden JEDES KIND EINZELN mit dem aktuellen Alpha, statt die
-    // Karte erst fertig zu komponieren und dann als Ganzes zu faden.
+    // KEIN needsOffscreenAlphaCompositing (mehr).
     //
-    // Sichtbar wird das überall dort, wo sich halbtransparente Kinder
-    // überlagern — bei den Destination-Karten liegt ein schwarzer Verlauf über
-    // dem Bild. Der wurde während des Fades getrennt vom Bild gedimmt und
-    // komponierte erst bei opacity 1 wieder richtig: Der Tiefeneffekt „sprang"
-    // am Ende rein, statt mit der Karte zu kommen.
+    // Es stand hier, weil Android beim Faden sonst JEDES KIND EINZELN mit dem
+    // Alpha zeichnet, statt die View fertig zu komponieren — bei den
+    // Destination-Karten dimmte der Verlauf getrennt vom Bild und sprang am Ende
+    // rein. Das Flag behebt das, indem Android einen Offscreen-Buffer in
+    // VIEW-GRÖSSE anlegt, solange alpha != 1.
     //
-    // Kostet nur WÄHREND des Fades einen Offscreen-Buffer: Android legt ihn nur
-    // an, wenn alpha != 1. Kein dauerhafter Hardware-Layer (der hat an anderer
-    // Stelle schon mal 66 ms Record-View#draw gekostet, siehe Saved-Parallax).
-    <Animated.View
-      needsOffscreenAlphaCompositing={!scrim}
-      style={[style, animatedStyle]}
-    >
+    // Genau das kostete dann aber: In Saved hängt es an jeder ResultCard, und der
+    // Tab-Wechsel bekam spürbaren Input-Lag. Der Vorhang unten löst dasselbe
+    // Problem, ohne dass die View je durchsichtig wird — also ohne Buffer. Wer
+    // überlagerte halbtransparente Kinder hat, nimmt `scrim`; alle anderen
+    // brauchen weder das eine noch das andere.
+    <Animated.View style={[style, animatedStyle]}>
       {children}
       {scrim ? (
         <Animated.View

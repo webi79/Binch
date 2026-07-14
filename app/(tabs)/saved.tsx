@@ -54,6 +54,14 @@ function useFocusedStoreSnapshot<T>(
 type Tab = "trips" | "tickets";
 
 /**
+ * Hintergrund des Screens — der Vorhang, mit dem die Karten einblenden, muss
+ * exakt diese Farbe haben (siehe `scrim` in lib/motion.tsx). Karten per opacity
+ * zu faden hieße Offscreen-Compositing pro Karte, und genau das machte den
+ * Tab-Wechsel hierher träge.
+ */
+const SAVED_BG = "#1A1A1A";
+
+/**
  * Skeleton-Karte mit ähnlicher Höhe wie eine ResultCard. Während der Saved-
  * Tab nach Focus für ~220ms aufwacht, zeigen wir Skelett-Boxen statt die
  * echten ResultCards zu mounten — die messen sich sonst alle gleichzeitig
@@ -230,7 +238,12 @@ export default function SavedScreen() {
                   </Text>
                 </ScrollReveal>
                 {today.map((tr, i) => (
-                  <ScrollReveal key={tr.id} index={2 + i} style={{ marginBottom: 12 }}>
+                  <ScrollReveal
+                    key={tr.id}
+                    index={2 + i}
+                    scrim={SAVED_BG}
+                    style={{ marginBottom: 12 }}
+                  >
                     <ResultCard result={tr} passengers={tr.passengers} />
                   </ScrollReveal>
                 ))}
@@ -244,7 +257,12 @@ export default function SavedScreen() {
                   </Text>
                 </ScrollReveal>
                 {earlier.map((tr, i) => (
-                  <ScrollReveal key={tr.id} index={3 + today.length + i} style={{ marginBottom: 12 }}>
+                  <ScrollReveal
+                    key={tr.id}
+                    index={3 + today.length + i}
+                    scrim={SAVED_BG}
+                    style={{ marginBottom: 12 }}
+                  >
                     <ResultCard result={tr} passengers={tr.passengers} />
                   </ScrollReveal>
                 ))}
@@ -284,7 +302,7 @@ export default function SavedScreen() {
                   </Text>
                 </ScrollReveal>
                 {tickets.map((tk, i) => (
-                  <ScrollReveal key={tk.id} index={3 + i}>
+                  <ScrollReveal key={tk.id} index={3 + i} scrim={SAVED_BG}>
                     <TicketCard ticket={tk} />
                   </ScrollReveal>
                 ))}
