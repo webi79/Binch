@@ -1,9 +1,9 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   AccessibilityInfo,
+  View,
   useWindowDimensions,
   type StyleProp,
-  type View,
   type ViewStyle,
 } from "react-native";
 import { useIsFocused } from "@react-navigation/native";
@@ -191,6 +191,12 @@ export function revealEntering(index: number) {
  */
 const REVEAL_MARGIN = 48;
 
+/**
+ * Notausstieg: Kommt binnen dieser Zeit keine Messung zurück, blendet das
+ * Element trotzdem ein. Lieber ohne Welle als unsichtbar.
+ */
+const BAIL_OUT_MS = 600;
+
 interface ScrollRevealCtx {
   /** Treibt die Neubewertung — bei jedem Scroll-Frame. */
   scrollY: SharedValue<number>;
@@ -263,9 +269,14 @@ export function ScrollReveal({ children, index = 0, style }: RevealProps) {
    * dem UI-Thread, STÜRZT aber ab, sobald die native View noch nicht (oder nicht
    * mehr) im Baum hängt — nicht „gibt null zurück", sondern reißt die App mit
    * einer C++-Exception um. Beim App-Start und beim Tab-Wechsel passiert genau
-   * das. `measureInWindow` läuft dagegen auf dem JS-Thread, ist asynchron und
-   * kann nicht abstürzen. Danach ist es reine Arithmetik — das Worklet fasst
-   * keine View mehr an.
+   * das. `measureInWindow` läuft dagegen auf dem JS-Thread und kann nicht
+   * abstürzen. Danach ist es reine Arithmetik — das Worklet fasst keine View an.
+   *
+   * Gemessen wird an einer ECHTEN View, nicht an der Animated.View: Deren Ref
+   * ist die Wrapper-Instanz, `measureInWindow` gibt es dort nicht — der
+   * Optional-Chain lief ins Leere, der Anker blieb `null`, und JEDER TAB WAR
+   * LEER. Die äußere View wird außerdem nie transformiert, ihr Anker bleibt also
+   * gültig, während das Kind hochgleitet.
    */
   const anchorY = useSharedValue<number | null>(null);
   const anchorScroll = useSharedValue(0);
@@ -283,24 +294,40 @@ export function ScrollReveal({ children, index = 0, style }: RevealProps) {
    */
   const pending = useSharedValue(true);
 
-  // Neuer Fokus → Welle von vorn. Der Anstoß im nächsten Frame ist nötig, weil
-  // die Reaktion sonst NUR beim Scrollen liefe — beim Öffnen des Screens bliebe
-  // alles unsichtbar stehen.
   useEffect(() => {
     progress.value = reduceMotion ? 1 : 0;
     pending.value = true;
-    const id = requestAnimationFrame(() => {
+    // Anstoß im nächsten Frame: Sonst liefe die Prüfung NUR beim Scrollen, und
+    // beim Öffnen des Screens bliebe alles unsichtbar stehen.
+    const frame = requestAnimationFrame(() => {
       pulse.value = pulse.value + 1;
     });
-    return () => cancelAnimationFrame(id);
-  }, [generation, reduceMotion, progress, pulse, pending]);
+
+    // REISSLEINE. Eine Animation ist keinen leeren Screen wert: Wenn das Messen
+    // aus irgendeinem Grund nicht durchkommt, blendet das Element trotzdem ein.
+    // Genau dieser Fall ist schon eingetreten (siehe oben) — und ohne die
+    // Reißleine sah der User eine leere App.
+    const bail = setTimeout(() => {
+      if (anchorY.value === null && progress.value === 0) {
+        progress.value = withTiming(1, {
+          duration: MOTION.duration,
+          easing: MOTION.easing,
+        });
+      }
+    }, BAIL_OUT_MS);
+
+    return () => {
+      cancelAnimationFrame(frame);
+      clearTimeout(bail);
+    };
+  }, [generation, reduceMotion, progress, pulse, pending, anchorY]);
 
   // onLayout feuert erst, wenn die native View wirklich steht — hier ist
   // measureInWindow sicher. Und es feuert wieder, wenn sich das Layout ändert
-  // (Kategorie-Wechsel, Umschalter in Saved), womit sich der Anker selbst
-  // nachzieht.
+  // (Kategorie-Wechsel, Umschalter in Saved), womit sich der Anker nachzieht.
   const measureAnchor = () => {
     ref.current?.measureInWindow((_x, y) => {
+      if (typeof y !== "number") return;
       anchorY.value = y;
       anchorScroll.value = ctx ? ctx.scrollY.value : 0;
       pulse.value = pulse.value + 1;
@@ -324,8 +351,8 @@ export function ScrollReveal({ children, index = 0, style }: RevealProps) {
         reveal(staggerDelay(index));
         return;
       }
-      // Noch nicht vermessen → die nächste Prüfung holt es nach (measureAnchor
-      // stößt selbst an).
+      // Noch nicht vermessen → measureAnchor stößt selbst wieder an, und wenn
+      // das nie passiert, greift die Reißleine oben.
       if (anchorY.value === null) return;
 
       const y = anchorY.value - (ctx.scrollY.value - anchorScroll.value);
@@ -351,8 +378,8 @@ export function ScrollReveal({ children, index = 0, style }: RevealProps) {
   }));
 
   return (
-    <Animated.View ref={ref} style={[style, animatedStyle]} onLayout={measureAnchor}>
-      {children}
-    </Animated.View>
+    <View ref={ref} style={style} onLayout={measureAnchor} collapsable={false}>
+      <Animated.View style={animatedStyle}>{children}</Animated.View>
+    </View>
   );
 }
