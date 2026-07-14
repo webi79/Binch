@@ -87,6 +87,26 @@ Alle Endpoints sind GET, JSON, kein Auth-Header.
 
 Pro Travel-Mode aggregiert das Backend **mehrere Provider parallel** (siehe `server/src/providers/registry.ts`). Tokens leben in `server/.env` — Provider ohne Token werden automatisch übersprungen.
 
+### Zug-Quellen: db-vendo + MOTIS (wichtig)
+
+Zwei Provider laufen parallel, `searchService.dedupe()` führt sie zusammen:
+
+| | **db-vendo** (DBs eigene Engine, via `dbweb`-Sidecar → int.bahn.de) | **MOTIS** (offene GTFS-Daten, Transitous) |
+|---|---|---|
+| Routing | identisch zu bahn.de | eigener Pareto-Set |
+| Gleise | **korrekt** (Köln Hbf 1-11) | DELFI-Müll (Köln Hbf „85-91") |
+| Zugnamen | **korrekt** (RJX 65) | falsch (dort „IC 63") |
+| Preise | **ja** (innerdeutsch) | keine |
+| Limit | **~60 req/min pro IP** | unlimitiert, self-hostbar |
+| Coverage | was DB verkauft | alles (CH-Nahverkehr, Tram/Bus) |
+
+Daraus folgen zwei Regeln, die man nicht versehentlich umdrehen sollte:
+
+1. **Bei Gleichstand gewinnt db-vendo.** `SOURCE_TRUST` in `searchService.ts` — sonst behält der Dedupe zur selben Fahrt die schlechteren Daten, nur weil MOTIS im Registry vorne steht.
+2. **Das DB-Kontingent gehört der SUCHE.** Abfahrtstafeln laufen bewusst über MOTIS (`profile === "db"` → MOTIS zuerst, `routes/stops.ts`), sonst fährt die Umgebungs-/Kartenansicht die 60 req/min leer. Preis: in DE fehlen auf den Tafeln oft Gleise.
+
+**Warum das lange nicht ging:** DBs `403 OPS_BLOCKED` war **kein IP-Block**, sondern Akamai-TLS-Fingerprinting — Nodes Cipher-Liste verrät den Nicht-Browser. Fix: `NODE_OPTIONS=--tls-cipher-list=<Chrome-Liste>` auf beiden Sidecars (YAML-Anker `x-chrome-tls` in `server/docker-compose.yml`, dort auch die Messmatrix). Kommt der Block zurück → dort ansetzen, nicht bei IP/User-Agent.
+
 ### Endpoints
 
 | Pfad | Zweck | Query-Params |

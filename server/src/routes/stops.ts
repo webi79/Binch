@@ -213,6 +213,30 @@ export async function stopsRoutes(app: FastifyInstance) {
       return motisFallback(stop.label, parsed.data.code, stop.hafasId, board);
     }
 
+    // Deutsche Stops: MOTIS ZUERST, DB nur als Rückfall.
+    //
+    // DB lässt uns pro IP nur ~60 req/min. Die Tafeln sind der Volumentreiber
+    // (die Umgebungs-/Kartenansicht fragt viele Stops auf einmal), die SUCHE ist
+    // der wertvolle Verbraucher — dort liefert DB Preise, echte Gleise und echte
+    // Zugnamen, die MOTIS prinzipbedingt nicht hat. Also gehört das Kontingent
+    // der Suche, nicht den Tafeln.
+    //
+    // Bis heute landeten die Tafeln nur DESHALB auf MOTIS, weil dbrest geblockt
+    // war und der DB-Versuch immer ins Leere lief. Seit der Sidecar wieder
+    // antwortet (TLS-Cipher-Fix, siehe docker-compose.yml) würde die alte
+    // Reihenfolge „DB zuerst" das Kontingent sofort leer fahren. Darum hier
+    // explizit gedreht — MOTIS ist unlimitiert und self-hostbar.
+    //
+    // Preis dafür: In DE fehlen auf den Tafeln öfter Gleise (DELFI meldet für
+    // Köln Hbf „Gleis 85-91" statt 1-11 → wir verwerfen solche Werte lieber,
+    // siehe util/platform.ts). DB bleibt der Rückfall, wenn MOTIS nichts hat.
+    if (profile === "db") {
+      const motis = await getMotisStopBoard(parsed.data.code, stop.label, board).catch(() => null);
+      if (motis && motis.results.length > 0) {
+        return { ...motis, stop: { code: parsed.data.code, label: stop.label, hafasId: stop.hafasId } };
+      }
+    }
+
     const resolvedId = await resolveStopHafasId(stop, profile);
     if (!resolvedId) {
       return motisFallback(stop.label, parsed.data.code, stop.hafasId, board);

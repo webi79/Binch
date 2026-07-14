@@ -3,6 +3,8 @@ import { config } from "../../config.js";
 import { db } from "../../db/client.js";
 import { locations } from "../../db/schema.js";
 import { BoundedTtlCache } from "../../util/boundedCache.js";
+import { cleanPlatform } from "../../util/platform.js";
+import { lineLabel } from "../../util/line.js";
 import type {
   SearchProvider,
   ProviderSearchInput,
@@ -93,10 +95,16 @@ export const dbVendoProvider: SearchProvider = {
   mode: "TRAIN",
 
   isConfigured() {
-    // DBVENDO_SEARCH_ENABLED ist Default AUS: die DB blockt db-vendo-client
-    // extern (OPS_BLOCKED) — 0 Treffer bei 72 Aufrufen. Der dbrest-Sidecar
-    // bleibt für Trip-Details/Live-Positionen/Stop-Infos in Betrieb.
-    return config.DBVENDO_SEARCH_ENABLED && Boolean(config.DBREST_BASE_URL);
+    // Läuft über den DBWEB-Sidecar (int.bahn.de), NICHT über dbrest
+    // (app.services-bahn.de — antwortet weiter mit „Unknown").
+    //
+    // Der frühere Block (403 OPS_BLOCKED, 0 Treffer bei 72 Aufrufen) war KEINE
+    // IP-Sperre, sondern Akamais TLS-Fingerprinting: Nodes Cipher-Liste ≠ die
+    // eines Browsers. Seit die Sidecars mit `NODE_OPTIONS=--tls-cipher-list=…`
+    // laufen (siehe docker-compose.yml), antwortet int.bahn.de wieder — und
+    // zwar mit dem, was MOTIS prinzipbedingt nicht kann: DB-eigenem Routing,
+    // DB-Gleisen, DB-Zugnamen und PREISEN.
+    return config.DBVENDO_SEARCH_ENABLED && Boolean(config.DBWEB_BASE_URL);
   },
 
   async search(input: ProviderSearchInput, signal?: AbortSignal): Promise<ProviderResult> {
@@ -247,7 +255,7 @@ async function fetchJourneys(
   // HAFAS-`laterThan`. Pagination („gesamter Tag") explizit user-getriggered
   // via separatem Endpoint (search.ts route) — kein eager loop hier, sonst
   // würde ein einzelner Such-Klick 5 User-Slots verbrennen.
-  const url = new URL(`${config.DBREST_BASE_URL}/journeys`);
+  const url = new URL(`${config.DBWEB_BASE_URL}/journeys`);
   url.searchParams.set("from", fromId);
   url.searchParams.set("to", toId);
   if (laterRef) {
@@ -398,7 +406,7 @@ async function resolveStationId(
     // /locations (HAFAS) statt /stations (nur DE-Stationsdaten) — auf diese Art
     // werden auch internationale Bahnhöfe wie Amsterdam Centraal, Paris Gare
     // du Nord, Wien Hbf etc. gefunden.
-    const url = new URL(`${config.DBREST_BASE_URL}/locations`);
+    const url = new URL(`${config.DBWEB_BASE_URL}/locations`);
     url.searchParams.set("query", candidate);
     url.searchParams.set("results", "5");
     url.searchParams.set("stops", "true");
@@ -586,9 +594,9 @@ function parseJourneys(raw: unknown, input: ProviderSearchInput): NormalizedResu
         departTime: segDep,
         arriveTime: segArr,
         durationMinutes: segDuration,
-        departPlatform: seg.plannedDeparturePlatform ?? seg.departurePlatform,
-        arrivePlatform: seg.plannedArrivalPlatform ?? seg.arrivalPlatform,
-        line: seg.line?.name,
+        departPlatform: cleanPlatform(seg.plannedDeparturePlatform ?? seg.departurePlatform),
+        arrivePlatform: cleanPlatform(seg.plannedArrivalPlatform ?? seg.arrivalPlatform),
+        line: lineLabel(seg.line),
         product: seg.line?.product,
         fahrtNr: seg.line?.fahrtNr,
         direction: seg.direction,
@@ -618,8 +626,14 @@ function parseJourneys(raw: unknown, input: ProviderSearchInput): NormalizedResu
 
     out.push({
       externalId,
-      origin: first.origin?.id ?? input.origin,
-      destination: last.destination?.id ?? input.destination,
+      // Der GESUCHTE Binch-Code, nicht die intern aufgelöste HAFAS-Station-ID.
+      // `origin`/`destination` sind laut API-Vertrag Binch-Codes; hier stand
+      // vorher `first.origin.id` (= "8000080"), während MOTIS für dieselbe Suche
+      // "sta:8000080" liefert. Der Dedupe-Fingerprint enthält origin->destination
+      // — dieselbe Fahrt kam dadurch DOPPELT in die Liste, einmal je Provider
+      // (verifiziert: ICE 915, gleiche Minute, gleiche Labels, zwei Einträge).
+      origin: input.origin,
+      destination: input.destination,
       originLabel: first.origin?.name ?? input.originLabel,
       destLabel: last.destination?.name ?? input.destLabel,
       departTime: departIso,
@@ -643,7 +657,10 @@ function parseJourneys(raw: unknown, input: ProviderSearchInput): NormalizedResu
         first.plannedDeparture ?? first.departure ?? departIso,
         input.passengers,
       ),
-      flightNumber: first.line?.fahrtNr ?? first.line?.name,
+      // Kopfzeile des Treffers: „ICE 915", „RE 10025" — nie eine nackte
+      // Zugnummer (DB liefert für viele Regionalzüge nur fahrtNr, die Gattung
+      // steckt separat in productName; siehe util/line.ts).
+      flightNumber: lineLabel(first.line),
       operatedBy,
       providerLogo: "https://www.bahn.de/web-app/favicons/bahn-favicon.svg",
     });

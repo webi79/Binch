@@ -34,21 +34,27 @@ const schema = z.object({
     .transform((v) => v !== "false" && v !== "0"),
 
   /**
-   * db-vendo als SUCH-Provider (Zug + Bus). Default AUS.
+   * db-vendo als SUCH-Provider (Zug + Bus) — über den DBWEB-Sidecar (int.bahn.de).
    *
-   * Die DB blockt db-vendo-client extern (Akamai/OPS_BLOCKED) — der Provider
-   * lieferte über 3 h Messung 0 Treffer bei 72 Aufrufen, klopfte also nur
-   * nutzlos gegen die gesperrte API. MOTIS deckt Zug UND Bus inzwischen
-   * vollständig ab (inkl. Rückfahrt und Zugangs-Fußwegen).
+   * Historie: Stand vorher auf AUS, weil die DB uns blockte (403 OPS_BLOCKED,
+   * 0 Treffer bei 72 Aufrufen). Das war KEINE IP-Sperre, sondern Akamais
+   * TLS-Fingerprinting — Nodes Cipher-Liste verrät den Nicht-Browser. Mit
+   * `NODE_OPTIONS=--tls-cipher-list=<Chrome>` auf den Sidecars (docker-compose.yml)
+   * antwortet int.bahn.de wieder.
    *
-   * Betrifft nur die SUCHE. Der dbrest-Sidecar bleibt für Trip-Details,
-   * Live-Positionen und Stop-Infos in Betrieb (eigene Endpoints).
+   * Warum das die WICHTIGSTE Zug-Quelle ist: db-vendo redet mit DBs eigener
+   * Routing-Engine. Seine Ergebnisse sind per Konstruktion die, die auch bahn.de
+   * zeigt — inklusive korrekter GLEISE, korrekter ZUGNAMEN (RJX 63, nicht IC 63)
+   * und PREISEN. Genau die drei Dinge, die MOTIS aus offenen GTFS-Daten nicht
+   * korrekt liefern kann (DELFI hat für Köln Hbf Gleis 85-91 statt 1-11).
    *
-   * Sobald die DB uns wieder durchlässt: DBVENDO_SEARCH_ENABLED=true.
+   * MOTIS bleibt parallel aktiv: es deckt ab, was DB nicht verkauft (Schweizer
+   * Nahverkehr, Tram/Bus-Zubringer). Beide laufen im Registry parallel, der
+   * Dedupe in searchService führt sie zusammen.
    */
   DBVENDO_SEARCH_ENABLED: z
     .string()
-    .default("false")
+    .default("true")
     .transform((v) => v !== "false" && v !== "0"),
 
   RAPIDAPI_KEY: z.string().optional(),

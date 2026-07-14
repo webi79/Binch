@@ -30,6 +30,7 @@ import {
 import type { HafasProfileKey, MultiHafasProfileKey } from "./countryProfile.js";
 import { getScheduledStopBoard } from "./gtfsSchedule.js";
 import { BoundedTtlCache } from "../util/boundedCache.js";
+import { lineLabel } from "../util/line.js";
 
 export type StopBoard = "departures" | "arrivals";
 
@@ -150,6 +151,8 @@ interface DbRestDeparture {
   line?: {
     name?: string;
     product?: string;
+    productName?: string;
+    fahrtNr?: string;
     mode?: string;
   };
   cancelled?: boolean;
@@ -165,7 +168,9 @@ function normalize(raw: DbRestDeparture, board: StopBoard, idx: number): StopBoa
   const planned = toIso(raw.plannedWhen) ?? toIso(raw.when);
   const actual = toIso(raw.when);
   if (!planned) return null;
-  const lineName = raw.line?.name?.trim() ?? "";
+  // lineLabel statt raw.line.name: DB liefert für viele Regionalzüge nur die
+  // Zugnummer („10025"), die Gattung steckt in productName → „RE 10025".
+  const lineName = lineLabel(raw.line) ?? "";
   const product = raw.line?.product ?? raw.line?.mode ?? null;
   // Anruf-Sammeltaxi / Rufbus rausfiltern: HAFAS markiert die als product=taxi
   // mit Linien-Namen wie „RUF Helmo" oder „ALT 399". Sind on-demand, müssen

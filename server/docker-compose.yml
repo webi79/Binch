@@ -1,3 +1,31 @@
+# -----------------------------------------------------------------------------
+# NODE_OPTIONS: --tls-cipher-list=<Chrome-Cipher-Liste>   (beide db-vendo-Sidecars)
+#
+# DB steht hinter Akamai, und das blockt nicht nach IP und nicht nach Header,
+# sondern nach TLS-FINGERABDRUCK (JA3): Der ClientHello nennt seine Cipher-Suites
+# in einer bestimmten Reihenfolge, und Nodes Default-Liste ist eine andere als die
+# eines Browsers. Antwort: 403 {"code":"OPS_BLOCKED"} — egal welcher User-Agent,
+# Referer, Origin. Genau darum sah es wie eine IP-Sperre aus: der Browser am selben
+# Anschluss bekam Daten, unser Server nicht.
+#
+# Nachgemessen gegen int.bahn.de/web/api/reiseloesung/orte (13.07.2026):
+#   curl (Default-Cipher)                → 403 OPS_BLOCKED
+#   curl --http2 (Default-Cipher)        → 403 OPS_BLOCKED   ← es liegt NICHT an HTTP/2
+#   curl --ciphers <Chrome> (HTTP/1.1)   → 200 ✓             ← es ist die Cipher-Liste
+#   node https.get (Default)             → 403 OPS_BLOCKED
+#   node https.get + ciphers: <Chrome>   → 200 ✓
+#
+# `--tls-cipher-list` ist in NODE_OPTIONS erlaubt und wirkt prozessweit, also auch
+# im fetch von db-vendo-client. Kein Patch am Image nötig.
+#
+# Wir geben uns damit NICHT als jemand anderes aus — der User-Agent bleibt
+# `binch-mobile/0.1`, wir sind für DB identifizierbar und halten das Ratelimit ein.
+# Wir verhandeln lediglich dieselben (modernen, sicheren) TLS-Ciphers wie ein Browser.
+# -----------------------------------------------------------------------------
+x-chrome-tls: &chrome-tls
+  NODE_OPTIONS: >-
+    --tls-cipher-list=TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA
+
 services:
   db:
     image: postgres:16-alpine
@@ -22,37 +50,49 @@ services:
   # bahn.de / DB Navigator. Gleiche hafas-rest-api-Foundation → REST-Routen
   # (/stops/:id/departures, /locations/nearby) sind drop-in kompatibel.
   # Source: https://github.com/public-transport/db-vendo-client
-  # Quota: 60 req/min pro IPv4 (dbnav-Profil) — unser 60s-Cache + Coalescing
-  # in stopInfoService halten uns weit drunter.
+  # Quota: ~60 req/min pro IPv4 — unser 60s-Cache + Coalescing in
+  # stopInfoService halten uns weit drunter.
+  #
+  # Bedient DBREST_BASE_URL: Abfahrts-/Ankunftstafeln, Trip-Details,
+  # /locations/nearby, Live-Positionen.
   dbrest:
     image: ghcr.io/public-transport/db-vendo-client:latest
     restart: unless-stopped
     ports:
       - "3001:3000"
     environment:
+      <<: *chrome-tls
       PORT: "3000"
-      # "db"-Profil (DB-Navigator + regio-guide-RIS) statt "dbnav":
-      # DBs reine Navigator-API (dbnav, app.services-bahn.de) blockt seit
-      # ~Juli 2026 alle Anfragen (Antwort OPS_BLOCKED → Zug-/Bus-Suchen
-      # lieferten 0 Ergebnisse). "dbweb" (bahn.de) umgeht zwar den Block,
-      # liefert aber Journeys OHNE Zeiten (null in db-vendo-client latest).
-      # "db" liefert Journeys MIT Zeiten + Preisen, Locations UND das
-      # Stop-Board (Departures) — alle drei von binch-server genutzten
-      # Endpoints verifiziert.
-      DB_PROFILE: "db"
+      # War "db" (DB-Navigator + regio-guide-RIS). Dieses Profil ist TOT: sein
+      # Backend app.services-bahn.de antwortet auch mit korrektem TLS-Fingerprint
+      # nur noch {"message":"Unknown"} — der Endpoint /mob/location/search
+      # existiert so nicht mehr.
+      #
+      # Die alte Begründung gegen "dbweb" („liefert Journeys OHNE Zeiten") war ein
+      # Artefakt des Blocks: Über int.bahn.de kommen Journeys sehr wohl mit Zeiten,
+      # Preisen, Gleisen und echten Zugnamen (13.07.2026 verifiziert).
+      #
+      # Warum das für die TAFELN zählt: Sie fielen ohne dbrest auf MOTIS/DELFI
+      # zurück — und das meldet für Köln Hbf „Gleis 85-91" (real: 1-11). Über
+      # dbweb steht dort jetzt „Gleis 5 D-G", „Gleis 11 B-C" — DBs eigene Werte.
+      DB_PROFILE: "dbweb"
       USER_AGENT: "binch-mobile/0.1"
 
-  # Zweiter db-vendo-client mit "dbweb"-Profil (int.bahn.de). Liefert pro
-  # Zug-Verbindung PREIS + Recon-Token (für den bahn.de-Direkt-Buchungslink).
-  # Anderer Host als das geblockte app.services-bahn.de → NICHT gesperrt.
-  # binch-server nutzt ihn nur fürs Preis-Enrichment (best-effort, gecacht,
-  # ~60 req/min-Limit). Routing/Zeiten kommen weiter von MOTIS.
+  # Zweiter db-vendo-client, gleiches Profil, eigener Prozess.
+  #
+  # Bedient DBWEB_BASE_URL: die SUCHE (Provider db-vendo) + Preis-Anreicherung der
+  # MOTIS-Treffer + Recon-Token für den bahn.de-Direkt-Buchungslink.
+  #
+  # Getrennt vom dbrest-Container, damit eine hängende Such-Anfrage nicht die
+  # Abfahrtstafeln mit blockiert (beide reden mit derselben API, aber ein
+  # Node-Prozess arbeitet Requests seriell ab).
   dbweb:
     image: ghcr.io/public-transport/db-vendo-client:latest
     restart: unless-stopped
     ports:
       - "3002:3000"
     environment:
+      <<: *chrome-tls
       PORT: "3000"
       DB_PROFILE: "dbweb"
       USER_AGENT: "binch-mobile/0.1"

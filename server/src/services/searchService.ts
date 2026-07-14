@@ -755,19 +755,43 @@ function sortResults<
  * Dedupe across providers: same physical journey returned by multiple APIs is collapsed
  * to a single entry. We keep the cheapest variant.
  */
+/**
+ * Datenqualität der Quelle — Tiebreak, wenn zwei Provider DIESELBE Fahrt liefern.
+ *
+ * db-vendo redet mit DBs eigener Routing-Engine: echte Gleise, echte Zugnamen
+ * (RJX 63), Preis und Buchungslink. MOTIS routet auf offenen GTFS-Daten — dort
+ * hat Köln Hbf die Gleise 85-91 (real: 1-11) und der RJX heißt „IC".
+ *
+ * Ohne diesen Tiebreak gewinnt bei gleicher Verbindungsqualität einfach der
+ * Provider, der im Registry vorne steht (MOTIS) — wir hätten zu jeder DB-Fahrt
+ * die schlechteren Daten behalten. Er greift NUR bei Gleichstand: findet MOTIS
+ * die objektiv bessere Verbindung, gewinnt weiter MOTIS.
+ */
+const SOURCE_TRUST: Record<string, number> = { "db-vendo": 2, trainline: 1 };
+const sourceTrust = (provider: string): number => SOURCE_TRUST[provider] ?? 0;
+
 function dedupe(candidates: Candidate[], mode: TravelMode): Candidate[] {
   const map = new Map<string, Candidate>();
   for (const c of candidates) {
     const key = fingerprint(c.result, mode);
     const existing = map.get(key);
+    if (!existing) {
+      map.set(key, c);
+      continue;
+    }
     // Züge: bei gleichem Fingerprint die qualitativ beste Variante behalten
-    // (weniger Umstiege / schneller) — Preise sind bei MOTIS-only 0 und taugen
-    // nicht als Tiebreak. Andere Modi: die günstigste.
-    const better =
-      !existing ||
-      (mode === "TRAIN"
-        ? connectionScore(c.result) < connectionScore(existing.result)
-        : effectivePrice(c.result) < effectivePrice(existing.result));
+    // (weniger Umstiege / schneller); bei Gleichstand die vertrauenswürdigere
+    // Quelle. Preise taugen hier nicht als Tiebreak — MOTIS-Treffer sind ohne
+    // Anreicherung 0. Andere Modi: die günstigste.
+    let better: boolean;
+    if (mode === "TRAIN") {
+      const score = connectionScore(c.result);
+      const prev = connectionScore(existing.result);
+      better =
+        score < prev || (score === prev && sourceTrust(c.provider) > sourceTrust(existing.provider));
+    } else {
+      better = effectivePrice(c.result) < effectivePrice(existing.result);
+    }
     if (better) {
       map.set(key, c);
     }
