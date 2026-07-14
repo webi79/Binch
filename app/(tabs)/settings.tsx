@@ -134,25 +134,32 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
 
   return (
     <View>
-      <ProfileCard />
+      {/* Der Hub ist das, was beim Tab-Wechsel erscheint — hier MUSS die Welle
+          laufen. Vorher lagen die Reveals nur im Detail-Unterscreen, den man
+          erst öffnen muss; der Tab selbst blendete gar nicht ein und fühlte sich
+          dadurch völlig anders an als Home. */}
+      <Reveal index={0}>
+        <ProfileCard />
+      </Reveal>
 
       {/* Spacer matching the hidden "Bereiche" label slot in the design */}
       <View style={{ height: 30 }} />
 
       <View style={{ paddingHorizontal: 16 }}>
         {tiles.map((tile, idx) => (
-          <View key={tile.id} style={{ marginBottom: idx < tiles.length - 1 ? 8 : 0 }}>
+          <Reveal key={tile.id} index={1 + idx} style={{ marginBottom: idx < tiles.length - 1 ? 8 : 0 }}>
             <SectionCard
               title={t(tile.titleKey)}
               desc={t(tile.descKey)}
               illu={tile.illu}
               onPress={() => onNav(tile.id)}
             />
-          </View>
+          </Reveal>
         ))}
       </View>
 
       <View style={styles.divider} />
+      <Reveal index={4}>
       {isAuthed ? (
         <RippleTouch
           onPress={onSignOut}
@@ -173,6 +180,7 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
           <Text style={[styles.signInText, { color: accent.solid }]}>{t("auth.guest.cta")}</Text>
         </RippleTouch>
       )}
+      </Reveal>
 
       <Text style={styles.versionText}>{t("settings.app.version")}</Text>
     </View>

@@ -206,7 +206,9 @@ export default function SavedScreen() {
             contentContainerStyle={{ paddingBottom: 98 }}
             showsVerticalScrollIndicator={false}
           >
-            <EmptyState tab="trips" />
+            <Reveal index={1}>
+              <EmptyState tab="trips" />
+            </Reveal>
           </ScrollView>
         ) : (
           <ScrollView
@@ -214,27 +216,36 @@ export default function SavedScreen() {
             contentContainerStyle={{ paddingBottom: 98, paddingHorizontal: 16 }}
             showsVerticalScrollIndicator={false}
           >
+            {/* Die Karten laufen in derselben Welle weiter wie der Umschalter
+                darüber (Index 0) — vorher animierte NUR der Umschalter und die
+                Liste stand einfach da. Genau deshalb fühlte sich der Tab anders
+                an als Home. Der Index läuft über beide Sektionen durch, damit die
+                Welle nicht in der Mitte neu anfängt. */}
             {today.length > 0 && (
               <>
-                <Text className="text-[15px] font-semibold text-white mt-1 mb-2.5">
-                  {t("saved.section.today")}
-                </Text>
-                {today.map((tr) => (
-                  <View key={tr.id} className="mb-3">
+                <Reveal index={1}>
+                  <Text className="text-[15px] font-semibold text-white mt-1 mb-2.5">
+                    {t("saved.section.today")}
+                  </Text>
+                </Reveal>
+                {today.map((tr, i) => (
+                  <Reveal key={tr.id} index={2 + i} style={{ marginBottom: 12 }}>
                     <ResultCard result={tr} passengers={tr.passengers} />
-                  </View>
+                  </Reveal>
                 ))}
               </>
             )}
             {earlier.length > 0 && (
               <>
-                <Text className="text-[15px] font-semibold text-white mt-1 mb-2.5">
-                  {t("saved.section.earlier")}
-                </Text>
-                {earlier.map((tr) => (
-                  <View key={tr.id} className="mb-3">
+                <Reveal index={2 + today.length}>
+                  <Text className="text-[15px] font-semibold text-white mt-1 mb-2.5">
+                    {t("saved.section.earlier")}
+                  </Text>
+                </Reveal>
+                {earlier.map((tr, i) => (
+                  <Reveal key={tr.id} index={3 + today.length + i} style={{ marginBottom: 12 }}>
                     <ResultCard result={tr} passengers={tr.passengers} />
-                  </View>
+                  </Reveal>
                 ))}
               </>
             )}
@@ -256,17 +267,25 @@ export default function SavedScreen() {
             contentContainerStyle={{ paddingBottom: 98 }}
             showsVerticalScrollIndicator={false}
           >
-            <AddTicketButton onPress={() => setShowModal(true)} />
+            <Reveal index={1}>
+              <AddTicketButton onPress={() => setShowModal(true)} />
+            </Reveal>
 
             {tickets.length === 0 ? (
-              <EmptyState tab="tickets" />
+              <Reveal index={2}>
+                <EmptyState tab="tickets" />
+              </Reveal>
             ) : (
               <>
-                <Text className="text-[13px] text-[#56565C] font-medium mx-5 mb-2.5">
-                  {ticketCountLine}
-                </Text>
-                {tickets.map((tk) => (
-                  <TicketCard key={tk.id} ticket={tk} />
+                <Reveal index={2}>
+                  <Text className="text-[13px] text-[#56565C] font-medium mx-5 mb-2.5">
+                    {ticketCountLine}
+                  </Text>
+                </Reveal>
+                {tickets.map((tk, i) => (
+                  <Reveal key={tk.id} index={3 + i}>
+                    <TicketCard ticket={tk} />
+                  </Reveal>
                 ))}
               </>
             )}
