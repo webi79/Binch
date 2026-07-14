@@ -5,6 +5,7 @@ import { BoundedTtlCache } from "../util/boundedCache.js";
 import {
   motisFetch,
   motisGeocode,
+  motisGeocodeAnyStop,
   motisGeocodeNearestStop,
   type MotisPlace,
 } from "./motisClient.js";
@@ -125,9 +126,12 @@ export async function resolveMotisStopId(
   signal?: AbortSignal,
 ): Promise<MotisPlace | null> {
   const place = await resolveMotisPlace(code, label, signal);
-  if (place && !isCoordId(place.id)) return place;
+  if (place && !isCoordId(place.id) && place.type !== "PLACE") return place;
   if (!label) return null;
-  return motisGeocode(label, signal);
+  // motisGeocodeAnyStop statt motisGeocode: Die Tafel BRAUCHT eine Stop-ID, und
+  // motisGeocode gibt inzwischen bewusst auch Nicht-Halte zurück (Stadt-PLACE),
+  // mit denen /v6/stoptimes nichts anfangen kann → die Tafel bliebe leer.
+  return motisGeocodeAnyStop(label, signal);
 }
 
 export async function resolveMotisPlace(
@@ -165,6 +169,8 @@ export async function resolveMotisPlace(
   }
 
   // 2) ENTDECKUNG über die Abfahrtstafel.
+  //    (Der Seed muss ein echter STOP sein — eine Stadt/Adresse hat keine
+  //    stopTimes, die Entdeckung liefe ins Leere.)
   //
   // Für große deutsche/österreichische Bahnhöfe gibt der Transitous-Geocoder NUR
   // den at-Railway-Referenzknoten her — und der trägt keine Gleise. Genau daher
@@ -179,9 +185,10 @@ export async function resolveMotisPlace(
   //
   // Wirkung gemessen (München→Wien): 11/12 Legs mit Abfahrts-Gleis statt 5/12,
   // und „IC 63 ab München Hbf, Gleis 11" statt „RJX 63, Gleis —".
+  let seed: MotisPlace | null = null;
   if (!place && name) {
-    const seed = await motisGeocode(name, signal);
-    if (seed) {
+    seed = await motisGeocode(name, signal);
+    if (seed && seed.type === "STOP") {
       const railId = await discoverRailStopId(seed.id, signal);
       if (railId) {
         place = {
@@ -190,6 +197,7 @@ export async function resolveMotisPlace(
           lat: Number.isFinite(lat) ? lat : seed.lat,
           lon: Number.isFinite(lng) ? lng : seed.lon,
           tz: seed.tz,
+          type: "STOP",
         };
       }
     }
@@ -199,9 +207,20 @@ export async function resolveMotisPlace(
   if (!place && Number.isFinite(lat) && Number.isFinite(lng)) {
     place = { id: `${lat},${lng}`, name: name ?? code, lat, lon: lng };
   }
-  // 4) Letzter Ausweg: irgendein Geocode-Treffer.
-  if (!place && name) {
-    place = await motisGeocode(name, signal);
+
+  // 4) Letzter Ausweg: der Geocode-Treffer von oben.
+  //
+  //    Ist er KEIN Halt (Stadt/Adresse — unsere `type=ALL`-Einträge wie IT-ROM
+  //    „Roma Rom" haben gar keine Koordinate in der DB, landen also immer hier),
+  //    dann darf seine ID NICHT ins Routing: `fromPlace=<place-id>` wäre kein
+  //    Fahrplan-Knoten. Stattdessen über seine KOORDINATE routen — MOTIS sucht
+  //    sich den bedienten Halt selbst. Sonst wurde aus „Rom" die U-Bahn-Station
+  //    „Re di Roma".
+  if (!place && seed) {
+    place =
+      seed.type === "STOP" || seed.lat == null || seed.lon == null
+        ? seed
+        : { id: `${seed.lat},${seed.lon}`, name: seed.name, lat: seed.lat, lon: seed.lon, tz: seed.tz };
   }
 
   placeCache.set(code, place);

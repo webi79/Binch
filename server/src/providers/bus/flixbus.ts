@@ -1,4 +1,5 @@
 import { config } from "../../config.js";
+import { sameCity, normStationName } from "../../util/stationName.js";
 import type {
   SearchProvider,
   ProviderSearchInput,
@@ -90,10 +91,25 @@ export async function flixbusAutocomplete(
         (raw as { results?: AutocompleteItem[] })?.results ??
         []);
 
-  return [...list].sort((a, b) => {
-    if (a.is_train !== b.is_train) return a.is_train ? 1 : -1;
-    return (b.importance_order ?? b.score ?? 0) - (a.importance_order ?? a.score ?? 0);
-  });
+  // NICHT nach `importance_order` umsortieren.
+  //
+  // Das Feld ist KEIN Relevanz-Score, sondern ein über die Trefferliste
+  // ABSTEIGEND laufender Zähler (25, 24, 23 …) — die API liefert bereits nach
+  // Relevanz sortiert. Weiter unten hängen Fuzzy-Treffer, die nur auf einem
+  // Teilwort matchen und einen globalen Wichtigkeitswert von 100 tragen. Ein
+  // `sort(desc by importance_order)` hievt genau die nach oben:
+  //
+  //   Query „Berlin ZOB"
+  //     API:               Berlin central bus station (importance_order 25)
+  //     nach unserem Sort: Mannheim ZOB               (importance_order 100)
+  //
+  // Der Aufrufer nahm dann Mannheim, und die Suche Berlin→München lieferte
+  // 8 Verbindungen AB MANNHEIM — ausgewiesen als die Route des Users.
+  //
+  // Bleibt nur die eine legitime Präferenz: Bus-Stationen vor Bahnhöfen (wir
+  // suchen Busse). Array.sort ist stabil, die Relevanzreihenfolge der API bleibt
+  // innerhalb der Gruppen also erhalten.
+  return [...list].sort((a, b) => (a.is_train === b.is_train ? 0 : a.is_train ? 1 : -1));
 }
 
 interface FxFare {
@@ -283,10 +299,30 @@ async function resolveFlixId(
 
     const sorted = await flixbusAutocomplete(candidate, signal);
     if (sorted.length === 0) continue;
-    const first = sorted[0];
-    const cityId = first?.city?.id ?? first?.id;
+
+    // Auswahl in drei Stufen — bewusst PRÄFERENZEN, kein harter Filter:
+    //
+    // 1. Exakter STADT-Name. Nötig, weil FlixBus Vororte/Flughäfen als EIGENE
+    //    Cities führt: Der erste Treffer für „Berlin" ist „Berlin Airport BER"
+    //    mit city „Berlin Airport" — eine andere City-ID als „Berlin". Wer Bus
+    //    ab Berlin suchte, bekam nur Flughafen-Abfahrten und den ZOB gar nicht.
+    // 2. Sonst: irgendein Treffer aus derselben Stadt („Berlin ZOB" → „Berlin
+    //    central bus station").
+    // 3. Sonst: der relevanteste Treffer der API. Muss sein, weil FlixBus teils
+    //    englische Ortsnamen führt („München" → „Munich central bus station") —
+    //    ein Pflicht-Match würde den Provider für solche Städte stilllegen.
+    //
+    // Gegen den Mannheim-Fall schützt bereits die reparierte Sortierung oben.
+    const wanted = normStationName(candidate);
+    const hit =
+      sorted.find((s) => s?.city?.name && normStationName(s.city.name) === wanted) ??
+      sorted.find((s) => sameCity(candidate, s?.name) || sameCity(candidate, s?.city?.name)) ??
+      sorted[0];
+    if (!hit) continue;
+
+    const cityId = hit.city?.id ?? hit.id;
     if (cityId) {
-      cityIdCache.set(key, { cityId, stationId: first?.id ?? null });
+      cityIdCache.set(key, { cityId, stationId: hit.id ?? null });
       return cityId;
     }
   }

@@ -22,15 +22,24 @@ const REGISTRY: Record<TravelMode, SearchProvider[]> = {
   // transitSchedule liefert NUR für Tram/U-Bahn-Origin bzw. GTFS-only-Länder
   // (NL/BE/CZ/GB/…) Schedule-Cards (price=0, "Tarif beim Anbieter"). Für
   // normale Bahnhöfe macht der Provider früh `empty()` und kostet nichts.
-  // motis zuerst: verlässliche Zug-Verbindungen aus offenen GTFS-Daten (kein
-  // DB-Block, kein Rate-Limit), liefert Zeiten aber price=0. dbVendo bleibt
-  // dahinter — liefert Preise, sobald DB den OPS_BLOCK wieder löst.
+  // motis + dbVendo laufen parallel, dedupe() führt sie zusammen: MOTIS deckt ab,
+  // was DB nicht verkauft (CH-Nahverkehr, Tram/Bus-Zubringer), dbVendo liefert
+  // DBs eigenes Routing samt Preisen, echten Gleisen und echten Zugnamen.
   TRAIN: [motisProvider, trainlineProvider, dbVendoProvider, transitScheduleProvider],
-  // motis-bus zuerst: Regional-/Fernbusse aus offenen GTFS-Daten (kein DB-
-  // Block) — belebt BUS-Mode, nachdem dbVendo (HAFAS) extern geblockt wird und
-  // FlixBus/Busbud ohne API-Key nicht laufen. dbVendo bleibt dahinter (liefert
-  // wieder ÖPNV-Bus-Strecken, sobald DB entblockt), dann FlixBus/Busbud.
-  BUS: [motisBusProvider, dbVendoProvider, flixbusProvider, busbudProvider],
+
+  // dbVendo ist hier RAUS.
+  //
+  // Er kennt den gesuchten Modus gar nicht (ProviderSearchInput hat kein `mode`,
+  // und SearchProvider.mode ist statisch "TRAIN"), filtert seine Journeys also
+  // nicht — er lieferte in die BUS-Suche schlicht ZÜGE. Gemessen Dortmund →
+  // Frankfurt: 5 Treffer von dbVendo, darunter „ICE 529, 0 Umstiege". Wer nach
+  // Bussen sucht, bekam ICEs.
+  //
+  // Er stand hier aus der Zeit, als er nur ÖPNV-Bus-Strecken beisteuern sollte.
+  // Beigetragen hat er dazu nichts: Fernbusse kommen vollständig von motis-bus
+  // (FlixBus & Co. aus offenen GTFS-Daten). Nebeneffekt: spart DB-Kontingent,
+  // das bei ~60 req/min der Zug-Suche gehört.
+  BUS: [motisBusProvider, flixbusProvider, busbudProvider],
   CRUISE: [cruisedirectProvider],
 };
 

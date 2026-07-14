@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import { stationNameCompatible, normStationName } from "../util/stationName.js";
 import { BoundedTtlCache } from "../util/boundedCache.js";
 
 /**
@@ -16,6 +17,9 @@ export interface MotisPlace {
   lat?: number;
   lon?: number;
   tz?: string;
+  /** MOTIS-Treffertyp. "STOP" = echter Halt (als Routing-Ziel verwendbar);
+   *  "PLACE"/"ADDRESS" = Ort ohne Fahrplan → nur über die Koordinate routen. */
+  type?: string;
 }
 
 // Label → aufgelöster MOTIS-Stop. Mapping ist stabil → 24h.
@@ -97,7 +101,27 @@ export async function getMotisTripPolyline(
   return coords;
 }
 
-/** Freitext-Label → MOTIS-Stop (bevorzugt type STOP). Gecacht. */
+/**
+ * Freitext-Label → MOTIS-Treffer. Gecacht.
+ *
+ * WICHTIG: Wir nehmen NICHT mehr blind den ersten STOP. Vorher stand hier
+ * `raw.find(r => r.type === "STOP") ?? raw[0]` — der Geocoder liefert seine
+ * Treffer nach Relevanz sortiert, und wir haben ihn überstimmt, indem wir
+ * unbedingt einen Halt erzwangen. Für „Roma Rom" (unser Stadt-Eintrag IT-ROM)
+ * sah das so aus:
+ *
+ *     1. PLACE  Roma (Italia)          ← der richtige Treffer
+ *     2. STOP   RE DI ROMA (Italia)    ← den nahmen wir
+ *     3. PLACE  Roma (United States)
+ *
+ * „Re di Roma" ist eine U-Bahn-Station der Linie A. Wer Rom suchte, wurde also
+ * dorthin geroutet statt nach Roma Termini. Dieselbe Fehlerfamilie wie
+ * „Wien Hbf → Wien Blumental".
+ *
+ * Jetzt: Ein STOP gewinnt nur, wenn sein Name zum gesuchten passt. Sonst der
+ * relevanteste Treffer — bei Städten der PLACE, dessen Koordinate der Aufrufer
+ * zum Routen benutzt (MOTIS snappt selbst auf den bedienten Halt).
+ */
 export async function motisGeocode(label: string, signal?: AbortSignal): Promise<MotisPlace | null> {
   const key = label.trim().toLowerCase();
   if (!key) return null;
@@ -106,14 +130,19 @@ export async function motisGeocode(label: string, signal?: AbortSignal): Promise
 
   let place: MotisPlace | null = null;
   try {
-    const raw = (await motisFetch(
-      `/v1/geocode?text=${encodeURIComponent(label)}`,
-      signal,
-    )) as Array<{ type?: string; id?: string; name?: string; lat?: number; lon?: number; tz?: string }>;
-    if (Array.isArray(raw) && raw.length > 0) {
-      const hit = raw.find((r) => r.type === "STOP") ?? raw[0];
-      if (hit?.id) {
-        place = { id: hit.id, name: hit.name ?? label, lat: hit.lat, lon: hit.lon, tz: hit.tz };
+    const raw = await geocodeRaw(label, signal);
+    if (raw.length > 0) {
+      const stop = raw.find((r) => r.type === "STOP" && stationNameCompatible(label, r.name));
+      const hit = stop ?? raw[0]!;
+      if (hit.id) {
+        place = {
+          id: hit.id,
+          name: hit.name ?? label,
+          lat: hit.lat,
+          lon: hit.lon,
+          tz: hit.tz,
+          type: hit.type,
+        };
       }
     }
   } catch {
@@ -124,31 +153,49 @@ export async function motisGeocode(label: string, signal?: AbortSignal): Promise
   return place;
 }
 
-/** Bahnhofs-Abkürzungen, die dieselbe Station meinen (als ganzes Wort ersetzen —
- *  sonst würde „Bahnhofstrasse" verstümmelt). */
-const STATION_ABBR: Record<string, string> = {
-  hbf: "hauptbahnhof",
-  hb: "hauptbahnhof",
-  bhf: "bahnhof",
-  bf: "bahnhof",
-};
+interface GeocodeHit {
+  type?: string;
+  id?: string;
+  name?: string;
+  lat?: number;
+  lon?: number;
+  tz?: string;
+}
+
+async function geocodeRaw(label: string, signal?: AbortSignal): Promise<GeocodeHit[]> {
+  const raw = (await motisFetch(
+    `/v1/geocode?text=${encodeURIComponent(label)}`,
+    signal,
+  )) as GeocodeHit[];
+  return Array.isArray(raw) ? raw : [];
+}
 
 /**
- * Namen vergleichbar machen: Kleinbuchstaben, Abkürzungen aufgelöst, DIAKRITIKA
- * entfernt. Die Feeds schreiben denselben Bahnhof mal „Breclav", mal „Břeclav" —
- * ohne Normalisierung fänden wir den kanonischen Stop nicht wieder.
+ * Erster STOP-Treffer, ohne Namensprüfung — der alte Weg.
+ *
+ * Nur für Abfahrtstafeln: `/v6/stoptimes` braucht zwingend eine Stop-ID, eine
+ * Koordinate hilft dort nicht. Lieber eine Tafel vom ähnlichsten Halt als gar
+ * keine. Fürs ROUTING niemals verwenden — dafür ist motisGeocode zuständig.
  */
-function normName(s: string): string {
-  return s
-    .normalize("NFD")
-    .replace(/\p{Diacritic}/gu, "")
-    .toLowerCase()
-    .replace(/ß/g, "ss")
-    .split(/[^\p{L}\p{N}]+/u)
-    .filter(Boolean)
-    .map((tok) => STATION_ABBR[tok] ?? tok)
-    .join("");
+export async function motisGeocodeAnyStop(
+  label: string,
+  signal?: AbortSignal,
+): Promise<MotisPlace | null> {
+  if (!label.trim()) return null;
+  try {
+    const raw = await geocodeRaw(label, signal);
+    const hit = raw.find((r) => r.type === "STOP");
+    if (!hit?.id) return null;
+    return { id: hit.id, name: hit.name ?? label, lat: hit.lat, lon: hit.lon, tz: hit.tz, type: hit.type };
+  } catch {
+    return null;
+  }
 }
+
+/** Namensnormalisierung — eine Quelle für alle Provider, siehe util/stationName.ts.
+ *  (Stand hier früher als eigene Kopie; zwei Kopien driften auseinander, und
+ *  genau an so einem Vergleich hängt, ob wir den richtigen Bahnhof treffen.) */
+const normName = normStationName;
 
 /**
  * Feeds, die nur REFERENZDATEN enthalten (europaweite Bahnhofs-Dubletten), nicht

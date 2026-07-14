@@ -779,16 +779,25 @@ function dedupe(candidates: Candidate[], mode: TravelMode): Candidate[] {
       map.set(key, c);
       continue;
     }
-    // Züge: bei gleichem Fingerprint die qualitativ beste Variante behalten
-    // (weniger Umstiege / schneller); bei Gleichstand die vertrauenswürdigere
-    // Quelle. Preise taugen hier nicht als Tiebreak — MOTIS-Treffer sind ohne
-    // Anreicherung 0. Andere Modi: die günstigste.
     let better: boolean;
     if (mode === "TRAIN") {
+      // Züge: die qualitativ beste Variante behalten (weniger Umstiege /
+      // schneller); bei Gleichstand die vertrauenswürdigere Quelle. Preise
+      // taugen hier nicht als Tiebreak — MOTIS-Treffer sind ohne Anreicherung 0.
       const score = connectionScore(c.result);
       const prev = connectionScore(existing.result);
       better =
         score < prev || (score === prev && sourceTrust(c.provider) > sourceTrust(existing.provider));
+    } else if (mode === "BUS") {
+      // Busse: hier ist der Preis echt (FlixBus & Co.), also entscheidet er —
+      // aber bei GLEICHEM Preis die bessere Verbindung. Sonst behielten wir von
+      // zwei Varianten derselben Abfahrt zufällig die mit mehr Umstiegen, nur
+      // weil sie zuerst kam.
+      const price = effectivePrice(c.result);
+      const prevPrice = effectivePrice(existing.result);
+      better =
+        price < prevPrice ||
+        (price === prevPrice && connectionScore(c.result) < connectionScore(existing.result));
     } else {
       better = effectivePrice(c.result) < effectivePrice(existing.result);
     }
@@ -804,21 +813,26 @@ function fingerprint(r: NormalizedResult, mode: TravelMode): string {
   const arr = roundToMinute(r.arriveTime);
   const route = `${r.origin}->${r.destination}`;
 
-  if (mode === "TRAIN") {
-    // Fast-Duplikate kollabieren: dieselbe IC 198 ab derselben Minute einmal
-    // mit einem und einmal mit drei Zürcher Tram-Umstiegen ist EINE Verbindung
-    // — die DB zeigt pro Abfahrt genau die beste Variante. Darum nur erster Zug
-    // + Abfahrt + Strecke im Key (NICHT Ankunft/Stops, sonst bleiben die
-    // Varianten getrennt); dedupe() behält die beste Verbindungsqualität.
-    //
-    // Anker ist die Abfahrt des ersten ZUGES, nicht der Reisebeginn: seit
-    // Fußwege Teil der Reise sind, schwankt der Reisebeginn mit dem
-    // Fußweg-Routing — derselbe Zug bekäme sonst je Variante einen anderen Key
-    // und würde nicht mehr dedupliziert.
+  // Zug UND Bus: Fast-Duplikate kollabieren. Dieselbe IC 198 ab derselben Minute
+  // einmal mit einem und einmal mit drei Zürcher Tram-Umstiegen ist EINE
+  // Verbindung — DB zeigt pro Abfahrt genau die beste Variante. Darum nur erstes
+  // Fahrzeug + dessen Abfahrt + Strecke im Key (NICHT Ankunft/Stops, sonst
+  // bleiben die Varianten getrennt); dedupe() behält die beste Qualität.
+  //
+  // BUS war hier lange nicht dabei und lief in den generischen Zweig unten —
+  // dort steht die Ankunft im Key, also überlebten die Varianten. Ergebnis:
+  // „FlixBus 380, 12:00" stand doppelt in der Liste (einmal mit 1, einmal mit
+  // 2 Umstiegen). Es ist derselbe Pareto-Artefakt wie bei den Zügen, weil beide
+  // aus MOTIS kommen — also dieselbe Regel.
+  //
+  // Anker ist die Abfahrt des ersten FAHRZEUGS, nicht der Reisebeginn: seit
+  // Fußwege Teil der Reise sind, schwankt der Reisebeginn mit dem Fußweg-Routing
+  // — dieselbe Fahrt bekäme sonst je Variante einen anderen Key.
+  if (mode === "TRAIN" || mode === "BUS") {
     const firstTransit = r.legs?.find((l) => !l.walking);
-    const trainDep = roundToMinute(firstTransit?.departTime ?? r.departTime);
+    const vehicleDep = roundToMinute(firstTransit?.departTime ?? r.departTime);
     const first = (r.flightNumber ?? r.operatedBy ?? "").toUpperCase();
-    return `train:${first}|${trainDep}|${route}`;
+    return `${mode.toLowerCase()}:${first}|${vehicleDep}|${route}`;
   }
   if (mode === "FLIGHT" && r.flightNumber) {
     // ANKUNFT + STOPS gehören in den Fingerprint, sonst kollabieren völlig
