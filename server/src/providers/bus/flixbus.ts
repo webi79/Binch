@@ -1,33 +1,48 @@
 import { config } from "../../config.js";
-import { sameCity, normStationName } from "../../util/stationName.js";
+import { normStationName } from "../../util/stationName.js";
+import { resolveMotisPlace } from "../../services/motisPlaces.js";
 import type {
   SearchProvider,
   ProviderSearchInput,
   ProviderResult,
   NormalizedResult,
   LegInfo,
-  StopoverInfo,
 } from "../types.js";
 
-// FlixBus über RapidAPI (flixbus2-Variante).
-// Spec siehe RapidAPI: https://rapidapi.com/.../flixbus2
-//   - /autocomplete?query=...               → Stationen + Cities suchen
-//   - /search-trips?from_id=...&to_id=...   → Trips abrufen (Datum DD.MM.YYYY)
-//
-// Wenn ihr später einen direkten Affiliate-Vertrag (Awin/FlixBus) habt:
-// search() austauschen, der Rest des Codes (DB-Caching, Redirect-Tokens,
-// Aggregation in searchService.ts) bleibt unverändert.
+/**
+ * FlixBus über FlixBus' EIGENE öffentliche API (global.api.flixbus.com) — die,
+ * die auch shop.flixbus.com selbst benutzt. Kein Key, kein Kontingent.
+ *
+ * Vorher lief das über einen RapidAPI-Wrapper (flixbus2), der dieselbe Quelle
+ * weiterreicht — aber verlustbehaftet. Zwei Dinge gingen dabei kaputt:
+ *
+ * 1. ZEITEN. Der Wrapper schneidet den Zeitzonen-Offset ab:
+ *        FlixBus:  "2026-07-15T13:50:00+02:00"
+ *        Wrapper:  "2026-07-15T13:50:00.000"
+ *    Wir hängten ein „Z" an und behandelten die Ortszeit als UTC. Zusammen mit
+ *    dem fehlenden originTz (der alte Code kommentierte „die Timezone-Anzeige
+ *    übernimmt der Client via originTz" — gesetzt hat er es nie) rechnete der
+ *    Client die Gerätezeit ein ZWEITES Mal drauf: Ein Bus um 13:50 stand in der
+ *    App als 15:50. Zwei Stunden daneben — man verpasst den Bus.
+ *
+ * 2. TRIP-IDENTITÄT. Der Wrapper liefert keine `uid` und keine Stations-IDs,
+ *    nur Namen. Die Original-API gibt beides.
+ *
+ * Was FlixBus NICHT hergibt: einen Deeplink auf eine konkrete Fahrt. Der Shop
+ * kennt offiziell nur `departureCity`, `arrivalCity`, `rideDate`, `adult`,
+ * `children`, `bike_slot`, `currency`, `_locale` — keinen Trip-Parameter. Ein
+ * „direkt zum Ticket"-Link ist damit nicht baubar; wir liefern die exakt
+ * vorbelegte Tagessuche (siehe buildShopLink).
+ */
 
+const FLIX_API = "https://global.api.flixbus.com";
+
+/** Form beibehalten — `liveLocations.flixbusLiveLocations` hängt daran. */
 export interface AutocompleteItem {
   id?: string;
-  legacy_id?: number | string;
   name?: string;
-  is_train?: boolean;
-  importance_order?: number;
-  score?: number;
-  city?: { id?: string; legacy_id?: number | string; name?: string };
+  city?: { id?: string; name?: string };
   country?: { code?: string; name?: string };
-  zipcode?: string;
 }
 
 export class FlixbusApiError extends Error {
@@ -41,137 +56,173 @@ export class FlixbusApiError extends Error {
 }
 
 /** Erkennt Stop-IDs aus ÖPNV-Quellen (HAFAS, GTFS, db-rest, StaDa), für die
- *  FlixBus garantiert keine passenden Trips hat. Solche Searches früh skippen
- *  spart einen Autocomplete-Roundtrip + verhindert Phantom-Matches gegen
- *  zufällige FlixBus-Stationen in der Nähe. */
+ *  FlixBus garantiert keine Trips hat. Solche Searches früh skippen spart einen
+ *  Roundtrip + verhindert Phantom-Matches gegen zufällige FlixBus-Städte. */
 function looksLikeTransitStopId(code: string | undefined): boolean {
   if (!code) return false;
-  // Reine numerische HAFAS-EVA (6-9 Stellen, z.B. 615123 für Bus-Stop,
-  // 8011102 für Bahnhof). FlixBus-IDs sind UUIDs, nicht numerisch.
   if (/^\d{6,9}$/.test(code)) return true;
-  // Präfixierte ÖPNV-Quellen aus unserer locations-Tabelle.
   if (/^(gtfs|dbrest|sta|airport):/.test(code)) return true;
   return false;
 }
 
+interface FlixCity {
+  id?: string;
+  name?: string;
+  country?: string;
+  is_flixbus_city?: boolean;
+}
+
 /**
- * Ruft FlixBus-Autocomplete für eine Suchanfrage auf. Liefert die Roh-Liste
- * (Stations + Cities) sortiert nach Bus-Vorrang und Importance.
+ * Städte-Autocomplete. Liefert die Treffer in der Reihenfolge der API (nach
+ * deren `score` sortiert) — NICHT umsortieren.
  *
- * Wirft `FlixbusApiError` bei Quota-Überschreitung / API-Fehlern, damit der
- * Aufrufer das in DB / Logs sichtbar macht statt stillschweigend [] zurückzugeben.
+ * Der alte RapidAPI-Pfad sortierte absteigend nach `importance_order`. Das ist
+ * kein Score, sondern ein über die Liste abwärts laufender Zähler; Fuzzy-Treffer
+ * weiter unten trugen einen globalen Wert von 100 und wurden dadurch nach oben
+ * gehievt: „Berlin ZOB" löste auf MANNHEIM ZOB auf, und die Suche Berlin→München
+ * zeigte 8 Verbindungen ab Mannheim. Siehe util/stationName.ts.
  */
 export async function flixbusAutocomplete(
   query: string,
   signal?: AbortSignal,
 ): Promise<AutocompleteItem[]> {
   const trimmed = query.trim();
-  if (trimmed.length < 1 || !config.RAPIDAPI_KEY) return [];
+  if (!trimmed) return [];
 
-  const url = new URL(`https://${config.FLIXBUS_RAPIDAPI_HOST}/autocomplete`);
-  url.searchParams.set("query", trimmed);
+  const url = new URL(`${FLIX_API}/search/autocomplete/cities`);
+  url.searchParams.set("q", trimmed);
+  url.searchParams.set("lang", "de");
 
-  const res = await fetch(url, { headers: rapidHeaders(), signal });
+  const res = await fetch(url, { headers: { accept: "application/json" }, signal });
+  if (!res.ok) throw new FlixbusApiError(res.status, await res.text().catch(() => ""));
+
+  const raw = (await res.json().catch(() => null)) as FlixCity[] | null;
+  if (!Array.isArray(raw)) return [];
+
+  // Die API liefert CITIES (keine Stationen) → das Item ist selbst die Stadt.
+  return raw
+    .filter((c) => c.id && c.name)
+    .map((c) => ({
+      id: c.id,
+      name: c.name,
+      city: { id: c.id, name: c.name },
+      country: { code: c.country },
+    }));
+}
+
+/**
+ * Label → FlixBus-City-ID.
+ *
+ * Exakter Stadtname gewinnt, sonst der relevanteste Treffer der API. Nötig, weil
+ * FlixBus Flughäfen/Vororte als EIGENE Städte führt: Für „Berlin" steht
+ * „Berlin (Flughafen)" mit an, und wer darauf landet, sieht nur
+ * Flughafen-Abfahrten und den ZOB gar nicht.
+ */
+const cityIdCache = new Map<string, string | null>();
+
+async function resolveFlixCityId(
+  code: string,
+  label: string | undefined,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  if (/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(code)) return code;
+
+  const candidates = [label, code].filter((x): x is string => !!x);
+  for (const candidate of candidates) {
+    const key = candidate.toLowerCase();
+    const cached = cityIdCache.get(key);
+    if (cached !== undefined) {
+      if (cached) return cached;
+      continue;
+    }
+
+    const hits = await flixbusAutocomplete(candidate, signal);
+    if (hits.length === 0) {
+      cityIdCache.set(key, null);
+      continue;
+    }
+
+    const wanted = normStationName(candidate);
+    const exact = hits.find((h) => h.name && normStationName(h.name) === wanted);
+    const id = (exact ?? hits[0])?.id ?? null;
+    cityIdCache.set(key, id);
+    if (id) return id;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Such-Response von global.api.flixbus.com/search/service/v4/search
+// ---------------------------------------------------------------------------
+
+interface FlixPoint {
+  /** ISO MIT Offset — "2026-07-15T13:50:00+02:00". Der Grund für den Umbau. */
+  date?: string;
+  city_id?: string;
+  station_id?: string;
+}
+
+interface FlixLeg {
+  ride_id?: string;
+  departure?: FlixPoint;
+  arrival?: FlixPoint;
+  operator_id?: string;
+}
+
+interface FlixTrip {
+  uid?: string;
+  status?: string;
+  departure?: FlixPoint;
+  arrival?: FlixPoint;
+  price?: { total?: number; total_with_platform_fee?: number };
+  legs?: FlixLeg[];
+}
+
+interface FlixSearchResponse {
+  trips?: Array<{ results?: Record<string, FlixTrip> }>;
+  stations?: Record<string, { id?: string; name?: string }>;
+}
+
+interface FlixFetch {
+  ok: boolean;
+  raw: unknown;
+  statusCode: number;
+}
+
+async function fetchFlixTrips(
+  fromCityId: string,
+  toCityId: string,
+  isoDate: string,
+  input: ProviderSearchInput,
+  signal?: AbortSignal,
+): Promise<FlixFetch> {
+  const url = new URL(`${FLIX_API}/search/service/v4/search`);
+  url.searchParams.set("from_city_id", fromCityId);
+  url.searchParams.set("to_city_id", toCityId);
+  url.searchParams.set("departure_date", isoToDmy(isoDate));
+  url.searchParams.set("products", JSON.stringify({ adult: input.passengers }));
+  url.searchParams.set("currency", input.currency);
+  url.searchParams.set("locale", "de");
+  url.searchParams.set("search_by", "cities");
+  url.searchParams.set("include_after_midnight_rides", "1");
+
+  const res = await fetch(url, { headers: { accept: "application/json" }, signal });
   const raw = (await res.json().catch(() => null)) as unknown;
-
-  // RapidAPI signalisiert Quota / Plan-Probleme als 200/429 mit { message: "..." }.
-  if (raw && typeof raw === "object" && !Array.isArray(raw) && "message" in raw) {
-    const msg = String((raw as { message?: unknown }).message ?? "");
-    if (msg) throw new FlixbusApiError(res.status, msg);
-  }
-  if (!res.ok) {
-    throw new FlixbusApiError(res.status, JSON.stringify(raw).slice(0, 300));
-  }
-
-  const list: AutocompleteItem[] = Array.isArray(raw)
-    ? (raw as AutocompleteItem[])
-    : ((raw as { cities?: AutocompleteItem[]; data?: AutocompleteItem[]; results?: AutocompleteItem[] })
-        ?.cities ??
-        (raw as { data?: AutocompleteItem[] })?.data ??
-        (raw as { results?: AutocompleteItem[] })?.results ??
-        []);
-
-  // NICHT nach `importance_order` umsortieren.
-  //
-  // Das Feld ist KEIN Relevanz-Score, sondern ein über die Trefferliste
-  // ABSTEIGEND laufender Zähler (25, 24, 23 …) — die API liefert bereits nach
-  // Relevanz sortiert. Weiter unten hängen Fuzzy-Treffer, die nur auf einem
-  // Teilwort matchen und einen globalen Wichtigkeitswert von 100 tragen. Ein
-  // `sort(desc by importance_order)` hievt genau die nach oben:
-  //
-  //   Query „Berlin ZOB"
-  //     API:               Berlin central bus station (importance_order 25)
-  //     nach unserem Sort: Mannheim ZOB               (importance_order 100)
-  //
-  // Der Aufrufer nahm dann Mannheim, und die Suche Berlin→München lieferte
-  // 8 Verbindungen AB MANNHEIM — ausgewiesen als die Route des Users.
-  //
-  // Bleibt nur die eine legitime Präferenz: Bus-Stationen vor Bahnhöfen (wir
-  // suchen Busse). Array.sort ist stabil, die Relevanzreihenfolge der API bleibt
-  // innerhalb der Gruppen also erhalten.
-  return [...list].sort((a, b) => (a.is_train === b.is_train ? 0 : a.is_train ? 1 : -1));
+  return { ok: res.ok && raw !== null, raw, statusCode: res.status };
 }
-
-interface FxFare {
-  price?: number;
-  currency?: string;
-  additional_info?: string;
-}
-
-interface FxSegment {
-  dep_offset?: string;
-  arr_offset?: string;
-  dep_name?: string;
-  arr_name?: string;
-  dep_id?: string;
-  arr_id?: string;
-  intermediate_stop?: { name?: string; arr_offset?: string; dep_offset?: string }[];
-  product_type?: string;
-  product?: string;
-  line?: string;
-  line_code?: string;
-  direction?: string;
-}
-
-interface FxJourney {
-  dep_offset?: string;
-  arr_offset?: string;
-  dep_name?: string;
-  arr_name?: string;
-  duration?: string;
-  changeovers?: number;
-  segments?: FxSegment[];
-  deeplink?: string;
-  fares?: FxFare[];
-}
-
-interface FxSearchResponse {
-  headers?: { response_id?: number };
-  journeys?: FxJourney[];
-}
-
-const cityIdCache = new Map<string, { cityId: string; stationId: string | null }>();
 
 export const flixbusProvider: SearchProvider = {
   name: "flixbus",
   mode: "BUS",
 
+  // Kein Key mehr nötig — FlixBus' eigene API ist offen.
   isConfigured() {
-    return Boolean(config.RAPIDAPI_KEY);
+    return true;
   },
 
   async search(input: ProviderSearchInput, signal?: AbortSignal): Promise<ProviderResult> {
     const start = Date.now();
-    if (!this.isConfigured()) {
-      return { results: [], raw: { skipped: "no rapidapi key" }, statusCode: 0, durationMs: 0 };
-    }
 
-    // Self-Filter: HAFAS-/GTFS-Stop-IDs sind keine FlixBus-Stationen. Wenn
-    // Origin oder Destination wie eine ÖPNV-Stop-ID aussieht (numerische
-    // HAFAS-EVA oder gtfs:/dbrest:/sta:-Präfix), würde resolveFlixId via
-    // Autocomplete höchstens einen ZUFÄLLIGEN FlixBus-Halt in der Nähe
-    // matchen und falsche Trips zurückliefern. Lieber sofort skippen — spart
-    // einen RapidAPI-Call pro Anfrage und ist semantisch ehrlicher.
     if (looksLikeTransitStopId(input.origin) || looksLikeTransitStopId(input.destination)) {
       return {
         results: [],
@@ -184,8 +235,8 @@ export const flixbusProvider: SearchProvider = {
     let fromId: string | null;
     let toId: string | null;
     try {
-      fromId = await resolveFlixId(input.origin, input.originLabel, signal);
-      toId = await resolveFlixId(input.destination, input.destLabel, signal);
+      fromId = await resolveFlixCityId(input.origin, input.originLabel, signal);
+      toId = await resolveFlixCityId(input.destination, input.destLabel, signal);
     } catch (e) {
       if (e instanceof FlixbusApiError) {
         return {
@@ -200,44 +251,54 @@ export const flixbusProvider: SearchProvider = {
     if (!fromId || !toId) {
       return {
         results: [],
-        raw: {
-          skipped: "could not resolve flixbus id",
-          origin: input.origin,
-          destination: input.destination,
-        },
+        raw: { skipped: "could not resolve flixbus city", origin: input.origin, destination: input.destination },
         statusCode: 0,
         durationMs: Date.now() - start,
       };
     }
 
-    // FlixBus /trips ist One-Way. Bei returnDate parallel ein zweites Mal in
-    // Gegenrichtung suchen und Rück-Treffer mit `direction: "RETURN"` markieren.
-    // Client trennt sie über den Hinreise/Rückreise-Toggle.
-    const outboundPromise = fetchFlixTrips(fromId, toId, input.departDate, input, signal);
-    const returnPromise = input.returnDate
-      ? fetchFlixTrips(toId, fromId, input.returnDate, input, signal)
-      : Promise.resolve(null);
+    // Zeitzonen der Endpunkte — dieselbe geteilte Auflösung wie beim Zug-Provider
+    // (24h-Cache). Ohne sie rendert der Client die UTC-Zeit in der GERÄTE-Zone;
+    // für einen Bus in Spanien wäre das schlicht falsch.
+    const [fromPlace, toPlace] = await Promise.all([
+      resolveMotisPlace(input.origin, input.originLabel, signal).catch(() => null),
+      resolveMotisPlace(input.destination, input.destLabel, signal).catch(() => null),
+    ]);
+    const tz = { origin: fromPlace?.tz, destination: toPlace?.tz };
 
-    const [outbound, returnLeg] = await Promise.all([outboundPromise, returnPromise]);
+    const [outbound, returnLeg] = await Promise.all([
+      fetchFlixTrips(fromId, toId, input.departDate, input, signal),
+      input.returnDate
+        ? fetchFlixTrips(toId, fromId, input.returnDate, input, signal)
+        : Promise.resolve(null),
+    ]);
     const durationMs = Date.now() - start;
 
     if (!outbound.ok) {
       return { results: [], raw: outbound.raw, statusCode: outbound.statusCode, durationMs };
     }
 
-    const outboundResults: NormalizedResult[] = parseFlixJourneys(outbound.raw, input).map(
-      (r) => ({ ...r, direction: "OUTBOUND" as const }),
-    );
+    const outboundResults = parseTrips(outbound.raw, input, tz, {
+      fromCityId: fromId,
+      toCityId: toId,
+      rideDate: input.departDate,
+    }).map((r) => ({ ...r, direction: "OUTBOUND" as const }));
 
     let returnResults: NormalizedResult[] = [];
-    if (returnLeg?.ok) {
-      returnResults = parseFlixJourneys(returnLeg.raw, {
-        ...input,
-        origin: input.destination,
-        destination: input.origin,
-        originLabel: input.destLabel,
-        destLabel: input.originLabel,
-      }).map((r) => ({ ...r, direction: "RETURN" as const }));
+    if (returnLeg?.ok && input.returnDate) {
+      returnResults = parseTrips(
+        returnLeg.raw,
+        {
+          ...input,
+          origin: input.destination,
+          destination: input.origin,
+          originLabel: input.destLabel,
+          destLabel: input.originLabel,
+        },
+        // Rückfahrt → Zonen tauschen.
+        { origin: tz.destination, destination: tz.origin },
+        { fromCityId: toId, toCityId: fromId, rideDate: input.returnDate },
+      ).map((r) => ({ ...r, direction: "RETURN" as const }));
     }
 
     return {
@@ -249,204 +310,131 @@ export const flixbusProvider: SearchProvider = {
   },
 };
 
-interface FlixFetch {
-  ok: boolean;
-  raw: unknown;
-  statusCode: number;
+interface LinkContext {
+  fromCityId: string;
+  toCityId: string;
+  rideDate: string;
 }
 
-async function fetchFlixTrips(
-  fromId: string,
-  toId: string,
-  isoDate: string,
+function parseTrips(
+  raw: unknown,
   input: ProviderSearchInput,
-  signal?: AbortSignal,
-): Promise<FlixFetch> {
-  const url = new URL(`https://${config.FLIXBUS_RAPIDAPI_HOST}/trips`);
-  url.searchParams.set("from_id", fromId);
-  url.searchParams.set("to_id", toId);
-  url.searchParams.set("date", isoToDmy(isoDate));
-  url.searchParams.set("time", "00:00");
-  url.searchParams.set("adult", String(input.passengers));
-  url.searchParams.set("search_by", "cities");
-  url.searchParams.set("currency", input.currency);
-
-  const res = await fetch(url, { headers: rapidHeaders(), signal });
-  const raw = (await res.json().catch(() => null)) as unknown;
-  return { ok: res.ok && raw !== null, raw, statusCode: res.status };
-}
-
-function rapidHeaders(): Record<string, string> {
-  return {
-    "x-rapidapi-key": config.RAPIDAPI_KEY ?? "",
-    "x-rapidapi-host": config.FLIXBUS_RAPIDAPI_HOST,
-  };
-}
-
-async function resolveFlixId(
-  code: string,
-  label: string | undefined,
-  signal?: AbortSignal,
-): Promise<string | null> {
-  // Wenn der Input bereits wie eine UUID aussieht, direkt verwenden.
-  if (/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(code)) return code;
-
-  const candidates = [label, code].filter((x): x is string => typeof x === "string" && x.length > 0);
-  for (const candidate of candidates) {
-    const key = candidate.toLowerCase();
-    const cached = cityIdCache.get(key);
-    if (cached) return cached.cityId;
-
-    const sorted = await flixbusAutocomplete(candidate, signal);
-    if (sorted.length === 0) continue;
-
-    // Auswahl in drei Stufen — bewusst PRÄFERENZEN, kein harter Filter:
-    //
-    // 1. Exakter STADT-Name. Nötig, weil FlixBus Vororte/Flughäfen als EIGENE
-    //    Cities führt: Der erste Treffer für „Berlin" ist „Berlin Airport BER"
-    //    mit city „Berlin Airport" — eine andere City-ID als „Berlin". Wer Bus
-    //    ab Berlin suchte, bekam nur Flughafen-Abfahrten und den ZOB gar nicht.
-    // 2. Sonst: irgendein Treffer aus derselben Stadt („Berlin ZOB" → „Berlin
-    //    central bus station").
-    // 3. Sonst: der relevanteste Treffer der API. Muss sein, weil FlixBus teils
-    //    englische Ortsnamen führt („München" → „Munich central bus station") —
-    //    ein Pflicht-Match würde den Provider für solche Städte stilllegen.
-    //
-    // Gegen den Mannheim-Fall schützt bereits die reparierte Sortierung oben.
-    const wanted = normStationName(candidate);
-    const hit =
-      sorted.find((s) => s?.city?.name && normStationName(s.city.name) === wanted) ??
-      sorted.find((s) => sameCity(candidate, s?.name) || sameCity(candidate, s?.city?.name)) ??
-      sorted[0];
-    if (!hit) continue;
-
-    const cityId = hit.city?.id ?? hit.id;
-    if (cityId) {
-      cityIdCache.set(key, { cityId, stationId: hit.id ?? null });
-      return cityId;
-    }
-  }
-  return null;
-}
-
-function parseFlixJourneys(raw: unknown, input: ProviderSearchInput): NormalizedResult[] {
-  const r = raw as FxSearchResponse;
-  const journeys = r.journeys ?? [];
+  tz: { origin?: string; destination?: string },
+  link: LinkContext,
+): NormalizedResult[] {
+  const r = raw as FlixSearchResponse;
+  const stations = r.stations ?? {};
+  const stationName = (id?: string) => (id ? stations[id]?.name : undefined);
 
   const out: NormalizedResult[] = [];
-  for (let i = 0; i < journeys.length; i++) {
-    const j = journeys[i];
-    if (!j) continue;
+  const deepLink = buildShopLink(link, input);
 
-    const depart = parseLocalIso(j.dep_offset);
-    const arrive = parseLocalIso(j.arr_offset);
-    if (!depart || !arrive) continue;
+  for (const group of r.trips ?? []) {
+    for (const trip of Object.values(group.results ?? {})) {
+      // Die Zeiten tragen ihren Offset → new Date() liefert direkt korrektes UTC.
+      const depart = toIso(trip.departure?.date);
+      const arrive = toIso(trip.arrival?.date);
+      if (!depart || !arrive) continue;
 
-    const durationMinutes = parseHmDuration(j.duration, depart, arrive);
+      // Nicht buchbare Fahrten (ausverkauft, storniert) gehören nicht in die Liste.
+      if (trip.status && trip.status !== "available") continue;
 
-    const fare = j.fares?.[0];
-    const price = typeof fare?.price === "number" ? fare.price : Number.NaN;
-    if (!Number.isFinite(price) || price <= 0) continue;
+      const price = trip.price?.total;
+      if (typeof price !== "number" || price <= 0) continue;
 
-    const stops = typeof j.changeovers === "number" ? j.changeovers : 0;
-    const stopLabels: string[] = [];
-    if (j.segments && j.segments.length > 1) {
-      for (let s = 0; s < j.segments.length - 1; s++) {
-        const seg = j.segments[s];
-        if (seg?.arr_name) stopLabels.push(seg.arr_name);
+      const legs: LegInfo[] = [];
+      for (const leg of trip.legs ?? []) {
+        const legDep = toIso(leg.departure?.date);
+        const legArr = toIso(leg.arrival?.date);
+        if (!legDep || !legArr) continue;
+        legs.push({
+          origin: leg.departure?.station_id ?? "",
+          destination: leg.arrival?.station_id ?? "",
+          originLabel: stationName(leg.departure?.station_id),
+          destLabel: stationName(leg.arrival?.station_id),
+          departTime: legDep,
+          arriveTime: legArr,
+          durationMinutes: Math.max(1, Math.round((Date.parse(legArr) - Date.parse(legDep)) / 60_000)),
+          // Die Original-API führt keine Liniennummern (der RapidAPI-Wrapper
+          // erfand „FlixBus N951" aus internen Feldern). Marke statt Fantasie.
+          line: "FlixBus",
+          product: "bus",
+          stops: 0,
+        });
       }
-    }
 
-    const legs: LegInfo[] = [];
-    for (const seg of j.segments ?? []) {
-      const segDep = parseLocalIso(seg.dep_offset);
-      const segArr = parseLocalIso(seg.arr_offset);
-      if (!segDep || !segArr) continue;
-      const segDuration = Math.max(
-        1,
-        Math.round((Date.parse(segArr) - Date.parse(segDep)) / 60000),
-      );
-      const stopovers: StopoverInfo[] = (seg.intermediate_stop ?? [])
-        .map((s) => ({
-          name: s.name,
-          arrival: parseLocalIso(s.arr_offset) ?? undefined,
-          departure: parseLocalIso(s.dep_offset) ?? undefined,
-        }))
-        .filter((s) => s.name);
-      legs.push({
-        origin: seg.dep_id ?? "",
-        destination: seg.arr_id ?? "",
-        originLabel: seg.dep_name,
-        destLabel: seg.arr_name,
-        departTime: segDep,
-        arriveTime: segArr,
-        durationMinutes: segDuration,
-        line: seg.line_code ?? seg.line,
-        product: "bus",
-        direction: seg.direction,
-        stops: stopovers.length,
-        stopovers: stopovers.length > 0 ? stopovers : undefined,
+      // Umstiege = Fahrten minus 1. Bei Direktverbindungen liefert die API
+      // manchmal legs: [] → dann 0.
+      const stops = Math.max(0, legs.length - 1);
+      const stopLabels = legs.slice(0, -1).map((l) => l.destLabel ?? "").filter(Boolean);
+
+      out.push({
+        externalId: `flixbus:${trip.uid ?? `${depart}:${price}`}`,
+        origin: input.origin,
+        destination: input.destination,
+        originLabel: stationName(trip.departure?.station_id) ?? input.originLabel ?? input.origin,
+        destLabel: stationName(trip.arrival?.station_id) ?? input.destLabel ?? input.destination,
+        departTime: depart,
+        arriveTime: arrive,
+        originTz: tz.origin,
+        destinationTz: tz.destination,
+        durationMinutes: Math.max(1, Math.round((Date.parse(arrive) - Date.parse(depart)) / 60_000)),
+        stops,
+        stopLabels,
+        legs: legs.length > 0 ? legs : undefined,
+        // `total` ist der Preis, den der Shop in der Trefferliste zeigt — genau
+        // das sieht der User nach dem Klick. (`total_with_platform_fee` kommt
+        // dort erst an der Kasse dazu; hier stünde sonst eine andere Zahl als
+        // auf der Zielseite.)
+        price,
+        currency: input.currency,
+        deepLink,
+        operatedBy: "FlixBus",
+        providerLogo: "https://logos.flixbus.com/flixbus.png",
       });
     }
-
-    out.push({
-      externalId: `flixbus:${depart}:${j.dep_name ?? input.origin}:${j.arr_name ?? input.destination}:${i}`,
-      origin: input.origin,
-      destination: input.destination,
-      originLabel: j.dep_name ?? input.originLabel,
-      destLabel: j.arr_name ?? input.destLabel,
-      departTime: depart,
-      arriveTime: arrive,
-      durationMinutes,
-      stops,
-      stopLabels,
-      legs: legs.length > 0 ? legs : undefined,
-      price,
-      currency: fare?.currency ?? input.currency,
-      deepLink: j.deeplink ?? buildBookingFallback(input),
-      operatedBy: "FlixBus",
-      providerLogo: "https://logos.flixbus.com/flixbus.png",
-    });
   }
   return out;
 }
 
-// "2024-10-30T00:15:00.000" — kein Z, kein Offset. Local time relativ zur
-// Abfahrtsstation. Wir parsen als-ob-UTC, damit Date.parse stabil ist —
-// die echte Timezone-Anzeige übernimmt der Client via originTz/destinationTz.
-function parseLocalIso(value: string | undefined): string | null {
+/** ISO mit Offset → ISO-UTC. */
+function toIso(value: string | undefined): string | null {
   if (!value) return null;
-  const withZ = /Z|[+-]\d{2}:?\d{2}$/.test(value) ? value : `${value}Z`;
-  const d = new Date(withZ);
+  const d = new Date(value);
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-// "09:15" → 555 Minuten
-function parseHmDuration(value: string | undefined, depart: string, arrive: string): number {
-  if (typeof value === "string") {
-    const m = value.match(/^(\d+):(\d{1,2})$/);
-    if (m && m[1] && m[2]) return Number(m[1]) * 60 + Number(m[2]);
-  }
-  return Math.max(1, Math.round((Date.parse(arrive) - Date.parse(depart)) / 60000));
-}
-
-// "2026-05-15" → "15.05.2026"
+/** "2026-05-15" → "15.05.2026" */
 function isoToDmy(iso: string): string {
   const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (!m) return iso;
   return `${m[3]}.${m[2]}.${m[1]}`;
 }
 
-function buildBookingFallback(input: ProviderSearchInput): string {
+/**
+ * Buchungslink in den FlixBus-Shop.
+ *
+ * Vorbelegt mit Städten, Datum, Personenzahl und der WÄHRUNG DER APP — vorher
+ * kam der Link ungefiltert aus der API und trug deren Vorgaben (`currency=EUR`,
+ * `_locale=en`), passte also weder zur eingestellten Währung noch zur Sprache.
+ *
+ * `_locale` lassen wir bewusst WEG: Dann wählt der Shop die Sprache nach der
+ * Gerätesprache des Users. Setzten wir sie fest, müssten wir die App-Sprache bis
+ * hierher durchreichen und hätten sie im Cache-Key — für ein reines Anzeigedetail.
+ *
+ * Eine konkrete FAHRT lässt sich nicht verlinken: Der Shop akzeptiert keinen
+ * Trip-Parameter (die `uid` der API ist nur intern). Es bleibt die Tagessuche.
+ */
+function buildShopLink(link: LinkContext, input: ProviderSearchInput): string {
   const params = new URLSearchParams({
-    departureCity: input.originLabel ?? input.origin,
-    arrivalCity: input.destLabel ?? input.destination,
-    rideDate: isoToDmy(input.departDate),
+    departureCity: link.fromCityId,
+    arrivalCity: link.toCityId,
+    rideDate: isoToDmy(link.rideDate),
     adult: String(input.passengers),
+    children: "0",
+    bike_slot: "0",
     currency: input.currency,
   });
-  if (config.FLIXBUS_AFFILIATE_ID) {
-    params.set("partner", config.FLIXBUS_AFFILIATE_ID);
-  }
+  if (config.FLIXBUS_AFFILIATE_ID) params.set("partner", config.FLIXBUS_AFFILIATE_ID);
   return `https://shop.flixbus.com/search?${params.toString()}`;
 }
