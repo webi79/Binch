@@ -609,7 +609,7 @@ export default function HomeScreen() {
               App. (Der alte Slide steckte in SlideInRight/SlideInLeft; wenn du
               die Richtungs-Geste vermisst, hole ich sie zurück.) */}
           {destinations.map((d, i) => (
-            <ScrollReveal key={`${category}-${d.id}`} index={5 + i}>
+            <ScrollReveal key={`${category}-${d.id}`} index={5 + i} waveBase={5}>
               <DestinationCard d={d} />
             </ScrollReveal>
           ))}

@@ -42,10 +42,23 @@ export const MOTION = {
    *  allem: Zeit lassen. 550 ms ist noch weit unter der Schwelle, ab der
    *  Bewegung als Warten empfunden wird (Kontextwechsel dürfen 600-800 ms). */
   duration: 550,
-  /** Versatz je Element. Größer = die Welle ist deutlicher lesbar. */
+  /** Abstand zwischen den ERSTEN beiden Elementen. Danach klingt er ab. */
   stagger: 90,
-  /** Ab hier kein weiterer Versatz — sonst wartet das 20. Element ewig. */
-  maxSteps: 5,
+  /**
+   * Deckel, den die Welle nie überschreitet — sonst wartet das 20. Element
+   * ewig.
+   *
+   * Vorher war das eine harte Grenze bei 5 Schritten: Ab dem fünften Element
+   * bekamen ALLE denselben Versatz. Auf Home lagen die Popular-Destination-
+   * Karten genau dort (Index 5, 6, 7 …) — also 450 ms Stillstand, dann klatschte
+   * der ganze Block auf einmal rein. In Saved liegen die Karten bei 2, 3, 4, der
+   * Deckel griff nie, und deshalb wirkte NUR Saved gestaffelt.
+   *
+   * Jetzt klingt der Abstand ab (0, 90, 163, 223, 272, 311, 343 …): Jedes
+   * Element bekommt seinen eigenen Moment, die Welle läuft immer weiter, und die
+   * Summe bleibt trotzdem unter diesem Deckel.
+   */
+  maxDelay: 480,
   /**
    * easeOutCubic statt der Push-Kurve (0.05, 0.7, 0.1, 1).
    *
@@ -66,8 +79,9 @@ export const MOTION = {
  * JS-Aufrufer (Reveal, revealEntering) rufen sie unverändert weiter auf.
  */
 export function staggerDelay(index: number): number {
-  "worklet";
-  return Math.min(Math.max(index, 0), MOTION.maxSteps) * MOTION.stagger;
+  const i = Math.max(index, 0);
+  const decay = 1 - MOTION.stagger / MOTION.maxDelay;
+  return Math.round(MOTION.maxDelay * (1 - Math.pow(decay, i)));
 }
 
 /**
@@ -106,21 +120,53 @@ export function useReduceMotion(): boolean {
  * über einen Shared Value neu. (Klassisches RN-Animated bleibt hier auf der New
  * Architecture am Startwert hängen — deshalb reanimated.)
  */
-const EntranceContext = createContext(0);
+interface Entrance {
+  /** Zählt bei jedem Fokus hoch → die Welle läuft neu. */
+  generation: number;
+  /** Wann der Fokus kam. Daran erkennt ein Element, ob es zur Welle gehört oder
+   *  lange danach nachgewachsen ist (siehe `waveBase`). */
+  focusedAt: number;
+}
+
+const EntranceContext = createContext<Entrance>({ generation: 0, focusedAt: 0 });
 
 export function ScreenEntrance({ children }: { children: ReactNode }) {
   const focused = useIsFocused();
-  const [generation, setGeneration] = useState(0);
+  const [entrance, setEntrance] = useState<Entrance>(() => ({
+    generation: 0,
+    focusedAt: Date.now(),
+  }));
   useEffect(() => {
-    if (focused) setGeneration((g) => g + 1);
+    if (focused) {
+      setEntrance((e) => ({ generation: e.generation + 1, focusedAt: Date.now() }));
+    }
   }, [focused]);
-  return <EntranceContext.Provider value={generation}>{children}</EntranceContext.Provider>;
+  return <EntranceContext.Provider value={entrance}>{children}</EntranceContext.Provider>;
 }
+
+/**
+ * Ab wann ein Mount nicht mehr zur Screen-Welle gehört.
+ *
+ * Länger als die Welle selbst dauert, kürzer als jede plausible Nutzer-Aktion
+ * danach.
+ */
+const LATE_MOUNT_MS = 400;
 
 interface RevealProps {
   children: ReactNode;
   /** Position in der Welle. 0 = zuerst. */
   index?: number;
+  /**
+   * Nur für Elemente, die auch NACHTRÄGLICH entstehen können (Kategorie-Wechsel
+   * auf Home): der Index, bei dem ihre Gruppe beginnt.
+   *
+   * Beim Betreten des Screens zählt `index` — die Karten kommen nach Überschrift
+   * und Kategorie-Auswahl. Wechselt man später die Kategorie, mounten sie neu,
+   * ohne dass eine Welle vor ihnen läuft: Dann wäre `index` eine Wartezeit auf
+   * nichts (auf Home: 450 ms Stillstand, dann alles auf einmal). Deshalb zählt
+   * dort nur die Position INNERHALB der Gruppe.
+   */
+  waveBase?: number;
   style?: StyleProp<ViewStyle>;
 }
 
@@ -131,8 +177,8 @@ interface RevealProps {
  * Muss unter einem {@link ScreenEntrance} hängen — dann läuft die Welle bei
  * JEDEM Fokus des Screens neu, nicht nur beim ersten Mount.
  */
-export function Reveal({ children, index = 0, style }: RevealProps) {
-  const generation = useContext(EntranceContext);
+export function Reveal({ children, index = 0, waveBase = 0, style }: RevealProps) {
+  const { generation, focusedAt } = useContext(EntranceContext);
   const reduceMotion = useReduceMotion();
   const progress = useSharedValue(0);
 
@@ -141,12 +187,17 @@ export function Reveal({ children, index = 0, style }: RevealProps) {
       progress.value = 1;
       return;
     }
+    // Nachgewachsen statt mitgekommen → keine Welle davor, also auch kein
+    // Vorlauf, auf den zu warten wäre.
+    const late = Date.now() - focusedAt > LATE_MOUNT_MS;
+    const step = late ? index - waveBase : index;
+
     progress.value = 0;
     progress.value = withDelay(
-      staggerDelay(index),
+      staggerDelay(step),
       withTiming(1, { duration: MOTION.duration, easing: MOTION.easing }),
     );
-  }, [generation, index, reduceMotion, progress]);
+  }, [generation, focusedAt, index, waveBase, reduceMotion, progress]);
 
   const animatedStyle = useAnimatedStyle(() => ({
     opacity: progress.value,
@@ -220,9 +271,9 @@ export function RevealScrollView({
  * bleibt, weil die Screens ihn benutzen und weil hier später das Einblenden beim
  * Scrollen wieder andocken soll.
  */
-export function ScrollReveal({ children, index = 0, style }: RevealProps) {
+export function ScrollReveal({ children, index = 0, waveBase = 0, style }: RevealProps) {
   return (
-    <Reveal index={index} style={style}>
+    <Reveal index={index} waveBase={waveBase} style={style}>
       {children}
     </Reveal>
   );
