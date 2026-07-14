@@ -42,6 +42,21 @@ export interface LegInfo {
   destLng?: number;
   departTime: string;
   arriveTime: string;
+  /**
+   * Zeitzone DIESES Legs — IANA-Name ("Europe/London") oder UTC-Offset ("+02:00").
+   * date-fns-tz versteht beides.
+   *
+   * Ohne das rendert der Client jede Leg-ABFAHRT in der Zone des Reisestarts und
+   * jede Leg-ANKUNFT in der des Reiseziels. Bei einer Fahrt über eine
+   * Zeitzonengrenze (Dortmund → London) wird damit die Ankunft des ERSTEN Legs
+   * (in Brüssel) in London-Zeit angezeigt — eine Stunde zu früh. Fällt es nicht
+   * auf, weil die Endzeiten stimmen; die Umstiege dazwischen sind falsch.
+   *
+   * Fehlt es, fällt der Client auf die Reise-Zone zurück (altes Verhalten).
+   */
+  originTz?: string;
+  destTz?: string;
+
   departDelayMinutes?: number;
   arriveDelayMinutes?: number;
   durationMinutes: number;

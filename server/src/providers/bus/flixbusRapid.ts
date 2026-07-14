@@ -245,6 +245,10 @@ function parse(
         destLabel: seg.arr_name,
         departTime: segDep,
         arriveTime: segArr,
+        // Näherung wie bei der Zeitberechnung oben: Der Wrapper liefert pro Halt
+        // keine Zone, also Startzone für alles außer der Endankunft.
+        originTz: tz.origin,
+        destTz: isLast ? tz.destination : tz.origin,
         durationMinutes: Math.max(1, Math.round((Date.parse(segArr) - Date.parse(segDep)) / 60_000)),
         line: seg.line_code ?? seg.line ?? "FlixBus",
         product: "bus",

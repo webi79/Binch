@@ -1,5 +1,6 @@
 import { config } from "../../config.js";
 import { BoundedTtlCache } from "../../util/boundedCache.js";
+import { isoOffset } from "../../util/isoOffset.js";
 import { normStationName } from "../../util/stationName.js";
 import { resolveMotisPlace } from "../../services/motisPlaces.js";
 import { buildShopLink, isoToDmy } from "./flixbusLink.js";
@@ -424,6 +425,10 @@ function parseTrips(
           destLabel: stationName(leg.arrival?.station_id),
           departTime: legDep,
           arriveTime: legArr,
+          // Zone dieses Halts aus dem Offset — FlixBus' Stations-Dictionary
+          // führt keine Zeitzone, die Zeitstempel tragen sie aber.
+          originTz: isoOffset(leg.departure?.date),
+          destTz: isoOffset(leg.arrival?.date),
           durationMinutes: Math.max(1, Math.round((Date.parse(legArr) - Date.parse(legDep)) / 60_000)),
           // Die Original-API führt keine Liniennummern (der RapidAPI-Wrapper
           // erfand „FlixBus N951" aus internen Feldern). Marke statt Fantasie.

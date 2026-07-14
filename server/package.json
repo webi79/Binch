@@ -71,6 +71,7 @@
     "pdfjs-dist": "^5.6.205",
     "pg": "^8.13.1",
     "pino-pretty": "^11.3.0",
+    "tz-lookup": "^6.1.25",
     "zod": "^3.23.8"
   },
   "devDependencies": {

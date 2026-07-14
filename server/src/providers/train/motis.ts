@@ -370,6 +370,10 @@ function toLeg(leg: MotisLeg): LegInfo {
     originLng: leg.from.lon,
     destLat: leg.to.lat,
     destLng: leg.to.lon,
+    // MOTIS liefert die IANA-Zone pro Halt mit — bisher haben wir sie weggeworfen
+    // und der Client rendete jede Leg-Ankunft in der Zone des REISEZIELS.
+    originTz: leg.from.tz,
+    destTz: leg.to.tz,
     departTime: depart,
     arriveTime: arrive,
     departDelayMinutes: delayMinutes(leg.from.scheduledDeparture, leg.from.departure, leg.realTime),

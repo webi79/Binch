@@ -4,6 +4,7 @@ import { db } from "../../db/client.js";
 import { locations } from "../../db/schema.js";
 import { BoundedTtlCache } from "../../util/boundedCache.js";
 import { cleanPlatform } from "../../util/platform.js";
+import { dbStopTz, dbTimeToUtc } from "../../util/dbTime.js";
 import { resolveMotisPlace } from "../../services/motisPlaces.js";
 import { lineLabel } from "../../util/line.js";
 import type {
@@ -582,8 +583,22 @@ function parseJourneys(
     const last = trainLegs[trainLegs.length - 1];
     if (!first || !last) continue;
 
-    const departIso = toIso(first.plannedDeparture ?? first.departure);
-    const arriveIso = toIso(last.plannedArrival ?? last.arrival);
+    // Zonen der Endpunkte aus den Koordinaten der Halte (DB liefert sie mit).
+    const tripOriginTz = dbStopTz(first.origin);
+    const tripDestTz = dbStopTz(last.destination);
+
+    // ACHTUNG, DB-Eigenheit: Die Zeitstempel tragen den Offset des STARTORTS an
+    // JEDEM Halt — auch an solchen in einer anderen Zeitzone. Für Köln → London
+    // steht dort "13:57+02:00", gemeint ist aber 13:57 LONDONER Zeit (der
+    // Eurostar Brüssel→London braucht 2 h; mit +02:00 gelesen wären es 1 h —
+    // unmöglich). Der Offset ist also gelogen; die Uhrzeit selbst ist die
+    // ORTSZEIT des jeweiligen Halts.
+    //
+    // Darum: Offset wegwerfen, Uhrzeit in der ECHTEN Zone des Halts als Ortszeit
+    // lesen. Sonst wären UTC-Zeitpunkt UND Reisedauer bei jeder Fahrt über eine
+    // Zeitzonengrenze um Stunden falsch.
+    const departIso = dbTimeToUtc(first.plannedDeparture ?? first.departure, tripOriginTz);
+    const arriveIso = dbTimeToUtc(last.plannedArrival ?? last.arrival, tripDestTz);
     if (!departIso || !arriveIso) continue;
 
     const durationMinutes = Math.max(
@@ -602,8 +617,10 @@ function parseJourneys(
 
     const legs: LegInfo[] = [];
     for (const seg of trainLegs) {
-      const segDep = toIso(seg.plannedDeparture ?? seg.departure);
-      const segArr = toIso(seg.plannedArrival ?? seg.arrival);
+      const segOriginTz = dbStopTz(seg.origin);
+      const segDestTz = dbStopTz(seg.destination);
+      const segDep = dbTimeToUtc(seg.plannedDeparture ?? seg.departure, segOriginTz);
+      const segArr = dbTimeToUtc(seg.plannedArrival ?? seg.arrival, segDestTz);
       if (!segDep || !segArr) continue;
       const segDuration = Math.max(
         1,
@@ -614,8 +631,8 @@ function parseJourneys(
       const stopovers = middle
         .map((s) => ({
           name: s.stop?.name,
-          arrival: toIso(s.plannedArrival ?? s.arrival) ?? undefined,
-          departure: toIso(s.plannedDeparture ?? s.departure) ?? undefined,
+          arrival: dbTimeToUtc(s.plannedArrival ?? s.arrival, dbStopTz(s.stop)) ?? undefined,
+          departure: dbTimeToUtc(s.plannedDeparture ?? s.departure, dbStopTz(s.stop)) ?? undefined,
           platform: s.plannedArrivalPlatform ?? s.arrivalPlatform ?? s.plannedDeparturePlatform ?? s.departurePlatform,
         }))
         .filter((s) => s.name);
@@ -633,6 +650,11 @@ function parseJourneys(
         durationMinutes: segDuration,
         departPlatform: cleanPlatform(seg.plannedDeparturePlatform ?? seg.departurePlatform),
         arrivePlatform: cleanPlatform(seg.plannedArrivalPlatform ?? seg.arrivalPlatform),
+        // Zone DIESES Halts aus dem Offset des Zeitstempels ("…+02:00"). DB
+        // liefert keine IANA-Namen, aber der Offset reicht zum Anzeigen — sonst
+        // stünde ein Umstieg in London in Berliner Zeit.
+        originTz: segOriginTz,
+        destTz: segDestTz,
         line: lineLabel(seg.line),
         product: seg.line?.product,
         fahrtNr: seg.line?.fahrtNr,
@@ -675,8 +697,12 @@ function parseJourneys(
       destLabel: last.destination?.name ?? input.destLabel,
       departTime: departIso,
       arriveTime: arriveIso,
-      originTz: tz.origin,
-      destinationTz: tz.destination,
+      // Zonen aus den Koordinaten der ECHTEN Endhalte dieser Verbindung — genauer
+      // als die Auflösung über den gesuchten Ort (der User sucht „Köln", der Zug
+      // fährt ab „Köln Messe/Deutz"). Fällt die Koordinate aus, greift die
+      // geteilte Orts-Auflösung als Rückfall.
+      originTz: tripOriginTz ?? tz.origin,
+      destinationTz: tripDestTz ?? tz.destination,
       durationMinutes,
       stops,
       stopLabels,

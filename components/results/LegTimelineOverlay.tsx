@@ -358,14 +358,28 @@ function LegTimelineSheet({ result, hidden }: { result: SearchResult; hidden?: b
               // Ziel „Zürich Brunau“).
               const showOrigin = !leg.walking || isFirstLeg;
               const showDest = !leg.walking || isLastLeg;
+              // Zone DIESES Halts, nicht die der Gesamtreise.
+              //
+              // Vorher stand hier result.originTz für JEDE Abfahrt und
+              // result.destinationTz für JEDE Ankunft. Bei einer Reise über eine
+              // Zeitzonengrenze (Dortmund → London) wurde damit die Ankunft des
+              // ersten Legs — in Brüssel — in LONDON-Zeit angezeigt, also eine
+              // Stunde zu früh. Die Endzeiten stimmten, darum fiel es kaum auf;
+              // die Umstiege dazwischen waren falsch.
+              //
+              // Fallback auf die Reise-Zone, falls ein Provider keine Leg-Zone
+              // mitgibt (Flüge: dort ist die Zone bewusst "UTC", weil die Zeiten
+              // als Wall-Clock ankommen — der Fallback zeigt sie verbatim, richtig).
+              const legDepTz = leg.originTz ?? result.originTz;
+              const legArrTz = leg.destTz ?? result.destinationTz;
               return (
                 <View key={`${leg.origin}-${idx}`}>
                   {showOrigin ? (
                     <StationRow
-                      time={timeOf(leg.departTime, result.originTz)}
+                      time={timeOf(leg.departTime, legDepTz)}
                       delayed={
                         (leg.departDelayMinutes ?? 0) > 0
-                          ? timeOf(shiftIsoByMinutes(leg.departTime, leg.departDelayMinutes!), result.originTz)
+                          ? timeOf(shiftIsoByMinutes(leg.departTime, leg.departDelayMinutes!), legDepTz)
                           : undefined
                       }
                       name={leg.originLabel ?? leg.origin}
@@ -376,10 +390,10 @@ function LegTimelineSheet({ result, hidden }: { result: SearchResult; hidden?: b
                   <TransportSegment leg={leg} />
                   {showDest ? (
                     <StationRow
-                      time={timeOf(leg.arriveTime, result.destinationTz)}
+                      time={timeOf(leg.arriveTime, legArrTz)}
                       delayed={
                         (leg.arriveDelayMinutes ?? 0) > 0
-                          ? timeOf(shiftIsoByMinutes(leg.arriveTime, leg.arriveDelayMinutes!), result.destinationTz)
+                          ? timeOf(shiftIsoByMinutes(leg.arriveTime, leg.arriveDelayMinutes!), legArrTz)
                           : undefined
                       }
                       name={leg.destLabel ?? leg.destination}
