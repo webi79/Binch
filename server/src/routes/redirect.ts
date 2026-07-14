@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { consumeRedirectToken } from "../services/tokenService.js";
 import { resolveBookingUrl } from "../providers/flight/flightBookingDispatch.js";
+import { localizeBookingUrl, isAppLocale } from "../util/bookingLocale.js";
 
 /** Defense-in-Depth: wir leiten ausschließlich auf http(s)-URLs weiter.
  *  Die Links kommen zwar server-seitig von Providern (kein direkter User-
@@ -16,7 +17,7 @@ function isHttpUrl(value: string): boolean {
 }
 
 export async function redirectRoutes(app: FastifyInstance) {
-  app.get<{ Params: { token: string } }>("/redirect/:token", async (req, reply) => {
+  app.get<{ Params: { token: string }; Querystring: { lang?: string } }>("/redirect/:token", async (req, reply) => {
     const consumed = await consumeRedirectToken(req.params.token);
     if (!consumed) return reply.code(404).send({ error: "Token expired or unknown" });
 
@@ -46,6 +47,20 @@ export async function redirectRoutes(app: FastifyInstance) {
       req.log.warn({ deepLink: consumed.deepLink }, "redirect blocked: non-http deep link");
       return reply.code(404).send({ error: "Invalid redirect target" });
     }
-    return reply.redirect(consumed.deepLink, 302);
+
+    // Sprache des KLICKENDEN Users (`?lang=de`) — nicht die dessen, der die Suche
+    // zufällig als Erster ausgelöst und damit den Cache-Eintrag erzeugt hat.
+    //
+    // Deshalb steht das hier und nicht im Provider: Der Deeplink wird beim Suchen
+    // gebaut und MIT dem Ergebnis gecacht, die Sprache steckt aber nicht im
+    // Cache-Key. Sie hineinzunehmen würde den Cache je Sprache vervierfachen —
+    // auch für Flüge, wo das Anbieter-Kontingent knapp ist. Beim Redirect kostet
+    // es nichts und wirkt auch auf längst gecachte Treffer.
+    const lang = (req.query as { lang?: string } | undefined)?.lang;
+    const target = isAppLocale(lang)
+      ? localizeBookingUrl(consumed.deepLink, lang)
+      : consumed.deepLink;
+
+    return reply.redirect(target, 302);
   });
 }

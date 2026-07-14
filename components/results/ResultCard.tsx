@@ -96,7 +96,7 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
   const queryClient = useQueryClient();
 
   const bookUrl = result.redirectToken
-    ? redirectUrl(result.redirectToken)
+    ? redirectUrl(result.redirectToken, locale)
     : result.deepLink || "";
 
   async function onShare() {

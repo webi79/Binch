@@ -434,7 +434,7 @@ const DetailsContent = memo(function DetailsContent({
   }, [queryClient, bookingToken, result.currency, passengers, locale]);
 
   const bookUrl = result.redirectToken
-    ? redirectUrl(result.redirectToken)
+    ? redirectUrl(result.redirectToken, locale)
     : result.deepLink || "";
 
   const flightOptionsLoading = isFlight && !!bookingToken && optionsQuery.isLoading;

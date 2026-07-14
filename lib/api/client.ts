@@ -299,8 +299,19 @@ export function fetchStopArrivals(code: string): Promise<StopBoardResponse> {
   return getJson<StopBoardResponse>(`/api/stops/${encodeURIComponent(code)}/arrivals`, undefined, 10_000);
 }
 
-export function redirectUrl(token: string): string {
-  return `${API_BASE_URL}/redirect/${token}`;
+/**
+ * Buchungs-Redirect. `locale` bringt den User in der Sprache der App auf die
+ * Anbieter-Seite (FlixBus: shop.flixbus.de statt shop.global.flixbus.com).
+ *
+ * Die Sprache geht bewusst ERST hier mit, nicht schon in die Suche: Der Deeplink
+ * wird serverseitig zusammen mit dem Ergebnis gecacht, und die Sprache im
+ * Cache-Key hätte den Cache je Sprache vervierfacht — auch bei den Flügen, wo
+ * das Anbieter-Kontingent knapp ist. Der Server lokalisiert den Link beim
+ * Weiterleiten (routes/redirect.ts).
+ */
+export function redirectUrl(token: string, locale?: string): string {
+  const base = `${API_BASE_URL}/redirect/${token}`;
+  return locale ? `${base}?lang=${encodeURIComponent(locale)}` : base;
 }
 
 export interface FlightBookingOption {
