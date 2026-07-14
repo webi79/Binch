@@ -401,7 +401,21 @@ function toNormalized(
   mode: TravelMode,
 ): NormalizedResult | null {
   const transit = it.legs.filter((l) => l.mode !== "WALK");
-  if (transit.length === 0) return null; // reine Fußweg-"Verbindung" ignorieren
+  // Reine Fußweg-„Verbindung" ignorieren.
+  //
+  // WICHTIG ZU WISSEN: Liegt das Ziel in Gehweite, prunt MOTIS den ÖPNV komplett
+  // weg und liefert NUR einen Fußweg (in einem eigenen `direct`-Feld der
+  // Antwort). Für „Werl, Petrischule → Werl, Bahnhof" (300 m) heißt das:
+  // itineraries=0, direct=[8 Min zu Fuß] — obwohl dort der Bus 522 fährt
+  // (11 Min, also langsamer als gehen). Auch mit `directModes=` oder
+  // `maxDirectTime=0` rückt MOTIS die Busfahrt nicht heraus; das ist eine
+  // Eigenheit der Engine.
+  //
+  // Solche Strecken deckt db-vendo ab (er findet den 522) — siehe isBusOnly dort.
+  // Würde man hier stattdessen den Fußweg durchreichen, bekäme man eine
+  // Ergebnis-Karte ohne Linie, Betreiber und Preis; das ist eine eigene
+  // UI-Entscheidung und nicht nebenbei zu machen.
+  if (transit.length === 0) return null;
 
   const first = transit[0]!;
   const last = transit[transit.length - 1]!;

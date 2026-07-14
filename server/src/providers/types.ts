@@ -1,6 +1,11 @@
 import type { TravelMode } from "../db/schema.js";
 
 export interface ProviderSearchInput {
+  /** Gesuchter Modus. Wird von searchService immer mitgegeben (SearchInput
+   *  erweitert dieses Interface) — war nur nie deklariert, weshalb Provider, die
+   *  in MEHREREN Registries hängen, nicht filtern konnten. db-vendo lieferte
+   *  dadurch ZÜGE in die Bus-Suche. */
+  mode?: TravelMode;
   origin: string;
   destination: string;
   originLabel?: string;

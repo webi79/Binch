@@ -562,6 +562,26 @@ function applyCityAlias(label: string): string {
   return result;
 }
 
+/**
+ * Im BUS-Modus nur Verbindungen, die WIRKLICH aus Bussen bestehen.
+ *
+ * db-vendo hängt in zwei Registries (Zug UND Bus) und filterte nicht — er
+ * lieferte in die Bus-Suche Dortmund → Frankfurt schlicht ICEs („ICE 529, 0
+ * Umstiege"). Ich hatte ihn deshalb aus dem Bus-Modus geworfen. Das war zu grob:
+ * Damit fiel auch der LOKALE Busverkehr weg, den nur er findet — für
+ * „Werl, Petrischule → Werl, Bahnhof" ist er die einzige Quelle, die den Bus 522
+ * kennt (MOTIS prunt ihn weg, weil das Ziel in Gehweite liegt).
+ *
+ * Also: drin lassen, aber filtern. Ein Treffer zählt nur, wenn JEDE Fahrt darin
+ * ein Bus ist. Anruf-Sammeltaxis (product „taxi", z.B. „RUF Helmo") fliegen mit
+ * raus — die muss man telefonisch vorbestellen, in einer Bus-Trefferliste sind
+ * sie irreführend (die Abfahrtstafeln blenden sie aus demselben Grund aus).
+ */
+function isBusOnly(r: NormalizedResult): boolean {
+  const transit = (r.legs ?? []).filter((l) => !l.walking);
+  return transit.length > 0 && transit.every((l) => l.product === "bus");
+}
+
 function parseJourneys(
   raw: unknown,
   input: ProviderSearchInput,
@@ -728,7 +748,7 @@ function parseJourneys(
       providerLogo: "https://www.bahn.de/web-app/favicons/bahn-favicon.svg",
     });
   }
-  return out;
+  return input.mode === "BUS" ? out.filter(isBusOnly) : out;
 }
 
 function toIso(value: string | undefined): string | null {

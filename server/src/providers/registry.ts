@@ -27,19 +27,17 @@ const REGISTRY: Record<TravelMode, SearchProvider[]> = {
   // DBs eigenes Routing samt Preisen, echten Gleisen und echten Zugnamen.
   TRAIN: [motisProvider, trainlineProvider, dbVendoProvider, transitScheduleProvider],
 
-  // dbVendo ist hier RAUS.
+  // dbVendo ist hier wieder DRIN — aber mit Modus-Filter (siehe isBusOnly dort).
   //
-  // Er kennt den gesuchten Modus gar nicht (ProviderSearchInput hat kein `mode`,
-  // und SearchProvider.mode ist statisch "TRAIN"), filtert seine Journeys also
-  // nicht — er lieferte in die BUS-Suche schlicht ZÜGE. Gemessen Dortmund →
-  // Frankfurt: 5 Treffer von dbVendo, darunter „ICE 529, 0 Umstiege". Wer nach
-  // Bussen sucht, bekam ICEs.
+  // Historie: Er lieferte ungefiltert ZÜGE in die Bus-Suche („ICE 529, 0
+  // Umstiege" bei Dortmund → Frankfurt), also flog er raus. Das war zu grob —
+  // damit verschwand auch der LOKALE Busverkehr, den nur er findet:
+  // „Werl, Petrischule → Werl, Bahnhof" lieferte 0 Ergebnisse, obwohl der Bus 522
+  // dort fährt. MOTIS kann diese Strecke prinzipbedingt nicht (Ziel in Gehweite
+  // → ÖPNV wird weggeprunt), FlixBus überspringt GTFS-Stop-IDs.
   //
-  // Er stand hier aus der Zeit, als er nur ÖPNV-Bus-Strecken beisteuern sollte.
-  // Beigetragen hat er dazu nichts: Fernbusse kommen vollständig von motis-bus
-  // (FlixBus & Co. aus offenen GTFS-Daten). Nebeneffekt: spart DB-Kontingent,
-  // das bei ~60 req/min der Zug-Suche gehört.
-  BUS: [motisBusProvider, flixbusProvider, busbudProvider],
+  // Jetzt filtert er selbst: nur Verbindungen, deren Fahrten ALLE Busse sind.
+  BUS: [motisBusProvider, dbVendoProvider, flixbusProvider, busbudProvider],
   CRUISE: [cruisedirectProvider],
 };
 
