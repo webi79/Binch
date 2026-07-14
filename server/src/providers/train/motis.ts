@@ -670,10 +670,50 @@ function makeMotisProvider(mode: TravelMode, transitModes: string, name: string)
           // fasst die korrekt zusammen, der User sah danach aber nur noch 3-4
           // Verbindungen. Mit 10 bleiben nach dem Dedup ~6-10 übrig.
           `&transitModes=${encodeURIComponent(transitModes)}&numItineraries=10&maxTransfers=5&detailedTransfers=false`;
-        const raw = (await motisFetch(url, signal)) as {
+        type PlanResponse = {
           itineraries?: MotisItinerary[];
+          /** Reine Fußwege. MOTIS liefert sie in einem EIGENEN Feld — ihre bloße
+           *  Existenz verrät uns, dass das Ziel in Gehweite liegt. */
+          direct?: MotisItinerary[];
           nextPageCursor?: string;
         };
+        let raw = (await motisFetch(url, signal)) as PlanResponse;
+
+        // ZWEITER VERSUCH, wenn das Ziel in Gehweite liegt.
+        //
+        // MOTIS prunt den ÖPNV komplett weg, sobald man das Ziel erlaufen kann:
+        // Für „Werl, Petrischule → Werl, Bahnhof" (300 m) kommt itineraries=0 und
+        // direct=[8 Min zu Fuß] — obwohl dort der Bus 522 fährt (11 Min, also
+        // langsamer als gehen). Der User sah einen leeren Screen.
+        //
+        // Dass MOTIS Busse kann, steht außer Frage: Ab DEMSELBEN Halt, mit
+        // DEMSELBEN Bus, zur SELBEN Zeit findet es ihn — sobald das Ziel ein paar
+        // Minuten weiter weg liegt:
+        //     Werl, Bahnhof         (8 Min Fußweg)  → nichts
+        //     Werl, Melsterstraße  (12 Min Fußweg)  → Bus 522
+        //     Werl, Krankenhaus    (18 Min Fußweg)  → Bus 522
+        // Die Gehzeit ist die einzige Variable.
+        //
+        // Also fragen wir in genau diesem Fall ein zweites Mal — mit verbotenem
+        // Fußweg (`maxDirectTime=0`) und stark begrenzten Zu-/Abgangswegen. Nur
+        // diese enge Kombination fördert die Fahrt zutage; mit großzügigen
+        // Fußweg-Budgets gewinnt der Marsch wieder (alles durchgemessen).
+        //
+        // Gefahrlos, weil er NUR feuert, wenn der erste Versuch leer war: Er kann
+        // Ergebnisse hinzufügen, nie welche verdrängen. Findet auch er nichts,
+        // bleibt es beim alten Verhalten. Und er kostet nur in diesem seltenen
+        // Fall einen zweiten Call.
+        const walkable = (raw.itineraries?.length ?? 0) === 0 && (raw.direct?.length ?? 0) > 0;
+        if (walkable) {
+          const retry = `${url}&maxDirectTime=0&maxPreTransitTime=120&maxPostTransitTime=120`;
+          try {
+            const second = (await motisFetch(retry, signal)) as PlanResponse;
+            if ((second.itineraries?.length ?? 0) > 0) raw = second;
+          } catch {
+            // Zweiter Versuch fehlgeschlagen → beim leeren Ergebnis bleiben.
+          }
+        }
+
         const fresh: CachedPlan = {
           itineraries: raw.itineraries ?? [],
           nextPageCursor: raw.nextPageCursor,
