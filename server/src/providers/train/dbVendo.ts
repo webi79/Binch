@@ -484,9 +484,35 @@ async function resolveStationId(
         matchAll(s.name),
     );
     if (matches.length === 0) continue;
-    // Bei mehreren Treffern: bevorzuge KÜRZESTEN Namen (typischerweise der
-    // Hauptbahnhof selbst, nicht Sub-Stationen wie „Wien Hbf Bahnsteig 7").
-    matches.sort((a, b) => (a.name?.length ?? 999) - (b.name?.length ?? 999));
+
+    // Reihenfolge: erst wie GUT der Name passt, dann wie kurz er ist.
+    //
+    // „Kürzester Name gewinnt" allein war ein Reinfall. `allWordsMatch` prüft
+    // TEILSTRINGS, nicht Wörter — „Rom" steckt also auch in „Romanita" (einem
+    // italienischen Dorf). Und „Romanita" (8 Zeichen) ist kürzer als
+    // „ROM (Italien)" (12). Dortmund → Rom endete damit nach 23 Stunden in
+    // Romanita, obwohl DBs Suche „ROM (Italien)" korrekt an erster Stelle hatte.
+    //
+    // Jetzt: Exakter Name schlägt Wort-Treffer schlägt bloßen Teilstring. Die
+    // Kürze entscheidet erst innerhalb derselben Güteklasse — dort tut sie, wozu
+    // sie gedacht war (Hauptbahnhof vor „Wien Hbf Bahnsteig 7").
+    const wantedNorm = normalizeForMatch(candidate);
+    const wantedWords = wantedNorm.split(/\s+/).filter(Boolean);
+    const matchScore = (name: string): number => {
+      const norm = normalizeForMatch(name);
+      if (norm === wantedNorm) return 3;
+      const nameWords = new Set(norm.split(/[^\p{L}\p{N}]+/u).filter(Boolean));
+      const allWhole = wantedWords.every((w) => {
+        const variants = STATION_SYNONYMS[w] ?? [w];
+        return variants.some((v) => nameWords.has(v));
+      });
+      return allWhole ? 2 : 1;
+    };
+    matches.sort(
+      (a, b) =>
+        matchScore(b.name ?? "") - matchScore(a.name ?? "") ||
+        (a.name?.length ?? 999) - (b.name?.length ?? 999),
+    );
     const first = matches[0];
     if (first?.id) {
       stationCache.set(key, first.id);

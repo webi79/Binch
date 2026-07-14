@@ -367,27 +367,41 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
   //    Strecke nicht oder blockt uns gerade. So verbrennt der Doppel-Call im
   //    Normalfall keine Quota.
   //
-  // 2. NUR Zug/Bus: Die Strecke verlässt Deutschland.
+  // 2. NUR Zug/Bus: KURZSTRECKE im AUSLAND.
   //
-  //    DBs Routing wird jenseits der Grenze dünn — und zwar nicht nur in der
-  //    Beschriftung. Gemessen an London Waterloo → St Pancras:
-  //        db-vendo:  Waterloo-EAST → London Bridge → St Pancras   23 Min, 1 Umstieg
-  //        MOTIS:     Waterloo → Euston (Northern Line)            10 Min, direkt
-  //    DB kennt die Londoner U-Bahn nicht, schiebt einen ANDEREN Bahnhof unter
-  //    (Waterloo East) und routet über den Fernbahn-Umweg. Die Verbindung fährt
-  //    wirklich, ist aber die schlechtere Hälfte des Netzes.
+  //    DBs Auslandsdaten sind reiner FERNVERKEHR. Sobald es innerstädtisch wird,
+  //    kennt DB das Netz nicht — und liefert trotzdem etwas, indem es das Ziel
+  //    stillschweigend austauscht. Zweimal gemessen:
   //
-  //    In Amsterdam ist es harmlos (Route identisch, nur „IC 2718" statt
-  //    „Intercity") — aber unterscheiden können wir das vorher nicht. Also holen
-  //    wir bei Auslandsberührung die Zweitmeinung ein und lassen den Dedupe
-  //    entscheiden.
+  //      Amsterdam RAI → Amsterdam, DAM (Tram-Platz)
+  //        db-vendo:  → Amsterdam CENTRAAL (!), 20 Min Regionalzug über Duivendrecht
+  //        MOTIS:     → Amsterdam, Dam,        14 Min (Bus 62 · Metro 52 · Tram 4)
   //
-  //    Innerdeutsch — der weit überwiegende Fall — bleibt es bei db-vendo allein:
-  //    dort ist DB die bessere Quelle (Preise, echte Gleise, echte Zugnamen) und
-  //    die Suche bleibt schnell.
-  const crossesBorder =
-    (input.mode === "TRAIN" || input.mode === "BUS") && !(await isDomesticGerman(input));
-  if (candidates.length === 0 || crossesBorder) {
+  //      London Waterloo → St Pancras
+  //        db-vendo:  ab Waterloo EAST (!), 23 Min Fernbahn über London Bridge
+  //        MOTIS:     ab Waterloo,          10 Min Northern Line
+  //
+  //    Beide Male ein ANDERER Bahnhof als der gewählte, und der Umweg über die
+  //    Fernbahn, weil Metro/Tram/U-Bahn in DBs Daten fehlen.
+  //
+  //    Auf LANGEN Auslandsstrecken ist DB dagegen gut — und besser: Köln → London
+  //    stimmt bei beiden Quellen auf die Minute überein (db-vendo 359 Min, MOTIS
+  //    358), und nur DB hat Preise. Dort MOTIS mitlaufen zu lassen kostete 16 s
+  //    statt 5 und brachte nichts.
+  //
+  //    Also nicht „Ausland" als Kriterium, sondern „Ausland UND kurz".
+  //    Innerdeutsch bleibt es immer bei db-vendo allein (dort kennt DB auch den
+  //    Ortsbus, siehe Werl).
+  //    Kennen wir die Distanz NICHT (Code fehlt in unserer locations-Tabelle),
+  //    holen wir die Zweitmeinung ebenfalls — gerade dort, wo wir am wenigsten
+  //    über die Strecke wissen, wäre blindes Vertrauen in DB der falsche Reflex.
+  const route = await routeProfile(input);
+  const foreignShortHop =
+    (input.mode === "TRAIN" || input.mode === "BUS") &&
+    !route.domesticGerman &&
+    (route.distanceKm === null || route.distanceKm < LOCAL_HOP_KM);
+
+  if (candidates.length === 0 || foreignShortHop) {
     await runProviders(activeFallbackProvidersForMode(input.mode));
   }
 
@@ -888,23 +902,66 @@ function dedupe(candidates: Candidate[], mode: TravelMode): Candidate[] {
 }
 
 /**
- * Liegen BEIDE Endpunkte in Deutschland?
+ * Ab welcher Distanz gilt eine Auslandsfahrt als Fernverkehr, wo DB gut ist?
  *
- * Entscheidet, ob MOTIS als Zweitmeinung mitläuft (siehe Aufrufstelle). Bei
- * unbekanntem Land lieber `false` — dann holen wir die Zweitmeinung, statt uns
- * auf DB zu verlassen, wo wir es nicht wissen.
+ * Darunter ist es Stadt-/Regionalverkehr — genau die Daten, die DB jenseits der
+ * Grenze nicht hat. Die gemessenen Problemfälle liegen bei 3-5 km (London
+ * Waterloo → St Pancras, Amsterdam RAI → Dam), die gemessenen Gutfälle bei
+ * 480-500 km (Köln → London, Rom → Mailand). 50 km trennt beides mit reichlich
+ * Luft.
  */
-async function isDomesticGerman(input: SearchInput): Promise<boolean> {
+const LOCAL_HOP_KM = 50;
+
+interface RouteProfile {
+  domesticGerman: boolean;
+  /** Luftlinie zwischen den Endpunkten. `null`, wenn eine Koordinate fehlt. */
+  distanceKm: number | null;
+}
+
+/**
+ * Land und Distanz der Strecke — entscheidet, ob MOTIS als Zweitmeinung mitläuft
+ * (siehe Aufrufstelle).
+ *
+ * Bei unbekanntem Land lieber `domesticGerman: false` — dann holen wir die
+ * Zweitmeinung, statt uns auf DB zu verlassen, wo wir es nicht wissen.
+ */
+async function routeProfile(input: SearchInput): Promise<RouteProfile> {
   try {
     const rows = await db
-      .select({ code: locations.code, country: locations.country })
+      .select({
+        code: locations.code,
+        country: locations.country,
+        lat: locations.latitude,
+        lng: locations.longitude,
+      })
       .from(locations)
       .where(inArray(locations.code, [input.origin, input.destination]));
-    if (rows.length < 2) return false;
-    return rows.every((r) => r.country === "Germany");
+
+    const a = rows.find((r) => r.code === input.origin);
+    const b = rows.find((r) => r.code === input.destination);
+    if (!a || !b) return { domesticGerman: false, distanceKm: null };
+
+    const domesticGerman = a.country === "Germany" && b.country === "Germany";
+
+    let distanceKm: number | null = null;
+    if (a.lat != null && a.lng != null && b.lat != null && b.lng != null) {
+      distanceKm = haversineKm(Number(a.lat), Number(a.lng), Number(b.lat), Number(b.lng));
+    }
+    return { domesticGerman, distanceKm };
   } catch {
-    return false;
+    return { domesticGerman: false, distanceKm: null };
   }
+}
+
+function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
 }
 
 function fingerprint(r: NormalizedResult, mode: TravelMode): string {
