@@ -106,15 +106,25 @@ export default function RootLayout() {
 
   // Persistierte Recent-Searches + Saved-Stations gegen die aktuelle DB
   // validieren. Use-Case: nach Audit-Cleanup verweisen alte Recents auf
-  // gelöschte/umgelabelte Codes (z.B. „Wien Hbf"-Eintrag zeigt eigentlich auf
-  // einen sta:-Sub-Code der jetzt auf Wien Blumental routet). Persist-
-  // Middleware hydratet asynchron — kleiner Delay verhindert dass wir auf
-  // einem leeren Store starten (Recents wären noch nicht da).
+  // gelöschte/umgelabelte Codes — real passiert: ein Recent-Eintrag namens
+  // „Wien Hbf" trug den Code sta:8101003, der auf „Inzersdorf Wien Blumental
+  // Bahnhof" zeigt. Beim Antippen fuhr die Suche stumm nach Blumental.
+  //
+  // Hier hing der Aufruf früher an einem 800-ms-Timer. Das war ein Race: die
+  // Persist-Middleware hydratet asynchron, und war sie nach 800 ms noch nicht
+  // durch, stand `recentSearches` leer da → `codes.size === 0` → stiller
+  // Abbruch. Im Log tauchte NIE ein /api/locations/by-codes-Aufruf auf, die
+  // Selbstheilung lief also praktisch nie. Jetzt deterministisch an die
+  // Rehydration gehängt.
   useEffect(() => {
-    const t = setTimeout(() => {
+    const run = () => {
       void useSearchStore.getState().validatePersistedCodes();
-    }, 800);
-    return () => clearTimeout(t);
+    };
+    if (useSearchStore.persist.hasHydrated()) {
+      run();
+      return;
+    }
+    return useSearchStore.persist.onFinishHydration(run);
   }, []);
 
   // Einmalige Migration: Ticket-Bilder (früher Base64 im persistierten Store
