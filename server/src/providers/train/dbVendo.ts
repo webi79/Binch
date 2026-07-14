@@ -5,7 +5,6 @@ import { locations } from "../../db/schema.js";
 import { BoundedTtlCache } from "../../util/boundedCache.js";
 import { cleanPlatform } from "../../util/platform.js";
 import { dbStopTz, dbTimeToUtc } from "../../util/dbTime.js";
-import { resolveMotisPlace } from "../../services/motisPlaces.js";
 import { lineLabel } from "../../util/line.js";
 import type {
   SearchProvider,
@@ -169,6 +168,24 @@ export const dbVendoProvider: SearchProvider = {
       : Promise.resolve(null);
 
     const [outbound, returnLeg] = await Promise.all([outboundPromise, returnPromise]);
+
+    // ZWEITE SEITE bei der Erstsuche.
+    //
+    // DB liefert pro Anfrage nur 5 Verbindungen — der `results`-Parameter wird
+    // schlicht ignoriert (5, 10, 20 → immer 5, gemessen). Solange MOTIS parallel
+    // lief, fiel das nicht auf; als alleinige Quelle wäre die Liste zu dünn.
+    // Also blättern wir einmal nach (HAFAS-`laterThan`) und kommen auf ~10.
+    //
+    // Nur bei der ERSTSUCHE: Beim „Später"-Blättern schickt der Client bereits
+    // einen paginationToken mit, dann wäre eine zweite Seite doppelt.
+    let outbound2: JourneyFetch | null = null;
+    const firstLaterRef = (outbound.raw as { laterRef?: string } | null)?.laterRef;
+    if (outbound.ok && !input.paginationToken && firstLaterRef) {
+      outbound2 = await fetchJourneys(fromId, toId, input.departDate, signal, firstLaterRef).catch(
+        () => null,
+      );
+    }
+
     const durationMs = Date.now() - start;
 
     if (!outbound.ok) {
@@ -180,31 +197,22 @@ export const dbVendoProvider: SearchProvider = {
       };
     }
 
-    // Echte Zeitzonen der Endpunkte.
+    // Zeitzonen-RÜCKFALL. Die echten Zonen zieht parseJourneys aus den
+    // Koordinaten der Halte, die DB mitliefert (dbStopTz/tz-lookup, offline).
     //
-    // Hier standen fest verdrahtet "Europe/Berlin" für BEIDE Enden. Solange
-    // db-vendo nur zur Preis-Anreicherung lief, fiel das nicht auf — als
-    // Hauptquelle für Zug-Ergebnisse trifft es jede Verbindung: Für London
-    // St Pancras meldeten wir destinationTz=Europe/Berlin, der Client rechnete
-    // die Ankunft also in Berliner Zeit um und zeigte sie eine STUNDE ZU SPÄT.
-    // (MOTIS lieferte für dieselbe Fahrt korrekt Europe/London.)
+    // Hier stand ein Aufruf von resolveMotisPlace — also ein MOTIS-Geocode mitten
+    // im DB-Pfad, nur um an eine Zone zu kommen, die wir längst selbst haben.
+    // Das kostete 1-2 s pro Suche und hängte den primären Provider ausgerechnet
+    // an die Quelle, die wir in die Reserve geschoben haben.
     //
-    // Die IANA-Zone kommt aus der geteilten Orts-Auflösung — dieselbe, die der
-    // MOTIS-Provider im selben Suchlauf ohnehin benutzt (24h-Cache, also gratis).
-    // Fällt sie aus, bleibt Europe/Berlin: DBs Netz ist überwiegend CET, das ist
-    // der am wenigsten falsche Rückfall.
-    const [fromPlace, toPlace] = await Promise.all([
-      resolveMotisPlace(input.origin, input.originLabel, signal).catch(() => null),
-      resolveMotisPlace(input.destination, input.destLabel, signal).catch(() => null),
-    ]);
-    const tz = {
-      origin: fromPlace?.tz ?? DEFAULT_TZ,
-      destination: toPlace?.tz ?? DEFAULT_TZ,
-    };
+    // Bleibt Europe/Berlin als Rückfall, falls ein Halt keine Koordinate trägt:
+    // DBs Netz ist überwiegend CET, das ist der am wenigsten falsche Default.
+    const tz = { origin: DEFAULT_TZ, destination: DEFAULT_TZ };
 
-    const outboundResults: NormalizedResult[] = parseJourneys(outbound.raw, input, tz).map(
-      (r) => ({ ...r, direction: "OUTBOUND" as const }),
-    );
+    const outboundResults: NormalizedResult[] = [
+      ...parseJourneys(outbound.raw, input, tz),
+      ...(outbound2?.ok ? parseJourneys(outbound2.raw, input, tz) : []),
+    ].map((r) => ({ ...r, direction: "OUTBOUND" as const }));
 
     let returnResults: NormalizedResult[] = [];
     if (returnLeg?.ok) {
@@ -226,8 +234,10 @@ export const dbVendoProvider: SearchProvider = {
     // HAFAS-laterRef aus der OUTBOUND-Antwort rausziehen — den brauchen wir
     // für den „Später"-Knopf im Result-Screen. Bei Round-Trips nutzen wir
     // weiterhin den Outbound-laterRef (Pagination immer auf Hinrichtung).
-    const outboundRaw = outbound.raw as { laterRef?: string } | null;
-    const paginationToken = outboundRaw?.laterRef;
+    // „Später" muss hinter der ZWEITEN Seite weitermachen — sonst lieferte es
+    // genau die Verbindungen, die schon in der Liste stehen.
+    const lastRaw = (outbound2?.ok ? outbound2.raw : outbound.raw) as { laterRef?: string } | null;
+    const paginationToken = lastRaw?.laterRef;
 
     return {
       results: [...outboundResults, ...returnResults],

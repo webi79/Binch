@@ -22,10 +22,30 @@ const REGISTRY: Record<TravelMode, SearchProvider[]> = {
   // transitSchedule liefert NUR für Tram/U-Bahn-Origin bzw. GTFS-only-Länder
   // (NL/BE/CZ/GB/…) Schedule-Cards (price=0, "Tarif beim Anbieter"). Für
   // normale Bahnhöfe macht der Provider früh `empty()` und kostet nichts.
-  // motis + dbVendo laufen parallel, dedupe() führt sie zusammen: MOTIS deckt ab,
-  // was DB nicht verkauft (CH-Nahverkehr, Tram/Bus-Zubringer), dbVendo liefert
-  // DBs eigenes Routing samt Preisen, echten Gleisen und echten Zugnamen.
-  TRAIN: [motisProvider, trainlineProvider, dbVendoProvider, transitScheduleProvider],
+  // db-vendo ist die PRIMÄRE Zug-Quelle, MOTIS nur noch Reserve (siehe FALLBACK).
+  //
+  // Vorher liefen beide parallel und der Dedupe führte sie zusammen. Das kostete
+  // Zeit und Konsistenz:
+  //   - db-vendo antwortet in 1,2-1,8 s, MOTIS (öffentliches Transitous) in
+  //     9-15 s und lief bei langen Strecken regelmäßig in den Provider-Timeout.
+  //     Die Suche war also immer so langsam wie MOTIS.
+  //   - Zur selben Fahrt lieferten beide unterschiedliche Gleise, Zugnamen und
+  //     Preise; SOURCE_TRUST im Dedupe musste das jedes Mal geradebiegen.
+  //
+  // Die Annahme, MOTIS decke Nischen ab, die DB nicht kennt, hat sich nicht
+  // bestätigt. Gemessen liefert db-vendo überall Treffer, wo MOTIS welche hatte:
+  //     Zürich HB → Brunau (CH-Nahverkehr)      db-vendo 5
+  //     Werl, Petrischule → Bahnhof (Ortsbus)   db-vendo 5
+  //     Amsterdam Centraal → Sloterdijk         db-vendo 5
+  //     Rom → Mailand                           db-vendo 5
+  //     London Waterloo → St Pancras            db-vendo 5
+  // Nur wo BEIDE leer sind (Lissabon), hilft auch MOTIS nicht.
+  //
+  // BEKANNTE SCHWÄCHE: Im Ausland benennt DB die Linien schlecht (London: gar
+  // nicht, Amsterdam: "RE 8123" statt der NS-Linie). MOTIS hätte dort die echten
+  // Namen. Innerdeutsch — der weit überwiegende Fall — ist db-vendo klar besser
+  // (echte Gleise, echte Zugnamen, Preise).
+  TRAIN: [dbVendoProvider, trainlineProvider, transitScheduleProvider],
 
   // dbVendo ist hier wieder DRIN — aber mit Modus-Filter (siehe isBusOnly dort).
   //
@@ -37,7 +57,11 @@ const REGISTRY: Record<TravelMode, SearchProvider[]> = {
   // → ÖPNV wird weggeprunt), FlixBus überspringt GTFS-Stop-IDs.
   //
   // Jetzt filtert er selbst: nur Verbindungen, deren Fahrten ALLE Busse sind.
-  BUS: [motisBusProvider, dbVendoProvider, flixbusProvider, busbudProvider],
+  //
+  // motis-bus ebenfalls in die Reserve: Seine Fernbus-Treffer sind dieselben
+  // FlixBus-Fahrten, die der flixbus-Provider aus erster Hand hat (mit Preis und
+  // Buchungslink), und den lokalen Bus deckt db-vendo ab.
+  BUS: [dbVendoProvider, flixbusProvider, busbudProvider],
   CRUISE: [cruisedirectProvider],
 };
 
@@ -46,6 +70,12 @@ const REGISTRY: Record<TravelMode, SearchProvider[]> = {
 // Fall, nicht bei jeder Suche.
 const FALLBACK: Partial<Record<TravelMode, SearchProvider[]>> = {
   FLIGHT: [googleFlightsProvider],
+  // MOTIS springt nur ein, wenn DB NICHTS liefert — sei es, weil die Strecke ihr
+  // unbekannt ist, oder weil sie uns gerade blockt (Akamai/TLS, siehe
+  // docker-compose.yml). Damit bleibt die unblockbare, kontingentfreie Quelle als
+  // Sicherheitsnetz erhalten, ohne jede Suche auszubremsen.
+  TRAIN: [motisProvider],
+  BUS: [motisBusProvider],
 };
 
 export function providersForMode(mode: TravelMode): SearchProvider[] {

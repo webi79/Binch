@@ -378,8 +378,14 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
   // Zug-Enrichment: EIN int.bahn.de-Call ersetzt bei Match die MOTIS-Route
   // komplett durch bahn.des Route (Legs/Gleise/Label/Preis/Recon) → Anzeige =
   // Buchung. Best-effort — bei Drosselung/non-DE bleiben die MOTIS-Routen.
-  if (input.mode === "TRAIN" && outboundCandidates.length > 0) {
-    await enrichTrainResults(outboundCandidates.map((c) => c.result), input);
+  // NUR für Treffer OHNE Preis. Seit db-vendo die primäre Zug-Quelle ist, bringen
+  // die Ergebnisse Preis, Gleise und bahn.de-Route bereits mit — die Anreicherung
+  // wäre ein weiterer int.bahn.de-Call, der nichts hinzufügt (und Kontingent wie
+  // Sekunden kostet). Gebraucht wird sie nur noch, wenn MOTIS als Reserve
+  // eingesprungen ist: dessen Treffer haben price=0.
+  const needsPricing = outboundCandidates.filter((c) => !(c.result.price > 0));
+  if (input.mode === "TRAIN" && needsPricing.length > 0) {
+    await enrichTrainResults(needsPricing.map((c) => c.result), input);
     // NOCHMAL deduplizieren: Das Enrichment ersetzt Label und Route durch die
     // von bahn.de. Zwei MOTIS-Varianten desselben Zuges (z.B. „IC 63" aus DELFI
     // und „RJX 63" aus dem Referenz-Feed) überleben den ersten Dedup, weil ihre
