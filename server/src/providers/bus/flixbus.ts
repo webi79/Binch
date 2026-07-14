@@ -1,4 +1,5 @@
 import { config } from "../../config.js";
+import { BoundedTtlCache } from "../../util/boundedCache.js";
 import { normStationName } from "../../util/stationName.js";
 import { resolveMotisPlace } from "../../services/motisPlaces.js";
 import type {
@@ -111,6 +112,32 @@ export async function flixbusAutocomplete(
 }
 
 /**
+ * Bounded + TTL statt `new Map()`.
+ *
+ * Keys sind freie User-Eingaben (unbegrenzter Keyspace) — eine nackte Map wächst
+ * für immer. Und eine einmal danebengegriffene Stadt bliebe ewig kleben; genau
+ * so ein klebender Fehltreffer wäre der Mannheim-Bug gewesen, wenn er nicht
+ * schon beim Auflösen entstanden wäre. 24 h reichen: City-IDs sind stabil.
+ */
+const cityIdCache = new BoundedTtlCache<string | null>(500, 24 * 60 * 60 * 1000);
+
+/**
+ * Notbremse gegen die undokumentierte API.
+ *
+ * FlixBus' öffentliche API (die ihre eigene Website nutzt) nennt kein Rate-Limit
+ * und schickt keine Quota-Header — gedrosselt würde still per AWS-WAF. Gemessen:
+ * 30 Anfragen in 3 Wellen à 10 parallel → 30× HTTP 200, kein Drosseln. Das ist
+ * KEIN Beweis, dass es kein Limit gibt.
+ *
+ * Also: Sobald sie uns mit 429/403 abweist, pausieren wir sie für ein paar
+ * Minuten, statt weiter dagegen zu laufen. Das schützt uns vor einer härteren
+ * Sperre und ist der Gegenseite gegenüber anständig. Die Bus-Suche fällt dabei
+ * NICHT aus — motis-bus (offene GTFS-Daten, kein Limit) liefert weiter.
+ */
+const COOLDOWN_MS = 5 * 60 * 1000;
+let blockedUntil = 0;
+
+/**
  * Label → FlixBus-City-ID.
  *
  * Exakter Stadtname gewinnt, sonst der relevanteste Treffer der API. Nötig, weil
@@ -118,8 +145,6 @@ export async function flixbusAutocomplete(
  * „Berlin (Flughafen)" mit an, und wer darauf landet, sieht nur
  * Flughafen-Abfahrten und den ZOB gar nicht.
  */
-const cityIdCache = new Map<string, string | null>();
-
 async function resolveFlixCityId(
   code: string,
   label: string | undefined,
@@ -216,8 +241,10 @@ export const flixbusProvider: SearchProvider = {
   mode: "BUS",
 
   // Kein Key mehr nötig — FlixBus' eigene API ist offen.
+  // Während eines Cooldowns (429/403) melden wir uns bewusst als "nicht
+  // konfiguriert" ab, statt sinnlos gegen die Sperre zu laufen.
   isConfigured() {
-    return true;
+    return Date.now() >= blockedUntil;
   },
 
   async search(input: ProviderSearchInput, signal?: AbortSignal): Promise<ProviderResult> {
@@ -239,6 +266,7 @@ export const flixbusProvider: SearchProvider = {
       toId = await resolveFlixCityId(input.destination, input.destLabel, signal);
     } catch (e) {
       if (e instanceof FlixbusApiError) {
+        noteRateLimit(e.statusCode);
         return {
           results: [],
           raw: { error: "flixbus_api_error", message: e.apiMessage, statusCode: e.statusCode },
@@ -275,6 +303,7 @@ export const flixbusProvider: SearchProvider = {
     const durationMs = Date.now() - start;
 
     if (!outbound.ok) {
+      noteRateLimit(outbound.statusCode);
       return { results: [], raw: outbound.raw, statusCode: outbound.statusCode, durationMs };
     }
 
@@ -309,6 +338,13 @@ export const flixbusProvider: SearchProvider = {
     };
   },
 };
+
+/** 429/403 → FlixBus für COOLDOWN_MS pausieren (siehe blockedUntil oben). */
+function noteRateLimit(statusCode: number): void {
+  if (statusCode === 429 || statusCode === 403) {
+    blockedUntil = Date.now() + COOLDOWN_MS;
+  }
+}
 
 interface LinkContext {
   fromCityId: string;
