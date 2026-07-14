@@ -239,10 +239,29 @@ const STATION_ABBR: Record<string, string> = {
   bf: "bahnhof",
 };
 
-/** Stationsname → normalisierte WORT-Liste (Abkürzungen aufgelöst). */
+/**
+ * Wörter, die für sich genommen KEINEN Bahnhof identifizieren. Ein einzelnes
+ * „Bahnhof" darf nicht auf „Zürich Selnau, Bahnhof" matchen — sonst verschwände
+ * ein echter Fußweg. Zusammengesetzte Namen wie „Ostbahnhof" sind dagegen
+ * eindeutig und dürfen als Suffix matchen („Ostbahnhof" = „München Ostbahnhof").
+ */
+const GENERIC_STATION_WORDS = new Set(["bahnhof", "hauptbahnhof", "bahnhofsplatz"]);
+
+/**
+ * Stationsname → normalisierte WORT-Liste: Kleinbuchstaben, Abkürzungen
+ * aufgelöst, DIAKRITIKA entfernt.
+ *
+ * Diakritika sind hier kein Kosmetik-Detail: die Feeds schreiben denselben
+ * Bahnhof mal „Breclav", mal „Břeclav" — ohne Normalisierung hielten wir das für
+ * zwei Orte und zeigten einen 5-Minuten-Fußweg zwischen dem Bahnhof und sich
+ * selbst (Hamburg→Wien, ICE 175 → EC 207).
+ */
 function stationTokens(s: string): string[] {
   return s
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
     .toLowerCase()
+    .replace(/ß/g, "ss")
     .split(/[^\p{L}\p{N}]+/u)
     .filter(Boolean)
     .map((tok) => STATION_ABBR[tok] ?? tok);
@@ -266,6 +285,17 @@ function stationTokens(s: string): string[] {
  *   ["zürich","bahnhofstrasse","hauptbahnhof"] vs ["zürich","hauptbahnhof"] → false
  *     (echte Tram-Haltestelle nebenan — der Fußweg dorthin muss bleiben)
  */
+/**
+ * Von zwei Schreibweisen desselben Bahnhofs die bessere wählen: die mit den
+ * meisten Nicht-ASCII-Zeichen, also die native („Břeclav" vor „Breclav").
+ * Gleichstand → `a` (bei einem Umstieg das ankommende Leg, dessen Name dem
+ * entspricht, was der User in der Verbindung zuerst liest).
+ */
+function preferredStationName(a: string, b: string): string {
+  const exotic = (s: string) => (s.match(/[^\p{ASCII}]/gu) ?? []).length;
+  return exotic(b) > exotic(a) ? b : a;
+}
+
 function sameStation(a?: string, b?: string): boolean {
   if (!a || !b) return false;
   const x = stationTokens(a);
@@ -273,9 +303,15 @@ function sameStation(a?: string, b?: string): boolean {
   if (x.length === 0 || y.length === 0) return false;
 
   // Der kürzere Name muss ein WORT-SUFFIX des längeren sein (= nur Präfixe
-  // dazugekommen). Ein einzelnes Allerweltswort („Bahnhof") reicht dafür nicht.
+  // dazugekommen: „München Ostbahnhof" ⊃ „Ostbahnhof").
   const [short, long] = x.length <= y.length ? [x, y] : [y, x];
-  if (short.length < 2 && long.length !== short.length) return false;
+
+  // Ein EINZELNES generisches Wort identifiziert keinen Bahnhof: „Bahnhof" darf
+  // nicht auf „Zürich Selnau, Bahnhof" matchen. „Ostbahnhof" dagegen schon.
+  if (short.length === 1 && long.length > 1 && GENERIC_STATION_WORDS.has(short[0]!)) {
+    return false;
+  }
+
   const tail = long.slice(long.length - short.length);
   return short.every((tok, i) => tok === tail[i]);
 }
@@ -484,6 +520,22 @@ function toNormalized(
       sameStation(lastMapped.destLabel, destName))
   ) {
     lastMapped.destLabel = destName;
+  }
+
+  // Umstiegs-Bahnhöfe vereinheitlichen. Die Feeds benennen denselben Halt oft
+  // verschieden — man steigt laut Daten in „Breclav" aus und in „Břeclav" ein,
+  // bzw. in „München Hbf" aus und in „München Hauptbahnhof" ein. In der Timeline
+  // stehen dann zwei Zeilen, die wie ZWEI Bahnhöfe aussehen. Auf einen Namen
+  // ziehen — bevorzugt die Schreibweise mit Diakritika (die native), bei
+  // Gleichstand die des ankommenden Legs.
+  for (let i = 1; i < mappedLegs.length; i++) {
+    const prev = mappedLegs[i - 1]!;
+    const cur = mappedLegs[i]!;
+    if (!prev.destLabel || !cur.originLabel) continue;
+    if (!sameStation(prev.destLabel, cur.originLabel)) continue;
+    const name = preferredStationName(prev.destLabel, cur.originLabel);
+    prev.destLabel = name;
+    cur.originLabel = name;
   }
 
   return {

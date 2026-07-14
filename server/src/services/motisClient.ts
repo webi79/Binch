@@ -133,10 +133,17 @@ const STATION_ABBR: Record<string, string> = {
   bf: "bahnhof",
 };
 
-/** Namen vergleichbar machen: Kleinbuchstaben, Abkürzungen aufgelöst. */
+/**
+ * Namen vergleichbar machen: Kleinbuchstaben, Abkürzungen aufgelöst, DIAKRITIKA
+ * entfernt. Die Feeds schreiben denselben Bahnhof mal „Breclav", mal „Břeclav" —
+ * ohne Normalisierung fänden wir den kanonischen Stop nicht wieder.
+ */
 function normName(s: string): string {
   return s
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
     .toLowerCase()
+    .replace(/ß/g, "ss")
     .split(/[^\p{L}\p{N}]+/u)
     .filter(Boolean)
     .map((tok) => STATION_ABBR[tok] ?? tok)
