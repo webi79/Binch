@@ -4,6 +4,7 @@ import { db } from "../../db/client.js";
 import { locations } from "../../db/schema.js";
 import { BoundedTtlCache } from "../../util/boundedCache.js";
 import { cleanPlatform } from "../../util/platform.js";
+import { resolveMotisPlace } from "../../services/motisPlaces.js";
 import { lineLabel } from "../../util/line.js";
 import type {
   SearchProvider,
@@ -90,6 +91,10 @@ interface DbJourneysResponse {
 // HAFAS-Station-IDs können sich ändern — 24h-TTL statt „für immer cachen".
 const stationCache = new BoundedTtlCache<string>(500, 24 * 60 * 60 * 1000);
 
+/** Rückfall, wenn die Orts-Auflösung keine IANA-Zone hergibt. DBs Netz ist
+ *  überwiegend CET — der am wenigsten falsche Default. */
+const DEFAULT_TZ = "Europe/Berlin";
+
 export const dbVendoProvider: SearchProvider = {
   name: "db-vendo",
   mode: "TRAIN",
@@ -174,19 +179,47 @@ export const dbVendoProvider: SearchProvider = {
       };
     }
 
-    const outboundResults: NormalizedResult[] = parseJourneys(outbound.raw, input).map(
+    // Echte Zeitzonen der Endpunkte.
+    //
+    // Hier standen fest verdrahtet "Europe/Berlin" für BEIDE Enden. Solange
+    // db-vendo nur zur Preis-Anreicherung lief, fiel das nicht auf — als
+    // Hauptquelle für Zug-Ergebnisse trifft es jede Verbindung: Für London
+    // St Pancras meldeten wir destinationTz=Europe/Berlin, der Client rechnete
+    // die Ankunft also in Berliner Zeit um und zeigte sie eine STUNDE ZU SPÄT.
+    // (MOTIS lieferte für dieselbe Fahrt korrekt Europe/London.)
+    //
+    // Die IANA-Zone kommt aus der geteilten Orts-Auflösung — dieselbe, die der
+    // MOTIS-Provider im selben Suchlauf ohnehin benutzt (24h-Cache, also gratis).
+    // Fällt sie aus, bleibt Europe/Berlin: DBs Netz ist überwiegend CET, das ist
+    // der am wenigsten falsche Rückfall.
+    const [fromPlace, toPlace] = await Promise.all([
+      resolveMotisPlace(input.origin, input.originLabel, signal).catch(() => null),
+      resolveMotisPlace(input.destination, input.destLabel, signal).catch(() => null),
+    ]);
+    const tz = {
+      origin: fromPlace?.tz ?? DEFAULT_TZ,
+      destination: toPlace?.tz ?? DEFAULT_TZ,
+    };
+
+    const outboundResults: NormalizedResult[] = parseJourneys(outbound.raw, input, tz).map(
       (r) => ({ ...r, direction: "OUTBOUND" as const }),
     );
 
     let returnResults: NormalizedResult[] = [];
     if (returnLeg?.ok) {
-      returnResults = parseJourneys(returnLeg.raw, {
-        ...input,
-        origin: input.destination,
-        destination: input.origin,
-        originLabel: input.destLabel,
-        destLabel: input.originLabel,
-      }).map((r) => ({ ...r, direction: "RETURN" as const }));
+      returnResults = parseJourneys(
+        returnLeg.raw,
+        {
+          ...input,
+          origin: input.destination,
+          destination: input.origin,
+          originLabel: input.destLabel,
+          destLabel: input.originLabel,
+        },
+        // Rückfahrt → Zonen tauschen, sonst zeigt die Rückreise die Abfahrt in
+        // der Zeitzone des Hinreise-Starts.
+        { origin: tz.destination, destination: tz.origin },
+      ).map((r) => ({ ...r, direction: "RETURN" as const }));
     }
 
     // HAFAS-laterRef aus der OUTBOUND-Antwort rausziehen — den brauchen wir
@@ -528,7 +561,11 @@ function applyCityAlias(label: string): string {
   return result;
 }
 
-function parseJourneys(raw: unknown, input: ProviderSearchInput): NormalizedResult[] {
+function parseJourneys(
+  raw: unknown,
+  input: ProviderSearchInput,
+  tz: { origin: string; destination: string },
+): NormalizedResult[] {
   const r = raw as DbJourneysResponse;
   const journeys = r.journeys ?? [];
   const out: NormalizedResult[] = [];
@@ -638,8 +675,8 @@ function parseJourneys(raw: unknown, input: ProviderSearchInput): NormalizedResu
       destLabel: last.destination?.name ?? input.destLabel,
       departTime: departIso,
       arriveTime: arriveIso,
-      originTz: "Europe/Berlin",
-      destinationTz: "Europe/Berlin",
+      originTz: tz.origin,
+      destinationTz: tz.destination,
       durationMinutes,
       stops,
       stopLabels,
