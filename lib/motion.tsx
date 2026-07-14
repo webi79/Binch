@@ -36,13 +36,31 @@ import Animated, {
  * an YouTube nachgemessen): zügig an, langer weicher Auslauf.
  */
 export const MOTION = {
-  /** Weg nach oben. Klein halten — Elemente sollen sich SETZEN, nicht
-   *  hereinfliegen. */
-  rise: 10,
+  /**
+   * Weg nach oben.
+   *
+   * Stand auf 10 px, und damit war die Animation faktisch unsichtbar: 10 px über
+   * 550 ms sind ~18 px/s — langsamer, als das Auge Bewegung noch als Bewegung
+   * liest. Wahrnehmbarkeit kommt aus dem WEG, nicht aus der Dauer; wer eine
+   * Animation „smoother" machen will, indem er sie verlängert, macht sie in
+   * Wahrheit unsichtbar.
+   *
+   * 16 px sind weit genug, um gelesen zu werden, und kurz genug, dass sich die
+   * Elemente immer noch SETZEN statt hereinzufliegen.
+   */
+  rise: 16,
+  /**
+   * Weg für große Flächen.
+   *
+   * Größere Elemente brauchen MEHR Weg, nicht weniger: Derselbe Weg wirkt an
+   * einer bildschirmhohen Karte proportional kleiner als an einem Chip und
+   * verschwindet dort in der Wahrnehmung.
+   */
+  riseLarge: 22,
   /** Erste Fassung lief mit 360 ms und wirkte gehetzt. „Smooth" heißt hier vor
    *  allem: Zeit lassen. 550 ms ist noch weit unter der Schwelle, ab der
    *  Bewegung als Warten empfunden wird (Kontextwechsel dürfen 600-800 ms). */
-  duration: 550,
+  duration: 500,
   /**
    * Für große Flächen (bildschirmhohe Bild-Karten).
    *
@@ -53,7 +71,7 @@ export const MOTION = {
    * bewegen sich träger"; hier heißt es schlicht: die Destination-Karten
    * bekommen mehr Zeit als die Chips darüber.
    */
-  durationLarge: 780,
+  durationLarge: 700,
   /** Abstand zwischen den ERSTEN beiden Elementen. Danach klingt er ab. */
   stagger: 90,
   /**
@@ -242,11 +260,15 @@ export function Reveal({
   const animatedStyle = useAnimatedStyle(() => ({
     // Mit Vorhang bleibt die View selbst opak — der Vorhang erledigt das Faden.
     opacity: scrim ? 1 : progress.value,
-    // Große Flächen FADEN, sie wandern nicht: Ein 10-px-Weg ist an einem Chip
-    // eine Geste, an einer bildschirmhohen Karte ein Ruck — und er zwingt Android,
-    // die ganze Fläche pro Frame neu zu komponieren. Kleine Elemente bewegen sich,
-    // große setzen sich einfach.
-    transform: [{ translateY: large ? 0 : (1 - progress.value) * MOTION.rise }],
+    // Große Flächen bewegen sich WEITER, nicht weniger — derselbe Weg wirkt an
+    // einer bildschirmhohen Karte proportional kleiner als an einem Chip.
+    //
+    // (Der Weg war hier zwischenzeitlich auf 0, weil ich das Verschieben für den
+    // Ruckler hielt. War es nicht: Teuer war das Alpha-Compositing. Eine OPAKE
+    // View zu verschieben macht die ScrollView ohnehin bei jedem Scroll-Frame.)
+    transform: [
+      { translateY: (1 - progress.value) * (large ? MOTION.riseLarge : MOTION.rise) },
+    ],
   }));
 
   const scrimStyle = useAnimatedStyle(() => ({ opacity: 1 - progress.value }));
