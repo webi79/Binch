@@ -606,7 +606,14 @@ function makeMotisProvider(mode: TravelMode, transitModes: string, name: string)
           // maxTransfers=5 kappt absurde Pareto-Odysseen (6+ Umstiege quer
           // durchs Regionalnetz), die die DB nie zeigt — legitime grenz-
           // überschreitende+lokale Routen brauchen max. ~3-4 Umstiege.
-          `&transitModes=${encodeURIComponent(transitModes)}&numItineraries=6&maxTransfers=5&detailedTransfers=false`;
+          //
+          // numItineraries=10 statt 6: MOTIS gibt eine PARETO-Menge zurück und
+          // verbrät oft die Hälfte davon auf Varianten DERSELBEN Abfahrt (Berlin→
+          // Frankfurt: 7 Itineraries, aber nur 4 distinkte Verbindungen — je zwei
+          // Mal FLX10 09:57 und ICE 599 10:37 mit anderem Anschluss). Unser Dedup
+          // fasst die korrekt zusammen, der User sah danach aber nur noch 3-4
+          // Verbindungen. Mit 10 bleiben nach dem Dedup ~6-10 übrig.
+          `&transitModes=${encodeURIComponent(transitModes)}&numItineraries=10&maxTransfers=5&detailedTransfers=false`;
         const raw = (await motisFetch(url, signal)) as {
           itineraries?: MotisItinerary[];
           nextPageCursor?: string;
