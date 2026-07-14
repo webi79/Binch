@@ -12,7 +12,7 @@ import { AddTicketModal } from "@/components/saved/AddTicketModal";
 import { EmptyState } from "@/components/saved/EmptyState";
 import { AddTicketButton } from "@/components/saved/AddTicketButton";
 import { SegmentedToggle } from "@/components/ui/SegmentedToggle";
-import { Reveal, ScreenEntrance } from "@/lib/motion";
+import { RevealScrollView, ScreenEntrance, ScrollReveal } from "@/lib/motion";
 import { SlidingPanels } from "@/components/ui/SlidingPanels";
 import { useAccent } from "@/lib/theme/accent";
 import { overlayCover, UNDERLAY_TRAVEL_FRAC } from "@/lib/nav/overlayCover";
@@ -171,7 +171,7 @@ export default function SavedScreen() {
           Saved
         </Text>
       </View>
-      <Reveal index={0}>
+      <ScrollReveal index={0}>
       <View className="px-4 pt-4 pb-4">
         <SegmentedToggle
           items={[
@@ -184,7 +184,7 @@ export default function SavedScreen() {
           segmentHeight={36}
         />
       </View>
-      </Reveal>
+      </ScrollReveal>
 
       {/* Pager-Style Slide — beide Panels in EINEM breiten Container, der
           als Ganzes translateX'd wird. Wirkt wie eine durchgehende
@@ -206,12 +206,12 @@ export default function SavedScreen() {
             contentContainerStyle={{ paddingBottom: 98 }}
             showsVerticalScrollIndicator={false}
           >
-            <Reveal index={1}>
+            <ScrollReveal index={1}>
               <EmptyState tab="trips" />
-            </Reveal>
+            </ScrollReveal>
           </ScrollView>
         ) : (
-          <ScrollView
+          <RevealScrollView
             className="flex-1"
             contentContainerStyle={{ paddingBottom: 98, paddingHorizontal: 16 }}
             showsVerticalScrollIndicator={false}
@@ -223,33 +223,33 @@ export default function SavedScreen() {
                 Welle nicht in der Mitte neu anfängt. */}
             {today.length > 0 && (
               <>
-                <Reveal index={1}>
+                <ScrollReveal index={1}>
                   <Text className="text-[15px] font-semibold text-white mt-1 mb-2.5">
                     {t("saved.section.today")}
                   </Text>
-                </Reveal>
+                </ScrollReveal>
                 {today.map((tr, i) => (
-                  <Reveal key={tr.id} index={2 + i} style={{ marginBottom: 12 }}>
+                  <ScrollReveal key={tr.id} index={2 + i} style={{ marginBottom: 12 }}>
                     <ResultCard result={tr} passengers={tr.passengers} />
-                  </Reveal>
+                  </ScrollReveal>
                 ))}
               </>
             )}
             {earlier.length > 0 && (
               <>
-                <Reveal index={2 + today.length}>
+                <ScrollReveal index={2 + today.length}>
                   <Text className="text-[15px] font-semibold text-white mt-1 mb-2.5">
                     {t("saved.section.earlier")}
                   </Text>
-                </Reveal>
+                </ScrollReveal>
                 {earlier.map((tr, i) => (
-                  <Reveal key={tr.id} index={3 + today.length + i} style={{ marginBottom: 12 }}>
+                  <ScrollReveal key={tr.id} index={3 + today.length + i} style={{ marginBottom: 12 }}>
                     <ResultCard result={tr} passengers={tr.passengers} />
-                  </Reveal>
+                  </ScrollReveal>
                 ))}
               </>
             )}
-          </ScrollView>
+          </RevealScrollView>
         )}
 
         {/* TICKETS */}
@@ -262,34 +262,34 @@ export default function SavedScreen() {
             <SkeletonList />
           </ScrollView>
         ) : (
-          <ScrollView
+          <RevealScrollView
             className="flex-1"
             contentContainerStyle={{ paddingBottom: 98 }}
             showsVerticalScrollIndicator={false}
           >
-            <Reveal index={1}>
+            <ScrollReveal index={1}>
               <AddTicketButton onPress={() => setShowModal(true)} />
-            </Reveal>
+            </ScrollReveal>
 
             {tickets.length === 0 ? (
-              <Reveal index={2}>
+              <ScrollReveal index={2}>
                 <EmptyState tab="tickets" />
-              </Reveal>
+              </ScrollReveal>
             ) : (
               <>
-                <Reveal index={2}>
+                <ScrollReveal index={2}>
                   <Text className="text-[13px] text-[#56565C] font-medium mx-5 mb-2.5">
                     {ticketCountLine}
                   </Text>
-                </Reveal>
+                </ScrollReveal>
                 {tickets.map((tk, i) => (
-                  <Reveal key={tk.id} index={3 + i}>
+                  <ScrollReveal key={tk.id} index={3 + i}>
                     <TicketCard ticket={tk} />
-                  </Reveal>
+                  </ScrollReveal>
                 ))}
               </>
             )}
-          </ScrollView>
+          </RevealScrollView>
         )}
       </SlidingPanels>
       </Animated.View>

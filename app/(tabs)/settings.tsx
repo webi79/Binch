@@ -11,7 +11,7 @@ import {
   ActivityIndicator,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { Reveal, ScreenEntrance } from "@/lib/motion";
+import { RevealScrollView, ScreenEntrance, ScrollReveal } from "@/lib/motion";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
 import Svg, { Circle, Path, Rect } from "react-native-svg";
@@ -77,7 +77,7 @@ export default function SettingsScreen() {
   return (
     <ScreenEntrance>
     <SafeAreaView style={styles.safe} edges={["top"]}>
-      <ScrollView
+      <RevealScrollView
         contentContainerStyle={{ paddingBottom: 90 }}
         showsVerticalScrollIndicator={false}
       >
@@ -85,7 +85,7 @@ export default function SettingsScreen() {
         {sub === "details" && <DetailsScreen onBack={back} />}
         {sub === "settings" && <SettingsSubScreen onBack={back} />}
         {sub === "support" && <SupportSubScreen onBack={back} />}
-      </ScrollView>
+      </RevealScrollView>
     </SafeAreaView>
     </ScreenEntrance>
   );
@@ -138,28 +138,28 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
           laufen. Vorher lagen die Reveals nur im Detail-Unterscreen, den man
           erst öffnen muss; der Tab selbst blendete gar nicht ein und fühlte sich
           dadurch völlig anders an als Home. */}
-      <Reveal index={0}>
+      <ScrollReveal index={0}>
         <ProfileCard />
-      </Reveal>
+      </ScrollReveal>
 
       {/* Spacer matching the hidden "Bereiche" label slot in the design */}
       <View style={{ height: 30 }} />
 
       <View style={{ paddingHorizontal: 16 }}>
         {tiles.map((tile, idx) => (
-          <Reveal key={tile.id} index={1 + idx} style={{ marginBottom: idx < tiles.length - 1 ? 8 : 0 }}>
+          <ScrollReveal key={tile.id} index={1 + idx} style={{ marginBottom: idx < tiles.length - 1 ? 8 : 0 }}>
             <SectionCard
               title={t(tile.titleKey)}
               desc={t(tile.descKey)}
               illu={tile.illu}
               onPress={() => onNav(tile.id)}
             />
-          </Reveal>
+          </ScrollReveal>
         ))}
       </View>
 
       <View style={styles.divider} />
-      <Reveal index={4}>
+      <ScrollReveal index={4}>
       {isAuthed ? (
         <RippleTouch
           onPress={onSignOut}
@@ -180,7 +180,7 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
           <Text style={[styles.signInText, { color: accent.solid }]}>{t("auth.guest.cta")}</Text>
         </RippleTouch>
       )}
-      </Reveal>
+      </ScrollReveal>
 
       <Text style={styles.versionText}>{t("settings.app.version")}</Text>
     </View>
@@ -368,7 +368,7 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
     <View>
       <BackHeader title={t("settings.tile.details")} onBack={onBack} />
 
-      <Reveal index={0}>
+      <ScrollReveal index={0}>
       <View style={styles.avatarLargeOuter}>
         <Pressable
           onPress={user ? onPickPhoto : () => { haptic("button"); openAuth(); }}
@@ -416,9 +416,9 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
         )}
       </View>
 
-      </Reveal>
+      </ScrollReveal>
 
-      <Reveal index={1}>
+      <ScrollReveal index={1}>
       <SLabel text={t("settings.personal")} />
       <Group>
         <Row
@@ -436,9 +436,9 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
         />
       </Group>
 
-      </Reveal>
+      </ScrollReveal>
 
-      <Reveal index={2}>
+      <ScrollReveal index={2}>
       <SLabel text={t("settings.security")} />
       <Group>
         <Row
@@ -454,7 +454,7 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
           isLast
         />
       </Group>
-      </Reveal>
+      </ScrollReveal>
     </View>
   );
 }

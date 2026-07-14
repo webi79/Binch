@@ -1,14 +1,19 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
-import { AccessibilityInfo, type StyleProp, type ViewStyle } from "react-native";
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { AccessibilityInfo, useWindowDimensions, type StyleProp, type ViewStyle } from "react-native";
 import { useIsFocused } from "@react-navigation/native";
 import Animated, {
   Easing,
   FadeInDown,
   ReduceMotion,
+  measure,
+  useAnimatedReaction,
+  useAnimatedRef,
+  useAnimatedScrollHandler,
   useAnimatedStyle,
   useSharedValue,
   withDelay,
   withTiming,
+  type SharedValue,
 } from "react-native-reanimated";
 
 /**
@@ -161,4 +166,154 @@ export function revealEntering(index: number) {
     .easing(MOTION.easing)
     .withInitialValues({ opacity: 0, transform: [{ translateY: MOTION.rise }] })
     .reduceMotion(ReduceMotion.System);
+}
+
+// ---------------------------------------------------------------------------
+// Beim Scrollen einblenden
+// ---------------------------------------------------------------------------
+
+/**
+ * Vorlauf: Ein Element blendet ein, sobald seine Oberkante 48 px VOR der unteren
+ * Bildschirmkante liegt. Ohne diesen Vorlauf sieht man es aufblenden, während es
+ * schon halb im Bild ist — das wirkt wie Nachladen, nicht wie Bewegung.
+ */
+const REVEAL_MARGIN = 48;
+
+interface ScrollRevealCtx {
+  /** Treibt die Neubewertung — bei jedem Scroll-Frame. */
+  scrollY: SharedValue<number>;
+  /** Untere Bildschirmkante. */
+  windowHeight: number;
+  generation: number;
+}
+
+const ScrollRevealContext = createContext<ScrollRevealCtx | null>(null);
+
+/**
+ * ScrollView, die ihre Kinder beim Hereinscrollen einblenden lässt.
+ *
+ * Zwei Fälle, EIN Verhalten:
+ *   - Beim Öffnen des Tabs blenden die SICHTBAREN Elemente gestaffelt ein (die
+ *     Welle).
+ *   - Alles darunter blendet einzeln ein, sobald man es hereinscrollt — dann
+ *     aber OHNE Versatz. Ein Element, das man gerade ins Bild schiebt, soll
+ *     sofort reagieren; ein Versatz läse sich dort als Verzögerung.
+ */
+export function RevealScrollView({
+  children,
+  ...props
+}: React.ComponentProps<typeof Animated.ScrollView>) {
+  const generation = useContext(EntranceContext);
+  const { height: windowHeight } = useWindowDimensions();
+  const scrollY = useSharedValue(0);
+
+  const onScroll = useAnimatedScrollHandler((e) => {
+    scrollY.value = e.contentOffset.y;
+  });
+
+  const ctx = useMemo(
+    () => ({ scrollY, windowHeight, generation }),
+    [scrollY, windowHeight, generation],
+  );
+
+  return (
+    <ScrollRevealContext.Provider value={ctx}>
+      <Animated.ScrollView {...props} onScroll={onScroll} scrollEventThrottle={16}>
+        {children}
+      </Animated.ScrollView>
+    </ScrollRevealContext.Provider>
+  );
+}
+
+/**
+ * Ein Element, das einblendet, sobald es ins Bild kommt — und beim Öffnen des
+ * Screens als Teil der Welle.
+ *
+ * Einmal eingeblendet bleibt es sichtbar. Beim Zurückscrollen wieder
+ * auszublenden wäre nervig: Man hat es ja schon gesehen.
+ *
+ * Ohne umgebende {@link RevealScrollView} verhält es sich wie {@link Reveal}.
+ */
+export function ScrollReveal({ children, index = 0, style }: RevealProps) {
+  const ctx = useContext(ScrollRevealContext);
+  const generation = useContext(EntranceContext);
+  const reduceMotion = useReduceMotion();
+  const ref = useAnimatedRef<Animated.View>();
+  const progress = useSharedValue(0);
+  /** Stößt die Sichtbarkeitsprüfung einmal an, ohne dass gescrollt wurde. */
+  const pulse = useSharedValue(0);
+  /**
+   * Wartet dieses Element noch auf SEINE ERSTE Prüfung?
+   *
+   * Daran hängt, ob es Teil der Welle ist: War es beim Erscheinen des Screens
+   * schon im Bild, bekommt es den Versatz seiner Position. Kommt es erst durch
+   * Scrollen herein, blendet es SOFORT ein — ein Element, das man gerade ins
+   * Bild schiebt, soll reagieren; ein Versatz läse sich dort als Verzögerung.
+   *
+   * Das ist auch der Grund, warum das kein Zeitfenster ist: Beim
+   * Kategorie-Wechsel entstehen die Karten neu, sind sofort im Bild — und sollen
+   * dann ebenfalls kaskadieren, egal wie lange der Fokus schon her ist.
+   */
+  const pending = useSharedValue(true);
+
+  // Neuer Fokus → Welle von vorn. Und einen Frame später prüfen: Ohne diesen
+  // Anstoß liefe die Prüfung NUR beim Scrollen — beim Öffnen des Screens bliebe
+  // alles unsichtbar. Ein Frame Verzögerung, damit das Layout steht (vorher
+  // misst measure() ins Leere).
+  useEffect(() => {
+    progress.value = reduceMotion ? 1 : 0;
+    pending.value = true;
+    const id = requestAnimationFrame(() => {
+      pulse.value = pulse.value + 1;
+    });
+    return () => cancelAnimationFrame(id);
+  }, [generation, reduceMotion, progress, pulse, pending]);
+
+  // measure() statt onLayout: onLayout liefert die Position relativ zum
+  // ELTERNELEMENT. Eine Karte, die in einer Sektion steckt, meldete damit eine
+  // Position nahe 0 und würde sofort einblenden, egal wo sie auf dem Schirm
+  // steht. measure() gibt die echte Bildschirmposition (pageY).
+  useAnimatedReaction(
+    () => (ctx ? ctx.scrollY.value : 0) + pulse.value,
+    () => {
+      if (reduceMotion || progress.value !== 0) return;
+      if (!ctx) {
+        // Keine RevealScrollView drumherum → verhält sich wie Reveal.
+        progress.value = withDelay(
+          staggerDelay(index),
+          withTiming(1, { duration: MOTION.duration, easing: MOTION.easing }),
+        );
+        return;
+      }
+      const m = measure(ref);
+      if (!m) return;
+
+      // Noch unterhalb des Bildschirms → warten. Aber merken, dass die erste
+      // Prüfung gelaufen ist: Wenn es später hereingescrollt wird, gehört es
+      // NICHT mehr zur Welle.
+      if (m.pageY >= ctx.windowHeight - REVEAL_MARGIN) {
+        pending.value = false;
+        return;
+      }
+
+      const delay = pending.value ? staggerDelay(index) : 0;
+      pending.value = false;
+      progress.value = withDelay(
+        delay,
+        withTiming(1, { duration: MOTION.duration, easing: MOTION.easing }),
+      );
+    },
+    [index, reduceMotion, ctx],
+  );
+
+  const animatedStyle = useAnimatedStyle(() => ({
+    opacity: progress.value,
+    transform: [{ translateY: (1 - progress.value) * MOTION.rise }],
+  }));
+
+  return (
+    <Animated.View ref={ref} style={[style, animatedStyle]}>
+      {children}
+    </Animated.View>
+  );
 }

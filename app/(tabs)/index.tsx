@@ -2,7 +2,6 @@ import { memo, useEffect, useRef, useState } from "react";
 import {
   View,
   Text,
-  ScrollView,
   Pressable,
   StatusBar,
   StyleSheet,
@@ -27,8 +26,6 @@ import Animated, {
   FadeInDown,
   FadeOutUp,
   LinearTransition,
-  SlideInLeft,
-  SlideInRight,
   useAnimatedStyle,
   useSharedValue,
   withSequence,
@@ -37,7 +34,7 @@ import Animated, {
 } from "react-native-reanimated";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
-import { Reveal, ScreenEntrance } from "@/lib/motion";
+import { RevealScrollView, ScreenEntrance, ScrollReveal } from "@/lib/motion";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { RecentCard } from "@/components/home/RecentCard";
@@ -480,25 +477,11 @@ export default function HomeScreen() {
   const openRecentHistoryOverlay = useSearchStore((s) => s.openRecentHistoryOverlay);
   const [recentExpanded, setRecentExpanded] = useState(false);
   const [category, setCategory] = useState<CategoryId>("ocean");
-  // Vorherige Kategorie merken → für die Slide-Richtung. Wechsel nach rechts
-  // (höherer Chip-Index) → neue Cards kommen von rechts, sonst von links.
-  const prevCategoryRef = useRef<CategoryId>(category);
-  const currentCatIdx = CATEGORIES.findIndex((c) => c.id === category);
-  const prevCatIdx = CATEGORIES.findIndex((c) => c.id === prevCategoryRef.current);
-  const slideFromRight = currentCatIdx >= prevCatIdx;
-  // shouldAnimateCategory: nur slide wenn der User WIRKLICH die Kategorie
-  // gewechselt hat — NICHT beim Initial-Mount und NICHT bei Remount nach
-  // freezeOnBlur-Unfreeze (Bottom-Tabs nutzen react-freeze = Suspense-
-  // basiert, beim Refocus mountet die ganze Landing-Tree neu → entering
-  // würde sonst auf jedem Tab-Switch zurück zu Landing für 320ms feuern
-  // und mit dem Scroll auf UI-Thread kollidieren = laggy scroll).
-  const [shouldAnimateCategory, setShouldAnimateCategory] = useState(false);
-  useEffect(() => {
-    if (prevCategoryRef.current !== category) {
-      setShouldAnimateCategory(true);
-      prevCategoryRef.current = category;
-    }
-  }, [category]);
+  // Der Slide-nach-links/rechts beim Kategorie-Wechsel ist raus — die Karten
+  // kaskadieren jetzt einzeln (ScrollReveal, key enthält die Kategorie). Damit
+  // entfällt auch die ganze Buchhaltung, WANN der Slide feuern durfte: Sie war
+  // nur nötig, weil `entering` bei jedem Refocus mit dem Scroll auf dem
+  // UI-Thread kollidierte.
   const destinations = DESTINATIONS_BY_CATEGORY[category];
   const visibleRecents = recentSearches.slice(
     0,
@@ -513,7 +496,7 @@ export default function HomeScreen() {
     <ScreenEntrance>
     <View style={styles.root}>
       <StatusBar barStyle="light-content" backgroundColor="transparent" translucent />
-      <ScrollView
+      <RevealScrollView
         style={styles.scroll}
         contentContainerStyle={[styles.scrollContent, { paddingTop: insets.top + 8 }]}
         showsVerticalScrollIndicator={false}
@@ -523,7 +506,7 @@ export default function HomeScreen() {
               fiele die ganze Seite von oben herein, statt dass sich der Inhalt
               setzt. Die Welle beginnt darunter. */}
           <Header />
-          <Reveal index={0}>
+          <ScrollReveal index={0}>
             <SearchBar
               style={[styles.searchBarSpacing, { borderWidth: 1.5, borderColor: "rgba(255,255,255,0.14)" }]}
               onPress={() => router.navigate("/assistant")}
@@ -531,23 +514,33 @@ export default function HomeScreen() {
                 router.navigate({ pathname: "/assistant", params: { autoVoice: "1" } })
               }
             />
-          </Reveal>
-          <Reveal index={1}>
+          </ScrollReveal>
+          <ScrollReveal index={1}>
             <TransportTabs />
-          </Reveal>
+          </ScrollReveal>
 
           {recentSearches.length > 0 && (
-            <Reveal index={2} style={styles.recentSection}>
-              <SectionHeaderSmall
-                title={t("home.recent.title")}
-                onViewAll={() => {
-                  haptic("button");
-                  openRecentHistoryOverlay();
-                }}
-              />
+            // Kein ScrollReveal um den GANZEN Block — sonst blenden die Karten
+            // doppelt ein (der Block als Ganzes und jede Karte einzeln). Der
+            // Container bleibt statisch, nur Kopf und Karten kommen in der Welle.
+            <View style={styles.recentSection}>
+              <ScrollReveal index={2}>
+                <SectionHeaderSmall
+                  title={t("home.recent.title")}
+                  onViewAll={() => {
+                    haptic("button");
+                    openRecentHistoryOverlay();
+                  }}
+                />
+              </ScrollReveal>
               {visibleRecents.map((s, idx) =>
                 idx < RECENT_COLLAPSED ? (
-                  <RecentCard key={s.id} search={s} />
+                  // Einzeln statt als Block — wie die Kacheln in den
+                  // Einstellungen. Der Index läuft hinter dem Sektionskopf (2)
+                  // weiter, damit die Welle durchgeht.
+                  <ScrollReveal key={s.id} index={3 + idx}>
+                    <RecentCard search={s} />
+                  </ScrollReveal>
                 ) : (
                   <Animated.View
                     key={s.id}
@@ -581,7 +574,7 @@ export default function HomeScreen() {
                   )}
                 </RippleTouch>
               )}
-            </Reveal>
+            </View>
           )}
 
           {/* Plain View statt Animated.View+LinearTransition — die Layout-
@@ -591,38 +584,36 @@ export default function HomeScreen() {
               spürbare Frame-Drops im ScrollView verursachte. Ohne
               LinearTransition snappt die Höhe direkt — kaum sichtbarer
               Verlust, viel smoother Scroll. */}
-          <Reveal index={3}>
+          <ScrollReveal index={3}>
             <View style={styles.popularHeader}>
               <Text style={styles.sectionTitle}>{t("home.destinations.title")}</Text>
               <Pressable hitSlop={8}>
                 <Text style={[styles.actionLink, { color: accent.solid }]}>{t("home.viewall")}</Text>
               </Pressable>
             </View>
+          </ScrollReveal>
+
+          <ScrollReveal index={4}>
             <CategoryChips value={category} onChange={setCategory} />
             <View style={{ height: 14 }} />
-            {/* Keyed wrapper → bei jedem ECHTEN Kategorie-Wechsel remountet
-                die Liste und Reanimated spielt die Slide-Animation. Bei
-                Initial-Mount + Remount-nach-Refocus (shouldAnimateCategory=
-                false) rendern wir einen plain View ohne entering → kein
-                320ms Slide der mit dem Scroll-Handler kollidiert. */}
-            {shouldAnimateCategory ? (
-              <Animated.View
-                key={category}
-                entering={(slideFromRight ? SlideInRight : SlideInLeft).duration(320)}
-              >
-                {destinations.map((d) => (
-                  <DestinationCard key={d.id} d={d} />
-                ))}
-              </Animated.View>
-            ) : (
-              <View key={category}>
-                {destinations.map((d) => (
-                  <DestinationCard key={d.id} d={d} />
-                ))}
-              </View>
-            )}
-          </Reveal>
-      </ScrollView>
+          </ScrollReveal>
+
+          {/* Jede Karte blendet EINZELN ein — vorher kam der ganze Block als ein
+              Klotz, und genau das fiel im Vergleich zu Settings (wo jede Kachel
+              einzeln kommt) als grober auf.
+
+              Der `key` enthält die Kategorie: Beim Wechsel entstehen die Karten
+              neu, sind sofort im Bild und kaskadieren dadurch von selbst. Das
+              ersetzt den bisherigen Slide-nach-links/rechts — eine Bewegung
+              statt zweier konkurrierender, und dieselbe wie überall sonst in der
+              App. (Der alte Slide steckte in SlideInRight/SlideInLeft; wenn du
+              die Richtungs-Geste vermisst, hole ich sie zurück.) */}
+          {destinations.map((d, i) => (
+            <ScrollReveal key={`${category}-${d.id}`} index={5 + i}>
+              <DestinationCard d={d} />
+            </ScrollReveal>
+          ))}
+      </RevealScrollView>
     </View>
     </ScreenEntrance>
   );
