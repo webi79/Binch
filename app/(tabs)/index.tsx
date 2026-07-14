@@ -635,20 +635,26 @@ export default function HomeScreen() {
             <View style={{ height: 14 }} />
           </ScrollReveal>
 
-          {/* Jede Karte blendet EINZELN ein — vorher kam der ganze Block als ein
-              Klotz, und genau das fiel im Vergleich zu Settings (wo jede Kachel
-              einzeln kommt) als grober auf.
+          {/* Alle Karten faden GLEICHZEITIG — gleicher Index, kein `+ i`.
+              Einzeln kaskadierend wirkten sie unruhig: Die Karten sind groß,
+              fast bildschirmhoch, und eine Welle über Elemente dieser Größe liest
+              sich nicht als Rhythmus, sondern als Nachladen. Die Welle davor
+              (Suchleiste → Tabs → Recents → Überschrift → Chips) trägt die
+              Bewegung; die Karten sind ihr Schlusspunkt, nicht ihre Fortsetzung.
+
+              Bewusst KEIN gemeinsamer Wrapper um den Block: Der wäre mehrere
+              Bildschirme hoch, und das Offscreen-Compositing (nötig, damit der
+              Verlauf mit der Karte fadet statt danach) müsste einen entsprechend
+              riesigen Puffer anlegen. So komponiert jede Karte nur ihre eigene
+              Fläche — und sie faden trotzdem synchron.
 
               Der `key` enthält die Kategorie: Beim Wechsel entstehen die Karten
-              neu, sind sofort im Bild und kaskadieren dadurch von selbst. Das
-              ersetzt den bisherigen Slide-nach-links/rechts — eine Bewegung
-              statt zweier konkurrierender, und dieselbe wie überall sonst in der
-              App. (Der alte Slide steckte in SlideInRight/SlideInLeft; wenn du
-              die Richtungs-Geste vermisst, hole ich sie zurück.) */}
-          {destinations.map((d, i) => (
+              neu und faden als Block ein (waveBase → kein Vorlauf, auf den zu
+              warten wäre). Das ersetzt den früheren Slide-nach-links/rechts. */}
+          {destinations.map((d) => (
             <ScrollReveal
               key={`${category}-${d.id}`}
-              index={wave.destinationCards + i}
+              index={wave.destinationCards}
               waveBase={wave.destinationCards}
             >
               <DestinationCard d={d} />
