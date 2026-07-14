@@ -1,6 +1,6 @@
 import { fromZonedTime } from "date-fns-tz";
 import { config } from "../../config.js";
-import { normStationName } from "../../util/stationName.js";
+import { normStationName, sameCity } from "../../util/stationName.js";
 import { BoundedTtlCache } from "../../util/boundedCache.js";
 import { buildShopLink, isoToDmy } from "./flixbusLink.js";
 import type { ProviderSearchInput, NormalizedResult, LegInfo } from "../types.js";
@@ -102,9 +102,17 @@ async function resolveCityId(
       cityIdCache.set(key, null);
       continue;
     }
+    // Dieselbe Auswahl in Stufen wie im Hauptpfad (flixbus.ts): exakter Stadtname
+    // vor irgendeinem Treffer derselben Stadt vor dem relevantesten Treffer.
+    // Vorher fiel dieser Pfad direkt auf hits[0] zurück — genau der Griff, der uns
+    // aus „Berlin ZOB" MANNHEIM gemacht hat. Im Notfallpfad ist das nicht weniger
+    // gefährlich, nur seltener.
     const wanted = normStationName(candidate);
-    const exact = hits.find((h) => h.city?.name && normStationName(h.city.name) === wanted);
-    const id = (exact ?? hits[0])?.city?.id ?? (exact ?? hits[0])?.id ?? null;
+    const hit =
+      hits.find((h) => h.city?.name && normStationName(h.city.name) === wanted) ??
+      hits.find((h) => sameCity(candidate, h.name) || sameCity(candidate, h.city?.name)) ??
+      hits[0];
+    const id = hit?.city?.id ?? hit?.id ?? null;
     cityIdCache.set(key, id);
     if (id) return id;
   }
