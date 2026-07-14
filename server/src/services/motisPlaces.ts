@@ -2,7 +2,12 @@ import { eq } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import { BoundedTtlCache } from "../util/boundedCache.js";
-import { motisGeocode, motisGeocodeNearestStop, type MotisPlace } from "./motisClient.js";
+import {
+  motisFetch,
+  motisGeocode,
+  motisGeocodeNearestStop,
+  type MotisPlace,
+} from "./motisClient.js";
 
 /**
  * Binch-`code` → MOTIS-Place. EINE Auflösung für alle Verbraucher (Such-Provider
@@ -33,6 +38,75 @@ const placeCache = new BoundedTtlCache<MotisPlace | null>(2000, 24 * 60 * 60 * 1
 /** `lat,lng`-Platzhalter statt echter Stop-ID? */
 function isCoordId(id: string): boolean {
   return /^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/.test(id);
+}
+
+/** Schienen-Modi — Tram/Bus/U-Bahn zählen bei der Knoten-Entdeckung NICHT mit,
+ *  sonst landet man auf der Straßenbahnhaltestelle vor dem Bahnhof. */
+const RAIL_MODES = new Set([
+  "HIGHSPEED_RAIL",
+  "LONG_DISTANCE",
+  "NIGHT_RAIL",
+  "REGIONAL_RAIL",
+  "REGIONAL_FAST_RAIL",
+  "SUBURBAN",
+]);
+
+/**
+ * Kanonischen Schienen-Knoten aus der Abfahrtstafel eines beliebigen Seed-Stops
+ * herauslesen. Die stopTimes tragen `place.stopId` des TATSÄCHLICH bedienten
+ * Halts — auch wenn der Seed ein Referenzdaten-Knoten war.
+ *
+ * Beispiel: Seed = at-Railway-…_de:09162:100:7:72 (Referenz, keine Gleise)
+ *           → stopTimes enthalten de-DELFI_de:09162:100:11:11
+ *           → gekürzt auf den Eltern-Knoten: de-DELFI_de:09162:100
+ */
+async function discoverRailStopId(seedStopId: string, signal?: AbortSignal): Promise<string | null> {
+  let raw: { stopTimes?: Array<{ mode?: string; place?: { stopId?: string } }> };
+  try {
+    raw = (await motisFetch(
+      `/v1/stoptimes?stopId=${encodeURIComponent(seedStopId)}&n=50`,
+      signal,
+    )) as typeof raw;
+  } catch {
+    return null;
+  }
+
+  const counts = new Map<string, number>();
+  for (const st of raw.stopTimes ?? []) {
+    if (!st.mode || !RAIL_MODES.has(st.mode)) continue;
+    const id = st.place?.stopId;
+    if (!id || /reference-data/i.test(id)) continue;
+
+    // "<feed>_<dhid>" → Eltern-Knoten = Feed + die ersten drei DHID-Segmente
+    // (de:AGS:Halt bzw. at:Region:Halt). Die weiteren Segmente sind
+    // Bereich/Bahnsteig.
+    const sep = id.indexOf("_");
+    if (sep < 0) continue;
+    const feed = id.slice(0, sep);
+    const parts = id.slice(sep + 1).split(":");
+    if (parts.length < 3) continue;
+    const trimmed = parts.slice(0, 3);
+
+    // GUARD: Das Kürzen auf drei Segmente gilt NUR für DHID-artige IDs. Schweizer
+    // sloids sehen anders aus („ch:1:sloid:3000:0:1") — dort schnitte man mitten
+    // im Bezeichner ab und bekäme „ch:1:sloid", einen unbrauchbaren Knoten.
+    // Genau das hat Zürich HB → Brunau auf 0 Ergebnisse gesetzt. Das letzte
+    // Segment eines echten Halt-Bezeichners ist numerisch — daran erkennen wir es.
+    if (!/^\d+$/.test(trimmed[2]!)) continue;
+
+    const base = `${feed}_${trimmed.join(":")}`;
+    counts.set(base, (counts.get(base) ?? 0) + 1);
+  }
+
+  let best: string | null = null;
+  let bestCount = 0;
+  for (const [id, n] of counts) {
+    if (n > bestCount) {
+      bestCount = n;
+      best = id;
+    }
+  }
+  return best;
 }
 
 /**
@@ -85,12 +159,47 @@ export async function resolveMotisPlace(
   const name = dbLabel ?? label;
   let place: MotisPlace | null = null;
 
+  // 1) Geocoder — funktioniert für Stops, die er kanonisch kennt (z.B. Schweiz).
   if (name && Number.isFinite(lat) && Number.isFinite(lng)) {
     place = await motisGeocodeNearestStop(name, lat, lng, 400, signal);
   }
+
+  // 2) ENTDECKUNG über die Abfahrtstafel.
+  //
+  // Für große deutsche/österreichische Bahnhöfe gibt der Transitous-Geocoder NUR
+  // den at-Railway-Referenzknoten her — und der trägt keine Gleise. Genau daher
+  // kam die Beobachtung „die Abfahrtstafel hat Gleise, die Suche nie": die Tafel
+  // fragt einen Knoten ab, der DELFI-Daten liefert, die Suche routete über die
+  // Koordinate und snappte auf den Referenzknoten.
+  //
+  // Die Tafel verrät aber den kanonischen Knoten: in ihren stopTimes steht
+  // `place.stopId` — z.B. de-DELFI_de:09162:100:11:11 für München Hbf. Wir nehmen
+  // den häufigsten SCHIENEN-Knoten (Tram/Bus filtern wir raus, sonst landet man
+  // auf der Straßenbahnhaltestelle davor) und kürzen ihn auf den Eltern-Knoten.
+  //
+  // Wirkung gemessen (München→Wien): 11/12 Legs mit Abfahrts-Gleis statt 5/12,
+  // und „IC 63 ab München Hbf, Gleis 11" statt „RJX 63, Gleis —".
+  if (!place && name) {
+    const seed = await motisGeocode(name, signal);
+    if (seed) {
+      const railId = await discoverRailStopId(seed.id, signal);
+      if (railId) {
+        place = {
+          id: railId,
+          name,
+          lat: Number.isFinite(lat) ? lat : seed.lat,
+          lon: Number.isFinite(lng) ? lng : seed.lon,
+          tz: seed.tz,
+        };
+      }
+    }
+  }
+
+  // 3) Koordinate — MOTIS snappt selbst auf den bedienten Halt.
   if (!place && Number.isFinite(lat) && Number.isFinite(lng)) {
     place = { id: `${lat},${lng}`, name: name ?? code, lat, lon: lng };
   }
+  // 4) Letzter Ausweg: irgendein Geocode-Treffer.
   if (!place && name) {
     place = await motisGeocode(name, signal);
   }
