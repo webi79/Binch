@@ -99,6 +99,44 @@ function isReferenceLeg(leg: MotisLeg): boolean {
   return /reference-data/i.test(leg.source ?? "");
 }
 
+/**
+ * Verwirft Verbindungen mit einem UNMÖGLICHEN Fußweg.
+ *
+ * MOTIS liefert gelegentlich Fußwege, die man nicht gehen kann — beobachtet:
+ * „Gronau, Bahnhof → Haag, Bräuhausplatz, 571 km in 10 Minuten". Ursache liegt
+ * upstream (im Feed sind offenbar zwei gleichnamige, hunderte Kilometer
+ * auseinanderliegende Halte verknüpft). Die betroffenen Routen sind komplett
+ * unbrauchbar: sie teleportieren quer durch Deutschland und tauchten in 3 von 7
+ * Hamburg→Wien-Ergebnissen auf.
+ *
+ * Vorher fiel das nicht auf, weil wir Fußwege versteckt haben — die Route sah
+ * dann bloß nach einem seltsamen Umstieg zwischen zwei Zügen aus. Seit die
+ * Fußwege sichtbar sind (und auf der Karte gezeichnet werden), springt es ins
+ * Auge: ein gestrichelter Strich quer über die Landkarte.
+ *
+ * Schwelle 15 km/h — Gehen liegt bei ~5, das lässt Luft für ungenaue Koordinaten
+ * und Rolltreppen-Wege, schlägt aber bei echtem Unsinn sofort an.
+ */
+const MAX_WALK_SPEED_KMH = 15;
+
+function hasImpossibleWalk(it: MotisItinerary): boolean {
+  for (const leg of it.legs) {
+    if (leg.mode !== "WALK") continue;
+    const { lat: aLat, lon: aLon } = leg.from;
+    const { lat: bLat, lon: bLon } = leg.to;
+    if (aLat == null || aLon == null || bLat == null || bLon == null) continue;
+
+    const minutes = Math.round((leg.duration ?? 0) / 60);
+    if (minutes <= 0) continue;
+
+    const dy = (bLat - aLat) * 111;
+    const dx = (bLon - aLon) * 111 * Math.cos((aLat * Math.PI) / 180);
+    const km = Math.sqrt(dx * dx + dy * dy);
+    if (km / (minutes / 60) > MAX_WALK_SPEED_KMH) return true;
+  }
+  return false;
+}
+
 function dropReferenceDuplicates(itineraries: MotisItinerary[]): MotisItinerary[] {
   const tripKey = (it: MotisItinerary): string | null => {
     const transit = it.legs.filter((l) => l.mode !== "WALK");
@@ -643,7 +681,10 @@ function makeMotisProvider(mode: TravelMode, transitModes: string, name: string)
         return empty(start, { error: "motis_plan_failed", message: e instanceof Error ? e.message : String(e) });
       }
 
-      const results = dropReferenceDuplicates(outbound.itineraries)
+      const usable = (its: MotisItinerary[]) =>
+        dropReferenceDuplicates(its.filter((it) => !hasImpossibleWalk(it)));
+
+      const results = usable(outbound.itineraries)
         .map((it, i) => toNormalized(it, input, from!, to!, i, mode))
         .filter((r): r is NormalizedResult => r !== null);
 
@@ -659,7 +700,7 @@ function makeMotisProvider(mode: TravelMode, transitModes: string, name: string)
           departDate: input.returnDate!,
           departTime: undefined,
         };
-        const returnResults = dropReferenceDuplicates(inbound.itineraries)
+        const returnResults = usable(inbound.itineraries)
           .map((it, i) => toNormalized(it, back, to!, from!, i, mode))
           .filter((r): r is NormalizedResult => r !== null)
           .map((r) => ({ ...r, direction: "RETURN" as const }));
