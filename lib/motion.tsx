@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import {
   AccessibilityInfo,
+  StyleSheet,
   type StyleProp,
   type ViewStyle,
 } from "react-native";
@@ -167,6 +168,22 @@ interface RevealProps {
    * dort nur die Position INNERHALB der Gruppe.
    */
   waveBase?: number;
+  /**
+   * Hintergrundfarbe → statt die View durchsichtig zu machen, blendet ein
+   * VORHANG in dieser Farbe darüber aus.
+   *
+   * Für große Bild-Karten. Ein `opacity`-Fade zwingt Android, pro Frame einen
+   * Offscreen-Buffer in Kartengröße zu füllen (sonst komponiert es die
+   * überlagerten halbtransparenten Kinder falsch, siehe unten) — bei einer fast
+   * bildschirmhohen Karte ist das der teuerste Posten der ganzen Welle und
+   * genau das, was als Ruckeln ankam.
+   *
+   * Mit Vorhang bleibt die Karte durchgehend opak: kein Alpha, kein
+   * Offscreen-Buffer, und der Tiefen-Verlauf stimmt von der ersten Millisekunde
+   * an. Sichtbar ist dasselbe — vorausgesetzt, dahinter liegt wirklich diese
+   * Farbe.
+   */
+  scrim?: string;
   style?: StyleProp<ViewStyle>;
 }
 
@@ -177,7 +194,7 @@ interface RevealProps {
  * Muss unter einem {@link ScreenEntrance} hängen — dann läuft die Welle bei
  * JEDEM Fokus des Screens neu, nicht nur beim ersten Mount.
  */
-export function Reveal({ children, index = 0, waveBase = 0, style }: RevealProps) {
+export function Reveal({ children, index = 0, waveBase = 0, scrim, style }: RevealProps) {
   const { generation, focusedAt } = useContext(EntranceContext);
   const reduceMotion = useReduceMotion();
   const progress = useSharedValue(0);
@@ -200,9 +217,12 @@ export function Reveal({ children, index = 0, waveBase = 0, style }: RevealProps
   }, [generation, focusedAt, index, waveBase, reduceMotion, progress]);
 
   const animatedStyle = useAnimatedStyle(() => ({
-    opacity: progress.value,
+    // Mit Vorhang bleibt die View selbst opak — der Vorhang erledigt das Faden.
+    opacity: scrim ? 1 : progress.value,
     transform: [{ translateY: (1 - progress.value) * MOTION.rise }],
   }));
+
+  const scrimStyle = useAnimatedStyle(() => ({ opacity: 1 - progress.value }));
 
   return (
     // needsOffscreenAlphaCompositing: React Native schaltet korrektes
@@ -220,8 +240,17 @@ export function Reveal({ children, index = 0, waveBase = 0, style }: RevealProps
     // Kostet nur WÄHREND des Fades einen Offscreen-Buffer: Android legt ihn nur
     // an, wenn alpha != 1. Kein dauerhafter Hardware-Layer (der hat an anderer
     // Stelle schon mal 66 ms Record-View#draw gekostet, siehe Saved-Parallax).
-    <Animated.View needsOffscreenAlphaCompositing style={[style, animatedStyle]}>
+    <Animated.View
+      needsOffscreenAlphaCompositing={!scrim}
+      style={[style, animatedStyle]}
+    >
       {children}
+      {scrim ? (
+        <Animated.View
+          pointerEvents="none"
+          style={[StyleSheet.absoluteFill, { backgroundColor: scrim }, scrimStyle]}
+        />
+      ) : null}
     </Animated.View>
   );
 }
@@ -290,9 +319,15 @@ export function RevealScrollView({
  * bleibt, weil die Screens ihn benutzen und weil hier später das Einblenden beim
  * Scrollen wieder andocken soll.
  */
-export function ScrollReveal({ children, index = 0, waveBase = 0, style }: RevealProps) {
+export function ScrollReveal({
+  children,
+  index = 0,
+  waveBase = 0,
+  scrim,
+  style,
+}: RevealProps) {
   return (
-    <Reveal index={index} waveBase={waveBase} style={style}>
+    <Reveal index={index} waveBase={waveBase} scrim={scrim} style={style}>
       {children}
     </Reveal>
   );

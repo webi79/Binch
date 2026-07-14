@@ -656,6 +656,7 @@ export default function HomeScreen() {
               key={`${category}-${d.id}`}
               index={wave.destinationCards}
               waveBase={wave.destinationCards}
+              scrim={C.bg}
             >
               <DestinationCard d={d} />
             </ScrollReveal>
