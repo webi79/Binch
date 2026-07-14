@@ -1,8 +1,6 @@
-import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import {
   AccessibilityInfo,
-  View,
-  useWindowDimensions,
   type StyleProp,
   type ViewStyle,
 } from "react-native";
@@ -11,13 +9,10 @@ import Animated, {
   Easing,
   FadeInDown,
   ReduceMotion,
-  useAnimatedReaction,
-  useAnimatedScrollHandler,
   useAnimatedStyle,
   useSharedValue,
   withDelay,
   withTiming,
-  type SharedValue,
 } from "react-native-reanimated";
 
 /**
@@ -185,201 +180,50 @@ export function revealEntering(index: number) {
 // ---------------------------------------------------------------------------
 
 /**
- * Vorlauf: Ein Element blendet ein, sobald seine Oberkante 48 px VOR der unteren
- * Bildschirmkante liegt. Ohne diesen Vorlauf sieht man es aufblenden, während es
- * schon halb im Bild ist — das wirkt wie Nachladen, nicht wie Bewegung.
- */
-const REVEAL_MARGIN = 48;
-
-/**
- * Notausstieg: Kommt binnen dieser Zeit keine Messung zurück, blendet das
- * Element trotzdem ein. Lieber ohne Welle als unsichtbar.
- */
-const BAIL_OUT_MS = 600;
-
-interface ScrollRevealCtx {
-  /** Treibt die Neubewertung — bei jedem Scroll-Frame. */
-  scrollY: SharedValue<number>;
-  /** Untere Bildschirmkante. */
-  windowHeight: number;
-  generation: number;
-}
-
-const ScrollRevealContext = createContext<ScrollRevealCtx | null>(null);
-
-/**
- * ScrollView, die ihre Kinder beim Hereinscrollen einblenden lässt.
+ * ScrollView, unter der {@link ScrollReveal} läuft.
  *
- * Zwei Fälle, EIN Verhalten:
- *   - Beim Öffnen des Tabs blenden die SICHTBAREN Elemente gestaffelt ein (die
- *     Welle).
- *   - Alles darunter blendet einzeln ein, sobald man es hereinscrollt — dann
- *     aber OHNE Versatz. Ein Element, das man gerade ins Bild schiebt, soll
- *     sofort reagieren; ein Versatz läse sich dort als Verzögerung.
+ * Hier hing mal eine Sichtbarkeitsprüfung dran (Scroll-Position + gemessene
+ * Element-Position), damit Elemente erst einblenden, wenn man sie hereinscrollt.
+ * Das ist DREIMAL schiefgegangen:
+ *
+ *   1. Reanimateds `measure()` im Worklet → App-Absturz („Value is null,
+ *      expected an Object"), sobald die native View noch nicht im Baum hängt.
+ *   2. `measureInWindow` auf der Animated.View → deren Ref ist die
+ *      Wrapper-Instanz, die Methode gibt es dort nicht. Der Optional-Chain lief
+ *      still ins Leere: JEDER TAB LEER.
+ *   3. Mit Notausstiegs-Timer → Tab kam eine Sekunde leer herein und alles
+ *      erschien dann auf einmal, statt in der Welle.
+ *
+ * Der gemeinsame Nenner ist die imperative Messung. Sie kann fehlschlagen, und
+ * wenn sie fehlschlägt, sieht der User einen LEEREN SCREEN — der schlechteste
+ * mögliche Ausgang für eine Verschönerung. Deshalb ist sie raus: Die Welle
+ * hängt jetzt an nichts mehr außer dem Fokus und dem Index, und kann damit
+ * nichts mehr verstecken.
+ *
+ * Bleibt als Komponente erhalten, damit die Screens nichts davon mitkriegen —
+ * und als Ort, an dem ein Einblenden-beim-Scrollen später wieder andocken kann,
+ * dann aber additiv (nie unsichtbar als Ausgangszustand).
  */
 export function RevealScrollView({
   children,
   ...props
 }: React.ComponentProps<typeof Animated.ScrollView>) {
-  const generation = useContext(EntranceContext);
-  const { height: windowHeight } = useWindowDimensions();
-  const scrollY = useSharedValue(0);
-
-  const onScroll = useAnimatedScrollHandler((e) => {
-    scrollY.value = e.contentOffset.y;
-  });
-
-  const ctx = useMemo(
-    () => ({ scrollY, windowHeight, generation }),
-    [scrollY, windowHeight, generation],
-  );
-
   return (
-    <ScrollRevealContext.Provider value={ctx}>
-      <Animated.ScrollView {...props} onScroll={onScroll} scrollEventThrottle={16}>
-        {children}
-      </Animated.ScrollView>
-    </ScrollRevealContext.Provider>
+    <Animated.ScrollView {...props}>
+      {children}
+    </Animated.ScrollView>
   );
 }
 
 /**
- * Ein Element, das einblendet, sobald es ins Bild kommt — und beim Öffnen des
- * Screens als Teil der Welle.
- *
- * Einmal eingeblendet bleibt es sichtbar. Beim Zurückscrollen wieder
- * auszublenden wäre nervig: Man hat es ja schon gesehen.
- *
- * Ohne umgebende {@link RevealScrollView} verhält es sich wie {@link Reveal}.
+ * Ein Element der Welle. Verhält sich exakt wie {@link Reveal} — der eigene Name
+ * bleibt, weil die Screens ihn benutzen und weil hier später das Einblenden beim
+ * Scrollen wieder andocken soll.
  */
 export function ScrollReveal({ children, index = 0, style }: RevealProps) {
-  const ctx = useContext(ScrollRevealContext);
-  const generation = useContext(EntranceContext);
-  const reduceMotion = useReduceMotion();
-  const ref = useRef<View>(null);
-  const progress = useSharedValue(0);
-  /** Stößt die Sichtbarkeitsprüfung einmal an, ohne dass gescrollt wurde. */
-  const pulse = useSharedValue(0);
-  /**
-   * Bildschirmposition der Oberkante beim Vermessen — und der Scroll-Stand zu
-   * genau dem Zeitpunkt. Aus dem Paar rechnet das Worklet die AKTUELLE Position
-   * selbst aus: `anchorY - (scrollY - anchorScroll)`.
-   *
-   * Warum nicht Reanimateds `measure()` im Worklet: Das misst zwar direkt auf
-   * dem UI-Thread, STÜRZT aber ab, sobald die native View noch nicht (oder nicht
-   * mehr) im Baum hängt — nicht „gibt null zurück", sondern reißt die App mit
-   * einer C++-Exception um. Beim App-Start und beim Tab-Wechsel passiert genau
-   * das. `measureInWindow` läuft dagegen auf dem JS-Thread und kann nicht
-   * abstürzen. Danach ist es reine Arithmetik — das Worklet fasst keine View an.
-   *
-   * Gemessen wird an einer ECHTEN View, nicht an der Animated.View: Deren Ref
-   * ist die Wrapper-Instanz, `measureInWindow` gibt es dort nicht — der
-   * Optional-Chain lief ins Leere, der Anker blieb `null`, und JEDER TAB WAR
-   * LEER. Die äußere View wird außerdem nie transformiert, ihr Anker bleibt also
-   * gültig, während das Kind hochgleitet.
-   */
-  const anchorY = useSharedValue<number | null>(null);
-  const anchorScroll = useSharedValue(0);
-  /**
-   * Wartet dieses Element noch auf SEINE ERSTE Prüfung?
-   *
-   * Daran hängt, ob es Teil der Welle ist: War es beim Erscheinen des Screens
-   * schon im Bild, bekommt es den Versatz seiner Position. Kommt es erst durch
-   * Scrollen herein, blendet es SOFORT ein — ein Element, das man gerade ins
-   * Bild schiebt, soll reagieren; ein Versatz läse sich dort als Verzögerung.
-   *
-   * Das ist auch der Grund, warum das kein Zeitfenster ist: Beim
-   * Kategorie-Wechsel entstehen die Karten neu, sind sofort im Bild — und sollen
-   * dann ebenfalls kaskadieren, egal wie lange der Fokus schon her ist.
-   */
-  const pending = useSharedValue(true);
-
-  useEffect(() => {
-    progress.value = reduceMotion ? 1 : 0;
-    pending.value = true;
-    // Anstoß im nächsten Frame: Sonst liefe die Prüfung NUR beim Scrollen, und
-    // beim Öffnen des Screens bliebe alles unsichtbar stehen.
-    const frame = requestAnimationFrame(() => {
-      pulse.value = pulse.value + 1;
-    });
-
-    // REISSLEINE. Eine Animation ist keinen leeren Screen wert: Wenn das Messen
-    // aus irgendeinem Grund nicht durchkommt, blendet das Element trotzdem ein.
-    // Genau dieser Fall ist schon eingetreten (siehe oben) — und ohne die
-    // Reißleine sah der User eine leere App.
-    const bail = setTimeout(() => {
-      if (anchorY.value === null && progress.value === 0) {
-        progress.value = withTiming(1, {
-          duration: MOTION.duration,
-          easing: MOTION.easing,
-        });
-      }
-    }, BAIL_OUT_MS);
-
-    return () => {
-      cancelAnimationFrame(frame);
-      clearTimeout(bail);
-    };
-  }, [generation, reduceMotion, progress, pulse, pending, anchorY]);
-
-  // onLayout feuert erst, wenn die native View wirklich steht — hier ist
-  // measureInWindow sicher. Und es feuert wieder, wenn sich das Layout ändert
-  // (Kategorie-Wechsel, Umschalter in Saved), womit sich der Anker nachzieht.
-  const measureAnchor = () => {
-    ref.current?.measureInWindow((_x, y) => {
-      if (typeof y !== "number") return;
-      anchorY.value = y;
-      anchorScroll.value = ctx ? ctx.scrollY.value : 0;
-      pulse.value = pulse.value + 1;
-    });
-  };
-
-  useAnimatedReaction(
-    () => (ctx ? ctx.scrollY.value : 0) + pulse.value,
-    () => {
-      if (reduceMotion || progress.value !== 0) return;
-
-      const reveal = (delay: number) => {
-        progress.value = withDelay(
-          delay,
-          withTiming(1, { duration: MOTION.duration, easing: MOTION.easing }),
-        );
-      };
-
-      if (!ctx) {
-        // Keine RevealScrollView drumherum → verhält sich wie Reveal.
-        reveal(staggerDelay(index));
-        return;
-      }
-      // Noch nicht vermessen → measureAnchor stößt selbst wieder an, und wenn
-      // das nie passiert, greift die Reißleine oben.
-      if (anchorY.value === null) return;
-
-      const y = anchorY.value - (ctx.scrollY.value - anchorScroll.value);
-
-      // Noch unterhalb des Bildschirms → warten. Aber merken, dass die erste
-      // Prüfung gelaufen ist: Wenn es später hereingescrollt wird, gehört es
-      // NICHT mehr zur Welle.
-      if (y >= ctx.windowHeight - REVEAL_MARGIN) {
-        pending.value = false;
-        return;
-      }
-
-      const delay = pending.value ? staggerDelay(index) : 0;
-      pending.value = false;
-      reveal(delay);
-    },
-    [index, reduceMotion, ctx],
-  );
-
-  const animatedStyle = useAnimatedStyle(() => ({
-    opacity: progress.value,
-    transform: [{ translateY: (1 - progress.value) * MOTION.rise }],
-  }));
-
   return (
-    <View ref={ref} style={style} onLayout={measureAnchor} collapsable={false}>
-      <Animated.View style={animatedStyle}>{children}</Animated.View>
-    </View>
+    <Reveal index={index} style={style}>
+      {children}
+    </Reveal>
   );
 }
