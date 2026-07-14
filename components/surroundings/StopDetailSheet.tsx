@@ -827,7 +827,7 @@ function StopDetailSheetInner() {
   };
 
   const queryFn = tab === "departures" ? fetchStopDepartures : fetchStopArrivals;
-  const { data, isLoading, isError } = useQuery<StopBoardResponse>({
+  const { data, isLoading, isError, refetch } = useQuery<StopBoardResponse>({
     queryKey: ["stopBoard", stop?.code ?? "_none_", tab],
     queryFn: () => queryFn(stop!.code),
     // Fetch erst sobald die Slide-Animation durch ist UND ein Stop aktiv ist.
@@ -1086,7 +1086,19 @@ function StopDetailSheetInner() {
             <View style={styles.body}>
               {!bodyReady ? null : isLoading ? (
                 <ActivityIndicator color={C.g1} style={{ marginTop: 24 }} />
-              ) : isError || items.length === 0 ? (
+              ) : isError ? (
+                // FEHLER ist nicht LEER. Vorher lief beides in denselben Zweig —
+                // ein Netz-Aussetzer behauptete dann „Keine Abfahrten", also eine
+                // Falschaussage über den Fahrplan. Jetzt sagen wir, dass WIR
+                // nichts laden konnten, und bieten einen Retry an.
+                <View style={styles.empty}>
+                  <Text style={styles.emptyTitle}>{t("stop.error.title")}</Text>
+                  <Text style={styles.emptyBody}>{t("results.error.body")}</Text>
+                  <Pressable onPress={() => void refetch()} style={styles.retryBtn} hitSlop={8}>
+                    <Text style={styles.retryText}>{t("results.retry")}</Text>
+                  </Pressable>
+                </View>
+              ) : items.length === 0 ? (
                 <View style={styles.empty}>
                   <Text style={styles.emptyTitle}>
                     {t(
@@ -1254,6 +1266,16 @@ const styles = StyleSheet.create({
   empty: { alignItems: "center", paddingTop: 32, paddingHorizontal: 24 },
   emptyTitle: { color: C.white, fontSize: 18, fontWeight: "700", textAlign: "center" },
   emptyBody: { color: C.g1, fontSize: 15, marginTop: 6, textAlign: "center", lineHeight: 22 },
+  retryBtn: {
+    marginTop: 16,
+    paddingVertical: 10,
+    paddingHorizontal: 22,
+    borderRadius: 999,
+    backgroundColor: C.surface3,
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  retryText: { color: C.white, fontSize: 15, fontWeight: "700" },
 
   // Liste: Hero hat eigenen Margin-Bottom (16), CardRows haben 10 marginBottom
   // → daher kein gap auf Container-Ebene.

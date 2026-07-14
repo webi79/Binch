@@ -148,7 +148,7 @@ export default function SurroundingsScreen() {
   // Train-Stationen für Clustering; unter zoom 9 zeigt der Server eh nichts.
   const zoomLimit = keyZoom >= 13 ? 60 : keyZoom >= 11 ? 200 : 400;
 
-  const { data } = useQuery({
+  const { data: fresh } = useQuery({
     queryKey: ["surroundings", deferredMode, keyLat, keyLng, keyDistance, keyZoom],
     queryFn: () =>
       fetchSurroundings({
@@ -160,10 +160,31 @@ export default function SurroundingsScreen() {
         mode: deferredMode,
       }),
     staleTime: 60_000,
-    enabled: deferredMode === "transit",
+    // Erst fragen, wenn wir wissen WO. Vorher stand `coord` noch auf dem
+    // Default USER_LOC (Berlin Hbf) — der erste Call ging also immer für Berlin
+    // raus, egal wo der User ist, und war schlicht Müll. Sobald die Karte
+    // einmal idle war (`viewport`) oder die Ortung durch ist (granted/denied/
+    // error → dann gilt bewusst der Default), fragen wir.
+    enabled: deferredMode === "transit" && (viewport !== null || locationStatus !== "loading"),
     retry: 1,
     placeholderData: (prev) => prev,
   });
+
+  /**
+   * Letzte erfolgreiche Antwort festhalten.
+   *
+   * Bei einem Query-FEHLER ist `data` undefined (placeholderData greift nur
+   * während des Ladens, nicht im Error-State). Unten stand `if (!data) return []`
+   * — ein einziger Aussetzer (WLAN-Hänger, 10s-Timeout) räumte damit die
+   * komplette Karte leer und die Liste gleich mit: die Icons „verschwanden
+   * random". Jetzt bleibt der letzte gute Stand stehen, bis wieder etwas
+   * ankommt.
+   */
+  const lastGood = useRef<typeof fresh>(undefined);
+  useEffect(() => {
+    if (fresh) lastGood.current = fresh;
+  }, [fresh]);
+  const data = fresh ?? lastGood.current;
 
   // Wichtig: API-Daten nur im Transit-Mode verwenden. In Airport/Cruise-Mode
   // ist die Query disabled, aber `placeholderData: (prev) => prev` kann
