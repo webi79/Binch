@@ -59,7 +59,15 @@ export const MOTION = {
   easing: Easing.bezier(0.33, 1, 0.68, 1),
 } as const;
 
+/**
+ * `"worklet"`, weil ScrollReveal das aus einer `useAnimatedReaction` heraus
+ * aufruft — die läuft auf dem UI-Thread und kann keine normale JS-Funktion
+ * synchron ausführen („Tried to synchronously call a non-worklet function").
+ * Mit der Direktive wird die Funktion auf BEIDE Threads kopiert; die
+ * JS-Aufrufer (Reveal, revealEntering) rufen sie unverändert weiter auf.
+ */
 export function staggerDelay(index: number): number {
+  "worklet";
   return Math.min(Math.max(index, 0), MOTION.maxSteps) * MOTION.stagger;
 }
 
