@@ -7,6 +7,7 @@ import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import { profileForStop, type HafasProfileKey } from "../services/countryProfile.js";
 import { fetchTrip as multiFetchTrip } from "../services/multiHafas.js";
+import { cleanPlatform } from "../util/platform.js";
 
 /**
  * Liefert die geographische Polyline (Route entlang der Schienen) für eine
@@ -218,8 +219,8 @@ function motisStopToStopover(s: MotisTripStop): DbTripStopover {
     plannedArrival: s.scheduledArrival,
     departure: s.scheduledDeparture ?? s.departure,
     plannedDeparture: s.scheduledDeparture,
-    arrivalPlatform: s.scheduledTrack ?? s.track,
-    departurePlatform: s.scheduledTrack ?? s.track,
+    arrivalPlatform: cleanPlatform(s.scheduledTrack ?? s.track),
+    departurePlatform: cleanPlatform(s.scheduledTrack ?? s.track),
   };
 }
 

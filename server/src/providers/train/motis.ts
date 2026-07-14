@@ -8,6 +8,7 @@ import { motisFetch, type MotisPlace } from "../../services/motisClient.js";
 // jeder Verbraucher seine eigene, und ein Fix erreichte nur die halbe App.
 import { resolveMotisPlace } from "../../services/motisPlaces.js";
 import { buildBahnDeeplink } from "../../util/bahnDeeplink.js";
+import { cleanPlatform } from "../../util/platform.js";
 import type {
   LegInfo,
   NormalizedResult,
@@ -132,7 +133,7 @@ function toStopovers(stops: MotisLegStop[] | undefined): StopoverInfo[] | undefi
     // Verspätung; sonst zeigt die Timeline verwirrende „Ist"-Zeiten.
     arrival: s.scheduledArrival ?? s.arrival,
     departure: s.scheduledDeparture ?? s.departure,
-    platform: s.track ?? s.scheduledTrack,
+    platform: cleanPlatform(s.track ?? s.scheduledTrack),
   }));
 }
 
@@ -336,8 +337,8 @@ function toLeg(leg: MotisLeg): LegInfo {
     departDelayMinutes: delayMinutes(leg.from.scheduledDeparture, leg.from.departure, leg.realTime),
     arriveDelayMinutes: delayMinutes(leg.to.scheduledArrival, leg.to.arrival, leg.realTime),
     durationMinutes,
-    departPlatform: leg.from.track ?? leg.from.scheduledTrack,
-    arrivePlatform: leg.to.track ?? leg.to.scheduledTrack,
+    departPlatform: cleanPlatform(leg.from.track ?? leg.from.scheduledTrack),
+    arrivePlatform: cleanPlatform(leg.to.track ?? leg.to.scheduledTrack),
     line: lineLabel(leg),
     product: leg.mode,
     fahrtNr: leg.tripShortName || undefined,

@@ -1,5 +1,6 @@
 import { eq } from "drizzle-orm";
 import { config } from "../config.js";
+import { cleanPlatform } from "../util/platform.js";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import { BoundedTtlCache } from "../util/boundedCache.js";
@@ -244,8 +245,9 @@ function buildDbwebRoute(j: DbwebJourney): DbwebRoute | null {
         name: s.stop?.name,
         arrival: iso(s.plannedArrival ?? s.arrival),
         departure: iso(s.plannedDeparture ?? s.departure),
-        platform:
+        platform: cleanPlatform(
           s.plannedArrivalPlatform ?? s.arrivalPlatform ?? s.plannedDeparturePlatform ?? s.departurePlatform,
+        ),
       }))
       .filter((s) => !!s.name);
     legs.push({
@@ -262,8 +264,8 @@ function buildDbwebRoute(j: DbwebJourney): DbwebRoute | null {
       departDelayMinutes: legDelay(seg.plannedDeparture, seg.departure),
       arriveDelayMinutes: legDelay(seg.plannedArrival, seg.arrival),
       durationMinutes: Math.max(1, Math.round((Date.parse(a) - Date.parse(d)) / 60_000)),
-      departPlatform: seg.plannedDeparturePlatform ?? seg.departurePlatform,
-      arrivePlatform: seg.plannedArrivalPlatform ?? seg.arrivalPlatform,
+      departPlatform: cleanPlatform(seg.plannedDeparturePlatform ?? seg.departurePlatform),
+      arrivePlatform: cleanPlatform(seg.plannedArrivalPlatform ?? seg.arrivalPlatform),
       line: cleanLineLabel(seg.line),
       product: dbwebProductToMode(seg.line?.product),
       fahrtNr: seg.line?.fahrtNr,

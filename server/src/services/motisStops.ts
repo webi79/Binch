@@ -1,4 +1,5 @@
 import { motisFetch } from "./motisClient.js";
+import { cleanPlatform } from "../util/platform.js";
 import { resolveMotisStopId } from "./motisPlaces.js";
 import type { StopBoard, StopBoardItem, StopBoardResponse } from "./stopInfoService.js";
 
@@ -101,7 +102,7 @@ function toItem(st: MotisStopTime, board: StopBoard, idx: number): StopBoardItem
     line,
     product: modeToProduct(st.mode),
     direction: st.headsign ?? "",
-    platform: p.track ?? p.scheduledTrack ?? null,
+    platform: cleanPlatform(p.track ?? p.scheduledTrack) ?? null,
     cancelled: !!(p.cancelled || st.cancelled || st.tripCancelled),
   };
 }
