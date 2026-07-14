@@ -455,8 +455,19 @@ function toNormalized(
   // Abfahrt/Dauer stimmten bei uns dadurch auch nicht (09:10/4h31 statt
   // 09:13/4h19). Solche Fußwege ZUM EIGENEN Bahnhof fliegen raus; ein Fußweg zu
   // einer ANDEREN Station (Billoweg → Brunau) bleibt drin.
-  const originName = input.originLabel ?? from.name;
-  const destName = input.destLabel ?? to.name;
+  // UNSER aufgelöster Name gewinnt, NICHT das vom Client mitgeschickte Label.
+  //
+  // Warum das wichtig ist: Der Client persistiert (code, label) in Recents und
+  // gespeicherten Stationen. Ändert sich später der Datensatz, hält er ein
+  // VERALTETES Label zu einem Code — real passiert: die App schickte
+  // `destination=sta:8101003` mit `destLabel=Wien Hbf`, obwohl 8101003
+  // „Inzersdorf Wien Blumental Bahnhof" ist. Vertrauten wir dem Client-Label,
+  // schrieben wir „Wien Hbf" ans Ende einer Reise, die in Wahrheit nach
+  // Blumental führt — wir würden dem User die falsche Strecke als richtige
+  // verkaufen. Der Code bestimmt die Fahrt, also muss auch der Name aus unserer
+  // Auflösung kommen.
+  const originName = from.name || input.originLabel || input.origin;
+  const destName = to.name || input.destLabel || input.destination;
   const droppedAccessWalk =
     journeyLegs[0]?.mode === "WALK" && sameStation(journeyLegs[0].to?.name, originName);
   if (droppedAccessWalk) journeyLegs.shift();
@@ -542,8 +553,10 @@ function toNormalized(
     externalId: `motis:${input.origin}:${input.destination}:${it.startTime}:${idx}`,
     origin: input.origin,
     destination: input.destination,
-    originLabel: input.originLabel ?? from.name,
-    destLabel: input.destLabel ?? to.name,
+    // Unser aufgelöster Name, nicht das (womöglich veraltete) Client-Label —
+    // siehe originName/destName oben.
+    originLabel: originName,
+    destLabel: destName,
     departTime,
     arriveTime,
     departDelayMinutes: startsWithWalk
@@ -581,8 +594,8 @@ function toNormalized(
     deepLink:
       mode === "TRAIN"
         ? buildBahnDeeplink({
-            origin: { name: input.originLabel ?? from.name, lat: journeyFrom.lat, lng: journeyFrom.lon },
-            destination: { name: input.destLabel ?? to.name, lat: journeyTo.lat, lng: journeyTo.lon },
+            origin: { name: originName, lat: journeyFrom.lat, lng: journeyFrom.lon },
+            destination: { name: destName, lat: journeyTo.lat, lng: journeyTo.lon },
             departTime,
             originTz: journeyFrom.tz ?? from.tz,
           })
