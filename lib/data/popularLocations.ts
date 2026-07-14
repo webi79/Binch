@@ -28,8 +28,15 @@ export const POPULAR_LOCATIONS: Record<TravelMode | "ALL", Location[]> = {
     { code: "sta:8002549", label: "Hamburg Hbf", city: "Hamburg", country: "Germany", type: "TRAIN", latitude: 53.5528, longitude: 10.0067 },
     { code: "sta:8000105", label: "Frankfurt (Main) Hbf", city: "Frankfurt", country: "Germany", type: "TRAIN", latitude: 50.1075, longitude: 8.6629 },
     { code: "sta:8000207", label: "Köln Hbf", city: "Köln", country: "Germany", type: "TRAIN", latitude: 50.9430, longitude: 6.9587 },
-    { code: "sta:8101003", label: "Wien Hbf", city: "Wien", country: "Austria", type: "TRAIN", latitude: 48.1854, longitude: 16.3768 },
-    { code: "sta:8503000", label: "Zürich HB", city: "Zürich", country: "Switzerland", type: "TRAIN", latitude: 47.3779, longitude: 8.5403 },
+    // ACHTUNG: sta:8101003 ist NICHT Wien Hbf, sondern „Inzersdorf Wien
+    // Blumental Bahnhof" (südlich von Wien). Mit dem falschen Code routete jede
+    // Suche stumm dorthin — der Code bestimmt die Fahrt, das Label nur die
+    // Anzeige. Richtig ist sta:8103000.
+    { code: "sta:8103000", label: "Wien Hbf", city: "Wien", country: "Austria", type: "TRAIN", latitude: 48.1849, longitude: 16.3759 },
+    // sta:8503000 existiert in unserer locations-Tabelle gar nicht (Schweizer
+    // Stops kommen aus dem GTFS-Import, nicht aus StaDa) → resolvePlace fand
+    // keine Koordinate und fiel auf reines Label-Geocoding zurück.
+    { code: "gtfs:ch:8503000", label: "Zürich HB", city: "Zürich", country: "Switzerland", type: "TRAIN", latitude: 47.3782, longitude: 8.5402 },
     { code: "sta:8727100", label: "Paris Gare du Nord", city: "Paris", country: "France", type: "TRAIN", latitude: 48.8810, longitude: 2.3554 },
     { code: "sta:8400058", label: "Amsterdam Centraal", city: "Amsterdam", country: "Netherlands", type: "TRAIN", latitude: 52.3789, longitude: 4.9003 },
     { code: "sta:8814001", label: "Bruxelles-Midi", city: "Bruxelles", country: "Belgium", type: "TRAIN", latitude: 50.8358, longitude: 4.3360 },

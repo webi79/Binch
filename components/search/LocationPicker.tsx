@@ -84,9 +84,18 @@ export function LocationPicker({
     () => recent.filter((l) => !savedCodes.has(l.code)),
     [recent, savedCodes],
   );
+  // Vorschläge, deren Code beim Start-Check nicht zu ihrem Label passte, fliegen
+  // raus. Die Liste ist hartkodiert (POPULAR_LOCATIONS) und kann von der DB
+  // abdriften — real passiert: „Wien Hbf" trug den Code von „Inzersdorf Wien
+  // Blumental Bahnhof". Das Label sah richtig aus, die Suche fuhr aber stumm in
+  // den falschen Ort. Lieber gar nicht anbieten als falsch hinschicken.
+  const invalidSuggestionCodes = useSearchStore((s) => s.invalidSuggestionCodes);
   const visibleSuggested = useMemo(
-    () => suggested.filter((l) => !savedCodes.has(l.code)),
-    [suggested, savedCodes],
+    () =>
+      suggested.filter(
+        (l) => !savedCodes.has(l.code) && !invalidSuggestionCodes.includes(l.code),
+      ),
+    [suggested, savedCodes, invalidSuggestionCodes],
   );
 
   useEffect(() => {

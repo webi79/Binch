@@ -4,6 +4,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { AppState } from "react-native";
 import { SearchResult, TravelMode, Location } from "@/types/search";
 import { SavedTrip, Ticket } from "@/types/saved";
+import { POPULAR_LOCATIONS } from "@/lib/data/popularLocations";
 import { tripSignature } from "@/lib/results/signature";
 import { saveAuthToken } from "@/lib/auth/tokenStorage";
 import type { AuthUser } from "@/lib/api/client";
@@ -305,6 +306,17 @@ interface SearchStore {
    *  aktuellen DB-Stand. Schlägt der Server-Call fehl, bleibt der Store
    *  unverändert (offline-friendly). */
   validatePersistedCodes: () => Promise<void>;
+  /** Codes aus POPULAR_LOCATIONS, die NICHT (mehr) zu ihrem Label passen.
+   *  Der LocationPicker blendet sie aus. Nicht persistiert — wird bei jedem
+   *  Start neu gegen die DB geprüft.
+   *
+   *  Warum es das braucht: die Vorschlagsliste ist HARTKODIERT. Driftet ein Code
+   *  von der DB ab, wählt der User einen Ort, der nach woanders routet — real
+   *  passiert: „Wien Hbf" trug sta:8101003, was „Inzersdorf Wien Blumental
+   *  Bahnhof" ist. Das Label stimmte, also fiel es niemandem auf; die Suche fuhr
+   *  stumm in den falschen Ort. Ein Vorschlag, der nicht auflösbar ist, darf gar
+   *  nicht erst antippbar sein. */
+  invalidSuggestionCodes: string[];
   recentSpots: string[];
   addRecentSpot: (query: string) => void;
   removeRecentSpot: (query: string) => void;
@@ -635,10 +647,11 @@ export const useSearchStore = create<SearchStore>()(
           recentSearches: state.recentSearches.filter((r) => r.id !== id),
         })),
       clearRecentSearches: () => set({ recentSearches: [] }),
+      invalidSuggestionCodes: [],
       validatePersistedCodes: async () => {
         const state = get();
-        // Codes aus Recents (origin+destination) UND aus Saved-Stations
-        // einsammeln. Dedupliziert via Set.
+        // Codes aus Recents (origin+destination), Saved-Stations UND der
+        // hartkodierten Vorschlagsliste einsammeln. Dedupliziert via Set.
         const codes = new Set<string>();
         for (const r of state.recentSearches) {
           if (r.origin.code) codes.add(r.origin.code);
@@ -647,6 +660,16 @@ export const useSearchStore = create<SearchStore>()(
         for (const s of state.savedStations) {
           if (s.code) codes.add(s.code);
         }
+        // POPULAR_LOCATIONS mitprüfen — die Liste steht fest im Code und kann
+        // von der DB abdriften, ohne dass es jemandem auffällt (das Label sieht
+        // ja richtig aus). Nur auflösbare Codes prüfen (Flug=IATA, Bus/Hafen
+        // haben eigene Namensräume und liegen nicht in `locations`).
+        const suggestionCodes = Object.values(POPULAR_LOCATIONS)
+          .flat()
+          .map((l) => l.code)
+          .filter((c) => /^(sta|gtfs|osm):/.test(c));
+        for (const c of suggestionCodes) codes.add(c);
+
         if (codes.size === 0) return;
         let lookup: Map<string, { exists: boolean; label?: string }>;
         try {
@@ -696,8 +719,39 @@ export const useSearchStore = create<SearchStore>()(
         const stationsChanged =
           nextStations.length !== state.savedStations.length ||
           nextStations.some((s, i) => s.label !== state.savedStations[i]?.label);
-        if (!recentsChanged && !stationsChanged) return;
+
+        // Vorschlagsliste gegenprüfen: der Code muss existieren UND sein
+        // DB-Name muss zum angezeigten Label passen. Tut er das nicht, führt
+        // der Vorschlag den User woanders hin (siehe Wien Hbf / Blumental) —
+        // dann lieber gar nicht anbieten, statt ihn stumm falsch fahren zu
+        // lassen. Codes, die der Server nicht zurückgab, bewerten wir nicht.
+        const norm = (v: string) => v.toLowerCase().replace(/[^a-z0-9]/g, "");
+        const invalid: string[] = [];
+        for (const l of Object.values(POPULAR_LOCATIONS).flat()) {
+          if (!/^(sta|gtfs|osm):/.test(l.code)) continue;
+          const hit = lookup.get(l.code);
+          if (!hit) continue;
+          const want = norm(l.label);
+          const got = hit.exists && hit.label ? norm(hit.label) : "";
+          const matches =
+            !!got && (got.includes(want.slice(0, 8)) || want.includes(got.slice(0, 8)));
+          if (!matches) {
+            invalid.push(l.code);
+            if (__DEV__) {
+              console.warn(
+                `[popularLocations] "${l.label}" (${l.code}) zeigt auf ` +
+                  `"${hit.exists ? hit.label : "— existiert nicht —"}". Vorschlag ausgeblendet.`,
+              );
+            }
+          }
+        }
+        const invalidChanged =
+          invalid.length !== state.invalidSuggestionCodes.length ||
+          invalid.some((c, i) => c !== state.invalidSuggestionCodes[i]);
+
+        if (!recentsChanged && !stationsChanged && !invalidChanged) return;
         set({
+          ...(invalidChanged ? { invalidSuggestionCodes: invalid } : {}),
           ...(recentsChanged ? { recentSearches: nextRecents } : {}),
           ...(stationsChanged ? { savedStations: nextStations } : {}),
         });
