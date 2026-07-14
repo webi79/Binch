@@ -1,13 +1,17 @@
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { AccessibilityInfo, useWindowDimensions, type StyleProp, type ViewStyle } from "react-native";
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  AccessibilityInfo,
+  useWindowDimensions,
+  type StyleProp,
+  type View,
+  type ViewStyle,
+} from "react-native";
 import { useIsFocused } from "@react-navigation/native";
 import Animated, {
   Easing,
   FadeInDown,
   ReduceMotion,
-  measure,
   useAnimatedReaction,
-  useAnimatedRef,
   useAnimatedScrollHandler,
   useAnimatedStyle,
   useSharedValue,
@@ -246,13 +250,25 @@ export function ScrollReveal({ children, index = 0, style }: RevealProps) {
   const ctx = useContext(ScrollRevealContext);
   const generation = useContext(EntranceContext);
   const reduceMotion = useReduceMotion();
-  const ref = useAnimatedRef<Animated.View>();
+  const ref = useRef<View>(null);
   const progress = useSharedValue(0);
   /** Stößt die Sichtbarkeitsprüfung einmal an, ohne dass gescrollt wurde. */
   const pulse = useSharedValue(0);
-  /** Erst wenn onLayout gefeuert hat, existiert die native View — vorher reißt
-   *  measure() die App um. */
-  const laidOut = useSharedValue(false);
+  /**
+   * Bildschirmposition der Oberkante beim Vermessen — und der Scroll-Stand zu
+   * genau dem Zeitpunkt. Aus dem Paar rechnet das Worklet die AKTUELLE Position
+   * selbst aus: `anchorY - (scrollY - anchorScroll)`.
+   *
+   * Warum nicht Reanimateds `measure()` im Worklet: Das misst zwar direkt auf
+   * dem UI-Thread, STÜRZT aber ab, sobald die native View noch nicht (oder nicht
+   * mehr) im Baum hängt — nicht „gibt null zurück", sondern reißt die App mit
+   * einer C++-Exception um. Beim App-Start und beim Tab-Wechsel passiert genau
+   * das. `measureInWindow` läuft dagegen auf dem JS-Thread, ist asynchron und
+   * kann nicht abstürzen. Danach ist es reine Arithmetik — das Worklet fasst
+   * keine View mehr an.
+   */
+  const anchorY = useSharedValue<number | null>(null);
+  const anchorScroll = useSharedValue(0);
   /**
    * Wartet dieses Element noch auf SEINE ERSTE Prüfung?
    *
@@ -267,10 +283,9 @@ export function ScrollReveal({ children, index = 0, style }: RevealProps) {
    */
   const pending = useSharedValue(true);
 
-  // Neuer Fokus → Welle von vorn. Und einen Frame später prüfen: Ohne diesen
-  // Anstoß liefe die Prüfung NUR beim Scrollen — beim Öffnen des Screens bliebe
-  // alles unsichtbar. Ein Frame Verzögerung, damit das Layout steht (vorher
-  // misst measure() ins Leere).
+  // Neuer Fokus → Welle von vorn. Der Anstoß im nächsten Frame ist nötig, weil
+  // die Reaktion sonst NUR beim Scrollen liefe — beim Öffnen des Screens bliebe
+  // alles unsichtbar stehen.
   useEffect(() => {
     progress.value = reduceMotion ? 1 : 0;
     pending.value = true;
@@ -280,23 +295,18 @@ export function ScrollReveal({ children, index = 0, style }: RevealProps) {
     return () => cancelAnimationFrame(id);
   }, [generation, reduceMotion, progress, pulse, pending]);
 
-  // measure() statt onLayout: onLayout liefert die Position relativ zum
-  // ELTERNELEMENT. Eine Karte, die in einer Sektion steckt, meldete damit eine
-  // Position nahe 0 und würde sofort einblenden, egal wo sie auf dem Schirm
-  // steht. measure() gibt die echte Bildschirmposition (pageY).
-  //
-  // ABER: measure() STÜRZT AB, wenn die View noch nicht im nativen Baum hängt —
-  // nicht „gibt null zurück", sondern reißt die App mit einer C++-Exception um
-  // („Value is null, expected an Object"). Ich hatte angenommen, ein Frame
-  // Verzögerung (requestAnimationFrame) reiche aus. Beim App-Start reicht es
-  // nicht.
-  //
-  // Zwei Sicherungen:
-  //   1. Gemessen wird erst, wenn onLayout gefeuert hat — dann existiert die
-  //      native View garantiert. Das onLayout stößt die Prüfung auch gleich an.
-  //   2. try/catch drumherum. Ein fehlgeschlagenes Messen darf höchstens
-  //      bedeuten, dass ein Element sichtbar bleibt — niemals, dass die App
-  //      abstürzt.
+  // onLayout feuert erst, wenn die native View wirklich steht — hier ist
+  // measureInWindow sicher. Und es feuert wieder, wenn sich das Layout ändert
+  // (Kategorie-Wechsel, Umschalter in Saved), womit sich der Anker selbst
+  // nachzieht.
+  const measureAnchor = () => {
+    ref.current?.measureInWindow((_x, y) => {
+      anchorY.value = y;
+      anchorScroll.value = ctx ? ctx.scrollY.value : 0;
+      pulse.value = pulse.value + 1;
+    });
+  };
+
   useAnimatedReaction(
     () => (ctx ? ctx.scrollY.value : 0) + pulse.value,
     () => {
@@ -314,22 +324,16 @@ export function ScrollReveal({ children, index = 0, style }: RevealProps) {
         reveal(staggerDelay(index));
         return;
       }
-      if (!laidOut.value) return;
+      // Noch nicht vermessen → die nächste Prüfung holt es nach (measureAnchor
+      // stößt selbst an).
+      if (anchorY.value === null) return;
 
-      let m: ReturnType<typeof measure> = null;
-      try {
-        m = measure(ref);
-      } catch {
-        // View (noch) nicht messbar → lieber sichtbar machen als hängen lassen.
-        reveal(0);
-        return;
-      }
-      if (!m) return;
+      const y = anchorY.value - (ctx.scrollY.value - anchorScroll.value);
 
       // Noch unterhalb des Bildschirms → warten. Aber merken, dass die erste
       // Prüfung gelaufen ist: Wenn es später hereingescrollt wird, gehört es
       // NICHT mehr zur Welle.
-      if (m.pageY >= ctx.windowHeight - REVEAL_MARGIN) {
+      if (y >= ctx.windowHeight - REVEAL_MARGIN) {
         pending.value = false;
         return;
       }
@@ -347,14 +351,7 @@ export function ScrollReveal({ children, index = 0, style }: RevealProps) {
   }));
 
   return (
-    <Animated.View
-      ref={ref}
-      style={[style, animatedStyle]}
-      onLayout={() => {
-        laidOut.value = true;
-        pulse.value = pulse.value + 1;
-      }}
-    >
+    <Animated.View ref={ref} style={[style, animatedStyle]} onLayout={measureAnchor}>
       {children}
     </Animated.View>
   );
