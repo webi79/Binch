@@ -122,18 +122,77 @@ export async function getMotisTripPolyline(
  * relevanteste Treffer — bei Städten der PLACE, dessen Koordinate der Aufrufer
  * zum Routen benutzt (MOTIS snappt selbst auf den bedienten Halt).
  */
-export async function motisGeocode(label: string, signal?: AbortSignal): Promise<MotisPlace | null> {
-  const key = label.trim().toLowerCase();
-  if (!key) return null;
+export async function motisGeocode(
+  label: string,
+  signal?: AbortSignal,
+  /** ISO-3166-alpha2 des erwarteten Landes. Siehe unten — ohne das landet „Paris"
+   *  in Brasilien. */
+  country?: string,
+): Promise<MotisPlace | null> {
+  const key = `${label.trim().toLowerCase()}|${country ?? ""}`;
+  if (!label.trim()) return null;
   const cached = geocodeCache.get(key);
   if (cached !== undefined) return cached;
 
   let place: MotisPlace | null = null;
   try {
-    const raw = await geocodeRaw(label, signal);
+    let raw = await geocodeRaw(label, signal);
+
+    // LÄNDER-FILTER — der wichtigste Teil dieser Funktion.
+    //
+    // Der Geocoder sortiert nach seinem eigenen Score, und der greift daneben:
+    //   „Paris"  → 1. STOP „Paris ,  -"  [BR]   ← Rio de Janeiro!
+    //              2. STOP „Paris Est"   [FR]
+    //              4. PLACE „Paris"      [FR]
+    //
+    // Die Namensprüfung rettet hier NICHT: Der brasilianische Halt heißt wirklich
+    // „Paris". Gemessen hat uns das eine Zug-Suche München → Paris zerstört —
+    // MOTIS routete von einem Referenz-Knoten nach RIO DE JANEIRO und lieferte
+    // folgerichtig 0 Ergebnisse.
+    //
+    // Wir kennen aber das Land des gesuchten Ortes (siehe motisPlaces). Treffer
+    // aus anderen Ländern fliegen raus. Bleibt nichts übrig, suchen wir ohne
+    // Filter weiter — lieber ein unsicherer Treffer als gar keiner.
+    if (country) {
+      const inCountry = raw.filter((r) => r.country?.toUpperCase() === country.toUpperCase());
+      if (inCountry.length > 0) raw = inCountry;
+    }
+
+    // ACHTUNG: Referenzdaten-Feeds hier NICHT herausfiltern.
+    //
+    // Verlockend ist es (als ROUTING-ZIEL sind sie Gift, siehe isReferenceFeed),
+    // aber der Transitous-Geocoder kennt große Bahnhöfe NUR als Referenz-Knoten:
+    //     „München Hbf" → at-Railway-Current-Reference-Data-2026_de:09162:100:11:11
+    // Genau dafür gibt es die Knoten-Entdeckung in motisPlaces, die daraus den
+    // kanonischen DELFI-Knoten macht. Filtert man sie schon hier weg, nimmt man
+    // ihr den Startpunkt — im Test blieb für „München" der FLUGHAFEN übrig.
+    // Verworfen werden sie erst dort, wo sie tatsächlich Ziel würden.
     if (raw.length > 0) {
-      const stop = raw.find((r) => r.type === "STOP" && stationNameCompatible(label, r.name));
-      const hit = stop ?? raw[0]!;
+      // Unter den namensverträglichen Halten den WICHTIGSTEN nehmen, nicht den
+      // erstbesten.
+      //
+      // Vorher gewann für die Stadt „München" der Halt „München Ost" — schlicht
+      // weil „münchen" ein Präfix davon ist und er zufällig oben stand. MOTIS
+      // liefert aber ein Wichtigkeits-Maß mit:
+      //     München Hbf 0.377 · Flughafen 0.025 · München Ost 0.017
+      // Damit landet man dort, wo der User hinwollte.
+      //
+      // KEIN Vorrang für exakte Namensgleichheit — das war ein Reinfall: Es gibt
+      // einen Bushalt, der schlicht „München" heißt (im Landkreis Ebersberg,
+      // de:09178:3240). Als exakter Treffer verdrängte er den Hauptbahnhof.
+      // Die Namensprüfung engt bereits auf die richtige Stadt ein; innerhalb
+      // dieser Menge entscheidet allein die Wichtigkeit — und ein Dorfhalt hat
+      // sie nicht.
+      //
+      // „Werl, Rathaus" bleibt trotzdem heil: „Werl, Bahnhof" ist zu diesem
+      // Suchbegriff gar nicht namensverträglich, konkurriert also nicht.
+      //
+      // Bewusst KEIN Ausweichen auf den Stadt-PLACE (Koordinate): MOTIS müsste
+      // dann per Straßen-Routing einen Halt suchen — für München → Paris dauerte
+      // das über 15 s und lief in den Provider-Timeout.
+      const stops = raw.filter((r) => r.type === "STOP" && stationNameCompatible(label, r.name));
+      const best = [...stops].sort((a, b) => (b.importance ?? 0) - (a.importance ?? 0))[0];
+      const hit = best ?? raw[0]!;
       if (hit.id) {
         place = {
           id: hit.id,
@@ -160,6 +219,12 @@ interface GeocodeHit {
   lat?: number;
   lon?: number;
   tz?: string;
+  /** ISO-3166-alpha2 des Treffers ("FR", "BR", "DE"). Der Rettungsanker gegen
+   *  gleichnamige Orte auf anderen Kontinenten. */
+  country?: string;
+  /** MOTIS' eigenes Wichtigkeits-Maß. München Hbf = 0.377, München Ost = 0.017 —
+   *  damit trifft man den Hauptbahnhof statt irgendeines Halts der Stadt. */
+  importance?: number;
 }
 
 async function geocodeRaw(label: string, signal?: AbortSignal): Promise<GeocodeHit[]> {
@@ -205,7 +270,7 @@ const normName = normStationName;
  * absurden Fußweg zwischen zwei gleichnamigen Knoten ein („München Hauptbahnhof
  * → 8 min zu Fuß → München Hbf"). Also nie als Routing-Endpunkt verwenden.
  */
-function isReferenceFeed(id: string): boolean {
+export function isReferenceFeedId(id: string): boolean {
   return /reference-data/i.test(id.split("_")[0] ?? "");
 }
 
@@ -248,7 +313,7 @@ export async function motisGeocodeNearestStop(
 
   for (const r of raw) {
     if (r.type !== "STOP" || !r.id || !r.name || r.lat == null || r.lon == null) continue;
-    if (isReferenceFeed(r.id)) continue;
+    if (isReferenceFeedId(r.id)) continue;
 
     // Name muss EXAKT der gewählte Ort sein (Abkürzungen aufgelöst). Bewusst
     // keine Teilstring-Toleranz: „Wien Hbf" hätte sonst auf „Wien Hauptbahnhof

@@ -114,8 +114,21 @@ function sortResults(list: SearchResult[], sort: SortKey): SearchResult[] {
   }
 }
 
-function shortCity(label: string): string {
-  return label.split(",")[0]?.trim() ?? label;
+/**
+ * Vorher: `label.split(",")[0]` — alles nach dem ersten Komma weg.
+ *
+ * Das zerstört genau die Information, um die es geht. Deutsche ÖPNV-Halte heißen
+ * „Stadt, Halt": Aus „Werl, Krankenhaus" → „Werl, Rathaus" wurde in der Kopfzeile
+ * „Werl → Werl". Die Suche lief korrekt (13 Treffer, 9 Min), aber der User sah
+ * eine Suche von einem Ort zu sich selbst und musste annehmen, wir hätten seine
+ * Auswahl verworfen.
+ *
+ * Ein Land steht in unseren Labels nie hinter dem Komma (`country` ist eine
+ * eigene Spalte) — es gab also nichts abzuschneiden. Der Header klemmt lange
+ * Namen bereits selbst (numberOfLines=2 + adjustsFontSizeToFit).
+ */
+function stationLabel(label: string): string {
+  return label.trim();
 }
 
 /**
@@ -596,13 +609,13 @@ export default function ResultsScreen() {
         <View style={styles.routeRow}>
           <RouteSide
             code={mode === "FLIGHT" ? displayCode(origin) : ""}
-            city={shortCity(originLabel)}
+            city={stationLabel(originLabel)}
             align="flex-start"
           />
           <RouteIndicator mode={mode} loading={isLoading} />
           <RouteSide
             code={mode === "FLIGHT" ? displayCode(destination) : ""}
-            city={shortCity(destLabel)}
+            city={stationLabel(destLabel)}
             align="flex-end"
           />
         </View>

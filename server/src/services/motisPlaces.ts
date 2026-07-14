@@ -3,6 +3,7 @@ import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import { BoundedTtlCache } from "../util/boundedCache.js";
 import {
+  isReferenceFeedId,
   motisFetch,
   motisGeocode,
   motisGeocodeAnyStop,
@@ -35,6 +36,20 @@ import {
 
 // code → MOTIS-Place. Mapping ist stabil → 24 h.
 const placeCache = new BoundedTtlCache<MotisPlace | null>(2000, 24 * 60 * 60 * 1000);
+
+/**
+ * ISO-Land aus dem Binch-Code.
+ *
+ * Unsere kuratierten Städte-Einträge tragen es im Code: `FR-PAR`, `DE-MUC`,
+ * `IT-ROM` — geprüft, das gilt für ALLE (0 Ausnahmen). Genau diese Einträge haben
+ * KEINE Koordinaten, können also nicht über die Distanz disambiguiert werden. Das
+ * Land ist dort die einzige Handhabe — und ohne sie löste „Paris" auf einen
+ * gleichnamigen Halt in RIO DE JANEIRO auf (München → Paris: 0 Ergebnisse).
+ */
+function isoFromCode(code: string): string | undefined {
+  const m = /^([A-Z]{2})-/.exec(code);
+  return m ? m[1] : undefined;
+}
 
 /** `lat,lng`-Platzhalter statt echter Stop-ID? */
 function isCoordId(id: string): boolean {
@@ -161,6 +176,7 @@ export async function resolveMotisPlace(
   // Unser DB-Name gewinnt vor dem mitgeschickten Label: der Client kann ein
   // veraltetes Label zu einem Code halten (Recents/Vorschläge).
   const name = dbLabel ?? label;
+  const iso = isoFromCode(code);
   let place: MotisPlace | null = null;
 
   // 1) Geocoder — funktioniert für Stops, die er kanonisch kennt (z.B. Schweiz).
@@ -187,7 +203,7 @@ export async function resolveMotisPlace(
   // und „IC 63 ab München Hbf, Gleis 11" statt „RJX 63, Gleis —".
   let seed: MotisPlace | null = null;
   if (!place && name) {
-    seed = await motisGeocode(name, signal);
+    seed = await motisGeocode(name, signal, iso);
     if (seed && seed.type === "STOP") {
       const railId = await discoverRailStopId(seed.id, signal);
       if (railId) {
@@ -217,8 +233,15 @@ export async function resolveMotisPlace(
   //    sich den bedienten Halt selbst. Sonst wurde aus „Rom" die U-Bahn-Station
   //    „Re di Roma".
   if (!place && seed) {
+    // HIER gehören Referenz-Knoten abgefangen — als Routing-ZIEL bauen sie
+    // Phantom-Fußwege zwischen zwei gleichnamigen Knoten ein („München
+    // Hauptbahnhof → 8 min zu Fuß → München Hbf"). Beim GEOCODING dürfen sie
+    // dagegen nicht fehlen, weil die Entdeckung oben sie als Startpunkt braucht.
+    // Erreicht die Entdeckung sie nicht (kein Schienen-Knoten gefunden), routen
+    // wir über ihre Koordinate — MOTIS snappt selbst auf den bedienten Halt.
+    const unusable = isReferenceFeedId(seed.id) || seed.type !== "STOP";
     place =
-      seed.type === "STOP" || seed.lat == null || seed.lon == null
+      !unusable || seed.lat == null || seed.lon == null
         ? seed
         : { id: `${seed.lat},${seed.lon}`, name: seed.name, lat: seed.lat, lon: seed.lon, tz: seed.tz };
   }
