@@ -1,6 +1,6 @@
-import { and, desc, eq, gte, isNull } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull } from "drizzle-orm";
 import { db } from "../db/client.js";
-import { providerResponses, searchRequests, searchResults } from "../db/schema.js";
+import { locations, providerResponses, searchRequests, searchResults } from "../db/schema.js";
 import type { TravelMode } from "../db/schema.js";
 import { activeProvidersForMode, activeFallbackProvidersForMode } from "../providers/registry.js";
 import { enrichTrainResults } from "./trainPricing.js";
@@ -359,10 +359,35 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
   };
 
   await runProviders(activeProvidersForMode(input.mode));
-  // Fallback (FLIGHT: google-flights2) nur wenn die Primaries 0 Treffer lieferten
-  // — z.B. SearchAPI-Ausfall oder Round-Trip (SearchAPI = one-way-only). So
-  // verbrennt der Doppel-Call im Normalfall keine Quota.
-  if (candidates.length === 0) {
+
+  // Fallback — zwei Auslöser.
+  //
+  // 1. Die Primaries lieferten NICHTS. Bei Flügen heißt das SearchAPI-Ausfall
+  //    oder Round-Trip (SearchAPI ist one-way-only), bei Zug/Bus: DB kennt die
+  //    Strecke nicht oder blockt uns gerade. So verbrennt der Doppel-Call im
+  //    Normalfall keine Quota.
+  //
+  // 2. NUR Zug/Bus: Die Strecke verlässt Deutschland.
+  //
+  //    DBs Routing wird jenseits der Grenze dünn — und zwar nicht nur in der
+  //    Beschriftung. Gemessen an London Waterloo → St Pancras:
+  //        db-vendo:  Waterloo-EAST → London Bridge → St Pancras   23 Min, 1 Umstieg
+  //        MOTIS:     Waterloo → Euston (Northern Line)            10 Min, direkt
+  //    DB kennt die Londoner U-Bahn nicht, schiebt einen ANDEREN Bahnhof unter
+  //    (Waterloo East) und routet über den Fernbahn-Umweg. Die Verbindung fährt
+  //    wirklich, ist aber die schlechtere Hälfte des Netzes.
+  //
+  //    In Amsterdam ist es harmlos (Route identisch, nur „IC 2718" statt
+  //    „Intercity") — aber unterscheiden können wir das vorher nicht. Also holen
+  //    wir bei Auslandsberührung die Zweitmeinung ein und lassen den Dedupe
+  //    entscheiden.
+  //
+  //    Innerdeutsch — der weit überwiegende Fall — bleibt es bei db-vendo allein:
+  //    dort ist DB die bessere Quelle (Preise, echte Gleise, echte Zugnamen) und
+  //    die Suche bleibt schnell.
+  const crossesBorder =
+    (input.mode === "TRAIN" || input.mode === "BUS") && !(await isDomesticGerman(input));
+  if (candidates.length === 0 || crossesBorder) {
     await runProviders(activeFallbackProvidersForMode(input.mode));
   }
 
@@ -860,6 +885,26 @@ function dedupe(candidates: Candidate[], mode: TravelMode): Candidate[] {
     }
   }
   return Array.from(map.values());
+}
+
+/**
+ * Liegen BEIDE Endpunkte in Deutschland?
+ *
+ * Entscheidet, ob MOTIS als Zweitmeinung mitläuft (siehe Aufrufstelle). Bei
+ * unbekanntem Land lieber `false` — dann holen wir die Zweitmeinung, statt uns
+ * auf DB zu verlassen, wo wir es nicht wissen.
+ */
+async function isDomesticGerman(input: SearchInput): Promise<boolean> {
+  try {
+    const rows = await db
+      .select({ code: locations.code, country: locations.country })
+      .from(locations)
+      .where(inArray(locations.code, [input.origin, input.destination]));
+    if (rows.length < 2) return false;
+    return rows.every((r) => r.country === "Germany");
+  } catch {
+    return false;
+  }
 }
 
 function fingerprint(r: NormalizedResult, mode: TravelMode): string {
