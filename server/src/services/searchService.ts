@@ -7,6 +7,7 @@ import { enrichTrainResults } from "./trainPricing.js";
 import type {
   LegInfo,
   NormalizedResult,
+  ProviderResult,
   ProviderSearchInput,
   SearchProvider,
 } from "../providers/types.js";
@@ -324,7 +325,7 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
       list.map(async (p) => {
         const start = Date.now();
         try {
-          const out = await p.search(input);
+          const out = await withProviderTimeout(p, input);
           if (out.paginationToken && !paginationToken) {
             paginationToken = out.paginationToken;
           }
@@ -769,6 +770,53 @@ function sortResults<
  */
 const SOURCE_TRUST: Record<string, number> = { "db-vendo": 2, trainline: 1 };
 const sourceTrust = (provider: string): number => SOURCE_TRUST[provider] ?? 0;
+
+/**
+ * Kein Provider darf die ganze Suche mitreißen.
+ *
+ * Bisher lief `p.search(input)` OHNE Timeout und ohne AbortSignal. Für eine
+ * Fernbus-Suche Frankfurt → Rom brauchte motis-bus (öffentliches Transitous)
+ * 41 SEKUNDEN, während FlixBus nach 3,5 s fertig war. Der Client bricht nach
+ * 20 s ab — der User sah also „Server nicht erreichbar", obwohl 31 Ergebnisse
+ * vorlagen und ein Anbieter längst geliefert hatte.
+ *
+ * Jetzt bekommt jeder Provider ein eigenes Zeitfenster. Läuft es ab, brechen wir
+ * SEINE Anfrage ab (das Signal geht bis in den fetch durch) und arbeiten mit dem
+ * weiter, was die anderen geliefert haben. Ein langsamer Anbieter kostet dann
+ * Vollständigkeit, nicht die ganze Suche.
+ *
+ * 15 s ist bewusst großzügig: Eine kalte Zug-Suche über die öffentliche
+ * MOTIS-Instanz braucht regulär 9-13 s. Wir wollen den Ausreißer kappen, nicht
+ * den Normalfall.
+ */
+const PROVIDER_TIMEOUT_MS = 15_000;
+
+async function withProviderTimeout(
+  p: SearchProvider,
+  input: ProviderSearchInput,
+): Promise<ProviderResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROVIDER_TIMEOUT_MS);
+  try {
+    return await Promise.race([
+      p.search(input, controller.signal),
+      new Promise<ProviderResult>((resolve) =>
+        setTimeout(
+          () =>
+            resolve({
+              results: [],
+              raw: { error: "provider_timeout", timeoutMs: PROVIDER_TIMEOUT_MS },
+              statusCode: 0,
+              durationMs: PROVIDER_TIMEOUT_MS,
+            }),
+          PROVIDER_TIMEOUT_MS,
+        ),
+      ),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function dedupe(candidates: Candidate[], mode: TravelMode): Candidate[] {
   const map = new Map<string, Candidate>();

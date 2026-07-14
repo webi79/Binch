@@ -12,6 +12,7 @@ import { GlobetrotterScene } from "./GlobetrotterScene";
 import { DealHunterScene } from "./DealHunterScene";
 import { GreetingScene } from "./GreetingScene";
 import { WeatherScene } from "./WeatherScene";
+import { useT } from "@/lib/i18n/useT";
 import { LoaderPausedContext, SpruecheLine } from "./SearchSceneChrome";
 
 interface Props {
@@ -42,27 +43,16 @@ const CYCLE_MS_BY_VARIANT: Record<Variant, number> = {
   weather: 5000, // useArcMotion(5000)
 };
 
-const SPRUECHE_BY_VARIANT: Record<Variant, string[]> = {
-  globe: [
-    "Düse einmal um die halbe Welt…",
-    "Vergleiche schneller als du 'Urlaub' sagst…",
-    "Sammle die besten Verbindungen ein…",
-  ],
-  deal: [
-    "Fange die fettesten Schnäppchen…",
-    "Pflücke Rabatte aus der Luft…",
-    "Feilsche um jeden Cent für dich…",
-  ],
-  greet: [
-    "Ich pack das für dich…",
-    "Beste Route kommt gleich…",
-    "Einen Moment, ich suche…",
-  ],
-  weather: [
-    "Schau, wie warm es ist…",
-    "Sonne tanken…",
-    "Beste Verbindung ins Warme…",
-  ],
+/**
+ * Die Sprüche standen hier als deutsche String-Literale — die App zeigte sie
+ * also auch bei französischer Oberfläche auf Deutsch. Jetzt sind es
+ * Dictionary-Keys; den Text holt useT() zur Sprache des Users.
+ */
+const SPRUCH_KEYS_BY_VARIANT: Record<Variant, string[]> = {
+  globe: ["loader.globe.1", "loader.globe.2", "loader.globe.3"],
+  deal: ["loader.deal.1", "loader.deal.2", "loader.deal.3"],
+  greet: ["loader.greet.1", "loader.greet.2", "loader.greet.3"],
+  weather: ["loader.weather.1", "loader.weather.2", "loader.weather.3"],
 };
 
 function pickVariant(): Variant {
@@ -72,8 +62,12 @@ function pickVariant(): Variant {
 
 export function RandomSearchLoader({ originLabel, destLabel, onCyclePulse, paused = false }: Props) {
   // Nur EINMAL beim Mount würfeln — sonst flackerts beim Re-Render.
+  const t = useT();
   const variant = useMemo(() => pickVariant(), []);
-  const sprueche = useMemo(() => SPRUECHE_BY_VARIANT[variant], [variant]);
+  const sprueche = useMemo(
+    () => SPRUCH_KEYS_BY_VARIANT[variant].map((k) => t(k)),
+    [variant, t],
+  );
 
   // Pulse-Interval: jeder vollendete Cycle ruft den Callback. Caller
   // entscheidet ob er beim nächsten Pulse auf die Tickets umschalten will

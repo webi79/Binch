@@ -5,6 +5,7 @@ import { View, Text, StyleSheet } from "react-native";
 import Svg, { Path } from "react-native-svg";
 import Animated from "react-native-reanimated";
 import { Bo } from "@/components/assistant/Bo";
+import { useT } from "@/lib/i18n/useT";
 import { useAccent } from "@/lib/theme/accent";
 import {
   Sun,
@@ -23,6 +24,7 @@ interface Props {
 
 export function WeatherScene({ destLabel }: Props) {
   const accent = useAccent();
+  const t = useT();
   const p = useArcMotion(5000);
   // Anker = Bos Körpermitte (size 86): ~ (43, 70)
   const flyerStyle = useArcStyle(p, 43, 70);
@@ -63,7 +65,7 @@ export function WeatherScene({ destLabel }: Props) {
       <View style={{ position: "absolute", left: 256, top: 156 }}>
         <MapPin size={26} color={accent.solid} />
       </View>
-      <Text style={[styles.code, { left: 8, top: 186, color: "#8A8A90" }]}>VON</Text>
+      <Text style={[styles.code, { left: 8, top: 186, color: "#8A8A90" }]}>{t("loader.from")}</Text>
       <Text style={[styles.code, { left: 250, top: 186, color: accent.solid }]}>
         NACH
       </Text>

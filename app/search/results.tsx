@@ -693,7 +693,11 @@ export default function ResultsScreen() {
           </View>
           <Text style={styles.errorTitle}>{t("results.error")}</Text>
           <Text style={styles.errorBody}>{t("results.error.body")}</Text>
-          {error instanceof Error ? (
+          {/* Die rohe Fehlermeldung ist Entwickler-Text: unübersetzt (kommt aus
+              lib/api/client.ts), enthält die interne Server-URL und braucht drei
+              Zeilen, die das Layout auseinanderziehen. Dem User sagen Titel und
+              Text oben bereits alles. Im Dev-Build bleibt sie zum Debuggen. */}
+          {__DEV__ && error instanceof Error ? (
             <Text style={styles.errorDetail} numberOfLines={3}>
               {error.message}
             </Text>
@@ -717,6 +721,7 @@ export default function ResultsScreen() {
         <SlidingPanels activeIndex={direction === "OUTBOUND" ? 0 : 1}>
           <ResultsListView
             data={outboundSorted.slice(0, visibleCount)}
+            totalCount={outboundSorted.length}
             direction="OUTBOUND"
             fetchedAt={data?.fetchedAt ?? ""}
             passengers={passengers}
@@ -733,6 +738,7 @@ export default function ResultsScreen() {
           />
           <ResultsListView
             data={returnSorted.slice(0, visibleCount)}
+            totalCount={returnSorted.length}
             direction="RETURN"
             fetchedAt={data?.fetchedAt ?? ""}
             passengers={passengers}
@@ -751,6 +757,7 @@ export default function ResultsScreen() {
       ) : (
         <ResultsListView
           data={outboundSorted.slice(0, visibleCount)}
+          totalCount={outboundSorted.length}
           direction="OUTBOUND"
           fetchedAt={data?.fetchedAt ?? ""}
           passengers={passengers}
@@ -887,6 +894,10 @@ interface ResultsListViewProps {
   refreshFresh: () => void;
   isLoadingMore: boolean;
   loadMore: () => Promise<void> | void;
+  /** Wie viele Treffer INSGESAMT vorliegen (`data` ist auf visibleCount beschnitten).
+   *  Liegt mehr vor als sichtbar ist, gibt es etwas aufzudecken — auch in Modi
+   *  ohne Server-Pagination. */
+  totalCount: number;
   accentSolid: string;
   tEmpty: string;
   tRetry: string;
@@ -911,6 +922,7 @@ function ResultsListView({
   refreshFresh,
   isLoadingMore,
   loadMore,
+  totalCount,
   accentSolid,
   tEmpty,
   tRetry,
@@ -918,6 +930,11 @@ function ResultsListView({
   tMore,
   tLoading,
 }: ResultsListViewProps) {
+  // Mehr Treffer geladen als sichtbar? Dann kann der Footer sie lokal aufdecken.
+  const hasHidden = totalCount > data.length;
+  const showFooter =
+    data.length > 0 && (hasHidden || mode === "TRAIN" || mode === "FLIGHT");
+
   // Entrance-Animation NUR für den initial sichtbaren Batch. Items die später
   // beim Scrollen in den virtualisierten Viewport mounten, sollen NICHT erneut
   // einfaden — das per-Item-FadeInDown bei jedem Scroll-Mount war eine Haupt-
@@ -989,7 +1006,17 @@ function ResultsListView({
         </View>
       }
       ListFooterComponent={
-        (mode === "TRAIN" || mode === "FLIGHT") && data.length > 0 ? (
+        // Zwei Gründe für den Footer, vorher nur einer:
+        //
+        // 1. Es liegen mehr Treffer vor als sichtbar sind (die Liste wird auf
+        //    PAGE_SIZE=20 beschnitten). Der Button deckt sie lokal auf, ohne Netz.
+        //    Das galt bisher NUR für TRAIN/FLIGHT — bei einer Bus-Suche mit 23
+        //    Treffern waren die letzten drei schlicht unerreichbar, weil der
+        //    Footer nie gerendert wurde. (Das Aufdecken selbst konnte
+        //    handleShowMore längst — es fehlte nur der Knopf dafür.)
+        // 2. Der Modus kann serverseitig nachladen (Zug: HAFAS-„später",
+        //    Flug: frische Suche).
+        showFooter ? (
           <View style={styles.laterWrap}>
             <RippleTouch
               onPress={loadMore}
@@ -998,7 +1025,7 @@ function ResultsListView({
             >
               <GradientFill />
               <Text style={styles.laterBtnText}>
-                {isLoadingMore ? tLoading : mode === "FLIGHT" ? tMore : tLater}
+                {isLoadingMore ? tLoading : hasHidden || mode === "FLIGHT" ? tMore : tLater}
               </Text>
             </RippleTouch>
           </View>
