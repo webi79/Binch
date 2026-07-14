@@ -1,4 +1,5 @@
-import { motisFetch, motisGeocode } from "./motisClient.js";
+import { motisFetch } from "./motisClient.js";
+import { resolveMotisStopId } from "./motisPlaces.js";
 import type { StopBoard, StopBoardItem, StopBoardResponse } from "./stopInfoService.js";
 
 /**
@@ -131,16 +132,25 @@ function dedupeBoard(items: StopBoardItem[]): StopBoardItem[] {
 }
 
 /**
- * @param label  Anzeigename des Stops (für den MOTIS-Geocode).
+ * @param code   Binch-Location-Code — nötig für die geteilte Auflösung, die über
+ *               unsere gespeicherte Koordinate disambiguiert.
+ * @param label  Anzeigename des Stops (Fallback fürs Geocoding).
  * @returns StopBoardResponse oder null, wenn der Stop bei MOTIS nicht auflösbar
  *          ist (dann soll der Aufrufer sein eigenes Empty-Result liefern).
  */
 export async function getMotisStopBoard(
+  code: string,
   label: string,
   board: StopBoard,
   limit = 25,
 ): Promise<StopBoardResponse | null> {
-  const stop = await motisGeocode(label);
+  // Vorher stand hier `motisGeocode(label)` — das nimmt schlicht den ERSTEN
+  // STOP-Treffer. Für „Köln Hbf" ist das ein Bahnsteig-Knoten aus dem
+  // Referenzdaten-Feed, an dem Stadtbahn-Halte mit hängen: die Tafel zeigte
+  // dann „Gleis 86" (eine Stadtbahn-Gleisnummer) und bei den echten Zügen gar
+  // keins. Die geteilte Auflösung verwirft Referenz-Feeds und disambiguiert
+  // über unsere gespeicherte Koordinate — dieselbe, die auch die Suche nutzt.
+  const stop = await resolveMotisStopId(code, label);
   if (!stop) return null;
 
   // Doppelt so viele roh holen — der Feed-Dedup halbiert die Liste grob.

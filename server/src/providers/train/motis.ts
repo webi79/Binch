@@ -3,12 +3,10 @@ import { config } from "../../config.js";
 import { db } from "../../db/client.js";
 import { locations, type TravelMode } from "../../db/schema.js";
 import { BoundedTtlCache } from "../../util/boundedCache.js";
-import {
-  motisFetch,
-  motisGeocode,
-  motisGeocodeNearestStop,
-  type MotisPlace,
-} from "../../services/motisClient.js";
+import { motisFetch, type MotisPlace } from "../../services/motisClient.js";
+// Geteilte Auflösung — dieselbe wie die Abfahrtstafeln benutzen. Vorher hatte
+// jeder Verbraucher seine eigene, und ein Fix erreichte nur die halbe App.
+import { resolveMotisPlace } from "../../services/motisPlaces.js";
 import { buildBahnDeeplink } from "../../util/bahnDeeplink.js";
 import type {
   LegInfo,
@@ -36,8 +34,6 @@ import type {
  * Plan-Cache (5 min) senken die Anzahl teurer Routing-Calls.
  */
 
-// code → MOTIS-Place (bevorzugt aus unseren gespeicherten Koordinaten). Stabil → 24h.
-const coordCache = new BoundedTtlCache<MotisPlace | null>(2000, 24 * 60 * 60 * 1000);
 // Plan-Response pro (from|to|10-Min-Bucket) → 5 min (schont Transitous, Routing
 // ist deren teuerster Endpoint; Ergebnisse sind für ein paar Minuten stabil).
 interface CachedPlan {
@@ -126,63 +122,6 @@ function dropReferenceDuplicates(itineraries: MotisItinerary[]): MotisItinerary[
     const k = tripKey(it);
     return !k || !operational.has(k);
   });
-}
-
-/**
- * Binch-`code` → MOTIS-Place. Bevorzugt die **exakte MOTIS-Stop-ID** (via
- * Label-Geocode, disambiguiert über die gespeicherte Koordinate), damit die
- * Route genau am gewählten Halt endet. Routet man nur an eine Koordinate,
- * snappt MOTIS auf den nächstgelegenen Halt — bei eng benachbarten Stops
- * (Zürich Brunau vs. Saalsporthalle) landet die Fahrt am falschen Ort.
- *
- * Fallback-Kette: exakte Stop-ID (Geocode + Koordinaten-Nähe) → gespeicherte
- * Koordinate als `lat,lng` → reines Label-Geocode. So gibt es nie 0 Ergebnisse
- * nur weil der Geocode danebengreift. (Die HAFAS-ID taugt nicht als MOTIS-ID —
- * anderer Namespace.)
- */
-async function resolvePlace(
-  code: string,
-  label: string | undefined,
-  signal?: AbortSignal,
-): Promise<MotisPlace | null> {
-  const cached = coordCache.get(code);
-  if (cached !== undefined) return cached;
-
-  let lat = NaN;
-  let lng = NaN;
-  let dbLabel: string | undefined;
-  try {
-    const hit = await db
-      .select({ lat: locations.latitude, lng: locations.longitude, label: locations.label })
-      .from(locations)
-      .where(eq(locations.code, code))
-      .limit(1);
-    lat = hit[0]?.lat != null ? Number(hit[0].lat) : NaN;
-    lng = hit[0]?.lng != null ? Number(hit[0].lng) : NaN;
-    dbLabel = hit[0]?.label ?? undefined;
-  } catch {
-    // DB-Fehler → unten auf Geocode/Koordinate fallen.
-  }
-
-  const name = dbLabel ?? label;
-  let place: MotisPlace | null = null;
-
-  // 1) Exakte Stop-ID: Label geocoden, den STOP nächst unserer Koordinate nehmen.
-  if (name && Number.isFinite(lat) && Number.isFinite(lng)) {
-    place = await motisGeocodeNearestStop(name, lat, lng, 400, signal);
-  }
-  // 2) Sonst Koordinate direkt (MOTIS akzeptiert `lat,lng` als fromPlace/toPlace).
-  //    lat/lon mitgeben — Aufrufer (Deeplink) brauchen sie als Fallback.
-  if (!place && Number.isFinite(lat) && Number.isFinite(lng)) {
-    place = { id: `${lat},${lng}`, name: name ?? code, lat, lon: lng };
-  }
-  // 3) Gar keine Koordinate → reines Label-Geocode.
-  if (!place && name) {
-    place = await motisGeocode(name, signal);
-  }
-
-  coordCache.set(code, place);
-  return place;
 }
 
 function toStopovers(stops: MotisLegStop[] | undefined): StopoverInfo[] | undefined {
@@ -629,8 +568,8 @@ function makeMotisProvider(mode: TravelMode, transitModes: string, name: string)
       let to: MotisPlace | null;
       try {
         [from, to] = await Promise.all([
-          resolvePlace(input.origin, input.originLabel, signal),
-          resolvePlace(input.destination, input.destLabel, signal),
+          resolveMotisPlace(input.origin, input.originLabel, signal),
+          resolveMotisPlace(input.destination, input.destLabel, signal),
         ]);
       } catch (e) {
         return empty(start, { error: "motis_resolve_failed", message: e instanceof Error ? e.message : String(e) });

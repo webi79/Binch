@@ -120,7 +120,7 @@ async function motisFallback(
   board: StopBoard,
 ): Promise<StopBoardApiResponse> {
   try {
-    const motis = await getMotisStopBoard(label, board);
+    const motis = await getMotisStopBoard(code, label, board);
     if (motis && motis.results.length > 0) {
       return { ...motis, stop: { code, label, hafasId } };
     }
