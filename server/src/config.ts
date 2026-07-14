@@ -69,8 +69,16 @@ const schema = z.object({
   AMADEUS_CLIENT_SECRET: z.string().optional(),
   TRAINLINE_API_KEY: z.string().optional(),
   DB_VENDO_API_KEY: z.string().optional(),
-  FLIXBUS_API_KEY: z.string().optional(),
-  FLIXBUS_RAPIDAPI_HOST: z.string().default("flixbus2.p.rapidapi.com"),
+  // FlixBus läuft über deren EIGENE öffentliche API (global.api.flixbus.com) —
+  // ohne Key, ohne Kontingent. Der frühere RapidAPI-Wrapper (flixbus2) ist raus:
+  // Er schnitt die Zeitzonen-Offsets ab, wodurch wir jede Abfahrt 2h zu spät
+  // anzeigten. Darum gibt es hier KEINEN FLIXBUS_API_KEY und KEINEN
+  // FLIXBUS_RAPIDAPI_HOST mehr.
+  //
+  // Achtung, nicht verwechseln: RAPIDAPI_KEY wird weiter gebraucht — für
+  // google-flights2 (Flugsuche) und AeroDataBox (Flug-Tafeln).
+  //
+  // Nur fürs Partner-Tracking im Buchungslink, optional:
   FLIXBUS_AFFILIATE_ID: z.string().optional(),
   BUSBUD_API_KEY: z.string().optional(),
   CRUISEDIRECT_API_KEY: z.string().optional(),
