@@ -269,8 +269,10 @@ export default function ResultsScreen() {
   // gekeyed → der Params-Wechsel löst automatisch eine neue Suche mit
   // vertauschter Strecke aus, kein manuelles refetch nötig.
   const handleSwap = useCallback(() => {
+    // Haptik + Rotation + Spam-Lock macht die RouteHeader (doSwap) selbst; hier
+    // nur noch der eigentliche Routentausch. Läuft eine rAF später (siehe
+    // doSwap), damit die Rotation vor dem Query-Remount startet.
     if (!origin || !destination) return;
-    haptic("button");
     router.setParams({
       origin: destination,
       destination: origin,
@@ -611,6 +613,7 @@ export default function ResultsScreen() {
           // stehen statt der Lade-Welle. So läuft die Welle im Header genau,
           // während unten der Such-Loader läuft.
           loading={!showResults}
+          busy={!showResults}
           resultCount={sorted.length}
           accentSolid={accent.solid}
           accentSubtle={accent.subtle}
@@ -798,6 +801,7 @@ function RouteHeader({
   fromLabel,
   toLabel,
   loading,
+  busy,
   resultCount,
   accentSolid,
   accentSubtle,
@@ -807,6 +811,8 @@ function RouteHeader({
   fromLabel: string;
   toLabel: string;
   loading: boolean;
+  /** Suche läuft → Swap gesperrt (Abuse-Schutz) und Button gedimmt. */
+  busy: boolean;
   resultCount: number;
   accentSolid: string;
   accentSubtle: string;
@@ -817,30 +823,43 @@ function RouteHeader({
   const [fieldsHeight, setFieldsHeight] = useState(0);
   // Dreht bei jedem Tausch um 180°. Reanimated, nicht RN-Animated (siehe oben).
   //
-  // Timing 1:1 vom Search-Hero (SearchHero.tsx handleSwap) übernommen — dort
-  // wirkt der Swap smooth: 320 ms easeOutCubic statt der vorherigen 420 ms mit
-  // eigener Bezier, die zäher lief.
+  // Timing 1:1 vom Search-Hero (SearchHero.tsx handleSwap): 320 ms easeOutCubic.
   //
-  // Und das Target läuft über einen Ref, NICHT über spin.value + 180: Bei einem
-  // Doppelklick während die Drehung noch läuft hat spin.value einen
-  // interpolierten Zwischenwert (z.B. 90°), und +180 ergäbe 270 statt der
-  // erwarteten 360 — die zweite Drehung ruckelte. Mit dem Ref inkrementieren wir
-  // immer sauber um 180, egal wo die Animation gerade steht.
+  // Target über einen Ref, NICHT spin.value + 180: Bei Doppelklick während der
+  // Drehung hätte spin.value einen interpolierten Zwischenwert (z.B. 90°), und
+  // +180 ergäbe 270 statt 360 — die zweite Drehung ruckelte. Der Ref
+  // inkrementiert immer sauber um 180.
   const spin = useSharedValue(0);
   const spinTarget = useRef(0);
+  const swapIconStyle = useAnimatedStyle(() => ({
+    transform: [{ rotate: `${spin.value}deg` }],
+  }));
+
+  // Spam-/Abuse-Schutz: Jeder Swap löst eine echte Suche aus (Netzwerk, DB-
+  // Kontingent). Ein synchrones Lock verhindert, dass man den Button schneller
+  // drückt, als die Suche fertig wird — inkl. Doppel-Tap im SELBEN Frame, den
+  // ein State-/Prop-Guard nicht abfängt (der aktualisiert sich erst nach dem
+  // Render). Freigegeben wird erst, wenn die laufende Suche durch ist (busy →
+  // false), also frühestens nach einem vollen Loader-Zyklus.
+  const swapLock = useRef(false);
+  useEffect(() => {
+    if (!busy) swapLock.current = false;
+  }, [busy]);
 
   const doSwap = () => {
+    if (swapLock.current || busy) return;
+    swapLock.current = true;
+    haptic("button");
     spinTarget.current += 180;
     spin.value = withTiming(spinTarget.current, {
       duration: 320,
       easing: Easing.out(Easing.cubic),
     });
-    onSwap();
+    // Den schweren Teil (Params-Wechsel → Query-Refetch → Loader-Remount) einen
+    // Frame später, damit die Rotation zuerst sauber auf den UI-Thread kommt und
+    // nicht mit dem Remount um denselben JS-Frame konkurriert.
+    requestAnimationFrame(() => onSwap());
   };
-
-  const swapStyle = useAnimatedStyle(() => ({
-    transform: [{ rotate: `${spin.value}deg` }],
-  }));
 
   const railHeight = Math.max(0, fieldsHeight - RH_RAIL_INSET_Y * 2);
 
@@ -894,8 +913,11 @@ function RouteHeader({
         </View>
 
         {/* Swap-Button — überlappt beide Felder rechts, Rand in Kartenfarbe für
-            die „ausgestanzt"-Optik. */}
-        <Animated.View style={[styles.rhSwapWrap, swapStyle]}>
+            die „ausgestanzt"-Optik. Es rotiert NUR das Icon, nicht der ganze
+            Button: Den umrandeten, overflow:hidden-geclippten Button pro Frame zu
+            drehen zwang Android zum Neurastern (wie beim Schatten) und ruckelte —
+            der Hero dreht ebenfalls nur das Icon. */}
+        <View style={[styles.rhSwapWrap, busy && styles.rhSwapWrapBusy]}>
           <RippleTouch
             borderless
             onPress={doSwap}
@@ -903,9 +925,11 @@ function RouteHeader({
             accessibilityLabel={t("results.change")}
           >
             <GradientFill />
-            <ArrowUpDown color={C.black} size={20} strokeWidth={2.6} />
+            <Animated.View style={swapIconStyle}>
+              <ArrowUpDown color={C.black} size={20} strokeWidth={2.6} />
+            </Animated.View>
           </RippleTouch>
-        </Animated.View>
+        </View>
       </View>
 
       {/* Meta-Zeile: Ergebniszahl links in einer Box, „Ändern" rechts — beide
@@ -1182,6 +1206,9 @@ const styles = StyleSheet.create({
     marginTop: -27,
     zIndex: 3,
   },
+  // Während eine Suche läuft: Swap gesperrt → sichtbar gedimmt, damit der
+  // no-op-Tap nicht wie ein toter Button wirkt.
+  rhSwapWrapBusy: { opacity: 0.5 },
   rhSwapBtn: {
     width: 54,
     height: 54,
