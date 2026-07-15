@@ -31,6 +31,12 @@ const C = {
   white: "#FFFFFF",
   gray300: "#8A8A90",
   gray400: "#56565C",
+  // Farbe der ausgestanzten Perforationskerben. NICHT der reine Hintergrund:
+  // Die Karte schwebt jetzt (Schatten), und in ein Loch einer schwebenden Karte
+  // fällt Schatten — die Kerbe muss also dunkler sein als der freie Hintergrund,
+  // sonst wirkt sie als flacher heller Kreis, der den Schatten am Rand
+  // unterbricht. #1A1A1A mit ~35 % Schatten überlagert ≈ #111111.
+  notchShadow: "#111111",
 };
 
 const DATE_LOCALES = { en: enGB, de, fr, es } as const;
@@ -137,7 +143,7 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
             Notch-Kreise von card.overflow:hidden sauber an den Card-Rändern
             geclippt werden (halbe Kreise die wie ausgestanzt aussehen). Mit
             einem Padding-Wrapper wäre der Clip-Anker falsch positioniert. */}
-        <Perforation notchColor={C.bg} />
+        <Perforation notchColor={C.notchShadow} />
 
         <View style={styles.countdown}>
           <View style={styles.countdownTop}>
