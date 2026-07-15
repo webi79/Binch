@@ -35,8 +35,13 @@ const C = {
   // Die Karte schwebt jetzt (Schatten), und in ein Loch einer schwebenden Karte
   // fällt Schatten — die Kerbe muss also dunkler sein als der freie Hintergrund,
   // sonst wirkt sie als flacher heller Kreis, der den Schatten am Rand
-  // unterbricht. #1A1A1A mit ~35 % Schatten überlagert ≈ #111111.
-  notchShadow: "#111111",
+  // unterbricht.
+  //
+  // #111111 (≈35 % Schatten) war zu schwarz: Der dunkelste Schatten-Layer ist
+  // zwar rgba(0,0,0,0.42) — voll deckend ergäbe das #0F0F0F —, aber so dunkel
+  // wird er NIE sichtbar, weil der Blur ihn verteilt. Die dunkelste tatsächlich
+  // sichtbare Stelle liegt bei ~15 % Schatten: #1A1A1A → #161616.
+  notchShadow: "#161616",
 };
 
 const DATE_LOCALES = { en: enGB, de, fr, es } as const;
@@ -129,8 +134,16 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
           Rand ausgestanzt werden (left/right:-9), und overflow:hidden clippt
           einen Außenschatten weg. Der Wrapper hat denselben Radius, damit der
           Schatten den runden Ecken folgt — und keinerlei Rand/Padding, ändert
-          also nichts am Layout. */}
-      <View style={styles.cardShadow}>
+          also nichts am Layout.
+
+          renderToHardwareTextureAndroid: Der Blur-Schatten (3 Layer über die
+          volle Kartenbreite) wurde beim Scrollen JEDEN Frame neu gerastert —
+          genau der Lag, der mit dem Schatten auftauchte. Als Hardware-Textur wird
+          die fertige Karte samt Schatten beim Scrollen nur noch verschoben statt
+          neu gezeichnet. Anders als der Layer-Flip beim Parallax (der 66 ms kostete,
+          weil er ständig an/aus ging) ist diese Textur klein und dauerhaft an —
+          sie flippt nie. */}
+      <View style={styles.cardShadow} renderToHardwareTextureAndroid>
       <RippleTouch
         onPress={onPress}
         onLongPress={onLongPress}
