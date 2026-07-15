@@ -604,7 +604,13 @@ export default function ResultsScreen() {
         <RouteHeader
           fromLabel={stationLabel(originLabel)}
           toLabel={stationLabel(destLabel)}
-          loading={isLoading}
+          // An !showResults, NICHT isLoading: showResults wird bei JEDEM
+          // Routenwechsel (auch Swap) auf false gesetzt und der Loader läuft
+          // mindestens einen Zyklus. isLoading dagegen ist beim Swap zu einer
+          // gecachten Gegenrichtung false — dann blieb der alte Zählerstand
+          // stehen statt der Lade-Welle. So läuft die Welle im Header genau,
+          // während unten der Such-Loader läuft.
+          loading={!showResults}
           resultCount={sorted.length}
           accentSolid={accent.solid}
           accentSubtle={accent.subtle}
@@ -1101,8 +1107,11 @@ const styles = StyleSheet.create({
     borderRadius: 24,
     marginHorizontal: GUTTER,
     marginTop: 12,
+    // KEIN gap mehr: Der Abstand zur Meta-Zeile kommt allein aus deren
+    // marginTop. Vorher addierten sich gap (14) UND marginTop (12) zu 26 px
+    // oben, während unten nur die 16 px paddingBottom standen — der „Ändern"-
+    // Button klebte sichtbar näher am unteren Rand. Jetzt rundum 16.
     padding: 16,
-    gap: 14,
   },
   // ── RouteHeader (vertikales Design) ──────────────────────────────────────
   rhFieldsWrap: { position: "relative" },
@@ -1173,9 +1182,8 @@ const styles = StyleSheet.create({
   rhMetaRow: {
     flexDirection: "row",
     alignItems: "center",
-    marginTop: 12,
+    marginTop: 16,
     paddingHorizontal: 6,
-    paddingVertical: 2,
     gap: 10,
   },
   rhCountWrap: { flex: 1, flexDirection: "row", alignItems: "center", minWidth: 0 },
