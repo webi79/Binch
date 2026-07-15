@@ -216,7 +216,7 @@ export default function SavedScreen() {
             showsVerticalScrollIndicator={false}
           >
             <ScrollReveal index={1}>
-              <EmptyState tab="trips" />
+              <EmptyState tab="trips" active={tab === "trips"} />
             </ScrollReveal>
           </ScrollView>
         ) : (

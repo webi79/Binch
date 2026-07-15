@@ -18,6 +18,16 @@ import { useReduceMotion } from "@/lib/motion";
 
 interface Props {
   tab: "trips" | "tickets";
+  /**
+   * Ist dieses Empty-State-Panel gerade das SICHTBARE?
+   *
+   * Reicht nicht, nur auf `isFocused` (Saved-Tab offen) zu prüfen: Wechselt man
+   * im Saved-Tab auf die Tickets-Ansicht, bleibt das Trips-Panel gemountet
+   * (SlidingPanels hält beide) und läge nur off-screen. Die Herz-Schleife liefe
+   * dann unsichtbar im Hintergrund weiter und fräße Performance. `active` schaltet
+   * sie ab, sobald das Panel nicht das vordere ist.
+   */
+  active?: boolean;
 }
 
 const HEART_COLOR = "#FF6B7A";
@@ -117,7 +127,7 @@ function FloatingHeart({
   );
 }
 
-export function EmptyState({ tab }: Props) {
+export function EmptyState({ tab, active = true }: Props) {
   const t = useT();
   // Native-Bottom-Tabs halten alle Tab-Screens mounted. Bo hat 33+
   // Reanimated-Hooks (auch mit paused=true bleiben die als UI-Thread-
@@ -127,6 +137,8 @@ export function EmptyState({ tab }: Props) {
   // sobald der User die Saved-Tab verlässt. Die Herzen laufen aus demselben
   // Grund nur bei Fokus (siehe FloatingHeart).
   const isFocused = useIsFocused();
+  // Animieren nur, wenn der Saved-Tab offen UND dieses Panel das sichtbare ist.
+  const animate = isFocused && active;
   const titleKey =
     tab === "trips" ? "saved.empty.trips.title" : "saved.empty.tickets.title";
   const bodyKey =
@@ -142,8 +154,8 @@ export function EmptyState({ tab }: Props) {
             size={26}
             rotate={-12}
             opacity={0.85}
-            focused={isFocused}
-            duration={2600}
+            focused={animate}
+            duration={3600}
             amp={6}
             sway={6}
           />
@@ -153,9 +165,9 @@ export function EmptyState({ tab }: Props) {
             size={18}
             rotate={14}
             opacity={0.7}
-            focused={isFocused}
-            delay={520}
-            duration={3200}
+            focused={animate}
+            delay={700}
+            duration={4400}
             amp={4}
             sway={5}
           />
@@ -165,9 +177,9 @@ export function EmptyState({ tab }: Props) {
             size={20}
             rotate={-8}
             opacity={0.75}
-            focused={isFocused}
-            delay={980}
-            duration={2900}
+            focused={animate}
+            delay={1300}
+            duration={4000}
             amp={5}
             sway={5}
           />
