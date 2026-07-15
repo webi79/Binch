@@ -118,6 +118,13 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
           erhalten (TouchableNativeFeedback wrapper auf Android, plus
           overflow:hidden Clip am inner View). Visueller Ripple ist aus
           (transparent) damit's bei LongPress nicht als Welle stehen bleibt. */}
+      {/* Schatten sitzt auf einem eigenen Wrapper, NICHT auf der Karte: Die
+          Karte braucht overflow:"hidden", damit die Perforationskreise sauber am
+          Rand ausgestanzt werden (left/right:-9), und overflow:hidden clippt
+          einen Außenschatten weg. Der Wrapper hat denselben Radius, damit der
+          Schatten den runden Ecken folgt — und keinerlei Rand/Padding, ändert
+          also nichts am Layout. */}
+      <View style={styles.cardShadow}>
       <RippleTouch
         onPress={onPress}
         onLongPress={onLongPress}
@@ -152,6 +159,7 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
           <ProgressBar value={countdown.progress} />
         </View>
       </RippleTouch>
+      </View>
 
       <Text style={styles.hint}>{t("saved.ticket.openHint")}</Text>
     </View>
@@ -172,6 +180,17 @@ const styles = StyleSheet.create({
     color: C.white,
     letterSpacing: -0.5,
     marginTop: 2,
+  },
+
+  // Mehrschichtiger Schatten (aus der Vorlage 1:1 übernommen — Fabric-boxShadow
+  // nutzt dasselbe Modell wie CSS: offsetX offsetY blur spread color):
+  //   0 32px 80px -12px rgba(0,0,0,.42)  — weiter, tiefer Abwurf
+  //   0 12px 32px  -8px rgba(0,0,0,.26)  — mittlere Lage
+  //   0  3px 10px       rgba(0,0,0,.18)  — enge Kantenabhebung
+  cardShadow: {
+    borderRadius: 24,
+    boxShadow:
+      "0px 32px 80px -12px rgba(0, 0, 0, 0.42), 0px 12px 32px -8px rgba(0, 0, 0, 0.26), 0px 3px 10px rgba(0, 0, 0, 0.18)",
   },
 
   card: {
