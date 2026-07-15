@@ -816,12 +816,24 @@ function RouteHeader({
   const t = useT();
   const [fieldsHeight, setFieldsHeight] = useState(0);
   // Dreht bei jedem Tausch um 180°. Reanimated, nicht RN-Animated (siehe oben).
+  //
+  // Timing 1:1 vom Search-Hero (SearchHero.tsx handleSwap) übernommen — dort
+  // wirkt der Swap smooth: 320 ms easeOutCubic statt der vorherigen 420 ms mit
+  // eigener Bezier, die zäher lief.
+  //
+  // Und das Target läuft über einen Ref, NICHT über spin.value + 180: Bei einem
+  // Doppelklick während die Drehung noch läuft hat spin.value einen
+  // interpolierten Zwischenwert (z.B. 90°), und +180 ergäbe 270 statt der
+  // erwarteten 360 — die zweite Drehung ruckelte. Mit dem Ref inkrementieren wir
+  // immer sauber um 180, egal wo die Animation gerade steht.
   const spin = useSharedValue(0);
+  const spinTarget = useRef(0);
 
   const doSwap = () => {
-    spin.value = withTiming(spin.value + 180, {
-      duration: 420,
-      easing: Easing.bezier(0.2, 0.8, 0.2, 1),
+    spinTarget.current += 180;
+    spin.value = withTiming(spinTarget.current, {
+      duration: 320,
+      easing: Easing.out(Easing.cubic),
     });
     onSwap();
   };
@@ -896,9 +908,10 @@ function RouteHeader({
         </Animated.View>
       </View>
 
-      {/* Meta-Zeile */}
+      {/* Meta-Zeile: Ergebniszahl links in einer Box, „Ändern" rechts — beide
+          dieselbe Pill-Optik. */}
       <View style={styles.rhMetaRow}>
-        <View style={styles.rhCountWrap}>
+        <View style={styles.rhCountPill}>
           <Text style={styles.rhCountText} numberOfLines={1}>
             {loading ? t("results.searching") : `${resultCount} ${t("results.count")}`}
           </Text>
@@ -1182,11 +1195,23 @@ const styles = StyleSheet.create({
   rhMetaRow: {
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "space-between",
     marginTop: 16,
-    paddingHorizontal: 6,
     gap: 10,
   },
-  rhCountWrap: { flex: 1, flexDirection: "row", alignItems: "center", minWidth: 0 },
+  // Ergebniszahl in derselben Pill-Optik wie der „Ändern"-Button — nur nicht
+  // tippbar. Content-breit (kein flex:1), damit die Box den Text umschließt.
+  rhCountPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    minWidth: 0,
+    flexShrink: 1,
+    backgroundColor: C.surface3,
+    borderRadius: 9999,
+    paddingVertical: 9,
+    paddingHorizontal: 15,
+  },
   rhCountText: { flexShrink: 1, fontSize: 13, fontWeight: "600", color: C.gray200 },
   rhChangeBtn: {
     flexDirection: "row",
