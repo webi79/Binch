@@ -129,21 +129,27 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
           erhalten (TouchableNativeFeedback wrapper auf Android, plus
           overflow:hidden Clip am inner View). Visueller Ripple ist aus
           (transparent) damit's bei LongPress nicht als Welle stehen bleibt. */}
-      {/* Schatten sitzt auf einem eigenen Wrapper, NICHT auf der Karte: Die
-          Karte braucht overflow:"hidden", damit die Perforationskreise sauber am
-          Rand ausgestanzt werden (left/right:-9), und overflow:hidden clippt
-          einen Außenschatten weg. Der Wrapper hat denselben Radius, damit der
-          Schatten den runden Ecken folgt — und keinerlei Rand/Padding, ändert
-          also nichts am Layout.
+      {/* Zwei ineinandergeschachtelte Wrapper, beide nötig:
 
-          renderToHardwareTextureAndroid: Der Blur-Schatten (3 Layer über die
-          volle Kartenbreite) wurde beim Scrollen JEDEN Frame neu gerastert —
-          genau der Lag, der mit dem Schatten auftauchte. Als Hardware-Textur wird
-          die fertige Karte samt Schatten beim Scrollen nur noch verschoben statt
-          neu gezeichnet. Anders als der Layer-Flip beim Parallax (der 66 ms kostete,
-          weil er ständig an/aus ging) ist diese Textur klein und dauerhaft an —
-          sie flippt nie. */}
-      <View style={styles.cardShadow} renderToHardwareTextureAndroid>
+          shadowClip (außen) = die Hardware-Textur gegen den Scroll-Lag. Der
+          Blur-Schatten (3 Layer über die volle Kartenbreite) wurde beim Scrollen
+          JEDEN Frame neu gerastert — genau der Lag, der mit dem Schatten kam. Als
+          Textur wird die fertige Karte samt Schatten beim Scrollen nur noch
+          verschoben. ABER: Die Textur wird exakt auf die View-Größe zugeschnitten,
+          und ein Außenschatten ragt darüber hinaus — texturiert man die enge Karte,
+          wird der Schatten ABGESCHNITTEN (genau das war eben kaputt). Deshalb hat
+          shadowClip ringsum so viel Innenabstand, wie der Schatten ausgreift
+          (oben 8, unten 28, seitlich 20), damit er vollständig in der Textur liegt.
+          Ein exakt gegenläufiger negativer Rand rechnet diesen Abstand wieder
+          heraus — das Layout bleibt unverändert. Seitlich passt der Abstand in den
+          20-px-Rand, den die Karte ohnehin hat.
+
+          cardShadow (innen) = trägt den boxShadow. Sitzt NICHT auf der Karte
+          selbst, weil die overflow:"hidden" für die Perforationskreise braucht und
+          das den Außenschatten wegclippen würde. Gleicher Radius, damit der Schatten
+          den runden Ecken folgt. */}
+      <View style={styles.shadowClip} renderToHardwareTextureAndroid>
+      <View style={styles.cardShadow}>
       <RippleTouch
         onPress={onPress}
         onLongPress={onLongPress}
@@ -179,6 +185,7 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
         </View>
       </RippleTouch>
       </View>
+      </View>
 
       <Text style={styles.hint}>{t("saved.ticket.openHint")}</Text>
     </View>
@@ -210,6 +217,17 @@ const styles = StyleSheet.create({
   //   0 10px 24px -8px rgba(0,0,0,.42)  — Abwurf, jetzt kurz
   //   0  5px 14px -6px rgba(0,0,0,.26)  — mittlere Lage
   //   0  2px  6px      rgba(0,0,0,.18)  — enge Kantenabhebung
+  // Innenabstand = Schatten-Ausdehnung (oben 8, unten 28, seitlich 20), damit die
+  // Hardware-Textur den ganzen Schatten umfasst; negativer Rand gleich groß, damit
+  // das Layout unverändert bleibt (seitlich in den 20-px-Kartenrand hinein).
+  shadowClip: {
+    paddingTop: 8,
+    paddingBottom: 28,
+    paddingHorizontal: 20,
+    marginTop: -8,
+    marginBottom: -28,
+    marginHorizontal: -20,
+  },
   cardShadow: {
     borderRadius: 24,
     boxShadow:
