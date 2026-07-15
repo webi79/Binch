@@ -921,10 +921,9 @@ function RouteHeader({
           <RippleTouch
             borderless
             onPress={doSwap}
-            style={styles.rhSwapBtn}
+            style={[styles.rhSwapBtn, { backgroundColor: accentSolid }]}
             accessibilityLabel={t("results.change")}
           >
-            <GradientFill />
             <Animated.View style={swapIconStyle}>
               <ArrowUpDown color={C.black} size={20} strokeWidth={2.6} />
             </Animated.View>
@@ -1209,6 +1208,11 @@ const styles = StyleSheet.create({
   // Während eine Suche läuft: Swap gesperrt → sichtbar gedimmt, damit der
   // no-op-Tap nicht wie ein toter Button wirkt.
   rhSwapWrapBusy: { opacity: 0.5 },
+  // Flacher Akzent-Kreis wie im Hero: backgroundColor kommt inline (accentSolid),
+  // KEIN overflow:hidden und KEIN GradientFill-Kind. Genau die zwei sorgten dafür,
+  // dass Android den geclippten Container jedes Mal neu compositete, wenn das Icon
+  // darin rotierte — das war das Ruckeln. Der 5px-Rand in Kartenfarbe bleibt (die
+  // „ausgestanzt"-Optik) und stört die Rotation nicht, weil er nichts clippt.
   rhSwapBtn: {
     width: 54,
     height: 54,
@@ -1217,7 +1221,6 @@ const styles = StyleSheet.create({
     borderColor: C.card,
     alignItems: "center",
     justifyContent: "center",
-    overflow: "hidden",
   },
   rhMetaRow: {
     flexDirection: "row",
