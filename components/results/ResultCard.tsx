@@ -232,6 +232,15 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
   const flightCode = result.flightNumber ?? "";
 
   return (
+    // Schatten wie bei der Ticket-Karte (Saved): shadowClip (außen) wird als
+    // Hardware-Textur gecacht, damit der Blur beim Scrollen nicht jeden Frame neu
+    // gerastert wird, und hat ringsum so viel Innenabstand, wie der Schatten
+    // ausgreift — sonst schneidet die Textur ihn ab. Der negative Rand rechnet den
+    // Abstand wieder heraus (seitlich in den 20-px-Listenrand), das Layout bleibt
+    // gleich. cardShadow (innen) trägt den boxShadow. Testweise eingebaut — fällt
+    // in einem Stück wieder raus, wenn's nicht gefällt.
+    <View style={styles.shadowClip} renderToHardwareTextureAndroid>
+    <View style={styles.cardShadow}>
     <Animated.View style={[styles.card, cardAnim]}>
       <View style={styles.headerRow}>
         <View style={styles.providerWrap}>
@@ -355,6 +364,8 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
         </RippleTouch>
       </View>
     </Animated.View>
+    </View>
+    </View>
   );
 }
 
@@ -370,6 +381,22 @@ export const ResultCard = memo(
 );
 
 const styles = StyleSheet.create({
+  // Innenabstand = Schatten-Ausdehnung (oben 8, unten 28, seitlich 20), damit die
+  // Hardware-Textur den ganzen Schatten umfasst; negativer Rand gleich groß, damit
+  // das Layout unverändert bleibt (seitlich in den 20-px-Listenrand hinein).
+  shadowClip: {
+    paddingTop: 8,
+    paddingBottom: 28,
+    paddingHorizontal: 20,
+    marginTop: -8,
+    marginBottom: -28,
+    marginHorizontal: -20,
+  },
+  cardShadow: {
+    borderRadius: 20,
+    boxShadow:
+      "0px 10px 24px -8px rgba(0, 0, 0, 0.42), 0px 5px 14px -6px rgba(0, 0, 0, 0.26), 0px 2px 6px rgba(0, 0, 0, 0.18)",
+  },
   card: {
     backgroundColor: C.card,
     borderRadius: 20,
