@@ -182,15 +182,19 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
 
-  // Mehrschichtiger Schatten (aus der Vorlage 1:1 übernommen — Fabric-boxShadow
-  // nutzt dasselbe Modell wie CSS: offsetX offsetY blur spread color):
-  //   0 32px 80px -12px rgba(0,0,0,.42)  — weiter, tiefer Abwurf
-  //   0 12px 32px  -8px rgba(0,0,0,.26)  — mittlere Lage
-  //   0  3px 10px       rgba(0,0,0,.18)  — enge Kantenabhebung
+  // Mehrschichtiger Schatten (Fabric-boxShadow, dasselbe Modell wie CSS:
+  // offsetX offsetY blur spread color). Bewusst ZUSAMMENGEZOGEN: Die Vorlage warf
+  // mit 32 px Versatz / 80 px Blur weit nach unten und zog dadurch einen langen
+  // Verlauf. Kleinere Versätze und engere Blurs lassen den Schatten die Karte
+  // umschließen, statt nach unten auszulaufen — die drei Lagen und die
+  // abgestufte Opazität bleiben.
+  //   0 10px 24px -8px rgba(0,0,0,.42)  — Abwurf, jetzt kurz
+  //   0  5px 14px -6px rgba(0,0,0,.26)  — mittlere Lage
+  //   0  2px  6px      rgba(0,0,0,.18)  — enge Kantenabhebung
   cardShadow: {
     borderRadius: 24,
     boxShadow:
-      "0px 32px 80px -12px rgba(0, 0, 0, 0.42), 0px 12px 32px -8px rgba(0, 0, 0, 0.26), 0px 3px 10px rgba(0, 0, 0, 0.18)",
+      "0px 10px 24px -8px rgba(0, 0, 0, 0.42), 0px 5px 14px -6px rgba(0, 0, 0, 0.26), 0px 2px 6px rgba(0, 0, 0, 0.18)",
   },
 
   card: {
