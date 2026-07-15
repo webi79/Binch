@@ -14,15 +14,13 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { CommonActions, useNavigation } from "@react-navigation/native";
 import {
-  Plane,
   Train,
   Bus,
-  Ship,
   ArrowLeftRight,
+  ArrowUpDown,
   SlidersHorizontal,
   RotateCcw,
   WifiOff,
-  type LucideIcon,
 } from "lucide-react-native";
 import { useQuery } from "@tanstack/react-query";
 import Animated, {
@@ -62,17 +60,11 @@ const C = {
   border: "#2E2E30",
   surface3: "#2A2A2C",
   text: "#FFFFFF",
+  gray200: "#C8C8CC",
   sub: "#8A8A90",
   subDim: "#56565C",
   lime: "#7FEA4D",
   black: "#000000",
-};
-
-const MODE_ICON: Record<TravelMode, LucideIcon> = {
-  FLIGHT: Plane,
-  TRAIN: Train,
-  BUS: Bus,
-  CRUISE: Ship,
 };
 
 // Max. gleichzeitig gerenderte Treffer. Die Suche liefert oft 100+ Flüge —
@@ -131,19 +123,6 @@ function sortResults(list: SearchResult[], sort: SortKey): SearchResult[] {
  */
 function stationLabel(label: string): string {
   return label.trim();
-}
-
-/**
- * Returns a clean display code or empty string if the code is an internal
- * provider id (e.g. `dbrest:8006342`). Internal ids never reach the UI —
- * the city label takes the headline slot in that case.
- */
-function displayCode(code: string): string {
-  if (!code) return "";
-  if (code.includes(":")) return "";
-  // Heuristic: real airport / station codes are short alphanumerics.
-  if (code.length > 6) return "";
-  return code;
 }
 
 export default function ResultsScreen() {
@@ -284,6 +263,21 @@ export default function ResultsScreen() {
   const destination = p.destination ?? "";
   const originLabel = p.originLabel ?? origin;
   const destLabel = p.destLabel ?? destination;
+
+  // Richtung tauschen. Wir schreiben die Route-Params um (origin↔destination,
+  // Labels mit), sonst nichts. Die useQuery unten ist auf origin/destination
+  // gekeyed → der Params-Wechsel löst automatisch eine neue Suche mit
+  // vertauschter Strecke aus, kein manuelles refetch nötig.
+  const handleSwap = useCallback(() => {
+    if (!origin || !destination) return;
+    haptic("button");
+    router.setParams({
+      origin: destination,
+      destination: origin,
+      originLabel: destLabel,
+      destLabel: originLabel,
+    });
+  }, [router, origin, destination, originLabel, destLabel]);
   const departDate = p.departDate ?? "";
   // Uhrzeit aus dem Datums-/Zeit-Picker (UTC-ISO). Muss in JEDEN Query-Key und
   // jeden Suchaufruf — sonst sucht der Server ab einer Default-Zeit statt ab
@@ -607,42 +601,19 @@ export default function ResultsScreen() {
   return (
     <Animated.View style={[styles.slideRoot, slideStyle]}>
       <SafeAreaView style={styles.root} edges={["top"]}>
-        <View style={styles.routePanel}>
-        <View style={styles.routeRow}>
-          <RouteSide
-            code={mode === "FLIGHT" ? displayCode(origin) : ""}
-            city={stationLabel(originLabel)}
-            align="flex-start"
-          />
-          <RouteIndicator mode={mode} loading={isLoading} />
-          <RouteSide
-            code={mode === "FLIGHT" ? displayCode(destination) : ""}
-            city={stationLabel(destLabel)}
-            align="flex-end"
-          />
-        </View>
-
-        <View style={styles.routeFooter}>
-          <View style={[styles.routeFooterBtn, styles.routeFooterBtnSearch]}>
-            <Text style={styles.routeFooterText}>
-              {isLoading
-                ? t("results.searching")
-                : `${sorted.length} ${t("results.count")}`}
-            </Text>
-            {isLoading ? <LoadingDots /> : null}
-          </View>
-          <RippleTouch
-            onPress={() => {
-              haptic("button");
-              router.back();
-            }}
-            style={[styles.routeFooterBtn, styles.routeFooterBtnChange]}
-          >
-            <Text style={styles.routeFooterText}>{t("results.change")}</Text>
-            <ArrowLeftRight color={C.text} size={14} />
-          </RippleTouch>
-        </View>
-      </View>
+        <RouteHeader
+          fromLabel={stationLabel(originLabel)}
+          toLabel={stationLabel(destLabel)}
+          loading={isLoading}
+          resultCount={sorted.length}
+          accentSolid={accent.solid}
+          accentSubtle={accent.subtle}
+          onSwap={handleSwap}
+          onChange={() => {
+            haptic("button");
+            router.back();
+          }}
+        />
 
       {showDirectionToggle ? (
         <View style={styles.dirToggleWrap}>
@@ -801,80 +772,137 @@ export default function ResultsScreen() {
   );
 }
 
-function RouteSide({
-  code,
-  city,
-  align,
+/**
+ * Verbindungs-Header (vertikales Design): Abfahrt oben, Ziel darunter, eine
+ * gestrichelte Route durch beide Felder, ein Akzent-Swap-Button, der die Route
+ * dreht, plus Meta-Zeile mit Ergebniszahl und „Ändern".
+ *
+ * Übernommen aus einer externen Design-Vorlage, aber an unsere Prinzipien
+ * angepasst: Akzent-System statt Lime, fontWeight statt Inter-fontFamily, alle
+ * Strings über useT, Tokens fürs Spacing — und die Swap-Rotation auf Reanimated,
+ * weil klassisches RN-Animated (useNativeDriver) auf der New Architecture am
+ * Startwert hängen bleibt.
+ */
+// Marker-Mitte: Feld-paddingLeft (18) + halbe Marker-Spalte (6).
+const RH_RAIL_X = 24;
+// Feld-paddingVertical (18) + halbe Textzeile (lineHeight 26 → 13) = 31.
+const RH_RAIL_INSET_Y = 31;
+
+function RouteHeader({
+  fromLabel,
+  toLabel,
+  loading,
+  resultCount,
+  accentSolid,
+  accentSubtle,
+  onSwap,
+  onChange,
 }: {
-  code: string;
-  city: string;
-  align: "flex-start" | "flex-end";
+  fromLabel: string;
+  toLabel: string;
+  loading: boolean;
+  resultCount: number;
+  accentSolid: string;
+  accentSubtle: string;
+  onSwap: () => void;
+  onChange: () => void;
 }) {
-  const hasCode = code.length > 0;
-  return (
-    <View style={[styles.routeSide, { alignItems: align }]}>
-      {hasCode ? (
-        <>
-          <Text
-            style={[styles.routeCode, { textAlign: align === "flex-end" ? "right" : "left" }]}
-            adjustsFontSizeToFit
-            numberOfLines={1}
-            minimumFontScale={0.6}
-          >
-            {code}
-          </Text>
-          <Text style={[styles.routeCity, { textAlign: align === "flex-end" ? "right" : "left" }]}>
-            {city}
-          </Text>
-        </>
-      ) : (
-        <Text
-          style={[styles.routeCityBig, { textAlign: align === "flex-end" ? "right" : "left" }]}
-          adjustsFontSizeToFit
-          numberOfLines={2}
-          minimumFontScale={0.6}
-        >
-          {city}
-        </Text>
-      )}
-    </View>
-  );
-}
+  const t = useT();
+  const [fieldsHeight, setFieldsHeight] = useState(0);
+  // Dreht bei jedem Tausch um 180°. Reanimated, nicht RN-Animated (siehe oben).
+  const spin = useSharedValue(0);
 
-function RouteIndicator({ mode, loading }: { mode: TravelMode; loading: boolean }) {
-  const Icon = MODE_ICON[mode] ?? Plane;
-  const rot = useSharedValue(0);
+  const doSwap = () => {
+    spin.value = withTiming(spin.value + 180, {
+      duration: 420,
+      easing: Easing.bezier(0.2, 0.8, 0.2, 1),
+    });
+    onSwap();
+  };
 
-  useEffect(() => {
-    if (loading) {
-      rot.value = 0;
-      rot.value = withRepeat(
-        withTiming(1, { duration: 1800, easing: Easing.linear }),
-        -1,
-        false
-      );
-    } else {
-      rot.value = withTiming(0, { duration: 200 });
-    }
-    // Cleanup beim Unmount oder loading-Wechsel — ohne das läuft das
-    // withRepeat im UI-Thread weiter wenn die Komponente unmountet wird.
-    return () => cancelAnimation(rot);
-  }, [loading, rot]);
-
-  const lineAnim = useAnimatedStyle(() => ({
-    opacity: 0.5 + 0.5 * Math.abs(Math.sin(rot.value * Math.PI)),
+  const swapStyle = useAnimatedStyle(() => ({
+    transform: [{ rotate: `${spin.value}deg` }],
   }));
 
+  const railHeight = Math.max(0, fieldsHeight - RH_RAIL_INSET_Y * 2);
+
   return (
-    <View style={styles.indicatorWrap}>
-      <Animated.View style={[styles.indicatorLine, lineAnim]} />
-      <View style={styles.indicatorDot} />
-      <View style={styles.indicatorBadge}>
-        <GradientFill />
-        <Icon color={C.black} size={16} strokeWidth={2.2} />
+    <View style={styles.routePanel}>
+      <View style={styles.rhFieldsWrap}>
+        {/* Gestrichelte Route durch beide Felder — als gestrichelter Border einer
+            2px breiten View, kein SVG nötig. */}
+        {railHeight > 0 ? (
+          <View
+            pointerEvents="none"
+            style={[styles.rhRail, { top: RH_RAIL_INSET_Y, height: railHeight }]}
+          />
+        ) : null}
+
+        <View
+          style={styles.rhFields}
+          onLayout={(e) => setFieldsHeight(e.nativeEvent.layout.height)}
+        >
+          {/* Abfahrt */}
+          <View style={styles.rhField}>
+            <View style={styles.rhMarkerCol}>
+              <View style={styles.rhOriginDot} />
+            </View>
+            <Text
+              style={styles.rhStation}
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.65}
+            >
+              {fromLabel}
+            </Text>
+          </View>
+
+          {/* Ziel */}
+          <View style={styles.rhField}>
+            <View style={styles.rhMarkerCol}>
+              <View style={[styles.rhDestGlow, { backgroundColor: accentSubtle }]}>
+                <View style={[styles.rhDestPin, { backgroundColor: accentSolid }]} />
+              </View>
+            </View>
+            <Text
+              style={styles.rhStation}
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.65}
+            >
+              {toLabel}
+            </Text>
+          </View>
+        </View>
+
+        {/* Swap-Button — überlappt beide Felder rechts, Rand in Kartenfarbe für
+            die „ausgestanzt"-Optik. */}
+        <Animated.View style={[styles.rhSwapWrap, swapStyle]}>
+          <RippleTouch
+            borderless
+            onPress={doSwap}
+            style={styles.rhSwapBtn}
+            accessibilityLabel={t("results.change")}
+          >
+            <GradientFill />
+            <ArrowUpDown color={C.black} size={20} strokeWidth={2.6} />
+          </RippleTouch>
+        </Animated.View>
       </View>
-      <View style={styles.indicatorDot} />
-      <Animated.View style={[styles.indicatorLine, lineAnim]} />
+
+      {/* Meta-Zeile */}
+      <View style={styles.rhMetaRow}>
+        <View style={styles.rhCountWrap}>
+          <Text style={styles.rhCountText} numberOfLines={1}>
+            {loading ? t("results.searching") : `${resultCount} ${t("results.count")}`}
+          </Text>
+          {loading ? <LoadingDots /> : null}
+        </View>
+        <RippleTouch onPress={onChange} style={styles.rhChangeBtn}>
+          <Text style={styles.rhChangeText}>{t("results.change")}</Text>
+          <ArrowLeftRight color={C.text} size={14} />
+        </RippleTouch>
+      </View>
     </View>
   );
 }
@@ -1076,56 +1104,92 @@ const styles = StyleSheet.create({
     padding: 16,
     gap: 14,
   },
-  routeRow: { flexDirection: "row", alignItems: "center", gap: 10 },
-  routeSide: { flex: 1.3, minWidth: 0 },
-  routeCode: { color: C.text, fontSize: 32, fontWeight: "800", letterSpacing: -0.8 },
-  routeCity: { color: C.sub, fontSize: 13, marginTop: 2 },
-  routeCityBig: {
-    color: C.text,
-    fontSize: 22,
-    fontWeight: "800",
-    letterSpacing: -0.5,
-    lineHeight: 26,
-  },
-
-  indicatorWrap: {
-    flex: 1,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 4,
-    minWidth: 90,
-  },
-  indicatorLine: {
-    flex: 1,
-    height: 0,
-    borderTopWidth: 1.5,
+  // ── RouteHeader (vertikales Design) ──────────────────────────────────────
+  rhFieldsWrap: { position: "relative" },
+  rhFields: { gap: 8 },
+  rhRail: {
+    position: "absolute",
+    left: RH_RAIL_X - 1,
+    width: 0,
+    borderLeftWidth: 2,
     borderColor: C.subDim,
     borderStyle: "dashed",
+    zIndex: 1,
   },
-  indicatorDot: { width: 5, height: 5, borderRadius: 3, backgroundColor: C.subDim },
-  indicatorBadge: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
+  rhField: {
+    backgroundColor: C.bg,
+    borderRadius: 18,
+    paddingVertical: 18,
+    paddingLeft: 18,
+    paddingRight: 80,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    minWidth: 0,
+  },
+  rhMarkerCol: { width: 12, alignItems: "center", zIndex: 2 },
+  rhOriginDot: {
+    width: 9,
+    height: 9,
+    borderRadius: 5,
+    borderWidth: 2.5,
+    borderColor: C.sub,
+    backgroundColor: C.bg,
+  },
+  rhDestGlow: {
+    width: 19,
+    height: 19,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    marginHorizontal: -4,
+  },
+  rhDestPin: { width: 11, height: 11, borderRadius: 6 },
+  rhStation: {
+    flex: 1,
+    fontSize: 22,
+    fontWeight: "800",
+    letterSpacing: -0.44,
+    color: C.text,
+    lineHeight: 26,
+  },
+  rhSwapWrap: {
+    position: "absolute",
+    right: 6,
+    top: "50%",
+    marginTop: -27,
+    zIndex: 3,
+  },
+  rhSwapBtn: {
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    borderWidth: 5,
+    borderColor: C.card,
     alignItems: "center",
     justifyContent: "center",
     overflow: "hidden",
   },
-
-  routeFooter: { flexDirection: "row", gap: 10 },
-  routeFooterBtn: {
-    flex: 1,
+  rhMetaRow: {
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "center",
-    gap: 6,
-    height: 40,
-    borderRadius: 9999,
+    marginTop: 12,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    gap: 10,
   },
-  routeFooterBtnSearch: { backgroundColor: C.surface3 },
-  routeFooterBtnChange: { backgroundColor: C.surface3 },
-  routeFooterText: { color: C.text, fontSize: 13, fontWeight: "600" },
+  rhCountWrap: { flex: 1, flexDirection: "row", alignItems: "center", minWidth: 0 },
+  rhCountText: { flexShrink: 1, fontSize: 13, fontWeight: "600", color: C.gray200 },
+  rhChangeBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7,
+    backgroundColor: C.surface3,
+    borderRadius: 9999,
+    paddingVertical: 9,
+    paddingHorizontal: 15,
+  },
+  rhChangeText: { fontSize: 12, fontWeight: "700", color: C.text },
 
   dotsRow: { flexDirection: "row", gap: 3, marginLeft: 4 },
   smallDot: { width: 4, height: 4, borderRadius: 2 },
