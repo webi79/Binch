@@ -78,8 +78,17 @@ export default function RouteMapScreen() {
   const handleBack = () => {
     // Erst Map raus, dann State leeren (kleiner Versatz damit der Map-Clear
     // nicht sichtbar während der Pop-Animation flackert).
+    //
+    // Guard gegen einen Race: Öffnet der User innerhalb der 400 ms schon die
+    // NÄCHSTE Route („Karte anzeigen" am nächsten Ergebnis), würde der Timer
+    // deren pendingRoute löschen — und der frisch gepushte Karten-Screen poppt
+    // sich sofort selbst wieder zu (siehe !pendingRoute-Effekt oben). Deshalb
+    // löschen wir nur, wenn die Route noch DIESELBE ist wie beim Zurücktippen.
+    const closing = pendingRoute;
     if (router.canGoBack()) router.back();
-    setTimeout(() => clearRoute(), 400);
+    setTimeout(() => {
+      if (useSearchStore.getState().pendingRoute === closing) clearRoute();
+    }, 400);
   };
 
   if (!pendingRoute) return <View style={styles.root} />;
