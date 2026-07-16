@@ -42,3 +42,22 @@ export const overlayCover = makeMutable(0);
 /** Parallax-Weg des Unterlays als Bruchteil der Screen-Breite (negativ =
  *  links). YouTube gemessen: ~13%. */
 export const UNDERLAY_TRAVEL_FRAC = -0.13;
+
+/**
+ * Eckenradius der horizontal reinslidenden Screens (results + Detail-Overlays).
+ *
+ * Bisher slideten sie mit eckigen Ecken rein. Ein Radius rundet die führende
+ * Kante beim Reinsliden ab und lässt den Screen im Stand wie eine Karte wirken,
+ * deren Ecken zur Bildschirm-Rundung des Geräts passen.
+ *
+ * Umgesetzt via `borderRadius` + `overflow: "hidden"`. Das ist HIER günstig: Der
+ * View wird nur VERSCHOBEN (nicht ein Kind darin rotiert), also nutzt Android
+ * `clipToOutline` für den runden Clip — GPU-beschleunigt, kein Neurastern pro
+ * Frame (anders als beim Swap-Button, wo ein Kind IM Clip rotierte).
+ *
+ * 40 ist ein gerätenaher Mittelwert (moderne Phones ~28-52 px). Exakt an den
+ * echten Bezel-Radius käme man nur über ein natives Modul
+ * (Android WindowInsets.getRoundedCorner, API 31+) — bewusst nicht gemacht, das
+ * kollidiert mit der CNG/EAS-Pipeline. Bei Bedarf hier zentral anpassen.
+ */
+export const SCREEN_CORNER_RADIUS = 40;

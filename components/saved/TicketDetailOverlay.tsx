@@ -41,6 +41,7 @@ import {
   COVER_DURATION,
   COVER_IN_EASING,
   COVER_OUT_EASING,
+  SCREEN_CORNER_RADIUS,
 } from "@/lib/nav/overlayCover";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { TicketHead, Perforation, bookingRefFor } from "./TicketParts";
@@ -328,6 +329,11 @@ const styles = StyleSheet.create({
     backgroundColor: C.bg,
     zIndex: 200,
     elevation: 24,
+    // Gerundete Ecken beim Reinsliden (siehe SCREEN_CORNER_RADIUS). Der Root
+    // ist ohnehin renderToHardwareTextureAndroid → der runde Clip wird als
+    // Textur geblittet, kostet im Slide nichts extra.
+    borderRadius: SCREEN_CORNER_RADIUS,
+    overflow: "hidden",
   },
   safe: { flex: 1, backgroundColor: C.bg },
 

@@ -40,7 +40,7 @@ import { searchByMode } from "@/lib/api/client";
 import { ResultCard } from "@/components/results/ResultCard";
 import { RandomSearchLoader } from "@/components/results/search-loaders/RandomSearchLoader";
 import { useT } from "@/lib/i18n/useT";
-import { overlayCover, UNDERLAY_TRAVEL_FRAC, PUSH_DURATION, PUSH_IN_EASING, POP_DURATION, POP_EASING } from "@/lib/nav/overlayCover";
+import { overlayCover, UNDERLAY_TRAVEL_FRAC, PUSH_DURATION, PUSH_IN_EASING, POP_DURATION, POP_EASING, SCREEN_CORNER_RADIUS } from "@/lib/nav/overlayCover";
 import { useSearchStore } from "@/stores/searchStore";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
@@ -1149,7 +1149,15 @@ const styles = StyleSheet.create({
   // slideRoot ist der Slide-Container — muss flex:1 + bg haben damit er den
   // ganzen Screen abdeckt während er von rechts reinslidet (sonst sieht der
   // User durch transparente Lücken den vorigen Tab).
-  slideRoot: { flex: 1, backgroundColor: C.bg },
+  slideRoot: {
+    flex: 1,
+    backgroundColor: C.bg,
+    // Gerundete Ecken beim Reinsliden (siehe SCREEN_CORNER_RADIUS). overflow
+    // clippt den Inhalt (inkl. FlatList) auf die runde Form; clipToOutline macht
+    // das GPU-seitig, der Slide bleibt flüssig.
+    borderRadius: SCREEN_CORNER_RADIUS,
+    overflow: "hidden",
+  },
   root: { flex: 1, backgroundColor: C.bg },
 
   routePanel: {

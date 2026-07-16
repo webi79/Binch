@@ -55,6 +55,7 @@ import {
   COVER_DURATION,
   COVER_IN_EASING,
   COVER_OUT_EASING,
+  SCREEN_CORNER_RADIUS,
 } from "@/lib/nav/overlayCover";
 import { usePathname } from "expo-router";
 import {
@@ -513,6 +514,9 @@ const DetailsContent = memo(function DetailsContent({
         // Overlay GANZ VORNE liegt, wenn er via Departure-Tap aus dem
         // Surroundings-Sheet geöffnet wird.
         { zIndex: 200, elevation: 24 },
+        // Gerundete Ecken beim Reinsliden — reiner Transform-View, clipToOutline
+        // ist günstig (siehe SCREEN_CORNER_RADIUS).
+        { borderRadius: SCREEN_CORNER_RADIUS, overflow: "hidden" },
         slideStyle,
       ]}
     >
