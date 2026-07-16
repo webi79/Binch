@@ -10,10 +10,13 @@ import Animated, {
   Easing,
   FadeInDown,
   ReduceMotion,
+  makeMutable,
+  useAnimatedReaction,
   useAnimatedStyle,
   useSharedValue,
   withDelay,
   withTiming,
+  type SharedValue,
 } from "react-native-reanimated";
 
 /**
@@ -156,21 +159,44 @@ interface Entrance {
   /** Wann der Fokus kam. Daran erkennt ein Element, ob es zur Welle gehört oder
    *  lange danach nachgewachsen ist (siehe `waveBase`). */
   focusedAt: number;
+  /**
+   * Zählt hoch, wenn die laufende Welle SOFORT fertig werden soll.
+   *
+   * Ausgelöst vom ersten Scroll-Griff (RevealScrollView.onScrollBeginDrag):
+   * Wer scrollt, will Inhalt sehen, keine Choreografie — und die noch laufenden
+   * Opacity/TranslateY-Animationen plus die Vorhang-Overlays der großen Karten
+   * konkurrieren auf dem UI-Thread genau mit diesem Scroll. Das war der Ruckler
+   * „Tab wechseln und sofort scrollen". Jedes Reveal springt dann direkt auf
+   * fertig; die anstehenden withDelay-Ketten werden durch die Zuweisung
+   * abgebrochen.
+   */
+  finishWave: SharedValue<number>;
 }
 
-const EntranceContext = createContext<Entrance>({ generation: 0, focusedAt: 0 });
+const EntranceContext = createContext<Entrance>({
+  generation: 0,
+  focusedAt: 0,
+  // Modulweiter Default, falls ein Reveal ohne ScreenEntrance läuft.
+  finishWave: makeMutable(0),
+});
 
 export function ScreenEntrance({ children }: { children: ReactNode }) {
   const focused = useIsFocused();
+  const finishWave = useSharedValue(0);
   const [entrance, setEntrance] = useState<Entrance>(() => ({
     generation: 0,
     focusedAt: Date.now(),
+    finishWave,
   }));
   useEffect(() => {
     if (focused) {
-      setEntrance((e) => ({ generation: e.generation + 1, focusedAt: Date.now() }));
+      setEntrance((e) => ({
+        generation: e.generation + 1,
+        focusedAt: Date.now(),
+        finishWave,
+      }));
     }
-  }, [focused]);
+  }, [focused, finishWave]);
   return <EntranceContext.Provider value={entrance}>{children}</EntranceContext.Provider>;
 }
 
@@ -233,9 +259,20 @@ export function Reveal({
   large = false,
   style,
 }: RevealProps) {
-  const { generation, focusedAt } = useContext(EntranceContext);
+  const { generation, focusedAt, finishWave } = useContext(EntranceContext);
   const reduceMotion = useReduceMotion();
   const progress = useSharedValue(0);
+
+  // Scroll-Griff → Welle sofort fertig. Die Zuweisung bricht ein noch
+  // anstehendes withDelay/withTiming auf progress ab.
+  useAnimatedReaction(
+    () => finishWave.value,
+    (v, prev) => {
+      if (prev === null || v === prev) return;
+      if (progress.value !== 1) progress.value = 1;
+    },
+    [finishWave],
+  );
 
   useEffect(() => {
     if (reduceMotion) {
@@ -349,10 +386,22 @@ export function revealEntering(index: number) {
  */
 export function RevealScrollView({
   children,
+  onScrollBeginDrag,
   ...props
 }: React.ComponentProps<typeof Animated.ScrollView>) {
+  const { finishWave } = useContext(EntranceContext);
   return (
-    <Animated.ScrollView {...props}>
+    <Animated.ScrollView
+      {...props}
+      onScrollBeginDrag={(e) => {
+        // Wer scrollt, will Inhalt sehen — die Welle sofort beenden, damit die
+        // laufenden Animationen nicht mit dem Scroll um den UI-Thread kämpfen.
+        finishWave.value = finishWave.value + 1;
+        // Der Prop-Typ erlaubt auch SharedValue-Handler (useAnimatedScrollHandler);
+        // durchreichen können wir nur normale Funktionen — mehr nutzt hier keiner.
+        if (typeof onScrollBeginDrag === "function") onScrollBeginDrag(e);
+      }}
+    >
       {children}
     </Animated.ScrollView>
   );

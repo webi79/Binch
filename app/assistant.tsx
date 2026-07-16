@@ -216,12 +216,25 @@ function AssistantScreenInner() {
   const [kbOffset, setKbOffset] = useState(0);
   const keyboardOpen = kbOffset > 0;
   const [inputbarHeight, setInputbarHeight] = useState(64);
+  // Tor vor kb.height: 1 = Bar folgt dem Keyboard, 0 = Bar bleibt unten.
+  //
+  // Nötig, weil useAnimatedKeyboard die Schließ-Transition VERPASST, wenn das
+  // IME zugeht, während der Screen gerade detached/eingefroren wird (Tab-
+  // Wechsel mit offenem Keyboard). kb.height bleibt dann auf der alten Höhe
+  // stehen, und beim Zurückkommen hing die Bar samt Chat dort, wo das Keyboard
+  // mal war. Das Tor schließt beim Verlassen des Tabs und öffnet erst wieder,
+  // wenn das Keyboard nachweislich (wieder) da ist — ein stehengebliebener
+  // kb.height-Wert erreicht die Bar damit nie.
+  const kbGate = useSharedValue(1);
 
   useEffect(() => {
     const showSub = Keyboard.addListener("keyboardDidShow", (e) => {
       const h = e.endCoordinates?.height ?? 320;
       lastKbHeightRef.current = h;
       setKbOffset(h);
+      // Keyboard ist nachweislich da → Tor auf (Sicherheitsnetz, falls es ohne
+      // onInputFocus aufging).
+      kbGate.value = 1;
     });
     const hideSub = Keyboard.addListener("keyboardDidHide", () => {
       setKbOffset(0);
@@ -230,11 +243,14 @@ function AssistantScreenInner() {
       showSub.remove();
       hideSub.remove();
     };
-  }, []);
+  }, [kbGate]);
 
   const onInputFocus = useCallback(() => {
+    // Tor auf, BEVOR die IME-Animation startet — so bleibt die Bar frame-synced
+    // mit dem aufgehenden Keyboard.
+    kbGate.value = 1;
     setKbOffset(lastKbHeightRef.current);
-  }, []);
+  }, [kbGate]);
 
   const onInputBlur = useCallback(() => {
     setKbOffset(0);
@@ -263,7 +279,7 @@ function AssistantScreenInner() {
   const kb = useAnimatedKeyboard();
   const navInset = insets.bottom;
   const barAnimStyle = useAnimatedStyle(() => {
-    const kbHeight = Math.max(0, kb.height.value - navInset);
+    const kbHeight = kbGate.value === 0 ? 0 : Math.max(0, kb.height.value - navInset);
     const lift = interpolate(kbHeight, [0, 80], [0, BAR_LIFT_FROM_KB], Extrapolation.CLAMP);
     return { transform: [{ translateY: -(kbHeight + lift) }] };
   });
@@ -428,13 +444,25 @@ function AssistantScreenInner() {
   // Wenn der Tab den Focus verliert (User wechselt zu Home etc.): laufende
   // Stream-XHRs abbrechen + Voice-Recognition stoppen. Sonst läuft die
   // Connection im Hintergrund weiter und der Mic-State bleibt offen.
+  //
+  // Außerdem Keyboard-Layout ZURÜCKSETZEN: Keyboard aktiv dismissen, Listen-
+  // Padding auf 0, Tor vor kb.height zu. Schließt das IME erst, während der
+  // Screen schon detached ist, verpasst useAnimatedKeyboard die Transition und
+  // kb.height bleibt stehen — beim Zurückkommen hing der Chat dann dort, wo
+  // die Tastatur war. Beim Re-Fokus öffnen wir das Tor nur, wenn das Keyboard
+  // wirklich sichtbar ist (sonst beim nächsten onInputFocus/keyboardDidShow).
   useEffect(() => {
     if (!isFocused) {
       abortRef.current?.abort();
       abortRef.current = null;
       if (listening) stopVoice();
+      Keyboard.dismiss();
+      setKbOffset(0);
+      kbGate.value = 0;
+    } else if (Keyboard.isVisible()) {
+      kbGate.value = 1;
     }
-  }, [isFocused, listening, stopVoice]);
+  }, [isFocused, listening, stopVoice, kbGate]);
 
   // Re-Focus auf Assistant-Tab: wenn der User noch keine Nachricht
   // geschrieben hat, mit 75% Wahrscheinlichkeit nochmal die Wink-Animation

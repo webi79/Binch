@@ -11,12 +11,14 @@
  * Back-Button → router.back() poppt sauber, Results sofort wieder sichtbar
  * ohne Re-Mount.
  */
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { View, StyleSheet } from "react-native";
+import Animated, { FadeOut } from "react-native-reanimated";
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useSearchStore } from "@/stores/searchStore";
 import { MapSurface, type MapSurfaceHandle } from "@/components/surroundings/MapSurface";
+import { MapSkeleton } from "@/components/surroundings/MapSkeleton";
 import { RouteLayer } from "@/components/surroundings/RouteLayer";
 import { RouteBanner } from "@/components/surroundings/RouteBanner";
 
@@ -28,6 +30,12 @@ export default function RouteMapScreen() {
   const pendingRoute = useSearchStore((s) => s.pendingRoute);
   const clearRoute = useSearchStore((s) => s.clearRoute);
   const mapRef = useRef<MapSurfaceHandle>(null);
+
+  // Die native MapLibre-Surface ist die ersten Frames WEISS, bis Style und
+  // Tiles gerendert sind — dieser Screen mountet die Map frisch, also blitzte
+  // beim Öffnen kurz Weiß auf. Gleiches Muster wie im Surroundings-Tab: das
+  // dunkle Skelett liegt oben, bis onMapRendered feuert, dann fadet es weg.
+  const [mapTilesRendered, setMapTilesRendered] = useState(false);
 
   // Bei Mount Auto-fit auf alle Waypoints. Berechne die Bbox aus allen
   // Koordinaten der Route.
@@ -78,13 +86,22 @@ export default function RouteMapScreen() {
 
   return (
     <View style={styles.root}>
-      <MapSurface ref={mapRef}>
+      <MapSurface ref={mapRef} onMapRendered={() => setMapTilesRendered(true)}>
         <RouteLayer
           waypoints={pendingRoute.waypoints}
           legs={pendingRoute.legs}
           mode={pendingRoute.mode}
         />
       </MapSurface>
+      {!mapTilesRendered && (
+        <Animated.View
+          style={StyleSheet.absoluteFill}
+          exiting={FadeOut.duration(280)}
+          pointerEvents="none"
+        >
+          <MapSkeleton />
+        </Animated.View>
+      )}
       <RouteBanner
         title={pendingRoute.title ?? "Route"}
         waypointCount={pendingRoute.waypoints.length}
