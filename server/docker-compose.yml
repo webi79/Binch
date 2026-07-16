@@ -106,13 +106,16 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
-    # Port 3000 direkt nach außen — NUR für lokalen Dev-Betrieb (LAN, Klartext).
-    # Im Produktionsbetrieb hinter Caddy (Profil `tls`) diesen Block auskommentieren:
-    # dann ist binch-server nur noch im Docker-Netz erreichbar, nach außen spricht
-    # ausschließlich Caddy über 443 (HTTPS). Wer 3000 offen lässt, hat neben HTTPS
-    # weiter einen offenen Klartext-Port — das untergräbt die Verschlüsselung.
+    # Bind-Adresse des Klartext-Ports steuerbar über SERVER_BIND.
+    #   DEV  (Default 0.0.0.0): 3000 im LAN erreichbar — das Handy braucht das.
+    #   PROD (SERVER_BIND=127.0.0.1): 3000 nur noch HOST-LOKAL. Vom Netz aus NICHT
+    #        erreichbar → kein Klartext-Bypass um Caddy herum und kein
+    #        X-Forwarded-For-Spoofing über den offenen Port. Caddy erreicht den
+    #        Server ohnehin über das Docker-Netz (binch-server:3000), NICHT über
+    #        diesen veröffentlichten Port — er ist im Prod also reiner Ballast und
+    #        wird auf localhost eingesperrt.
     ports:
-      - "3000:3000"
+      - "${SERVER_BIND:-0.0.0.0}:3000:3000"
     depends_on:
       db:
         condition: service_healthy
