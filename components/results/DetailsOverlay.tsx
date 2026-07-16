@@ -516,7 +516,15 @@ const DetailsContent = memo(function DetailsContent({
         { zIndex: 200, elevation: 24 },
         // Gerundete Ecken beim Reinsliden — reiner Transform-View, clipToOutline
         // ist günstig (siehe SCREEN_CORNER_RADIUS).
-        { borderRadius: SCREEN_CORNER_RADIUS, overflow: "hidden" },
+        //
+        // backgroundColor ist HIER PFLICHT, nicht Deko: Diese View trägt
+        // elevation:24. Ohne Background berechnet Android die Schatten-Outline aus
+        // den (eckigen) View-Bounds → ein ECKIGER Schatten füllt genau die runde
+        // Ecken-Aussparung mit einem dunklen Quadrat, sodass die Ecke beim
+        // Rausgleiten wieder eckig WIRKT. Mit Background wird die Outline rund und
+        // der Schatten folgt der Rundung. (results hat kein elevation,
+        // TicketDetailOverlay hat den Background schon.)
+        { backgroundColor: C.bg, borderRadius: SCREEN_CORNER_RADIUS, overflow: "hidden" },
         slideStyle,
       ]}
     >
