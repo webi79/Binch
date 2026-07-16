@@ -4,6 +4,20 @@ import { Location, SearchParams, SearchResponse, TravelMode } from "@/types/sear
 export const API_BASE_URL: string =
   (Constants.expoConfig?.extra as { apiBaseUrl?: string })?.apiBaseUrl ?? "http://localhost:3000";
 
+// Defense-in-Depth gegen unverschlüsselten Transport: Ein PRODUKTIONS-Build darf
+// niemals über http:// sprechen — dort reisen Login-Passwort, Bearer-Token,
+// Suchen, Chat und Ticket-PDFs für jeden im Netz mitlesbar. __DEV__ ist im
+// Release-Build false; eine http-URL dort ist ein Fehlkonfigurations-Unfall, der
+// LAUT scheitern soll (Startup-Crash mit klarer Meldung) statt still Klartext zu
+// senden. Im Dev (LAN-Server, kein Zertifikat möglich) bleibt http erlaubt.
+if (!__DEV__ && API_BASE_URL.startsWith("http://")) {
+  throw new Error(
+    `[binch] Unsicherer API-Base im Release-Build: ${API_BASE_URL}. ` +
+      `Produktion MUSS https:// nutzen (Caddy-Proxy). ` +
+      `EXPO_PUBLIC_API_BASE_URL auf die https-Domain setzen.`,
+  );
+}
+
 function buildUrl(path: string, params?: Record<string, string | number | undefined>): string {
   const url = new URL(path, API_BASE_URL);
   if (params) {

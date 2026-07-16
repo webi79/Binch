@@ -14,6 +14,13 @@
  */
 const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL ?? "http://192.168.2.84:3000";
 
+// Klartext-HTTP NUR erlauben, wenn die Backend-URL selbst http:// ist (lokaler
+// Dev-Server im LAN). Zeigt die URL auf https://, wird usesCleartextTraffic
+// automatisch false → das Android-System BLOCKT dann jeden versehentlichen
+// http-Fetch (Fallback-URL, vergessener Endpoint) auf OS-Ebene. So kann ein
+// Produktions-Build gar keine unverschlüsselten Daten mehr senden.
+const ALLOW_CLEARTEXT = API_BASE_URL.startsWith("http://");
+
 module.exports = {
   expo: {
     name: "Binch",
@@ -48,16 +55,17 @@ module.exports = {
     },
     plugins: [
       "expo-router",
-      // usesCleartextTraffic: Release-Builds blocken sonst JEDES http:// —
-      // damit wäre der lokale Dev-Server (http://192.168.2.x:3000) im
-      // Release-Build unerreichbar und Perf-Tests im Release unmöglich.
-      // TODO: Sobald der Hetzner-Server mit HTTPS steht, auf false drehen
-      // (Prod soll nur noch https sprechen).
+      // usesCleartextTraffic hängt jetzt an der Backend-URL (siehe
+      // ALLOW_CLEARTEXT oben): http:// (lokaler Dev-Server) → true, damit der
+      // LAN-Dev-Server auch im Release-Build erreichbar bleibt; https:// (Prod
+      // über Caddy) → false, dann blockt Android jeden Klartext-Fetch auf
+      // OS-Ebene. Kein manuelles Umdrehen mehr nötig — die HTTPS-Backend-URL
+      // schaltet Klartext von selbst ab.
       [
         "expo-build-properties",
         {
           android: {
-            usesCleartextTraffic: true,
+            usesCleartextTraffic: ALLOW_CLEARTEXT,
           },
         },
       ],

@@ -106,6 +106,11 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    # Port 3000 direkt nach außen — NUR für lokalen Dev-Betrieb (LAN, Klartext).
+    # Im Produktionsbetrieb hinter Caddy (Profil `tls`) diesen Block auskommentieren:
+    # dann ist binch-server nur noch im Docker-Netz erreichbar, nach außen spricht
+    # ausschließlich Caddy über 443 (HTTPS). Wer 3000 offen lässt, hat neben HTTPS
+    # weiter einen offenen Klartext-Port — das untergräbt die Verschlüsselung.
     ports:
       - "3000:3000"
     depends_on:
@@ -173,8 +178,44 @@ services:
   # OTP-Setup kann aus git history wiederhergestellt werden falls wir mal
   # auf stärkere Hardware umziehen (>= 32 GB RAM).
 
+  # ── TLS-Terminierung (Produktion) ──────────────────────────────────────────
+  # Caddy nimmt HTTPS auf 443 an und proxyt intern zu binch-server:3000. Für eine
+  # ECHTE Domain besorgt Caddy das Let's-Encrypt-Zertifikat vollautomatisch — es
+  # ist nichts weiter zu tun, als DOMAIN zu setzen und die DNS-A-Record auf diesen
+  # Host zeigen zu lassen.
+  #
+  # Damit ist die Server↔Client-Strecke verschlüsselt: Login-Passwort,
+  # Bearer-Token, Suchen, Chat und Ticket-PDFs sind für Dritte im Netz nicht mehr
+  # mitlesbar/manipulierbar (kein MITM mehr).
+  #
+  # Startet NUR mit dem Profil `tls` (`docker compose --profile tls up -d`), damit
+  # der normale Dev-Start unverändert bleibt:
+  #   DOMAIN=api.deine-domain.de docker compose --profile tls up -d
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["tls"]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # Ohne gesetzte DOMAIN nutzt Caddy `localhost` → selbst-signiertes Zertifikat
+      # (nur für lokale Tests; produktiv MUSS eine echte Domain gesetzt sein).
+      DOMAIN: ${DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      binch-server:
+        condition: service_started
+
 volumes:
   # `{}` = leeres Volume-Objekt mit Docker-Defaults (driver: local). Funktional
   # identisch zum bloßen `binch-db:` ohne Wert, aber strikte YAML-Schema-Linter
   # bemängeln den null-Wert. Mit explizitem `{}` ist die Warnung weg.
   binch-db: {}
+  # Persistente Caddy-Zertifikate/ACME-Account — ohne das würde Caddy bei jedem
+  # Neustart neu bei Let's Encrypt anfragen und liefe ins Rate-Limit.
+  caddy-data: {}
+  caddy-config: {}

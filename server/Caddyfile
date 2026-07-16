@@ -1,0 +1,29 @@
+# Caddy-Reverse-Proxy für binch-server — TLS-Terminierung.
+#
+# {$DOMAIN} kommt aus der Umgebung (docker-compose setzt sie aus $DOMAIN, Default
+# "localhost"). Für eine echte Domain holt Caddy das Let's-Encrypt-Zertifikat
+# automatisch; ist DOMAIN "localhost", nutzt Caddy sein internes, selbst-
+# signiertes Zertifikat (nur für lokale Tests brauchbar).
+{$DOMAIN} {
+	# Alles an den internen Server weiterreichen. Verschlüsselung endet HIER,
+	# dahinter läuft es im Docker-Netz (nicht nach außen erreichbar).
+	reverse_proxy binch-server:3000
+
+	# Sicherheits-Header. HSTS zwingt Browser-Clients für ein Jahr auf HTTPS —
+	# native App-Clients ignorieren das, aber es kostet nichts und schützt die
+	# (per web-Bundler ebenfalls existierende) Web-Variante.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		# Server-Version nicht preisgeben.
+		-Server
+	}
+
+	# Zugriffslog auf stdout (docker logs caddy).
+	log {
+		output stdout
+		format console
+	}
+}
