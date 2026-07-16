@@ -1239,18 +1239,19 @@ const styles = StyleSheet.create({
   rhMetaRow: {
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
     marginTop: 16,
     gap: 10,
   },
-  // Ergebniszahl in derselben Pill-Optik wie der „Ändern"-Button — nur nicht
-  // tippbar. Content-breit (kein flex:1), damit die Box den Text umschließt.
+  // Ergebniszahl und „Ändern" teilen sich die Zeile hälftig: beide flex:1, also
+  // gleich breit bis zur Mitte, Inhalt zentriert. Der 10-px-gap der Zeile trennt
+  // sie, links und rechts hält das routePanel-Padding (16) den Rand.
   rhCountPill: {
+    flex: 1,
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "center",
     gap: 6,
     minWidth: 0,
-    flexShrink: 1,
     backgroundColor: C.surface3,
     borderRadius: 9999,
     paddingVertical: 9,
@@ -1258,8 +1259,10 @@ const styles = StyleSheet.create({
   },
   rhCountText: { flexShrink: 1, fontSize: 13, fontWeight: "600", color: C.gray200 },
   rhChangeBtn: {
+    flex: 1,
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "center",
     gap: 7,
     backgroundColor: C.surface3,
     borderRadius: 9999,
