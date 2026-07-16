@@ -1,4 +1,5 @@
 import { Easing, makeMutable } from "react-native-reanimated";
+import { getDeviceCornerRadius } from "@/modules/screen-corners";
 
 /**
  * Timing der horizontalen Push-Transitions — Werte NACHGEMESSEN an YouTubes
@@ -46,7 +47,7 @@ export const UNDERLAY_TRAVEL_FRAC = -0.13;
 /**
  * Eckenradius der horizontal reinslidenden Screens (results + Detail-Overlays).
  *
- * Bisher slideten sie mit eckigen Ecken rein. Ein Radius rundet die führende
+ * Sie slideten früher mit eckigen Ecken rein. Der Radius rundet die führende
  * Kante beim Reinsliden ab und lässt den Screen im Stand wie eine Karte wirken,
  * deren Ecken zur Bildschirm-Rundung des Geräts passen.
  *
@@ -55,9 +56,16 @@ export const UNDERLAY_TRAVEL_FRAC = -0.13;
  * `clipToOutline` für den runden Clip — GPU-beschleunigt, kein Neurastern pro
  * Frame (anders als beim Swap-Button, wo ein Kind IM Clip rotierte).
  *
- * 40 ist ein gerätenaher Mittelwert (moderne Phones ~28-52 px). Exakt an den
- * echten Bezel-Radius käme man nur über ein natives Modul
- * (Android WindowInsets.getRoundedCorner, API 31+) — bewusst nicht gemacht, das
- * kollidiert mit der CNG/EAS-Pipeline. Bei Bedarf hier zentral anpassen.
+ * Der Wert kommt jetzt vom ECHTEN Geräteradius (natives Modul screen-corners):
+ *   - modernes Android/iOS mit rundem Bezel → exakter Radius
+ *   - Gerät mit eckigem Display → 0 → Ecken bleiben eckig (korrekt)
+ *   - Radius nicht bestimmbar (Modul nicht gebaut, z.B. Dev-Client ohne
+ *     EAS-Rebuild) → null → wir nehmen FALLBACK_RADIUS
+ *
+ * Konstante beim Modul-Load einmal gelesen — reicht, der Wert ändert sich zur
+ * Laufzeit nicht.
  */
-export const SCREEN_CORNER_RADIUS = 40;
+const FALLBACK_RADIUS = 40;
+const measuredRadius = getDeviceCornerRadius();
+export const SCREEN_CORNER_RADIUS =
+  measuredRadius != null ? measuredRadius : FALLBACK_RADIUS;
