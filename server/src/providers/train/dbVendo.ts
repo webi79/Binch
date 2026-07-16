@@ -118,8 +118,14 @@ export const dbVendoProvider: SearchProvider = {
     let fromId: string | null;
     let toId: string | null;
     try {
-      fromId = await resolveStationId(input.origin, input.originLabel, signal);
-      toId = await resolveStationId(input.destination, input.destLabel, signal);
+      // PARALLEL: Beide Auflösungen sind unabhängig, und jede kann einen
+      // HAFAS-/locations-Call enthalten (0,5-2 s bei Cache-Miss). Sequenziell
+      // addierte sich das auf jede Suche, bevor überhaupt eine Journey
+      // angefragt war.
+      [fromId, toId] = await Promise.all([
+        resolveStationId(input.origin, input.originLabel, signal),
+        resolveStationId(input.destination, input.destLabel, signal),
+      ]);
     } catch (e) {
       return {
         results: [],

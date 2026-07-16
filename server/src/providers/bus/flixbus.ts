@@ -299,8 +299,12 @@ export const flixbusProvider: SearchProvider = {
     let outbound: FlixFetch;
     let returnLeg: FlixFetch | null;
     try {
-      fromId = await resolveFlixCityId(input.origin, input.originLabel, signal);
-      toId = await resolveFlixCityId(input.destination, input.destLabel, signal);
+      // PARALLEL: unabhängige Autocomplete-Calls (~0,3-1 s je Cache-Miss) —
+      // sequenziell zahlte jede unkachierte Suche beide nacheinander.
+      [fromId, toId] = await Promise.all([
+        resolveFlixCityId(input.origin, input.originLabel, signal),
+        resolveFlixCityId(input.destination, input.destLabel, signal),
+      ]);
       if (!fromId || !toId) {
         return {
           results: [],

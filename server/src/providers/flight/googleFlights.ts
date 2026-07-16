@@ -61,11 +61,22 @@ export const googleFlightsProvider: SearchProvider = {
     // liefert mal 0, mal das KORREKTE günstige Set (z.B. 8 Flüge, Pegasus 185€ =
     // wie Google), mal ein „Garbage"-Set aus vielen teuren Mehrleg-Combos (z.B.
     // 57 Flüge, Eurowings/SWISS 1502€). NICHT nach Anzahl wählen — das Garbage-Set
-    // ist GRÖSSER aber falsch. Stattdessen über bis zu SEARCH_MAX_ATTEMPTS das
-    // Ergebnis mit dem GÜNSTIGSTEN Min-Preis behalten (bei ähnlichem Preis gewinnt
-    // die längere Liste). So bekommen wir das echte, günstige Google-Set, sobald
-    // es in EINEM der Versuche auftaucht. 3 Versuche deckeln die Latenz unter dem
-    // 25s-Client-Timeout. Mehr Treffer gibt's on-demand über „Mehr Ergebnisse".
+    // ist GRÖSSER aber falsch. Stattdessen Stichproben ziehen und die mit dem
+    // GÜNSTIGSTEN Min-Preis behalten (bei ähnlichem Preis gewinnt die längere
+    // Liste).
+    //
+    // SEQUENZIELL MIT FRÜHEM AUSSTIEG — beide Alternativen sind gemessen
+    // schlechter:
+    //   - Immer 3 Versuche nacheinander (alter Stand): p50 12,4 s pro Suche,
+    //     und JEDE Suche kostete 3 RapidAPI-Calls (~150/Monat-Kontingent).
+    //   - Parallel/gepipelint: bringt NICHTS, RapidAPI arbeitet gleichzeitige
+    //     Requests desselben Keys upstream seriell ab (Concurrency-Limit 1;
+    //     gemessen 15,5 s trotz Pipeline).
+    // Ausstiegsregel: Sobald ZWEI nicht-leere Stichproben im Min-Preis
+    // übereinstimmen (±10 %), ist Garbage praktisch ausgeschlossen → Versuch 3
+    // entfällt. Nur bei Widerspruch (Garbage-Verdacht) oder leeren Antworten
+    // wird weitergezogen. Normalfall: 2 Calls, ~5-10 s, ein Drittel Kontingent
+    // gespart.
     const SEARCH_MAX_ATTEMPTS = 3;
     const minPrice = (rs: NormalizedResult[]): number => {
       let m = Infinity;
@@ -76,9 +87,12 @@ export const googleFlightsProvider: SearchProvider = {
     let raw: unknown = null;
     let best: NormalizedResult[] = [];
     let bestMin = Infinity;
+    let nonEmptySamples = 0;
+    let agreed = false;
 
-    for (let attempt = 0; attempt < SEARCH_MAX_ATTEMPTS; attempt++) {
-      if (attempt > 0) await new Promise((r) => setTimeout(r, 400));
+    for (let attempt = 0; attempt < SEARCH_MAX_ATTEMPTS && !agreed; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 300));
+      if (signal?.aborted) break;
       let res: Response;
       try {
         res = await fetch(url, {
@@ -97,7 +111,12 @@ export const googleFlightsProvider: SearchProvider = {
       if (!res.ok || !body) continue;
       const parsed = parseGoogleFlights(body, input);
       if (parsed.length === 0) continue;
+      nonEmptySamples++;
       const m = minPrice(parsed);
+      // Zwei Stichproben, gleicher Min-Preis (±10 %) → bestätigt, aussteigen.
+      if (nonEmptySamples >= 2 && bestMin !== Infinity && m >= bestMin * 0.9 && m <= bestMin * 1.1) {
+        agreed = true;
+      }
       // Deutlich günstiger (<90 %) = das richtige Set → übernehmen. Ähnlicher
       // Preis (±10 %, gleicher „Modus") → die größere Liste gewinnt. Deutlich
       // teurer → verwerfen (Garbage-Mode).
