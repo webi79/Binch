@@ -796,6 +796,9 @@ export default function ResultsScreen() {
 const RH_RAIL_X = 24;
 // Feld-paddingVertical (18) + halbe Textzeile (lineHeight 26 → 13) = 31.
 const RH_RAIL_INSET_Y = 31;
+// Dauer der Swap-Icon-Drehung. Der eigentliche Routentausch startet danach,
+// damit die Drehung ungestört durchläuft (siehe doSwap).
+const SWAP_ROTATE_MS = 320;
 
 function RouteHeader({
   fromLabel,
@@ -846,19 +849,30 @@ function RouteHeader({
     if (!busy) swapLock.current = false;
   }, [busy]);
 
+  // Timer, der die eigentliche Suche NACH der Drehung startet. Beim Unmount
+  // abbrechen, sonst feuert setParams evtl. auf einer schon verlassenen Route.
+  const swapTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (swapTimer.current) clearTimeout(swapTimer.current);
+  }, []);
+
   const doSwap = () => {
     if (swapLock.current || busy) return;
     swapLock.current = true;
     haptic("button");
     spinTarget.current += 180;
     spin.value = withTiming(spinTarget.current, {
-      duration: 320,
+      duration: SWAP_ROTATE_MS,
       easing: Easing.out(Easing.cubic),
     });
-    // Den schweren Teil (Params-Wechsel → Query-Refetch → Loader-Remount) einen
-    // Frame später, damit die Rotation zuerst sauber auf den UI-Thread kommt und
-    // nicht mit dem Remount um denselben JS-Frame konkurriert.
-    requestAnimationFrame(() => onSwap());
+    // Die schwere Kette (Params-Wechsel → Query-Refetch → Boo-Loader-Mount, 33
+    // Reanimated-Hooks) startet ERST NACH der Drehung. Feuert sie währenddessen,
+    // jankt der Mount mitten in die Rotation („smooth, dann stockt es") — genau
+    // das war das Problem. Ein rAF reichte nicht. So läuft die Rotation komplett
+    // unabhängig auf dem UI-Thread, wie im Hero (der beim Swap nur leichtes
+    // lokales State-Update macht). Der Preis: die Suche startet ~300 ms später —
+    // unmerklich, und die Drehung liest sich ohnehin als „löst den Tausch aus".
+    swapTimer.current = setTimeout(() => onSwap(), SWAP_ROTATE_MS);
   };
 
   const railHeight = Math.max(0, fieldsHeight - RH_RAIL_INSET_Y * 2);
