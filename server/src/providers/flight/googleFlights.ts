@@ -69,14 +69,19 @@ export const googleFlightsProvider: SearchProvider = {
     // schlechter:
     //   - Immer 3 Versuche nacheinander (alter Stand): p50 12,4 s pro Suche,
     //     und JEDE Suche kostete 3 RapidAPI-Calls (~150/Monat-Kontingent).
-    //   - Parallel/gepipelint: bringt NICHTS, RapidAPI arbeitet gleichzeitige
-    //     Requests desselben Keys upstream seriell ab (Concurrency-Limit 1;
-    //     gemessen 15,5 s trotz Pipeline).
+    //   - Drei IDENTISCHE Anfragen gleichzeitig (Pipeline-Versuch): gemessen
+    //     15,5 s — identische Zwillings-Scrapes brachten keinen Zeitgewinn.
+    //     WICHTIG fürs Skalieren: VERSCHIEDENE Routen laufen beim Upstream
+    //     nachweislich PARALLEL (3 gleichzeitige Calls: 4,2/6,9/7,7 s, Gesamt
+    //     7,7 s). Viele Nutzer mit unterschiedlichen Suchen stauen sich also
+    //     nicht — nur das Selbst-Resampling derselben Anfrage profitiert nicht
+    //     von Parallelität.
     // Ausstiegsregel: Sobald ZWEI nicht-leere Stichproben im Min-Preis
     // übereinstimmen (±10 %), ist Garbage praktisch ausgeschlossen → Versuch 3
     // entfällt. Nur bei Widerspruch (Garbage-Verdacht) oder leeren Antworten
     // wird weitergezogen. Normalfall: 2 Calls, ~5-10 s, ein Drittel Kontingent
-    // gespart.
+    // gespart. (Historik-Check über 32 gespeicherte Antworten: Min-Preis pro
+    // Route über unabhängige Suchen hinweg stabil — kein Garbage im Output.)
     const SEARCH_MAX_ATTEMPTS = 3;
     const minPrice = (rs: NormalizedResult[]): number => {
       let m = Infinity;
@@ -113,6 +118,13 @@ export const googleFlightsProvider: SearchProvider = {
       if (parsed.length === 0) continue;
       nonEmptySamples++;
       const m = minPrice(parsed);
+      // Sichtbarkeit fürs Garbage-Restrisiko (zwei übereinstimmende
+      // Müll-Stichproben würden den Early-Exit täuschen): pro Stichprobe
+      // Min-Preis + Größe loggen — Ausreißer fallen damit im Log auf, statt
+      // still ausgeliefert zu werden.
+      console.log(
+        `[google-flights] ${input.origin}→${input.destination} Stichprobe ${attempt + 1}: ${parsed.length} Treffer, min ${m === Infinity ? "-" : m} ${input.currency}`,
+      );
       // Zwei Stichproben, gleicher Min-Preis (±10 %) → bestätigt, aussteigen.
       if (nonEmptySamples >= 2 && bestMin !== Infinity && m >= bestMin * 0.9 && m <= bestMin * 1.1) {
         agreed = true;
