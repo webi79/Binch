@@ -8,6 +8,17 @@ const schema = z.object({
   DATABASE_URL: z.string().url(),
   REDIRECT_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 24 * 30),
 
+  // Hinter einem Reverse-Proxy (nginx/Caddy/Cloudflare) auf "true" setzen, damit
+  // Fastify die Client-IP aus X-Forwarded-For liest statt der Proxy-Peer-IP.
+  // OHNE das landen hinter einem Proxy ALLE Nutzer in EINEM Rate-Limit-Bucket
+  // (die IP ist dann immer die des Proxys) — die Per-IP-Limits wären wirkungslos
+  // bzw. sperrten alle gemeinsam aus. Default false = direkte Exposition (der
+  // aktuelle Docker-Stand mappt Port 3000 direkt).
+  TRUST_PROXY: z
+    .string()
+    .optional()
+    .transform((v) => v === "true" || v === "1"),
+
   // Self-hosted db-rest (Docker) — siehe docker-compose.yml.
   // Public Instanz https://v6.db.transport.rest ist unzuverlässig, deshalb default lokal.
   DBREST_BASE_URL: z.string().default("http://localhost:3001"),

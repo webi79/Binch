@@ -24,6 +24,10 @@ const app = Fastify({
         ? { target: "pino-pretty", options: { colorize: true, translateTime: "HH:MM:ss" } }
         : undefined,
   },
+  // Nur hinter einem Reverse-Proxy true (siehe config.TRUST_PROXY): sonst würde
+  // ein Angreifer per gefälschtem X-Forwarded-For seine IP frei wählen und die
+  // Per-IP-Rate-Limits umgehen. Direkt exponiert (Default) = Peer-IP zählt.
+  trustProxy: config.TRUST_PROXY,
 });
 
 // CORS: mit CORS_ORIGINS (Prod) nur die gelisteten Origins, ungesetzt (Dev)

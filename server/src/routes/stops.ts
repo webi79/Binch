@@ -8,6 +8,7 @@ import { profileForStop, isAtRegionalProfile, type HafasProfileKey } from "../se
 import { getFlightBoard } from "../services/flightInfoService.js";
 import { getScheduledStopBoard } from "../services/gtfsSchedule.js";
 import { getMotisStopBoard } from "../services/motisStops.js";
+import { ipLimiter } from "../util/rateLimit.js";
 
 /**
  * Liefert die nächsten Abfahrten/Ankünfte einer Haltestelle. Wird vom
@@ -146,6 +147,8 @@ async function tryFlightBoard(code: string, board: StopBoard): Promise<StopBoard
 }
 
 export async function stopsRoutes(app: FastifyInstance) {
+  // Abfahrtstafeln: db-vendo/MOTIS — das DB-60/min-Kontingent hängt hier dran.
+  const preHandler = ipLimiter("stops", [{ limit: 60, windowMs: 60 * 1000 }]);
   async function handle(req: FastifyRequest, reply: FastifyReply, board: StopBoard) {
     const parsed = paramsSchema.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ error: "Bad request" });
@@ -287,6 +290,6 @@ export async function stopsRoutes(app: FastifyInstance) {
     }
   }
 
-  app.get("/api/stops/:code/departures", (req, reply) => handle(req, reply, "departures"));
-  app.get("/api/stops/:code/arrivals", (req, reply) => handle(req, reply, "arrivals"));
+  app.get("/api/stops/:code/departures", { preHandler }, (req, reply) => handle(req, reply, "departures"));
+  app.get("/api/stops/:code/arrivals", { preHandler }, (req, reply) => handle(req, reply, "arrivals"));
 }

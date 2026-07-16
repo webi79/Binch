@@ -4,6 +4,7 @@ import {
   getBookingOptions,
   getBookingUrlByProviderToken,
 } from "../providers/flight/flightBookingDispatch.js";
+import { ipLimiter } from "../util/rateLimit.js";
 
 /**
  * Zwei Endpoints für die Multi-Provider-Buchung von Flügen:
@@ -44,7 +45,9 @@ const urlQuerySchema = z.object({
 });
 
 export async function flightBookingOptionsRoutes(app: FastifyInstance) {
-  app.get("/api/flights/booking-options", async (req, reply) => {
+  // Booking-Optionen/-URL: SerpAPI-2nd-stage — pay-per-call, deshalb gedeckelt.
+  const preHandler = ipLimiter("flight-booking", [{ limit: 40, windowMs: 60 * 1000 }]);
+  app.get("/api/flights/booking-options", { preHandler }, async (req, reply) => {
     const parsed = optionsQuerySchema.safeParse(req.query);
     if (!parsed.success) {
       return reply.code(400).send({ error: "Bad request", details: parsed.error.flatten() });
@@ -73,7 +76,7 @@ export async function flightBookingOptionsRoutes(app: FastifyInstance) {
   // wir resolven den Provider-Token einmal und leiten direkt weiter. Vorteil
   // ggü. einer JSON-Response + zweiter clientseitiger openURL-Roundtrip:
   // weniger Latenz beim Tap, Anbieter-URL gar nicht erst im JS sichtbar.
-  app.get("/api/flights/booking-url", async (req, reply) => {
+  app.get("/api/flights/booking-url", { preHandler }, async (req, reply) => {
     const parsed = urlQuerySchema.safeParse(req.query);
     if (!parsed.success) {
       return reply.code(400).send({ error: "Bad request" });

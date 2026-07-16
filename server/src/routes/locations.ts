@@ -4,6 +4,7 @@ import { inArray } from "drizzle-orm";
 import { searchLocations } from "../services/locationService.js";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
+import { ipLimiter } from "../util/rateLimit.js";
 
 const querySchema = z.object({
   q: z.string().min(1),
@@ -19,7 +20,11 @@ const byCodesQuerySchema = z.object({
 });
 
 export async function locationsRoutes(app: FastifyInstance) {
-  app.get("/api/locations", async (req, reply) => {
+  // Locations-Autocomplete: tippt der User, feuert das oft — daher großzügig,
+  // aber gedeckelt gegen Skript-Fluten (jeder Miss kann einen Geocoder-Call
+  // auslösen).
+  const preHandler = ipLimiter("locations", [{ limit: 90, windowMs: 60 * 1000 }]);
+  app.get("/api/locations", { preHandler }, async (req, reply) => {
     const parsed = querySchema.safeParse(req.query);
     if (!parsed.success) {
       return reply.code(400).send({ error: "Bad request", issues: parsed.error.flatten() });
@@ -32,7 +37,7 @@ export async function locationsRoutes(app: FastifyInstance) {
   // `exists` (gibt's noch in der DB?) + `label` (aktuelle Anzeige). Client nutzt
   // das beim App-Start um stale Einträge zu prunen / Labels zu syncen — z.B.
   // wenn wir nach DB-Cleanup einen sta:-Code gelöscht oder umgelabelt haben.
-  app.get("/api/locations/by-codes", async (req, reply) => {
+  app.get("/api/locations/by-codes", { preHandler }, async (req, reply) => {
     const parsed = byCodesQuerySchema.safeParse(req.query);
     if (!parsed.success) {
       return reply.code(400).send({ error: "Bad request", issues: parsed.error.flatten() });

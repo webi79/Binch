@@ -8,6 +8,7 @@ import { locations } from "../db/schema.js";
 import { profileForStop, type HafasProfileKey } from "../services/countryProfile.js";
 import { fetchTrip as multiFetchTrip } from "../services/multiHafas.js";
 import { cleanPlatform } from "../util/platform.js";
+import { ipLimiter } from "../util/rateLimit.js";
 
 /**
  * Liefert die geographische Polyline (Route entlang der Schienen) für eine
@@ -659,11 +660,13 @@ const tripDetailQuerySchema = z.object({
 });
 
 export async function tripsRoutes(app: FastifyInstance) {
+  // Trips: bis zu 10 Polyline-/Detail-Calls pro Request (MOTIS/HAFAS) → DB-Quota.
+  const preHandler = ipLimiter("trips", [{ limit: 40, windowMs: 60 * 1000 }]);
   /**
    * GET /api/trips/polyline?ids=id1,id2,id3
    * → { polylines: { [tripId]: [[lng, lat], ...] } }
    */
-  app.get("/api/trips/polyline", async (req, reply) => {
+  app.get("/api/trips/polyline", { preHandler }, async (req, reply) => {
     const parsed = querySchema.safeParse(req.query);
     if (!parsed.success) {
       return reply.code(400).send({ error: "Bad request", issues: parsed.error.flatten() });
@@ -686,7 +689,7 @@ export async function tripsRoutes(app: FastifyInstance) {
    * `/journeys?from=X&to=Y`-Suche, weil HAFAS hier kein Routing macht sondern
    * einen schon-bekannten Trip ausliefert.
    */
-  app.get("/api/trips/detail", async (req, reply) => {
+  app.get("/api/trips/detail", { preHandler }, async (req, reply) => {
     const parsed = tripDetailQuerySchema.safeParse(req.query);
     if (!parsed.success) {
       return reply.code(400).send({ error: "Bad request", issues: parsed.error.flatten() });

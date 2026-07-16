@@ -3,6 +3,7 @@ import { z } from "zod";
 import { and, eq, gte, isNotNull, lte, or, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
+import { ipLimiter } from "../util/rateLimit.js";
 
 /**
  * Liefert Haltestellen/Bahnhöfe in der Nähe einer Koordinate. Quelle ist die
@@ -371,7 +372,9 @@ async function fetchTransitNearby(
 }
 
 export async function surroundingsRoutes(app: FastifyInstance) {
-  app.get("/api/surroundings", async (req, reply) => {
+  // Surroundings: MOTIS/Transit-nearby — verbraucht DB-/MOTIS-Kontingent.
+  const preHandler = ipLimiter("surroundings", [{ limit: 40, windowMs: 60 * 1000 }]);
+  app.get("/api/surroundings", { preHandler }, async (req, reply) => {
     const parsed = querySchema.safeParse(req.query);
     if (!parsed.success) {
       return reply.code(400).send({ error: "Bad request", issues: parsed.error.flatten() });
