@@ -22,6 +22,14 @@ export const googleFlightsProvider: SearchProvider = {
   name: "google-flights",
   mode: "FLIGHT",
 
+  // Gemessen (provider_responses, Juli 2026): p50 ~12,4 s, p90 ~15 s. Mit dem
+  // globalen 15-s-Deckel wurden Antworten regelmäßig knapp vor der Ziellinie
+  // gekappt — 15 s gewartet und trotzdem leer. Solange dieser Provider bei
+  // Flügen die einzige liefernde Quelle ist (SearchAPI-Kontingent), lohnt das
+  // größere Fenster: lieber nach 16-20 s Ergebnisse (die dann auch im Cache
+  // landen) als nach 15 s garantiert nichts.
+  timeoutMs: 25_000,
+
   isConfigured() {
     return Boolean(config.RAPIDAPI_KEY);
   },

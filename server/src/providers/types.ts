@@ -137,5 +137,9 @@ export interface SearchProvider {
   name: string;
   mode: TravelMode;
   isConfigured(): boolean;
+  /** Eigenes Timeout-Fenster (ms) statt des globalen Provider-Timeouts. Für
+   *  Quellen, die regulär nah an der globalen Grenze liefern UND alternativlos
+   *  sind (google-flights: p50 ~12 s — gekappt hieße 15 s warten für nichts). */
+  timeoutMs?: number;
   search(input: ProviderSearchInput, signal?: AbortSignal): Promise<ProviderResult>;
 }

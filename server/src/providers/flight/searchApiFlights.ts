@@ -19,12 +19,27 @@ const SEARCH_URL = `${config.SEARCHAPI_BASE_URL}/api/v1/search`;
 // zeigt sie via formatInTimeZone(.,"UTC") VERBATIM an (kein Geräte-TZ-Doppel-Offset).
 const FLIGHT_TZ = "UTC";
 
+/**
+ * Kontingent-Sperre. SearchAPI drosselt MONATLICH: Ist das Kontingent
+ * aufgebraucht, kommt auf jeden Call ein 429 („You have used all of the
+ * searches for the month"). Der lief hier still als „0 Treffer, kein Fehler"
+ * durch — 32 Calls in einer Woche, alle leer, nie aufgefallen. Jede Flugsuche
+ * verbrannte damit erst einen sinnlosen SearchAPI-Call und fiel DANN auf den
+ * langsamen google-flights-Fallback (8-15 s) zurück.
+ *
+ * Nach einem 429 melden wir uns deshalb für eine Weile als unkonfiguriert →
+ * die Registry überspringt uns, der Fallback startet sofort. 6 h statt
+ * „bis Monatsende", damit ein Plan-Upgrade/Reset ohne Neustart wieder greift.
+ */
+const QUOTA_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+let quotaBlockedUntil = 0;
+
 export const searchApiFlightsProvider: SearchProvider = {
   name: "searchapi-flights",
   mode: "FLIGHT",
 
   isConfigured() {
-    return Boolean(config.SEARCHAPI_API_KEY);
+    return Boolean(config.SEARCHAPI_API_KEY) && Date.now() >= quotaBlockedUntil;
   },
 
   async search(input: ProviderSearchInput, signal?: AbortSignal): Promise<ProviderResult> {
@@ -71,6 +86,12 @@ export const searchApiFlightsProvider: SearchProvider = {
       return { results: [], raw: { error: "fetch failed" }, statusCode: 0, durationMs: Date.now() - start };
     }
     const body = (await res.json().catch(() => null)) as unknown;
+    if (res.status === 429) {
+      quotaBlockedUntil = Date.now() + QUOTA_COOLDOWN_MS;
+      console.warn(
+        `[searchapi-flights] 429 — Monatskontingent aufgebraucht. Provider pausiert bis ${new Date(quotaBlockedUntil).toISOString()}; Flüge laufen solange über den Fallback (google-flights).`,
+      );
+    }
     const results = res.ok && body ? parseSearchApi(body, input, roundTrip) : [];
     return { results, raw: body, statusCode: res.status, durationMs: Date.now() - start };
   },

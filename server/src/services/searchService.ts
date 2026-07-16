@@ -840,8 +840,16 @@ async function withProviderTimeout(
   p: SearchProvider,
   input: ProviderSearchInput,
 ): Promise<ProviderResult> {
+  // Provider dürfen ein eigenes Fenster mitbringen (p.timeoutMs). Grund:
+  // google-flights ist bei Flügen oft die EINZIGE liefernde Quelle (SearchAPI-
+  // Monatskontingent aufgebraucht → 429) und braucht gemessen p50 ~12,4 s,
+  // p90 ~15 s. Mit dem 15-s-Deckel wurden Antworten regelmäßig HAARSCHARF vor
+  // der Ziellinie gekappt: 15 s gewartet, trotzdem 0 Treffer, nichts im Cache —
+  // und der User lädt neu und wartet wieder. Ein knapp längeres Fenster für
+  // genau diesen Provider rettet diese Antworten; alle anderen behalten 15 s.
+  const timeoutMs = p.timeoutMs ?? PROVIDER_TIMEOUT_MS;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), PROVIDER_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await Promise.race([
       p.search(input, controller.signal),
@@ -850,11 +858,11 @@ async function withProviderTimeout(
           () =>
             resolve({
               results: [],
-              raw: { error: "provider_timeout", timeoutMs: PROVIDER_TIMEOUT_MS },
+              raw: { error: "provider_timeout", timeoutMs },
               statusCode: 0,
-              durationMs: PROVIDER_TIMEOUT_MS,
+              durationMs: timeoutMs,
             }),
-          PROVIDER_TIMEOUT_MS,
+          timeoutMs,
         ),
       ),
     ]);
