@@ -32,6 +32,10 @@ const STANDARD_FONT_DATA_URL =
   pathToFileURL(path.join(pdfJsBase, "standard_fonts") + path.sep).href;
 const CMAP_URL = pathToFileURL(path.join(pdfJsBase, "cmaps") + path.sep).href;
 
+/** Obergrenze der Text-Extraktion (DoS-Schutz gegen präparierte Viel-Seiten-PDFs,
+ *  siehe Schleife). Ein Ticket hat 1-3 Seiten. */
+const MAX_TEXT_PAGES = 15;
+
 export interface RenderedPdf {
   text: string;
   pageCount: number;
@@ -67,11 +71,17 @@ export async function renderPdf(buffer: Buffer, scale = 2.0): Promise<RenderedPd
   });
   const doc = await loadingTask.promise;
 
-  // Text aus ALLEN Seiten extrahieren — der Parser braucht den vollen Text
+  // Text aus den ersten Seiten extrahieren — der Parser braucht den vollen Text
   // damit er Felder die auf späteren Seiten stehen (z.B. Buchungsnummer auf
-  // Seite 2) finden kann.
+  // Seite 2) findet.
+  //
+  // DECKEL: Nur bis MAX_TEXT_PAGES. Sonst ist eine präparierte PDF ein DoS —
+  // 12 MB (die Upload-Grenze) reichen für zehntausende winzige Textseiten, und
+  // diese Schleife würde je Seite getPage()+getTextContent() awaiten und den
+  // Parse minutenlang binden. Ein echtes Ticket hat 1-3 Seiten; 15 ist großzügig.
+  const pageCount = Math.min(doc.numPages, MAX_TEXT_PAGES);
   let allText = "";
-  for (let i = 1; i <= doc.numPages; i++) {
+  for (let i = 1; i <= pageCount; i++) {
     const page = await doc.getPage(i);
     const textContent = await page.getTextContent();
     const pageText = textContent.items

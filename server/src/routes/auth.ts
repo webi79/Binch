@@ -47,6 +47,16 @@ const avatarSchema = z.object({
   dataUrl: z.string().nullable(),
 });
 
+// Einmal berechneter, gecachter argon2-Hash gegen den bei nicht-existenten
+// Usern verifiziert wird — allein zum Angleichen der Login-Antwortzeit (siehe
+// Timing-Oracle im Login-Handler). Lazy, damit das teure Hashing nicht bei jedem
+// Server-Start läuft, sondern erst beim ersten Fehl-Login.
+let dummyHashCache: Promise<string> | null = null;
+function dummyPasswordHash(): Promise<string> {
+  if (!dummyHashCache) dummyHashCache = hashPassword("binch-timing-equalizer-not-a-real-password");
+  return dummyHashCache;
+}
+
 async function createSession(userId: string): Promise<string> {
   const token = randomToken(32);
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
@@ -130,6 +140,13 @@ export async function authRoutes(app: FastifyInstance) {
 
     const [user] = await db.select().from(users).where(eq(users.email, email)).limit(1);
     if (!user) {
+      // Timing-Oracle schließen: Ohne diesen Dummy-Verify kehrt „User existiert
+      // nicht" SOFORT zurück, während „User existiert, PW falsch" erst den
+      // ~50-100 ms teuren argon2-Verify durchläuft. An dieser Zeitdifferenz
+      // könnte ein Angreifer trotz generischer Fehlermeldung enumerieren, welche
+      // E-Mails registriert sind. Wir verifizieren daher gegen einen konstanten
+      // Dummy-Hash, damit beide Pfade gleich lange brauchen.
+      await verifyPassword(password, await dummyPasswordHash());
       return reply.code(401).send({ error: "Invalid credentials" });
     }
     const ok = await verifyPassword(password, user.passwordHash);

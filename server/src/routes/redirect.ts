@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { consumeRedirectToken } from "../services/tokenService.js";
 import { resolveBookingUrl } from "../providers/flight/flightBookingDispatch.js";
 import { localizeBookingUrl, isAppLocale } from "../util/bookingLocale.js";
+import { ipLimiter } from "../util/rateLimit.js";
 
 /** Defense-in-Depth: wir leiten ausschließlich auf http(s)-URLs weiter.
  *  Die Links kommen zwar server-seitig von Providern (kein direkter User-
@@ -17,7 +18,14 @@ function isHttpUrl(value: string): boolean {
 }
 
 export async function redirectRoutes(app: FastifyInstance) {
-  app.get<{ Params: { token: string }; Querystring: { lang?: string } }>("/redirect/:token", async (req, reply) => {
+  // Per-IP-Limit. /redirect ist NICHT single-use (Token bleibt für seine TTL
+  // gültig, damit ein Nutzer denselben „Buchen"-Link auch zweimal öffnen kann),
+  // UND es löst bei Flügen die bezahlte SerpAPI-2nd-stage-Auflösung aus. Ohne
+  // Limit könnte ein Angreifer mit EINEM gültigen Token (= eine Suche) den
+  // Endpoint beliebig oft replayen und pro Aufruf einen SerpAPI-Call verbrennen.
+  // 30/min ist weit über echtem Tippen auf Buchungslinks, kappt aber den Replay.
+  const preHandler = ipLimiter("redirect", [{ limit: 30, windowMs: 60 * 1000 }]);
+  app.get<{ Params: { token: string }; Querystring: { lang?: string } }>("/redirect/:token", { preHandler }, async (req, reply) => {
     const consumed = await consumeRedirectToken(req.params.token);
     if (!consumed) return reply.code(404).send({ error: "Token expired or unknown" });
 
