@@ -110,6 +110,18 @@ type Msg =
 let persistedMessages: Msg[] = [];
 let persistedMood: BoMood = "waving";
 
+/**
+ * Deckel für den In-Memory-Chatverlauf.
+ *
+ * Ohne Deckel wächst `messages` (und sein Modul-Mirror `persistedMessages`)
+ * über eine lange Session UNBEGRENZT — und schwer, denn jede Flug-Antwort hängt
+ * ein komplettes SearchResult (Legs, Stopovers, …) an ihre Nachricht. Der ganze
+ * Verlauf lebt zudem im React-State, solange der Tab gemountet ist (und das ist
+ * er dauerhaft, native Bottom-Tabs). 80 Nachrichten = ~40 Turns, mehr scrollt in
+ * der Praxis niemand zurück; die ältesten fallen still hinten raus.
+ */
+const MAX_CHAT_MESSAGES = 80;
+
 export default function AssistantScreen() {
   // Lazy-Render-Gate: der Tabs-Navigator mountet uns eager (lazy: false im
   // Layout) damit alle Tab-Switches snappy sind. Aber AssistantScreen ist
@@ -154,9 +166,22 @@ function AssistantScreenInner() {
   const [mood, setMood] = useState<BoMood>(() => persistedMood);
   const [listening, setListening] = useState(false);
 
+  // Verlauf deckeln: Läuft er über MAX_CHAT_MESSAGES, die ältesten wegtrimmen.
+  // Trimmt vom ANFANG (slice(-N)) — die neueste, evtl. gerade streamende
+  // Nachricht liegt immer am Ende und bleibt unberührt. Ein Trim ist selten
+  // (nur alle N Nachrichten ein Extra-Render), begrenzt aber den Speicher hart.
+  useEffect(() => {
+    if (messages.length > MAX_CHAT_MESSAGES) {
+      setMessages((prev) =>
+        prev.length > MAX_CHAT_MESSAGES ? prev.slice(-MAX_CHAT_MESSAGES) : prev,
+      );
+    }
+  }, [messages]);
+
   // Bei jeder Message- oder Mood-Änderung den Module-Level-Snapshot mit-
   // aktualisieren — sonst gehen Änderungen die nach dem letzten Mount
-  // passierten beim nächsten Mount verloren.
+  // passierten beim nächsten Mount verloren. `messages` ist hier bereits
+  // gedeckelt (Effekt oben), der Mirror erbt den Deckel.
   useEffect(() => {
     persistedMessages = messages;
   }, [messages]);
