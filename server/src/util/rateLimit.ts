@@ -58,24 +58,6 @@ export function rateLimit(
 }
 
 /**
- * Prüft ein Feature-Budget für die IP OHNE die Anfrage zu zählen. Für den
- * nocache-Sub-Check, der NACH dem generellen Limiter läuft: sonst würde die
- * normale Suche doppelt gezählt.
- */
-export function peekRateLimit(
-  scope: string,
-  key: string,
-  limit: number,
-  windowMs: number,
-): RateLimitResult {
-  const r = rateLimit(scope, key, limit, windowMs);
-  // Zählung zurücknehmen — wir wollten nur wissen, ob noch Budget da ist.
-  const w = windows.get(`${scope}:${key}`);
-  if (w && w.count > 0) w.count -= 1;
-  return r;
-}
-
-/**
  * Per-IP-Rate-Limit als Fastify-preHandler für die UNAUTHENTIFIZIERTEN, teuren
  * Endpoints (Suche, Booking-Optionen, Locations, Surroundings, Stops, Trips).
  *
