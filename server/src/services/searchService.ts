@@ -294,6 +294,73 @@ async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
  * neue Tokens aus. Wird via in-flight-Map dedupliziert wenn mehrere User
  * gleichzeitig die exakt selbe (uncached) Suche absenden.
  */
+/**
+ * Ergänzt fehlende Endpunkt-Koordinaten an Treffern coords-loser Provider.
+ *
+ * Nur die ENDPUNKTE der Suche (input.origin/destination sind unsere
+ * locations-Codes → exakter PK-Lookup). Ein Treffer wird angefasst, wenn er
+ * entweder gar keine Legs hat (dann synthetisieren wir das eine Leg, das der
+ * Client sonst selbst aus dem Result ableitet) oder wenn seine Legs komplett
+ * ohne Koordinaten sind (dann bekommen erster/letzter Leg die Endpunkte).
+ * Treffer mit echten Leg-Coords (HAFAS/MOTIS) bleiben unberührt.
+ */
+async function fillMissingLegCoords(candidates: Candidate[], input: SearchInput): Promise<void> {
+  const needy = candidates.filter((c) => {
+    const legs = c.result.legs;
+    if (!legs || legs.length === 0) return true;
+    return legs.every(
+      (l) => l.originLat == null && l.originLng == null && l.destLat == null && l.destLng == null,
+    );
+  });
+  if (needy.length === 0) return;
+
+  const rows = await db
+    .select({ code: locations.code, lat: locations.latitude, lng: locations.longitude })
+    .from(locations)
+    .where(inArray(locations.code, [input.origin, input.destination]));
+  const byCode = new Map(rows.map((r) => [r.code, r]));
+  const o = byCode.get(input.origin);
+  const d = byCode.get(input.destination);
+  const oLat = o?.lat != null ? Number(o.lat) : undefined;
+  const oLng = o?.lng != null ? Number(o.lng) : undefined;
+  const dLat = d?.lat != null ? Number(d.lat) : undefined;
+  const dLng = d?.lng != null ? Number(d.lng) : undefined;
+  if (oLat == null || oLng == null || dLat == null || dLng == null) return;
+
+  for (const c of needy) {
+    const r = c.result;
+    if (!r.legs || r.legs.length === 0) {
+      r.legs = [
+        {
+          origin: r.origin,
+          destination: r.destination,
+          // Labels der SUCH-Endpunkte, nicht die Provider-Stationsnamen:
+          // die Koordinaten sind die der gesuchten Stationen — Pin-Label und
+          // Pin-Position müssen zusammengehören (FlixBus' eigene Station
+          // kann ein paar km entfernt liegen, deren Name stünde sonst am
+          // falschen Punkt).
+          originLabel: input.originLabel ?? r.originLabel,
+          destLabel: input.destLabel ?? r.destLabel,
+          originLat: oLat,
+          originLng: oLng,
+          destLat: dLat,
+          destLng: dLng,
+          departTime: r.departTime,
+          arriveTime: r.arriveTime,
+          durationMinutes: r.durationMinutes,
+        },
+      ];
+    } else {
+      const first = r.legs[0]!;
+      const last = r.legs[r.legs.length - 1]!;
+      first.originLat = oLat;
+      first.originLng = oLng;
+      last.destLat = dLat;
+      last.destLng = dLng;
+    }
+  }
+}
+
 async function runLive(input: SearchInput): Promise<SearchOutput> {
   const [request] = await db
     .insert(searchRequests)
@@ -406,6 +473,16 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
   }
 
   const deduped = dedupe(candidates, input.mode);
+
+  // Endpunkt-Koordinaten für Provider ohne Leg-Geometrie (FlixBus & Co.):
+  // „Route anzeigen" im Client braucht mindestens zwei Waypoints mit Coords —
+  // FlixBus liefert keine, der Button tat also schlicht nichts. Die Suche
+  // kennt aber die exakten locations-Codes der Endpunkte (PK-Lookup, KEIN
+  // Namens-Raten — Roma→„Re di Roma"-Klasse ausgeschlossen). FLIGHT/CRUISE
+  // bleiben außen vor, dort hat der Client statische Pin-Listen.
+  if (input.mode === "TRAIN" || input.mode === "BUS") {
+    await fillMissingLegCoords(deduped, input);
+  }
 
   // Hin- und Rückfahrten getrennt behandeln: Rückfahrten persistieren wir
   // (noch) nicht — das DB-Schema hat keine `direction`-Spalte, und der

@@ -6,8 +6,10 @@ import {
   isReferenceFeedId,
   motisFetch,
   motisGeocode,
-  motisGeocodeAnyStop,
+  motisGeocodeStopNear,
+  motisGeocodeStopSimilar,
   motisGeocodeNearestStop,
+  motisReverseGeocodeStop,
   type MotisPlace,
 } from "./motisClient.js";
 
@@ -125,15 +127,29 @@ async function discoverRailStopId(seedStopId: string, signal?: AbortSignal): Pro
   return best;
 }
 
+// Fallback-Auflösung der Tafel-Stop-IDs — inkl. negativem Ergebnis (null),
+// damit tote Stops nicht bei jedem Marker-Tap neu gegen den Geocoder laufen.
+const stopIdCache = new BoundedTtlCache<MotisPlace | null>(2000, 24 * 60 * 60 * 1000);
+
 /**
  * Wie {@link resolveMotisPlace}, aber garantiert eine echte STOP-ID.
  *
  * Nötig für `/v6/stoptimes` (Abfahrtstafeln): der Endpoint akzeptiert nur eine
  * Stop-ID, keine Koordinate. Findet die strenge Auflösung keinen kanonischen
- * Stop (bei großen Bahnhöfen gibt der Transitous-Geocoder oft nur Referenzdaten-
- * Knoten her), fällt sie auf die Koordinate zurück — die wäre hier wertlos und
- * die Tafel bliebe LEER. Dann lieber irgendeinen Geocode-Treffer nehmen: eine
- * Tafel mit unsauberen Gleisangaben ist immer noch besser als keine.
+ * Stop, wird DISTANZ-GEBUNDEN weitergesucht — Anker ist unsere gespeicherte
+ * Marker-Koordinate:
+ *
+ *   1. reverse-geocode: nächster STOP ≤150 m (gleicher physischer Halt,
+ *      auch wenn der Feed ihn anders schreibt als unser OSM-Label)
+ *   2. Label-Geocode, aber nur Treffer nahe der Koordinate (≤150 m frei,
+ *      ≤600 m mit Namens-Guard)
+ *   3. nichts → null → LEERE Tafel.
+ *
+ * Früher stand hier „lieber irgendeinen Geocode-Treffer nehmen: eine Tafel
+ * mit unsauberen Gleisangaben ist besser als keine" — und genau das zeigte
+ * für den Marker „Iglesia" (Murcia) die Tafel von „IGLESIA" (Galicien,
+ * 700 km). Der User tappt dann einen Bus an, der an seiner Station nie
+ * abfährt, und die Route springt „ganz woanders" hin. Leer schlägt falsch.
  */
 export async function resolveMotisStopId(
   code: string,
@@ -142,11 +158,34 @@ export async function resolveMotisStopId(
 ): Promise<MotisPlace | null> {
   const place = await resolveMotisPlace(code, label, signal);
   if (place && !isCoordId(place.id) && place.type !== "PLACE") return place;
-  if (!label) return null;
-  // motisGeocodeAnyStop statt motisGeocode: Die Tafel BRAUCHT eine Stop-ID, und
-  // motisGeocode gibt inzwischen bewusst auch Nicht-Halte zurück (Stadt-PLACE),
-  // mit denen /v6/stoptimes nichts anfangen kann → die Tafel bliebe leer.
-  return motisGeocodeAnyStop(label, signal);
+
+  const cached = stopIdCache.get(code);
+  if (cached !== undefined) return cached;
+
+  // Anker-Koordinate: der Coord-Platzhalter bzw. PLACE-Treffer aus
+  // resolveMotisPlace trägt lat/lon (aus unserer DB oder dem Geocode).
+  const lat = place?.lat;
+  const lon = place?.lon;
+  const name = place?.name ?? label;
+
+  let hit: MotisPlace | null = null;
+  try {
+    if (lat != null && lon != null) {
+      hit = await motisReverseGeocodeStop(lat, lon, undefined, signal);
+      if (!hit && name) hit = await motisGeocodeStopNear(name, lat, lon, signal);
+    } else if (name) {
+      // Ohne Koordinate (kuratierte Stadt-Codes): wenigstens Namens-Guard —
+      // der Fuzzy-Geocoder darf keinen beliebig anderen Halt unterschieben.
+      hit = await motisGeocodeStopSimilar(name, signal);
+    }
+  } catch {
+    // Transienter MOTIS-Fehler: Tafel diesmal leer, aber NICHT negativ
+    // cachen — sonst brennt ein kurzer Transitous-Ausfall den Stop für
+    // 24 h als „existiert nicht" ein.
+    return null;
+  }
+  stopIdCache.set(code, hit);
+  return hit;
 }
 
 export async function resolveMotisPlace(
@@ -246,6 +285,11 @@ export async function resolveMotisPlace(
         : { id: `${seed.lat},${seed.lon}`, name: seed.name, lat: seed.lat, lon: seed.lon, tz: seed.tz };
   }
 
-  placeCache.set(code, place);
+  // null NICHT cachen: Es kann „Geocode transient down" bedeuten (motisGeocode
+  // schluckt Fetch-Fehler) — ein kurzer Transitous-Ausfall würde den Code
+  // sonst 24 h als unauflösbar einbrennen (Suche wie Tafel betroffen).
+  // Echte No-Hits negativ-cached bereits motisGeocodes eigener geocodeCache,
+  // der Wiederanlauf hier kostet also nur einen billigen DB-PK-Lookup.
+  if (place !== null) placeCache.set(code, place);
   return place;
 }

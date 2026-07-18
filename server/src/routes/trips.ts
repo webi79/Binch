@@ -383,6 +383,20 @@ async function fetchTripDetail(
     "gasse",
     "ring",
     "ufer",
+    // Romanische/weitere Generika — die Liste war deutsch/englisch-zentrisch.
+    // Ohne sie matched z.B. „Estación de Autobuses de Sevilla" auf „Estación
+    // de Autobuses de Granada" über {estación, autobuses} = 2 Tokens und der
+    // Slice startet an einer fremden Station (Spanien-Bugklasse). Akzent-
+    // Varianten doppelt, der Tokenizer strippt keine Diakritika.
+    "estación", "estacion", "estació", "estacio", "estação", "estacao",
+    "autobuses", "autobús", "autobus", "autocares",
+    "gare", "routière", "routiere",
+    "stazione", "autostazione", "fermata",
+    "paragem", "rodoviária", "rodoviaria",
+    "dworzec", "przystanek", "nádraží", "nadrazi", "zastávka", "zastavka",
+    "calle", "avenida", "avda", "carrer", "avinguda",
+    "rue", "avenue", "boulevard",
+    "praça", "praca", "plaça", "placa",
   ]);
   const tokenize = (s: string): string[] => {
     const cleaned = s.toLowerCase().replace(/[,()./\-]/g, " ").replace(/\s+/g, " ").trim();

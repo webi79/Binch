@@ -3,6 +3,7 @@ import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import type { LocationType } from "../db/schema.js";
 import { flixbusLiveLocations, dbRestLiveLocations } from "./liveLocations.js";
+import { exonymQueryVariants } from "../util/cityExonyms.js";
 
 export interface ClientLocation {
   code: string;
@@ -52,12 +53,27 @@ export async function searchLocations(
   // nach Dedup nur 18 ausspucken statt 20. Mit 2× Limit ist Puffer da.
   const fetchLimit = limit * 2;
 
+  // Sprach-Fallback via Exonyme: Die Datenquellen sind sprachlich gemischt
+  // (Airports englisch „Vienna", StaDa deutsch „Wien Hbf"). Tippt der User
+  // (oder übergibt Bo) „Wien" im Flug-Modus, findet ILIKE nichts — obwohl
+  // VIE gemeint ist. Bei 0 lokalen Treffern probieren wir die übersetzten
+  // Varianten; die Originalschreibweise gewinnt immer, wenn sie selbst trifft.
+  const searchWithExonyms = async (): Promise<ClientLocation[]> => {
+    const direct = await searchLocalDb(q, type, fetchLimit);
+    if (direct.length > 0) return direct;
+    for (const variant of exonymQueryVariants(q)) {
+      const alt = await searchLocalDb(variant, type, fetchLimit);
+      if (alt.length > 0) return alt;
+    }
+    return direct;
+  };
+
   if (type === "ALL") {
-    const dbResults = await searchLocalDb(q, type, fetchLimit);
+    const dbResults = await searchWithExonyms();
     return mergeAndCap(dbResults, limit);
   }
 
-  const dbResults = await searchLocalDb(q, type, fetchLimit);
+  const dbResults = await searchWithExonyms();
 
   if ((type === "BUS" || type === "TRAIN") && dbResults.length < LIVE_FALLBACK_THRESHOLD) {
     // Lokal zu wenig — Live als Fallback befragen.

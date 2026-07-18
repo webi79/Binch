@@ -1,5 +1,5 @@
 import { config } from "../config.js";
-import { stationNameCompatible, normStationName } from "../util/stationName.js";
+import { stationNameCompatible, normStationName, sameCity } from "../util/stationName.js";
 import { BoundedTtlCache } from "../util/boundedCache.js";
 
 /**
@@ -235,26 +235,119 @@ async function geocodeRaw(label: string, signal?: AbortSignal): Promise<GeocodeH
   return Array.isArray(raw) ? raw : [];
 }
 
+/** Grobe Distanz in Metern (equirectangular) — reicht für <10-km-Vergleiche. */
+function approxMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const dLat = (lat2 - lat1) * 111_320;
+  const dLon = (lon2 - lon1) * 111_320 * Math.cos((lat1 * Math.PI) / 180);
+  return Math.sqrt(dLat * dLat + dLon * dLon);
+}
+
+/** Ein STOP innerhalb dieser Distanz zum Marker ist derselbe physische Halt
+ *  (andere Schreibweise/Plattform-Knoten) — Name egal. */
+const SAME_SPOT_M = 150;
+/** Bis hierhin akzeptieren wir einen Halt nur bei verträglichem Namen —
+ *  fängt „unser OSM-Marker vs. der 300 m entfernte Feed-Knoten des gleichen
+ *  Bahnhofs". Urbane NACHBAR-Stops liegen typisch 200-500 m auseinander,
+ *  tragen dann aber andere Namen → Token-Guard schützt. */
+const SAME_STOP_NAMED_M = 600;
+
 /**
- * Erster STOP-Treffer, ohne Namensprüfung — der alte Weg.
+ * Abfahrtstafel-Stop-Suche, DISTANZ-GEBUNDEN an unsere Marker-Koordinate.
  *
- * Nur für Abfahrtstafeln: `/v6/stoptimes` braucht zwingend eine Stop-ID, eine
- * Koordinate hilft dort nicht. Lieber eine Tafel vom ähnlichsten Halt als gar
- * keine. Fürs ROUTING niemals verwenden — dafür ist motisGeocode zuständig.
+ * Früher stand hier motisGeocodeAnyStop — „erster STOP-Treffer, ohne
+ * Namensprüfung, lieber eine Tafel vom ähnlichsten Halt als gar keine". Das
+ * war die gefährlichste Zeile des Board-Pfads: Für Halte, die Transitous nicht
+ * kennt (Murcia-Stadtbusse, „Estanco Quijero"), lieferte der Fuzzy-Geocoder
+ * irgendeinen gleichnamigen Halt IRGENDWO — gemessen: Marker „Iglesia" bei
+ * Murcia → Tafel von „IGLESIA" in Galicien, 700 km entfernt. Tafel, Trip-
+ * Detail und Route waren dann konsistent falsch. Eine LEERE Tafel ist die
+ * ehrliche Antwort; eine falsche ist die schlimmste.
  */
-export async function motisGeocodeAnyStop(
+export async function motisGeocodeStopNear(
+  label: string,
+  refLat: number,
+  refLng: number,
+  signal?: AbortSignal,
+): Promise<MotisPlace | null> {
+  if (!label.trim()) return null;
+  // Transport-Fehler bewusst NICHT schlucken (wirft) — der Aufrufer darf ein
+  // transientes MOTIS-Down nicht als „Stop existiert nicht" negativ cachen.
+  const raw = await geocodeRaw(label, signal);
+  let best: MotisPlace | null = null;
+  let bestM = Infinity;
+  for (const r of raw) {
+    if (r.type !== "STOP" || !r.id || r.lat == null || r.lon == null) continue;
+    const d = approxMeters(refLat, refLng, r.lat, r.lon);
+    const limit = sameCity(label, r.name) || stationNameCompatible(label, r.name)
+      ? SAME_STOP_NAMED_M
+      : SAME_SPOT_M;
+    if (d <= limit && d < bestM) {
+      bestM = d;
+      best = { id: r.id, name: r.name ?? label, lat: r.lat, lon: r.lon, tz: r.tz, type: r.type };
+    }
+  }
+  return best;
+}
+
+/**
+ * Nächster STOP an einer Koordinate via `/v1/reverse-geocode` — findet den
+ * bedienten Halt auch dann, wenn sein Feed-Name mit unserem Marker-Label
+ * nichts gemein hat (OSM-Label vs. GTFS-Name). Distanz-Deckel zwingend:
+ * reverse-geocode liefert sonst auch km-weit entfernte Halte.
+ */
+export async function motisReverseGeocodeStop(
+  lat: number,
+  lng: number,
+  maxMeters = SAME_SPOT_M,
+  signal?: AbortSignal,
+): Promise<MotisPlace | null> {
+  // Transport-Fehler wirft (siehe motisGeocodeStopNear) — kein Negativ-Cache
+  // bei transientem MOTIS-Ausfall.
+  const raw = (await motisFetch(
+    `/v1/reverse-geocode?place=${lat},${lng}&type=STOP`,
+    signal,
+  )) as GeocodeHit[];
+  if (!Array.isArray(raw)) return null;
+  // Operative Feeds bevorzugen: Referenz-Knoten liefern Tafeln (ihre
+  // stopTimes tragen den bedienten Halt), aber ohne saubere Gleisangaben.
+  // Nur wenn im Radius NICHTS Operatives liegt, den Referenz-Knoten nehmen.
+  let bestOp: MotisPlace | null = null;
+  let bestOpM = Infinity;
+  let bestRef: MotisPlace | null = null;
+  let bestRefM = Infinity;
+  for (const r of raw) {
+    if (r.type !== "STOP" || !r.id || r.lat == null || r.lon == null) continue;
+    const d = approxMeters(lat, lng, r.lat, r.lon);
+    if (d > maxMeters) continue;
+    const place: MotisPlace = { id: r.id, name: r.name ?? "", lat: r.lat, lon: r.lon, tz: r.tz, type: r.type };
+    if (isReferenceFeedId(r.id)) {
+      if (d < bestRefM) { bestRefM = d; bestRef = place; }
+    } else if (d < bestOpM) {
+      bestOpM = d;
+      bestOp = place;
+    }
+  }
+  return bestOp ?? bestRef;
+}
+
+/**
+ * Koordinatenloser Rest-Fall (kuratierte Stadt-Codes ohne Coords): erster
+ * STOP-Treffer, aber NUR mit namensverträglichem Treffer — der Fuzzy-Geocoder
+ * darf aus „Estanco Quijero" kein „Estación de Autobuses" machen.
+ */
+export async function motisGeocodeStopSimilar(
   label: string,
   signal?: AbortSignal,
 ): Promise<MotisPlace | null> {
   if (!label.trim()) return null;
-  try {
-    const raw = await geocodeRaw(label, signal);
-    const hit = raw.find((r) => r.type === "STOP");
-    if (!hit?.id) return null;
-    return { id: hit.id, name: hit.name ?? label, lat: hit.lat, lon: hit.lon, tz: hit.tz, type: hit.type };
-  } catch {
-    return null;
-  }
+  // Wirft bei Transport-Fehler (siehe motisGeocodeStopNear).
+  const raw = await geocodeRaw(label, signal);
+  const hit = raw.find(
+    (r) => r.type === "STOP" && r.id
+      && (stationNameCompatible(label, r.name) || sameCity(label, r.name)),
+  );
+  if (!hit?.id) return null;
+  return { id: hit.id, name: hit.name ?? label, lat: hit.lat, lon: hit.lon, tz: hit.tz, type: hit.type };
 }
 
 /** Namensnormalisierung — eine Quelle für alle Provider, siehe util/stationName.ts.

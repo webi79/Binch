@@ -83,6 +83,24 @@ const GENERIC_TOKENS = new Set([
   "sued",
   "ost",
   "west",
+  // Romanische Pendants — sonst gälten „Estación de Autobuses de Murcia" und
+  // „Estación de Autobuses de Cartagena" über {estacion, autobuses} als
+  // „gleiche Stadt". placeTokens strippt Diakritika, daher nur Grundformen.
+  "estacion",
+  "estacio",
+  "estacao",
+  "autobuses",
+  "autobus",
+  "autocares",
+  "gare",
+  "routiere",
+  "stazione",
+  "autostazione",
+  "rodoviaria",
+  "paragem",
+  "dworzec",
+  "nadrazi",
+  "terminal",
 ]);
 
 function placeTokens(s: string): Set<string> {

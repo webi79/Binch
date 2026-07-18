@@ -232,11 +232,23 @@ export async function getScheduledStopBoard(args: {
     return null;
   }
 
-  if (allStopIds.length === 0) return emptyResponse();
+  // WICHTIG: null, nicht emptyResponse. Hierher kommt man nur, wenn der
+  // Coord-Lookup im lokalen Feed NICHTS im 250-m-Radius fand — der Stop
+  // liegt dann außerhalb der Coverage dieses Feeds (fr-transport hat z.B.
+  // nur ~350 Stops, be-gtfs nur Bahn). Ein leeres Board hätte in stops.ts
+  // den MOTIS-Fallback abgewürgt: praktisch jede französische/belgische
+  // Bus-Haltestelle zeigte „keine Abfahrten", obwohl Transitous die Daten
+  // hat. null → Aufrufer probiert HAFAS/MOTIS. Leer bleibt nur, wenn der
+  // Feed den Stop KENNT und wirklich nichts fährt.
+  if (allStopIds.length === 0) return null;
 
   const now = new Date();
   const services = await activeServiceIds(feedId, now);
-  if (services.size === 0) return emptyResponse();
+  // Auch hier null statt leer: 0 aktive Service-IDs heißt praktisch immer
+  // „Feed-Kalender abgelaufen" (Feed nicht refresht), nicht „heute fährt im
+  // ganzen Land nichts". Ein leeres Board würde den MOTIS-Fallback blocken —
+  // ein stale Feed macht sonst still sämtliche Tafeln des Landes leer.
+  if (services.size === 0) return null;
 
   const midnightMs = localMidnightMs(now);
   const nowSec = Math.floor((now.getTime() - midnightMs) / 1000);
@@ -332,15 +344,6 @@ export async function getScheduledStopBoard(args: {
 
   return {
     results: items,
-    fetchedAt: now.toISOString(),
-    validUntil: new Date(now.getTime() + 60_000).toISOString(),
-  };
-}
-
-function emptyResponse(): StopBoardResponse {
-  const now = new Date();
-  return {
-    results: [],
     fetchedAt: now.toISOString(),
     validUntil: new Date(now.getTime() + 60_000).toISOString(),
   };

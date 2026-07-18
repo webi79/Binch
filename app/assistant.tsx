@@ -83,7 +83,10 @@ type Msg =
       id: string;
       kind: "bot";
       text: string;
-      flight?: SearchResult;
+      /** Result-Cards zu dieser Bubble. Mehrere bei Vergleichs-Anfragen
+       *  („Flug vs. Zug") — Bo feuert dann zwei search_journey parallel und
+       *  der Server streamt zwei search_result-Events in denselben Turn. */
+      flights?: SearchResult[];
       stopBoard?: {
         stop: { code: string; label: string };
         board: "departures" | "arrivals";
@@ -568,7 +571,15 @@ function AssistantScreenInner() {
           .map((m) => ({
             role: m.kind === "user" ? ("user" as const) : ("assistant" as const),
             content: m.text,
-          })),
+          }))
+          // Leere Bubbles (Card-only, text="") raus — das Server-Schema
+          // verlangt content.min(1), EINE leere Bubble im Verlauf würde sonst
+          // jeden Folge-Turn mit 400 abbrechen.
+          .filter((m) => m.content.trim().length > 0)
+          // Server-Schema erlaubt max 60 Einträge INKLUSIVE der neuen
+          // Nachricht — der lokale Bubble-Cap liegt bei 80, ungekappt liefe
+          // jeder lange Chat in „Bad request".
+          .slice(-59),
         { role: "user" as const, content: trimmed },
       ];
 
@@ -686,13 +697,15 @@ function AssistantScreenInner() {
             }
             return;
           }
-          // save_trip / unsave_trip — letzten Flight aus dem Verlauf nehmen.
+          // save_trip / unsave_trip — letzten Flight aus dem Verlauf nehmen
+          // (bei Vergleichs-Bubbles mit mehreren Cards: die zuletzt gezeigte).
           setMessages((prev) => {
-            const lastFlight = [...prev]
+            const flightsMsg = [...prev]
               .reverse()
-              .find((m): m is Extract<Msg, { kind: "bot"; flight?: SearchResult }> =>
-                m.kind === "bot" && m.flight !== undefined,
-              )?.flight;
+              .find((m): m is Extract<Msg, { kind: "bot"; flights?: SearchResult[] }> =>
+                m.kind === "bot" && m.flights !== undefined && m.flights.length > 0,
+              );
+            const lastFlight = flightsMsg?.flights?.[flightsMsg.flights.length - 1];
             if (!lastFlight) return prev;
             const store = useSearchStore.getState();
             if (event.action === "save_trip") {
@@ -1053,11 +1066,21 @@ function attachFlightToBot(messages: Msg[], botId: string, flight: SearchResult)
     // (Text füllt sich dann mit der Folge-Delta).
     return [
       ...messages.filter((m) => m.kind !== "typing"),
-      { id: botId, kind: "bot", text: "", flight },
+      { id: botId, kind: "bot", text: "", flights: [flight] },
     ];
   }
   return messages.map((m, i) =>
-    i === idx && m.kind === "bot" ? { ...m, flight } : m,
+    // APPEND statt ersetzen — Vergleichs-Turns streamen zwei search_results
+    // in dieselbe Bubble (Flug-Card + Zug-Card). Dedupe über Result-Id, falls
+    // ein Retry dieselbe Suche doppelt liefert.
+    i === idx && m.kind === "bot"
+      ? {
+          ...m,
+          flights: (m.flights ?? []).some((f) => f.id === flight.id)
+            ? m.flights
+            : [...(m.flights ?? []), flight],
+        }
+      : m,
   );
 }
 
@@ -1176,11 +1199,11 @@ function BubbleInner({ msg, accent, onRetry, onOpenResults, t }: BubbleProps) {
           <RichText text={msg.text} accent={accent} />
         </View>
       )}
-      {msg.flight && (
-        <View style={styles.flightWrap}>
-          <ResultCard result={msg.flight} />
+      {msg.flights?.map((f) => (
+        <View key={f.id} style={styles.flightWrap}>
+          <ResultCard result={f} />
         </View>
-      )}
+      ))}
       {msg.stopBoard && (
         <View style={styles.flightWrap}>
           <StopBoardCard stop={msg.stopBoard.stop} initialBoard={msg.stopBoard.board} />

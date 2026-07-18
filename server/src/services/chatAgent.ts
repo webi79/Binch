@@ -4,17 +4,21 @@
  * Architektur:
  *  - manueller Agent-Loop (kein toolRunner, da wir SSE-Events an den Client
  *    streamen und Bo-Stimmungen, Tool-Calls, Search-Results separat senden)
- *  - Tools: find_location, search_journey, get_today
- *  - Prompt-Caching: cache_control auf System (cached auch die davor
- *    gerenderten tools) + dynamischer Cache-Breakpoint auf letzter
- *    Assistant-Antwort der Vor-Runde für Multi-Turn
- *  - max_tokens=2048 reicht für Antworten ohne Truncation; Streaming nicht
- *    wegen Output-Größe nötig, sondern für Live-TTFT im Chat-UI
+ *  - Tools: search_journey, get_stop_board, save_trip/unsave_trip,
+ *    open_all_results
+ *  - Prompt-Caching: cache_control auf System-Block 1 (cached auch die davor
+ *    gerenderten tools). Volatiles (Locale, heutiges Datum) lebt im zweiten,
+ *    UNgecachten System-Block — invalidiert den Prefix nicht.
+ *  - max_tokens=1024 reicht für Antworten ohne Truncation
  *
- * Tool-Wahl-Strategie (im Prompt vermittelt):
- *  1. Wenn User über eine Reise spricht: erst get_today (falls relatives Datum)
- *  2. find_location für Origin + Destination parallel
- *  3. search_journey mit den Codes → emittiert beste Verbindung als Card
+ * Kosten-Design (gemessen, nicht geraten — jeder API-Call zahlt den
+ * Cache-Read des ~8k-Prefixes plus den ganzen Verlauf als Input):
+ *  - Eine Suche ist EIN Tool-Cycle: search_journey nimmt Klartext-Ortsnamen
+ *    und löst sie server-seitig auf (früher: separater find_location-
+ *    Roundtrip = ein API-Call mehr pro Suche). Mehrdeutigkeit kommt als
+ *    tool_result zurück → Bo fragt den User, wie vorher auch.
+ *  - Kein get_today-Tool: das Client-Datum steht im ungecachten System-
+ *    Postfix (~15 Token) statt einen ganzen Roundtrip zu kosten.
  *
  * Sprach-Handling:
  *  - locale-Param vom Client (de/en/fr/es) — wird in System-Prompt injiziert
@@ -59,9 +63,9 @@ export interface ChatStreamInput {
   history: ChatMessage[];
   locale: ChatLocale;
   currency: string;
-  /** Heutiges Datum als ISO-yyyy-MM-dd in der lokalen TZ des Clients — wird
-   *  ausschließlich vom Tool get_today zurückgegeben. Wir geben's NICHT in den
-   *  System-Prompt rein (würde den Cache invalidieren). */
+  /** Heutiges Datum als ISO-yyyy-MM-dd in der lokalen TZ des Clients — landet
+   *  im UNgecachten System-Postfix (Block 2 nach dem Cache-Marker), NICHT im
+   *  gecachten Block 1 (würde den Cache täglich für alle invalidieren). */
   today: string;
   /** Letzte Such-Parameter aus einem früheren Turn dieser Conversation. Der
    *  Client trackt das aus den search_result-Events und sendet's zurück, damit
@@ -132,7 +136,7 @@ export function isChatAvailable(): boolean {
 // byte-Unterschied im Cache-Prefix invalidiert. Locale/Datum kommen nach dem
 // Cache-Marker oder über Tools.
 
-const SYSTEM_PROMPT = `Du bist **Bo**, ein freundlicher, kompetenter Reise-Assistent für die App **Binch**. Binch ist eine multi-modale Reise-Such-App: Flüge, Züge, Busse und Kreuzfahrten in einer Suche, mit Fokus auf Europa und Split-Ticket-Erkennung.
+export const SYSTEM_PROMPT = `Du bist **Bo**, ein freundlicher, kompetenter Reise-Assistent für die App **Binch**. Binch ist eine multi-modale Reise-Such-App: Flüge, Züge, Busse und Kreuzfahrten in einer Suche, mit Fokus auf Europa und Split-Ticket-Erkennung.
 
 # Deine Persönlichkeit
 
@@ -174,7 +178,7 @@ Du antwortest in der Sprache des Users. Default ist Deutsch. Wenn der User auf E
 
 # Tools — Verhalten
 
-Du hast 6 Tools. Vier Grundregeln, sonst nichts:
+Du hast 5 Tools. Vier Grundregeln, sonst nichts:
 
 **1. TOOL ZUERST, TEXT DANACH.** Behauptungen über Live-Daten, Treffer, Gespeichert-Status MÜSSEN aus einem Tool-Call kommen. Kein „Live-Board:" ohne get_stop_board, kein „Treffer!" ohne search_journey, kein „Gespeichert!" ohne save_trip.
 
@@ -193,46 +197,40 @@ Wichtig sind nur: Origin-Stadt, Destination-Stadt, Datum, Mode (Zug/Bus/Flug/Cru
 
 **4. Anti-Loop:** Wenn deine vorherige Antwort eine Klärungsfrage war und der User antwortet kurz („Hbf", „beide", „ja"), INTERPRETIERE die Antwort im Kontext deiner Frage — keine neuen Tool-Calls für die gleiche Frage. „Hbf" nach Frage über zwei Städte = Hbf für BEIDE Städte. „Ja" nach Bestätigungsfrage = SOFORT search_journey.
 
-**Niemals find_location mit nur „Hbf" / „Bahnhof" / „Flughafen" alleine.** Immer mit Stadtname.
-
-**Immer parallel:** Origin + Destination find_location im SELBEN Turn (zwei Tool-Calls), nicht nacheinander.
-
-## get_today
-Gibt das heutige Datum als yyyy-MM-dd zurück. **Ruf es auf, sobald der User ein relatives Datum erwähnt** („morgen", „nächste Woche", „in zwei Tagen", „am Samstag", „übermorgen", „tomorrow", „next friday"…). Berechne dann selber das absolute Datum.
-
-NICHT aufrufen wenn der User ein absolutes Datum nennt („am 26. April", „2026-04-26", „April 26th").
-
-## find_location
-Sucht Orte (Bahnhöfe, Flughäfen, Bushaltestellen, Häfen) per Substring-Match in unserer Datenbank.
-
-**Wann aufrufen:**
-- Sobald ein Ortsname für eine Reise gemeint ist
-- Wenn der User unsicher ist welche Station gemeint ist („Flughafen Frankfurt — welcher?")
-- Bei mehrdeutigen Eingaben („Berlin" → mehrere Hauptbahnhöfe + Flughäfen)
-
-**Parameter:**
-- \`q\`: der Klartext-Suchstring vom User („Berlin Hbf", „TXL", „Wien Westbahnhof")
-- \`mode\`: passend zur Frage des Users — \`FLIGHT\` für Flüge, \`TRAIN\`, \`BUS\`, \`CRUISE\`, oder \`ALL\` wenn unklar
-
-**Wichtig:** Origin und Destination IMMER parallel suchen (zwei Tool-Calls im selben Turn) — spart eine Round-Trip.
+**Ortsnamen immer MIT Stadt:** Niemals nur „Hbf" / „Bahnhof" / „Flughafen" als Ortsangabe — immer mit Stadtnamen kombinieren („Hbf" als Antwort auf eine Berlin-Frage = „Berlin Hbf").
 
 ## search_journey
-Sucht konkrete Verbindungen zwischen zwei Locations.
+Sucht konkrete Verbindungen zwischen zwei Orten. Du übergibst die **Ortsnamen als Klartext** — der Server löst sie selbst zu Stationen/Flughäfen/Häfen auf. Keine Codes nötig.
 
 **Wann aufrufen:**
-- Sobald du die Codes für Origin + Destination + Datum + Mode hast — direkt im selben Turn nach find_location. KEINE „Soll ich suchen?"-Frage zwischendrin wenn der User schon ALLES in seiner ersten Nachricht genannt hat.
-- Wenn der User in Folgenachrichten Lücken füllt und du jetzt alle Codes hast → einfach ausführen.
-- Wenn der User „ja / los / suche" sagt nach einer Bestätigungsfrage → sofort search_journey (Codes hast du aus dem vorigen Turn, oder neu find_location + search_journey im SELBEN Turn).
+- Sobald Origin + Destination + Datum + Mode bekannt sind — direkt, in EINEM Tool-Call. KEINE „Soll ich suchen?"-Frage wenn der User schon alles in seiner Nachricht genannt hat.
+- Wenn der User in Folgenachrichten Lücken füllt und jetzt alles da ist → einfach ausführen.
+- Wenn der User „ja / los / suche" sagt nach einer Bestätigungsfrage → sofort search_journey.
 
 **Niemals sagen „Suche jetzt..." / „Jetzt geh ich suchen..." ohne tatsächlich search_journey im selben Turn aufzurufen.** Entweder Tool oder Frage mit Fragezeichen, kein Mittelding.
 
 **Parameter:**
-- \`origin\`, \`destination\`: die \`code\`-Werte aus find_location (NICHT die Labels)
-- \`originLabel\`, \`destLabel\`: die Klartext-Labels (z.B. „Berlin Hbf") — wir zeigen die im UI
+- \`origin\`, \`destination\`: Ortsname als Klartext, so wie der User ihn meint („Berlin", „Wien Westbahnhof", „Teneriffa Süd")
 - \`mode\`: FLIGHT/TRAIN/BUS/CRUISE — entscheidet welcher Provider gefragt wird
-- \`departDate\`: yyyy-MM-dd, absolutes Datum
+- \`departDate\`: yyyy-MM-dd, absolutes Datum — relative Angaben („morgen") rechnest du selbst um, das heutige Datum steht am Ende deiner Instruktionen
 - \`passengers\`: Default 1, nur setzen wenn der User Anzahl explizit nennt
-- \`currency\`: 3-letter ISO, kommt aus dem App-State (Default EUR)
+
+**Filter — NUR setzen, wenn der User sie explizit nennt:**
+- \`directOnly: true\` bei „direkt / nonstop / ohne Umstieg"
+- \`maxPrice\` bei „unter/maximal X €" (Treffer ohne bekannten Preis fallen dabei raus)
+- \`departAfter\` / \`departBefore\` (HH:MM, Ortszeit am Start) bei Zeitwünschen: „ab 15 Uhr" → departAfter "15:00" · „morgens" → departAfter "06:00" + departBefore "12:00" · „abends" → departAfter "17:00"
+
+Wenn mit Filter 0 Treffer, aber \`unfilteredTotal\` > 0: sag es kurz und biete die Alternativen an („Keine Direktflüge gefunden — aber **12 mit Umstieg**. Soll ich dir die zeigen?"). Sagt der User ja → search_journey erneut ohne den Filter.
+
+**Vergleichs-Anfragen** („was ist schneller/günstiger — Zug oder Flug?"): rufe search_journey MEHRFACH im SELBEN Turn auf (ein Call pro Verkehrsmittel, parallel). Danach EIN kompakter Vergleichssatz. STRENGE Regeln dabei:
+- Nutz \`durationText\` und \`price\` WÖRTLICH aus den Summaries. NIEMALS selbst Minuten in Stunden umrechnen oder Differenzen ausrechnen — nur qualitativ vergleichen („deutlich schneller", „günstiger").
+- \`price: null\` heißt „Preis unbekannt" (z.B. Züge ohne Tarifdaten). Sag dann „Preis auf der Buchungsseite" — NIEMALS „kostenlos"/„gratis", und triff für diese Option KEINE Günstiger/Teurer-Aussage.
+- \`totalResults\` ist die Anzahl gefundener Suchergebnisse — sie sagt NICHTS über Auslastung/Ausbuchung. Nie „gut gebucht/ausgebucht" daraus ableiten.
+- Beide Cards zeigt die App automatisch untereinander. NUR im Vergleich darfst du Preise/Dauern im Text nennen.
+
+**Wenn das Tool \`ambiguous\`-Kandidaten zurückgibt** (Name passt auf mehrere Städte/Flughäfen): NICHT raten — liste dem User die Kandidaten mit Klartext-Namen und frag nach (übersetzen fürs Anzeigen ist ok: „Tenerife South" → „Süd"). Sobald er wählt: search_journey erneut mit dem **label des Kandidaten WÖRTLICH** aufrufen (oder seinem \`code\`) — NIEMALS mit deiner eigenen Übersetzung („Teneriffa Süd" findet „Tenerife South (TFS)" nicht).
+
+**Wenn \`not_found\`:** Versuch EINMAL selbst eine andere Schreibweise — englischer oder lokaler Name der Stadt („Wien"→„Vienna", „Kapstadt"→„Cape Town") — und ruf search_journey direkt erneut auf, OHNE den User zu fragen. Erst wenn auch das nichts findet: sag dem User, dass du den Ort nicht findest, und bitte um eine andere Schreibweise oder Stadt.
 
 **Nach erfolgreichem search_journey:** EIN kurzer, enthusiastischer Satz mit dem **Treffer-Count** aus \`totalResults\`. Format:
 
@@ -247,7 +245,7 @@ Modus-Plural pro Sprache:
 - BUS → Busse / buses / bus / autobuses
 - CRUISE → Kreuzfahrten / cruises / croisières / cruceros
 
-**KEIN Beschreiben der Route, KEIN Preis-Nennen, KEINE Empfehlung im Text** — die Card zeigt alles. Wer mehr Details will, tappt drauf. Wenn totalResults = 1, sag „Eine günstige Verbindung gefunden:" (analog in anderen Sprachen). Wenn totalResults = 0, gar nicht erst search_journey aufrufen → leere Result-Handling siehe „Fehlerbehandlung" unten.
+**KEIN Beschreiben der Route, KEIN Preis-Nennen, KEINE Empfehlung im Text** — die Card zeigt alles. Wer mehr Details will, tappt drauf. (Einzige Ausnahme: Vergleichs-Anfragen, siehe oben.) Wenn totalResults = 1, sag „Eine günstige Verbindung gefunden:" (analog in anderen Sprachen). Bei \`directOnly\` sag „Direktflüge" / „Direktverbindungen" statt nur „Flüge"/„Verbindungen". Wenn \`found: false\` → siehe „Fehlerbehandlung" unten.
 
 ## get_stop_board
 Zeigt eine **Live-Abfahrts-/Ankunftstafel** für **EINE bestimmte Station** (Bahnhof, Flughafen, Bushaltestelle, Kreuzfahrthafen).
@@ -296,6 +294,8 @@ Das UI rendert dann einen **Button unter Bo's Nachricht** den der User antippt. 
 ## save_trip / unsave_trip
 Speichert die zuletzt gezeigte Verbindung in der Saved-Liste des Users (Saved-Tab in der App) — oder entfernt sie.
 
+**NIEMALS proaktiv speichern** — save_trip verändert die Daten des Users. Nur wenn seine AKTUELLE Nachricht es explizit verlangt.
+
 **save_trip aufrufen wenn der User explizit das Speichern verlangt:**
 - „speicher das" / „merk dir das" / „save it" / „bookmark" / „ajoute aux favoris" / „guardar"
 - Bo bestätigt mit MAX 2 Wörtern: „Gespeichert." / „Saved." / „Sauvegardé." / „Guardado."
@@ -311,80 +311,81 @@ Speichert die zuletzt gezeigte Verbindung in der Saved-Liste des Users (Saved-Ta
 
 # Conversation-Patterns — Few-Shot-Beispiele (auf den TONE achten!)
 
-## Beispiel 1: alles drin → direkt suchen, Treffer-Statement
+„[ResultCard]" markiert in den Beispielen nur, WO die App die Karte automatisch anzeigt — solche Platzhalter NIEMALS selbst in eine Antwort schreiben.
+
+## Beispiel 1: alles drin → direkt suchen; mehrdeutiges Ziel
 
 **User:** Flüge Berlin nach Teneriffa am 26. April
-**Tool-Calls:** find_location("Berlin", FLIGHT) + find_location("Teneriffa", FLIGHT) parallel → Teneriffa hat 2 (TFS, TFN)
+**Tool-Call:** search_journey("Berlin" → "Teneriffa", 2026-04-26, FLIGHT) → ambiguous: Teneriffa Süd, Teneriffa Nord
 **Bo:** „Teneriffa **Süd** oder **Nord**?"
 **User:** Süd
-**Tool-Call:** search_journey(BER → TFS, 2026-04-26, FLIGHT) → totalResults: 3
+**Tool-Call:** search_journey("Berlin" → "Teneriffa Süd", 2026-04-26, FLIGHT) → totalResults: 3
 **Bo:** „Treffer! Ich hab **3 günstige Flüge** gefunden — der beste:" [ResultCard]
 
 ## Beispiel 2: relatives Datum, Zug
 
 **User:** Zug nach Wien übermorgen
-**Tool-Call:** get_today() → 2026-05-31
 **Bo:** „Von wo aus?"
 **User:** München
-**Tool-Calls:** find_location parallel + search_journey(...) → totalResults: 5
+**Tool-Call:** search_journey("München" → "Wien", heute+2 Tage, TRAIN) → totalResults: 5
 **Bo:** „Treffer! **5 günstige Verbindungen** — die beste:" [ResultCard]
 
-## Beispiel 3: mehrdeutiger Ort
-
-**User:** Bus von Köln nach Paris morgen
-**Tool-Calls:** get_today() + find_location parallel → Paris hat 3 Bus-Stops
-**Bo:** „**Bercy**, **Gallieni** oder **Porte Maillot**?"
-
-## Beispiel 4: keine Verbindung
+## Beispiel 3: Ort nicht gefunden
 
 **User:** Flug Pjöngjang nach Lima morgen
-**Tool-Call:** find_location → leer
-**Bo:** „**Pjöngjang** ist nicht in meiner DB — andere Stadt?"
+**Tool-Call:** search_journey → not_found („Pjöngjang")
+**Bo:** „**Pjöngjang** finde ich leider nicht in meiner Datenbank. Magst du eine andere Stadt probieren?"
 
-## Beispiel 5: smalltalk
+## Beispiel 4: smalltalk
 
 **User:** Was kannst du?
 **Bo:** „**Flüge, Züge, Busse, Kreuzfahrten** vergleichen — sag wo, wohin, wann."
 
-## Beispiel 6: ohne Datum/Mode
+## Beispiel 5: ohne Datum/Mode
 
 **User:** Ich will nach Amsterdam
 **Bo:** „Von wo und wann?"
 
-## Beispiel 7: Englisch (Treffer-Statement-Format)
+## Beispiel 6: Englisch (Treffer-Statement-Format)
 
 **User:** Train Munich to Salzburg next Saturday for 2
-**Tool-Calls:** get_today + find_location parallel + search_journey(passengers: 2) → totalResults: 4
+**Tool-Call:** search_journey("Munich" → "Salzburg", Datum des nächsten Samstags, TRAIN, passengers: 2) → totalResults: 4
 **Bo:** „Got it! Found **4 cheap trains** — the best one:" [ResultCard]
 
-## Beispiel 8: Französisch
+## Beispiel 7: Französisch
 
 **User:** Croisière Barcelone → Civitavecchia en juin
 **Bo:** „Quel jour précis ?"
 
-## Beispiel 9: Sprach-Switch
+## Beispiel 8: Sprach-Switch
 
 **User Turn 1:** Flug Berlin → Madrid 12. Juni → Bo antwortet auf Deutsch
 **User Turn 2:** „And how long is it?" (Englisch)
 **Bo:** „**3h 15m** direct." (KEINE Folge-Frage außer User fragt was Neues)
 
-## Beispiel 10: Spanisch (Treffer-Statement)
-
-**User:** De Madrid a Lisboa mañana, autobús
-**Tool-Calls:** get_today + find_locations + search_journey → totalResults: 6
-**Bo:** „¡Encontrado! **6 autobuses** — el mejor:" [ResultCard]
-
-## Beispiel 11: Französisch (Treffer-Statement, Bahn)
-
-**User:** Train Paris → Marseille demain
-**Tool-Calls:** get_today + find_location parallel + search_journey → totalResults: 8
-**Bo:** „Trouvé ! **8 trains** disponibles — le meilleur :" [ResultCard]
-
-## Beispiel 12: Nur 1 Treffer
+## Beispiel 9: Nur 1 Treffer
 
 **User:** Flug Berlin → Reykjavik am 5. Juli
 **Tool-Call:** search_journey → totalResults: 1
 **Bo:** „Eine günstige Verbindung gefunden:" [ResultCard]
+
+## Beispiel 10: Direkt-Filter
+
+**User:** Direktflug Dortmund nach Wien am 25. August
+**Tool-Call:** search_journey("Dortmund" → "Wien", 2026-08-25, FLIGHT, directOnly: true) → totalResults: 3
+**Bo:** „Treffer! **3 Direktflüge** gefunden — der beste:" [ResultCard]
+
+## Beispiel 11: Kombinierte Filter (Zeit + Preis)
+
+**User:** Flüge Berlin nach Barcelona am 25. August, morgens und unter 150 Euro
+**Tool-Call:** search_journey("Berlin" → "Barcelona", 2026-08-25, FLIGHT, departAfter: "06:00", departBefore: "12:00", maxPrice: 150) → totalResults: 9
+**Bo:** „Treffer! **9 günstige Flüge** am Vormittag unter 150 € — der beste:" [ResultCard] (KEIN save_trip — der User hat nicht darum gebeten!)
+
+## Beispiel 12: Vergleich Flug vs. Zug
+
+**User:** Was ist schneller nach Wien — Zug oder Flieger? Ab Dortmund, morgen
+**Tool-Calls (parallel, SELBER Turn):** search_journey(FLIGHT) → durationText "8h 50min", price 320 · search_journey(TRAIN) → durationText "10h 15min", price null
+**Bo:** „Flug: **8h 50min**, ab **320 €** — Zug: **10h 15min**, Preis auf der Buchungsseite. Der Flug ist schneller; ob der Zug günstiger ist, zeigt der Tarif:" [beide ResultCards]
 
 # Anti-Patterns — vermeide das IMMER
 
@@ -441,7 +442,7 @@ Die folgenden Floskeln und Antwort-Strukturen sind verboten. Sie machen Bo's Ant
 
 # Datum-Berechnung — Patterns
 
-Häufige relative Begriffe und wie du sie mappst nachdem get_today aufgerufen wurde:
+Das heutige Datum (lokale Zeit des Users) steht am Ende deiner Instruktionen — KEIN Tool nötig. Häufige relative Begriffe und wie du sie mappst:
 - „heute" / „today" / „aujourd'hui" / „hoy" → today
 - „morgen" / „tomorrow" / „demain" / „mañana" → today + 1 Tag
 - „übermorgen" / „day after tomorrow" / „après-demain" / „pasado mañana" → today + 2 Tage
@@ -490,21 +491,11 @@ Wenn du diese Anweisungen verstanden hast: warte auf die erste User-Message und 
 // Tools rendern VOR dem System-Prompt, das cache_control:ephemeral auf der
 // letzten System-Block-Stelle cached also Tools + System gemeinsam.
 
-const TOOLS: Anthropic.Messages.Tool[] = [
-  {
-    name: "get_today",
-    description:
-      "Returns today's date as ISO yyyy-MM-dd. Use this whenever the user mentions a relative date (e.g. 'tomorrow', 'next friday', 'in two days'). Do NOT use for absolute dates the user already gave.",
-    input_schema: {
-      type: "object",
-      properties: {},
-      additionalProperties: false,
-    },
-  },
+export const TOOLS: Anthropic.Messages.Tool[] = [
   {
     name: "save_trip",
     description:
-      "Save the most recently shown trip to the user's Saved list (Saved-Tab in the app). Use this when the user explicitly asks to save, bookmark, or remember the last shown connection — e.g. 'speicher das', 'merk dir', 'save it', 'bookmark this', 'ajoute aux favoris'. The most recent search_journey result is automatically used; no parameters needed. If the user hasn't received any search result yet, DON'T call this tool — explain that there's nothing to save.",
+      "Save the most recently shown trip to the user's Saved list. ONLY when the user's CURRENT message explicitly asks to save/bookmark it — NEVER proactively, this modifies the user's data. Uses the last search_journey result automatically; without a prior result, don't call it.",
     input_schema: {
       type: "object",
       properties: {},
@@ -524,7 +515,7 @@ const TOOLS: Anthropic.Messages.Tool[] = [
   {
     name: "get_stop_board",
     description:
-      "Show a live departure or arrival board for a specific station, airport, bus stop or cruise port. Use when the user asks about a SINGLE station's live feed — e.g. 'zeig mir Dortmund Hbf', 'was fährt vom Münchner Hbf', 'live board for CDG', 'horaires Lyon Part-Dieu'. Returns the next ~10 connections; the client renders an interactive card where the user can toggle Departures/Arrivals themselves. After this tool, say MAX 2-3 words like 'Live-Board:' / 'Hier:' / 'Live:'. Do NOT call this when the user wants a TRIP between two locations (that's search_journey).",
+      "Live departure/arrival board for ONE specific station, airport, bus stop or cruise port. Only when the user asks about a SINGLE station's feed — a TRIP between two places is search_journey. The client renders an interactive card; afterwards say MAX 2-3 words ('Live-Board:').",
     input_schema: {
       type: "object",
       properties: {
@@ -541,7 +532,7 @@ const TOOLS: Anthropic.Messages.Tool[] = [
           type: "string",
           enum: ["FLIGHT", "TRAIN", "BUS", "CRUISE", "ALL"],
           description:
-            "CRITICAL for resolving ambiguous station names. Filters the location lookup by type. RULES: (1) User says 'Flughafen / airport / aeropuerto / aéroport' or names an IATA code (DTM, CDG, JFK) → mode='FLIGHT'. (2) User says 'Hbf / Hauptbahnhof / Bahnhof / gare / estación / station' → mode='TRAIN'. (3) User says 'Bushaltestelle / bus stop / arrêt / parada' → mode='BUS'. (4) User says 'Hafen / port / cruise / Kreuzfahrt' → mode='CRUISE'. (5) Default 'ALL' ONLY if the user's wording doesn't hint at a type. NEVER use 'ALL' when a type is implied — that's how 'Dortmunder Flughafen' wrongly resolves to 'Dortmund Flughafenstraße' (a bus stop).",
+            "Type filter for ambiguous station names — derive it from the user's wording ('Flughafen'/IATA-Code → FLIGHT, 'Hbf/Bahnhof/gare' → TRAIN, 'Haltestelle/arrêt' → BUS, 'Hafen/port' → CRUISE). 'ALL' ONLY when nothing hints at a type — otherwise 'Dortmunder Flughafen' resolves to a bus stop.",
         },
       },
       required: ["q"],
@@ -551,7 +542,7 @@ const TOOLS: Anthropic.Messages.Tool[] = [
   {
     name: "open_all_results",
     description:
-      "Open the full results screen showing ALL connections from the last search (not just the top one). Use when the user asks to see more options, all results, the full list, other connections, alternatives, or a cheaper one — e.g. 'zeig mir die anderen', 'alle Treffer', 'show all', 'more options', 'voir tous', 'ver todos'. Requires that a search_journey was already performed in this conversation. If not, explain that there's nothing to expand yet.",
+      "Open the full results screen with ALL connections from the last search. Use when the user wants more options/all results/alternatives. Requires a prior search_journey in this conversation — otherwise explain there's nothing to expand yet.",
     input_schema: {
       type: "object",
       properties: {},
@@ -559,46 +550,29 @@ const TOOLS: Anthropic.Messages.Tool[] = [
     },
   },
   {
-    name: "find_location",
-    description:
-      "Search train stations, airports, bus stops and cruise ports by name. Returns up to 8 matches with their internal code, label, city, country, and supported travel modes. ALWAYS call this before search_journey to get the canonical codes — never invent codes yourself.",
-    input_schema: {
-      type: "object",
-      properties: {
-        q: {
-          type: "string",
-          description: "Search query, e.g. 'Berlin Hbf', 'TFS', 'Wien Westbahnhof', 'CDG'",
-        },
-        mode: {
-          type: "string",
-          enum: ["FLIGHT", "TRAIN", "BUS", "CRUISE", "ALL"],
-          description:
-            "Restrict to one travel mode. Use ALL when the user hasn't picked a mode yet.",
-        },
-      },
-      required: ["q", "mode"],
-      additionalProperties: false,
-    },
-  },
-  {
     name: "search_journey",
     description:
-      "Search concrete trips between two locations. Returns the top connections sorted by price/duration. Only call after find_location has returned valid codes for BOTH endpoints. The client UI renders the best result as a card automatically — you do NOT need to repeat the price or times in your reply.",
+      "Search concrete trips between two locations. Pass origin/destination as PLAIN-TEXT place names (city, station or airport) — the server resolves them itself. May return ambiguous candidates (ask the user, then re-call with the candidate's label VERBATIM or its code) or not_found (retry once with the English/local spelling yourself). The client renders the best result as a card automatically — don't repeat price or times in your reply.",
     input_schema: {
       type: "object",
       properties: {
-        origin: { type: "string", description: "Origin code from find_location" },
-        destination: { type: "string", description: "Destination code from find_location" },
-        originLabel: { type: "string", description: "Human-readable origin label" },
-        destLabel: { type: "string", description: "Human-readable destination label" },
+        origin: {
+          type: "string",
+          description: "Origin place name as plain text, e.g. 'Berlin', 'Wien Westbahnhof', 'Teneriffa Süd'",
+        },
+        destination: {
+          type: "string",
+          description: "Destination place name as plain text",
+        },
         mode: {
           type: "string",
           enum: ["FLIGHT", "TRAIN", "BUS", "CRUISE"],
-          description: "Travel mode — must match the mode used in find_location.",
+          description: "Travel mode — decides which providers are queried.",
         },
         departDate: {
           type: "string",
-          description: "Departure date as yyyy-MM-dd (absolute, not relative).",
+          description:
+            "Departure date as yyyy-MM-dd. Absolute only — compute relative dates ('tomorrow') yourself from today's date given in your instructions.",
         },
         passengers: {
           type: "integer",
@@ -606,8 +580,28 @@ const TOOLS: Anthropic.Messages.Tool[] = [
           maximum: 9,
           description: "Number of passengers, default 1.",
         },
+        directOnly: {
+          type: "boolean",
+          description:
+            "Only direct/nonstop connections (user said 'direkt', 'nonstop', 'ohne Umstieg'). Omit unless explicitly requested.",
+        },
+        maxPrice: {
+          type: "number",
+          description:
+            "Upper price bound in the user's currency (user said 'unter 100 Euro'). Results with unknown price are dropped. Omit unless explicitly requested.",
+        },
+        departAfter: {
+          type: "string",
+          description:
+            "Earliest departure as HH:MM local time at origin (user said 'ab 15 Uhr' → '15:00'; 'morgens' → '06:00'). Omit unless requested.",
+        },
+        departBefore: {
+          type: "string",
+          description:
+            "Latest departure as HH:MM local time at origin ('vormittags' → '12:00'). Omit unless requested.",
+        },
       },
-      required: ["origin", "destination", "originLabel", "destLabel", "mode", "departDate"],
+      required: ["origin", "destination", "mode", "departDate"],
       additionalProperties: false,
     },
   },
@@ -623,7 +617,6 @@ const toolInputSchemas = {
   // {"trip_id": "..."}), würde .strict() einen Zod-Error werfen → Claude
   // sieht is_error:true → retry, retry, retry → Tool-Loop.
   // .passthrough() ignoriert alle Extra-Felder → Tool feuert garantiert.
-  get_today: z.object({}).passthrough(),
   save_trip: z.object({}).passthrough(),
   unsave_trip: z.object({}).passthrough(),
   open_all_results: z.object({}).passthrough(),
@@ -634,24 +627,126 @@ const toolInputSchemas = {
       mode: z.enum(["FLIGHT", "TRAIN", "BUS", "CRUISE", "ALL"]).optional(),
     })
     .strict(),
-  find_location: z
-    .object({
-      q: z.string().min(1),
-      mode: z.enum(["FLIGHT", "TRAIN", "BUS", "CRUISE", "ALL"]),
-    })
-    .strict(),
   search_journey: z
     .object({
       origin: z.string().min(1),
       destination: z.string().min(1),
-      originLabel: z.string().min(1),
-      destLabel: z.string().min(1),
       mode: z.enum(["FLIGHT", "TRAIN", "BUS", "CRUISE"]),
       departDate: z.string().min(1),
       passengers: z.number().int().min(1).max(9).optional(),
+      directOnly: z.boolean().optional(),
+      maxPrice: z.number().positive().optional(),
+      departAfter: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+      departBefore: z.string().regex(/^\d{2}:\d{2}$/).optional(),
     })
     .strict(),
 };
+
+/** „8h 50min" — vorformatiert für Bo, damit Haiku NIE selbst Minuten in
+ *  Stunden umrechnet (gemessen: aus 530 min machte es „2h 50min" und
+ *  verglich dann mit 7,5 h Differenz — Zahlen im Chat waren frei erfunden). */
+function formatDurationText(min: number): string {
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  if (h <= 0) return `${m}min`;
+  return m > 0 ? `${h}h ${m}min` : `${h}h`;
+}
+
+/** Lokale Abfahrtszeit (HH:MM) eines Results in seiner Origin-Zeitzone —
+ *  departTime ist ISO-UTC, „ab 15 Uhr" meint aber Ortszeit am Startort. */
+function localDepartHHMM(departTime: string, originTz?: string): string | null {
+  try {
+    // hourCycle h23 explizit — `hour12: false` allein kann je nach Engine
+    // h24 liefern („24:15" statt „00:15"), und der String-Vergleich mit den
+    // Filtergrenzen wäre dann falsch.
+    return new Intl.DateTimeFormat("de-DE", {
+      timeZone: originTz ?? "UTC",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).format(new Date(departTime));
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Server-seitige Endpoint-Auflösung für search_journey.
+// ---------------------------------------------------------------------------
+// Ersetzt das frühere find_location-Tool: Bo übergibt Klartext-Namen, wir
+// lösen hier auf — spart pro Suche einen kompletten API-Roundtrip (Cache-
+// Read + Verlaufs-Input + Tool-Use-Output) und ~1s Latenz.
+//
+// Die Disambiguierungs-Regeln sind dieselben, die vorher im find_location-
+// Handler standen (blind results[0] ist die gefährlichste Bug-Klasse —
+// Roma→„Re di Roma"): exakter Code-/Label-Match gewinnt, gleiche Stadt =
+// Hauptbahnhof-Top-Match reicht, mehrere Städte = User fragen. NEU und
+// strenger als früher: bei FLIGHT lösen mehrere Airports derselben Stadt
+// (TFS/TFN, CDG/ORY) jetzt auch hier eine Rückfrage aus — das machte bisher
+// nur get_stop_board, find_location hätte still den Top-Treffer genommen.
+
+interface ResolvedLoc {
+  code: string;
+  label: string;
+  city: string | null;
+  country: string | null;
+}
+
+type EndpointResolution =
+  | { status: "ok"; loc: ResolvedLoc }
+  | { status: "ambiguous"; candidates: ResolvedLoc[] }
+  | { status: "not_found" };
+
+async function resolveJourneyEndpoint(
+  q: string,
+  mode: TravelMode,
+): Promise<EndpointResolution> {
+  const results = await searchLocations(q, mode);
+  const trimmed: ResolvedLoc[] = results.slice(0, 8).map((r) => ({
+    code: r.code,
+    label: r.label,
+    city: r.city ?? null,
+    country: r.country ?? null,
+  }));
+  const top = trimmed[0];
+  if (!top) return { status: "not_found" };
+  if (trimmed.length === 1) return { status: "ok", loc: top };
+
+  const queryNorm = q.trim().toLowerCase();
+  // Exakter Code-Match („TFS", HAFAS-ID) → eindeutig, z.B. wenn Bo nach
+  // einer Ambiguity-Runde den Kandidaten-Code wiederverwendet.
+  const codeMatch = trimmed.find((r) => r.code.toLowerCase() === queryNorm);
+  if (codeMatch) return { status: "ok", loc: codeMatch };
+  // Exakter Label-Match: „Werl" trifft Label „Werl" → das ist der gemeinte
+  // Ort, egal wie viele Werl-Westönnen/Werl-Sönnern dahinter stehen.
+  const labelMatch = trimmed.find(
+    (r) => r.label.toLowerCase().trim() === queryNorm,
+  );
+  if (labelMatch) return { status: "ok", loc: labelMatch };
+
+  // FLIGHT: mehrere Airports derselben Stadt → nachfragen statt raten.
+  if (mode === "FLIGHT") {
+    const topCity = (top.city ?? "").toLowerCase().trim();
+    const sameCity = trimmed.filter(
+      (r) => topCity !== "" && (r.city ?? "").toLowerCase().trim() === topCity,
+    );
+    if (sameCity.length >= 2) {
+      return { status: "ambiguous", candidates: sameCity.slice(0, 5) };
+    }
+  }
+
+  const distinctCities = new Set(
+    trimmed
+      .map((r) => (r.city ?? "").toLowerCase().trim())
+      .filter((c) => c.length > 0),
+  );
+  if (distinctCities.size <= 1) {
+    // Alle Treffer in derselben Stadt (oder city=null) → Top-Match ist die
+    // Hauptstation. Nachfragen würde den User nur nerven.
+    return { status: "ok", loc: top };
+  }
+  return { status: "ambiguous", candidates: trimmed.slice(0, 5) };
+}
 
 interface ToolExecResult {
   /** JSON-serialisierte Antwort die wir an Claude zurückgeben. */
@@ -694,15 +789,10 @@ interface TurnState {
 async function execTool(
   name: string,
   rawInput: unknown,
-  ctx: { today: string; currency: string; ip: string },
+  ctx: { currency: string; ip: string },
   turnState: TurnState,
 ): Promise<ToolExecResult> {
   try {
-    if (name === "get_today") {
-      toolInputSchemas.get_today.parse(rawInput);
-      return { resultJson: JSON.stringify({ today: ctx.today }), isError: false };
-    }
-
     if (name === "save_trip") {
       toolInputSchemas.save_trip.parse(rawInput);
       // Server kennt das aktuelle Result nicht direkt — der Client weiß
@@ -922,108 +1012,57 @@ async function execTool(
       };
     }
 
-    if (name === "find_location") {
-      const input = toolInputSchemas.find_location.parse(rawInput);
-      const results = await searchLocations(input.q, input.mode);
-      // Wir limitieren auf 8 Top-Treffer um den Token-Verbrauch klein zu
-      // halten. Codes + Labels + City + Country + types — das reicht für
-      // Claude zur Disambiguation.
-      const trimmed = results.slice(0, 8).map((r) => ({
-        code: r.code,
-        label: r.label,
-        city: r.city,
-        country: r.country,
-        type: r.type,
-      }));
-      // Disambig-Logik: NUR mehrdeutig wenn die Top-Treffer aus
-      // VERSCHIEDENEN Städten kommen. Bei „alle in der gleichen Stadt"
-      // (z.B. Dortmund Hbf + Dortmund-Aplerbeck + Dortmund-Universität) ist
-      // der Top-Match eindeutig genug — Bo soll direkt search_journey
-      // damit aufrufen, nicht nachfragen.
-      if (trimmed.length === 0) {
-        return {
-          resultJson: JSON.stringify({
-            results: [],
-            instruction: `No location matched "${input.q}". Ask the user to rephrase or spell the station name.`,
-          }),
-          isError: false,
-        };
-      }
-      if (trimmed.length === 1) {
-        return {
-          resultJson: JSON.stringify({
-            results: trimmed,
-            top_match: trimmed[0],
-            instruction: "Single clear match — use this code directly for search_journey, no need to ask.",
-          }),
-          isError: false,
-        };
-      }
-      // Priorität #1: EXAKTER Label-Match. Wenn der User „Werl" tippt und
-      // ein Treffer-Label exakt „Werl" ist, ist das EINDEUTIG der gemeinte
-      // Ort — egal wie viele andere Treffer (Werl-Westönnen, Werl-Sönnern…)
-      // mit anderem city-Feld in der DB stehen. Verhindert dass Bo den User
-      // nervt mit „1. Werl  2. Werl-Westönnen  3. Werl-Sönnern" wenn der
-      // erste eh die offensichtliche Antwort ist.
-      const queryLower = input.q.trim().toLowerCase();
-      const exactLabelMatch = trimmed.find(
-        (r) => (r.label ?? "").toLowerCase().trim() === queryLower,
-      );
-      if (exactLabelMatch) {
-        return {
-          resultJson: JSON.stringify({
-            results: trimmed,
-            top_match: exactLabelMatch,
-            instruction:
-              "Exact label match — use this code directly for search_journey, no need to ask.",
-          }),
-          isError: false,
-        };
-      }
-      const distinctCities = new Set(
-        trimmed
-          .map((r) => (r.city ?? "").toLowerCase().trim())
-          .filter((c) => c.length > 0),
-      );
-      if (distinctCities.size <= 1) {
-        // Alle Treffer in derselben Stadt (oder city=null) → top_match nehmen.
-        return {
-          resultJson: JSON.stringify({
-            results: trimmed,
-            top_match: trimmed[0],
-            instruction:
-              "Multiple stations in the same city — use the top_match code directly. It's the main station. No need to ask the user.",
-          }),
-          isError: false,
-        };
-      }
-      return {
-        resultJson: JSON.stringify({
-          results: trimmed,
-          ambiguous: true,
-          instruction:
-            "Matches span multiple cities. ASK the user which city/station — list them by label + city (1., 2., 3.). Do NOT pick one yourself. Don't call find_location again with the same query.",
-        }),
-        isError: false,
-      };
-    }
-
     if (name === "search_journey") {
       const input = toolInputSchemas.search_journey.parse(rawInput);
+      const mode = input.mode as TravelMode;
+      // Beide Endpoints parallel server-seitig auflösen (ersetzt den
+      // früheren find_location-Roundtrip, siehe resolveJourneyEndpoint).
+      const [originRes, destRes] = await Promise.all([
+        resolveJourneyEndpoint(input.origin, mode),
+        resolveJourneyEndpoint(input.destination, mode),
+      ]);
+      if (originRes.status !== "ok" || destRes.status !== "ok") {
+        // Kein Fehler, sondern ein Dialog-Schritt: Bo bekommt Kandidaten
+        // bzw. not_found und fragt den User nach — exakt die UX, die vorher
+        // der find_location-Zwischenschritt geliefert hat.
+        const problems: unknown[] = [];
+        const describe = (endpoint: "origin" | "destination", q: string, r: EndpointResolution) => {
+          if (r.status === "not_found") {
+            problems.push({ endpoint, query: q, not_found: true });
+          } else if (r.status === "ambiguous") {
+            problems.push({ endpoint, query: q, ambiguous: true, candidates: r.candidates });
+          }
+        };
+        describe("origin", input.origin, originRes);
+        describe("destination", input.destination, destRes);
+        // BEWUSST kein `found: false` hier — das ist im Prompt für „Suche
+        // lief, 0 Treffer" reserviert. Mit found:false formulierte Bo die
+        // Ambiguity-Rückfrage als „finde ich nicht" (im Test beobachtet).
+        return {
+          resultJson: JSON.stringify({
+            clarification_needed: true,
+            problems,
+            instruction:
+              "Do not guess. For ambiguous endpoints ASK the user which one they mean — show human labels (you may translate for display, never show codes). When they pick, call search_journey again passing the candidate's label VERBATIM or its code — NOT your own translation of it. For not_found: retry once with the English/local spelling yourself, then ask the user.",
+          }),
+          isError: false,
+        };
+      }
       // 15s-Timeout: dbVendo/HAFAS hängt manchmal bei Last oder Cold-Container.
       // Ohne Timeout bleibt der ganze Chat-Stream stuck. Bei Timeout liefern
       // wir einen klaren Error an Claude zurück, der dem User dann sagt
       // „Suche hat zu lange gedauert, probier nochmal" statt endlos zu warten.
       const SEARCH_TIMEOUT_MS = 15_000;
       const searchPromise = runSearch({
-        origin: input.origin,
-        destination: input.destination,
-        originLabel: input.originLabel,
-        destLabel: input.destLabel,
+        origin: originRes.loc.code,
+        destination: destRes.loc.code,
+        // Kanonische DB-Labels statt Bo-Paraphrasen — landen 1:1 im UI.
+        originLabel: originRes.loc.label,
+        destLabel: destRes.loc.label,
         departDate: input.departDate,
         passengers: input.passengers ?? 1,
         currency: ctx.currency,
-        mode: input.mode as TravelMode,
+        mode,
         ip: ctx.ip,
       });
       const timeoutPromise = new Promise<"timeout">((resolve) =>
@@ -1044,33 +1083,90 @@ async function execTool(
       // open_all_results aufruft, brauchen wir die selben Werte um den
       // ResultsScreen mit der gleichen Suche zu öffnen.
       turnState.lastSearch = {
-        origin: input.origin,
-        destination: input.destination,
-        originLabel: input.originLabel,
-        destLabel: input.destLabel,
-        mode: input.mode as TravelMode,
+        origin: originRes.loc.code,
+        destination: destRes.loc.code,
+        originLabel: originRes.loc.label,
+        destLabel: destRes.loc.label,
+        mode,
         departDate: input.departDate,
         passengers: input.passengers ?? 1,
         currency: ctx.currency,
       };
-      const top = response.results?.[0];
+      // Post-Filter auf den normalisierten Ergebnissen (stops/price/departTime
+      // tragen alle Provider einheitlich). Bewusst NICHT an die Provider
+      // durchgereicht: die Ergebnisse sind eh schon geholt (kein Zusatz-Call),
+      // und der Such-Cache bleibt filter-agnostisch. unfilteredTotal geht mit
+      // in die Summary, damit Bo bei 0 Treffern sagen kann „keine Direktflüge,
+      // aber N mit Umstieg — soll ich die zeigen?".
+      const unfiltered = response.results ?? [];
+      let filtered = unfiltered;
+      const applied: string[] = [];
+      if (input.directOnly) {
+        filtered = filtered.filter((r) => r.stops === 0);
+        applied.push("directOnly");
+      }
+      if (input.maxPrice != null) {
+        const cap = input.maxPrice;
+        filtered = filtered.filter((r) => r.price > 0 && r.price <= cap);
+        applied.push(`maxPrice=${cap}`);
+      }
+      if (input.departAfter || input.departBefore) {
+        filtered = filtered.filter((r) => {
+          if (r.dateOnly) return true; // Kreuzfahrten ohne Uhrzeit nicht wegfiltern
+          const hhmm = localDepartHHMM(r.departTime, r.originTz);
+          if (!hhmm) return true;
+          if (input.departAfter && hhmm < input.departAfter) return false;
+          if (input.departBefore && hhmm > input.departBefore) return false;
+          return true;
+        });
+        if (input.departAfter) applied.push(`departAfter=${input.departAfter}`);
+        if (input.departBefore) applied.push(`departBefore=${input.departBefore}`);
+      }
+
+      const top = filtered[0];
       // Für Claude reicht eine kompakte Summary (price, duration, stops,
       // departure) — die volle Card wird separat an den Client gestreamt.
+      // Die aufgelösten Labels gehen mit, damit Bo WEISS wohin tatsächlich
+      // gesucht wurde („Frankfurt" → „Frankfurt(Main)Hbf") und nichts
+      // Falsches behauptet.
       const summary = top
         ? {
             found: true,
+            mode: input.mode,
+            origin: originRes.loc.label,
+            destination: destRes.loc.label,
             best: {
               provider: top.provider,
-              price: top.price,
+              // price 0 = „Tarif unbekannt" (MOTIS liefert keine Preise) —
+              // als null durchreichen, sonst erzählt Bo dem User „kostenlos".
+              price: top.price > 0 ? top.price : null,
               currency: top.currency,
-              durationMinutes: top.durationMinutes,
+              durationText: formatDurationText(top.durationMinutes),
               stops: top.stops,
               departTime: top.departTime,
               arriveTime: top.arriveTime,
             },
-            totalResults: response.results?.length ?? 0,
+            totalResults: filtered.length,
+            ...(applied.length > 0 && {
+              appliedFilters: applied,
+              unfilteredTotal: unfiltered.length,
+            }),
           }
-        : { found: false, totalResults: 0 };
+        : {
+            found: false,
+            mode: input.mode,
+            origin: originRes.loc.label,
+            destination: destRes.loc.label,
+            totalResults: 0,
+            ...(applied.length > 0 && {
+              appliedFilters: applied,
+              unfilteredTotal: unfiltered.length,
+              instruction:
+                unfiltered.length > 0
+                  ? "No results match the filters, but unfilteredTotal exist without them. Tell the user briefly and OFFER the alternatives (e.g. 'Keine Direktflüge — aber 12 mit Umstieg. Soll ich die zeigen?'). If they agree, call search_journey again without the filter."
+                  : undefined,
+            }),
+          };
       return {
         resultJson: JSON.stringify(summary),
         searchResult: top ?? null,
@@ -1124,18 +1220,39 @@ export async function runChatTurn(
   // Tool-Cycles aus früheren Turns sind bewusst weg (wir wollen Claude soll
   // nicht versuchen, alte Tool-Results zu interpretieren — jede Anfrage
   // startet mit fresh Tool-State).
-  const messages: Anthropic.Messages.MessageParam[] = input.history.map((m) => ({
-    role: m.role,
-    content: m.content,
-  }));
+  //
+  // NORMALISIERUNG (Robustheit gegen Client-Verlaufslücken): Der Client
+  // filtert Error-/Leer-Bubbles raus und kappt auf die letzten 59 Einträge —
+  // dabei können (a) zwei gleichrollige Nachrichten aufeinanderfolgen (User
+  // schickte nach einem Fehler erneut) und (b) das Fenster mit einer
+  // Assistant-Nachricht beginnen. Die Messages-API verlangt User-Start und
+  // verträgt Rollen-Doppler schlecht → mergen bzw. führende Bot-Nachrichten
+  // (die Begrüßung) fallen lassen.
+  const messages: Anthropic.Messages.MessageParam[] = [];
+  for (const m of input.history) {
+    const prev = messages[messages.length - 1];
+    if (prev && prev.role === m.role && typeof prev.content === "string") {
+      prev.content = `${prev.content}\n\n${m.content}`;
+    } else {
+      messages.push({ role: m.role, content: m.content });
+    }
+  }
+  while (messages.length > 0 && messages[0]!.role === "assistant") {
+    messages.shift();
+  }
+  if (messages.length === 0) {
+    onEvent({ type: "error", message: "Empty history" });
+    onEvent({ type: "done" });
+    return;
+  }
 
   let toolUseCycles = 0;
-  // Max 5 Tool-Use-Cycles — passt für die normale Sequenz:
-  //   1) get_today (wenn relativer Datum)
-  //   2) find_location origin + find_location destination (parallel)
-  //   3) search_journey
-  //   → 3 Cycles. Mit Puffer für 1-2 Klärungs-/Retry-Iterationen = 5.
-  const MAX_TOOL_USE_CYCLES = 5;
+  // Max 4 Tool-Use-Cycles — die normale Suche ist EIN Cycle (search_journey
+  // löst Ortsnamen selbst auf, get_today gibt's nicht mehr). Puffer für
+  // Stop-Board-Retries und 1-2 Fehlversuche. Bounded bewusst eng: das ist
+  // zugleich der Kosten-Deckel pro Nachricht (API-Calls = Cycles + 1, und
+  // Bo's Tool-Suchen laufen am HTTP-ipLimiter vorbei).
+  const MAX_TOOL_USE_CYCLES = 4;
   let lastMood: BoMood = "idle";
   // Wenn in diesem Turn ein search_result emittiert wurde, bleibt Bo
   // beim Text-Emit auf „happy" statt auf „talking" zu switchen. Damit
@@ -1153,6 +1270,15 @@ export async function runChatTurn(
       lastMood = mood;
       onEvent({ type: "mood", mood });
     }
+  };
+  // Cards/Buttons, die während der Tool-Ausführung entstehen, aber erst NACH
+  // Bos Antwort-Text zum Client dürfen — der Chat muss chronologisch lesen:
+  // erst die Sprechblase, darunter die Karte(n). Geflusht direkt nach der
+  // Text-Emission (bzw. spätestens vor done/error, damit nichts verloren geht).
+  const pendingAttachments: ChatEvent[] = [];
+  const flushAttachments = () => {
+    for (const e of pendingAttachments) onEvent(e);
+    pendingAttachments.length = 0;
   };
 
   try {
@@ -1175,8 +1301,11 @@ export async function runChatTurn(
         // System-Prompt als zwei Blöcke:
         // 1) Großer, statischer Prompt mit cache_control → cached zusammen
         //    mit den TOOLS (die rendern davor in der Prefix-Ordnung).
-        // 2) Kleiner volatiler Postfix mit Locale — NICHT gecacht, damit
-        //    derselbe Cache-Eintrag für alle 4 Sprachen funktioniert.
+        // 2) Kleiner volatiler Postfix mit Locale + heutigem Datum — NICHT
+        //    gecacht, damit derselbe Cache-Eintrag für alle Sprachen und
+        //    Tage funktioniert. Das Datum hier (~15 uncached Token) ersetzt
+        //    das frühere get_today-Tool, das pro relativer Datumsangabe
+        //    einen kompletten API-Roundtrip gekostet hat.
         system: [
           {
             type: "text",
@@ -1185,7 +1314,7 @@ export async function runChatTurn(
           },
           {
             type: "text",
-            text: localePostfix(input.locale),
+            text: `${localePostfix(input.locale)} Today's date (user's local time): ${input.today}.`,
           },
         ],
         tools: TOOLS,
@@ -1208,6 +1337,9 @@ export async function runChatTurn(
         for (const block of textBlocks) {
           onEvent({ type: "text", delta: block.text });
         }
+        // Chronologie: Cards/Buttons aus dem vorigen Tool-Cycle JETZT — nach
+        // dem Text — rausschieben. Der Client hängt sie unter die Bubble.
+        flushAttachments();
         // Mood-Hold-Dauer: Happy darf richtig lang sein damit der User die
         // Hüpf-Animation + Sparkles sieht UND währenddessen die ResultCard
         // betrachtet. Talking nur so lang wie der Text Lese-Zeit braucht.
@@ -1232,8 +1364,10 @@ export async function runChatTurn(
         cacheWrite: usage.cache_creation_input_tokens ?? 0,
       });
 
-      // End-of-Turn — wir sind fertig.
+      // End-of-Turn — wir sind fertig. (Flush als Sicherheitsnetz, falls die
+      // Antwort ausnahmsweise KEINEN Text-Block hatte.)
       if (finalMessage.stop_reason === "end_turn") {
+        flushAttachments();
         setMood("idle");
         onEvent({ type: "done" });
         return;
@@ -1242,6 +1376,7 @@ export async function runChatTurn(
       // Refusal — Claude hat aus Safety-Gründen abgebrochen. Wir surfacen
       // das aber überschreiben den Mood auf error.
       if (finalMessage.stop_reason === "refusal") {
+        flushAttachments();
         setMood("error");
         onEvent({ type: "error", message: "Refused" });
         onEvent({ type: "done" });
@@ -1262,23 +1397,33 @@ export async function runChatTurn(
 
         setMood("thinking");
 
-        // Tools parallel ausführen → schneller wenn Claude z.B. zwei
-        // find_location-Calls in einem Turn macht (Origin + Destination).
-        const toolResults = await Promise.all(
-          toolUseBlocks.map(async (block) => {
+        // Tools in ZWEI Wellen: erst State-PRODUZENTEN (search_journey,
+        // get_stop_board) parallel, dann State-KONSUMENTEN (open_all_results,
+        // save_trip, unsave_trip). Ruft Claude z.B. search_journey +
+        // open_all_results im selben Turn auf, hängt open_all_results von
+        // turnState.lastSearch ab, das die Suche erst setzt — voll parallel
+        // wäre das ein Race (im Test real aufgetreten: Ausgang hing vom
+        // Timing der Provider-Antwort ab).
+        const STATE_CONSUMERS = new Set(["open_all_results", "save_trip", "unsave_trip"]);
+        const producerBlocks = toolUseBlocks.filter((b) => !STATE_CONSUMERS.has(b.name));
+        const consumerBlocks = toolUseBlocks.filter((b) => STATE_CONSUMERS.has(b.name));
+        const runToolBlock = async (block: Anthropic.Messages.ToolUseBlock) => {
             onEvent({ type: "tool_use", name: block.name });
             const exec = await execTool(
               block.name,
               block.input,
-              { today: input.today, currency: input.currency, ip: ctx.ip },
+              { currency: input.currency, ip: ctx.ip },
               turnState,
             );
             if (exec.searchResult && turnState.lastSearch) {
-              // Search-Result an den Client streamen damit das UI sofort
-              // die FlightCard rendern kann. params mitgeben damit der
-              // Client sie persistiert und beim nächsten Request wieder
-              // sendet (cross-turn Memory).
-              onEvent({
+              // NICHT sofort streamen, sondern puffern (Chronologie!): Die
+              // Card gehört UNTER Bos Antwort-Text, der erst mit der
+              // nächsten API-Antwort kommt. Sofort emittiert stünde die
+              // Card schon da, während sich der Text darüber nachträglich
+              // „vervollständigt" — wirkt wie aus der Zeit gefallen.
+              // params mitgeben damit der Client sie persistiert und beim
+              // nächsten Request zurücksendet (cross-turn Memory).
+              pendingAttachments.push({
                 type: "search_result",
                 result: exec.searchResult,
                 params: turnState.lastSearch,
@@ -1287,9 +1432,8 @@ export async function runChatTurn(
               foundSearchResult = true;
             }
             if (exec.stopBoard) {
-              // Stop-Board-Hint an den Client — der rendert die inline
-              // StopBoardCard im Chat. Live-Daten holt der Client selbst.
-              onEvent({
+              // Stop-Board-Hint — gepuffert aus demselben Chronologie-Grund.
+              pendingAttachments.push({
                 type: "stop_board",
                 stop: exec.stopBoard.stop,
                 board: exec.stopBoard.board,
@@ -1307,13 +1451,23 @@ export async function runChatTurn(
               // statt 4s. Schnellere Rückkehr in idle.
             }
             if (exec.action) {
-              // Client-Side-Action (save_trip etc.) durchschleifen — Client
-              // führt die State-Mutation aus.
-              onEvent({
-                type: "action",
-                action: exec.action.action,
-                payload: exec.action.payload,
-              });
+              if (exec.action.action === "open_results") {
+                // Der „Alle Treffer"-Button rendert wie die Cards UNTER dem
+                // Text → puffern (Chronologie).
+                pendingAttachments.push({
+                  type: "action",
+                  action: exec.action.action,
+                  payload: exec.action.payload,
+                });
+              } else {
+                // save/unsave mutieren State sofort (Toast IST das
+                // chronologische Ereignis, Bos Bestätigung folgt danach).
+                onEvent({
+                  type: "action",
+                  action: exec.action.action,
+                  payload: exec.action.payload,
+                });
+              }
             }
             return {
               type: "tool_result" as const,
@@ -1321,8 +1475,17 @@ export async function runChatTurn(
               content: exec.resultJson,
               is_error: exec.isError,
             };
-          }),
+        };
+        const producerResults = await Promise.all(producerBlocks.map(runToolBlock));
+        const consumerResults = await Promise.all(consumerBlocks.map(runToolBlock));
+        // Results in der ORIGINAL-Blockreihenfolge zurückgeben (IDs matchen
+        // eh, aber konsistente Ordnung hält den Verlauf lesbar).
+        const byId = new Map(
+          [...producerResults, ...consumerResults].map((r) => [r.tool_use_id, r]),
         );
+        const toolResults = toolUseBlocks
+          .map((b) => byId.get(b.id))
+          .filter((r): r is NonNullable<typeof r> => r !== undefined);
 
         // User-Turn mit allen Tool-Results auf einmal — Multi-Tool im
         // selben Turn.
@@ -1333,6 +1496,7 @@ export async function runChatTurn(
       }
 
       // Unerwarteter stop_reason (z.B. max_tokens, pause_turn).
+      flushAttachments();
       setMood("error");
       onEvent({
         type: "error",
@@ -1354,9 +1518,13 @@ export async function runChatTurn(
             : "Hmm, I need a bit more detail — could you write the full station names for origin and destination? E.g. 'London Kings Cross to Edinburgh Waverley'.";
     setMood("talking");
     onEvent({ type: "text", delta: fallbackText });
+    flushAttachments();
     setMood("idle");
     onEvent({ type: "done" });
   } catch (err) {
+    // Erst gepufferte Cards ausliefern (eine gefundene Verbindung soll dem
+    // User nicht verloren gehen, nur weil der Folge-Call scheiterte).
+    flushAttachments();
     setMood("error");
     const message = err instanceof Error ? err.message : String(err);
     onEvent({ type: "error", message });

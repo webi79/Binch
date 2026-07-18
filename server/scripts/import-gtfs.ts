@@ -476,17 +476,32 @@ async function main() {
     const subtype = hasData ? dominantSubtype(subtypeCounts) : "BUS";
     const kinds = hasData ? kindsForStop(subtypeCounts) : ["bus" as Kind];
     const type = subtypeToType(subtype);
-    // hafas_id nur setzen wenn die 7-stellige ID auch zum tatsächlichen
-    // (Polygon-erkannten) Land passt — sonst gibt's ID-Kollisionen mit
-    // anderen Ländern. Beispiel: BE-Feed enthält Lille-Stops mit IDs wie
-    // 8728600, die zwar 7-stellig sind, aber das HAFAS-UIC-Prefix `87` ist
-    // für Frankreich, nicht Belgien (88). Wenn wir die als BE-hafas_id
-    // speichern, mapped DB-HAFAS sie später auf irgendwelche
-    // Dentergem/Unterhaching-Bus-Stops → 0-Treffer-Suchen.
-    const expectedUicPrefix = uicPrefixForCountry(rowCountry);
+    // hafas_id nur setzen wenn (a) der Stop im HEIMATLAND des Feeds liegt und
+    // (b) die 7-stellige ID das UIC-Prefix dieses Landes trägt. Beides nötig:
+    //
+    //  - (a) Feed-fremde Stops tragen NIE autoritative UICs, sondern interne
+    //    Nummern des Feed-Betreibers. Praxis-Schaden: der CH-Feed führt seine
+    //    Auslands-Stops mit DiDok-Nummern, die zufällig plausible Prefixe
+    //    haben — „Bludenz" (AT) bekam so 8101230, das ist aber die echte UIC
+    //    von MÖDLING BAHNHOF. Die Abfahrtstafel von Bludenz zeigte Mödlinger
+    //    Züge. Der alte Prefix-Check allein ließ das durch, weil 81 zum
+    //    (grenz-ungenau Polygon-erkannten) Land passte.
+    //  - (b) Beispiel: BE-Feed enthält Lille-Stops mit IDs wie 8728600 —
+    //    7-stellig, aber `87` ist Frankreich, nicht Belgien (88).
+    //  - Kein bekanntes Prefix fürs Land → KEINE hafas_id (früher: ungeprüft
+    //    übernehmen — daher 8k NL-Rows mit internen 27-39xxxxx-Codes als
+    //    vermeintliche UICs). Ohne hafas_id resolven Boards sauber über die
+    //    Koordinate.
+    // detectedCountry (positiv erkannt) statt rowCountry: rowCountry fällt
+    // bei Polygon-Miss aufs Feed-Land zurück — damit bekäme ein Auslands-Stop
+    // in nicht-modellierten Ländern (z.B. dänischer Stop im DE-Feed) wieder
+    // eine Feed-Land-hafasId untergeschoben.
+    const expectedUicPrefix = uicPrefixForCountry(COUNTRY);
     const hafasId =
       /^\d{7}$/.test(stopId) &&
-      (!expectedUicPrefix || stopId.slice(0, 2) === expectedUicPrefix)
+      detectedCountry === COUNTRY &&
+      expectedUicPrefix !== null &&
+      stopId.slice(0, 2) === expectedUicPrefix
         ? stopId
         : null;
 

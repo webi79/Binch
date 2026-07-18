@@ -8,7 +8,7 @@
  *
  *     {"type":"mood","mood":"thinking|talking|happy|error|idle"}
  *     {"type":"text","delta":"Hallo"}            (Text-Chunk vom Modell)
- *     {"type":"tool_use","name":"find_location"}  (Tool wird ausgeführt)
+ *     {"type":"tool_use","name":"search_journey"}  (Tool wird ausgeführt)
  *     {"type":"search_result","result":{...}}     (Top-Trip nach search_journey)
  *     {"type":"usage","input":..., "output":..., "cacheRead":..., "cacheWrite":...}
  *     {"type":"error","message":"..."}

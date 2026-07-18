@@ -15,7 +15,7 @@
     "docker:rebuild": "docker compose up -d --build --force-recreate binch-server",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx --env-file=.env src/db/migrate.ts",
-    "db:seed": "tsx --env-file=.env src/db/seed.ts",
+    "db:seed": "tsx --env-file=.env src/db/seed.ts && tsx --env-file=.env scripts/backfill-static-coords.ts",
     "db:studio": "drizzle-kit studio",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build:marker-icons": "node scripts/build-marker-icons.mjs",
