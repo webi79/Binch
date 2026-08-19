@@ -10,6 +10,7 @@ import {
   boolean,
   jsonb,
   index,
+  uniqueIndex,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
@@ -151,7 +152,16 @@ export const users = pgTable(
   {
     id: uuid("id").defaultRandom().primaryKey(),
     email: varchar("email", { length: 255 }).notNull().unique(),
-    passwordHash: text("password_hash").notNull(),
+    /**
+     * NULLABLE, seit es Anmeldung über Apple und Google gibt.
+     *
+     * Wer sich nur über einen Anbieter anmeldet, hat bei uns nie ein Passwort
+     * gesetzt — ein Pflichtfeld zwänge zu einem Platzhalter-Hash, und ein
+     * Platzhalter, gegen den irgendwann jemand verifiziert, ist eine
+     * Hintertür. `null` heißt eindeutig: Dieses Konto hat kein Passwort, der
+     * Passwort-Login ist dafür gesperrt.
+     */
+    passwordHash: text("password_hash"),
     firstName: varchar("first_name", { length: 80 }).notNull(),
     lastName: varchar("last_name", { length: 80 }).notNull(),
     /** data: URL (image/jpeg base64) — capped at ~256x256 client-side. */
@@ -161,6 +171,45 @@ export const users = pgTable(
   },
   (t) => ({
     emailIdx: index("idx_users_email").on(t.email),
+  }),
+);
+
+/**
+ * Anmeldungen über Apple und Google.
+ *
+ * Eigene Tabelle statt Spalten an `users`, aus drei Gründen:
+ *  • Ein Konto darf mehrere Anbieter haben (heute Google, morgen zusätzlich
+ *    Apple — dieselbe Person, dasselbe Konto).
+ *  • Die Kennung des Anbieters (`sub`) ist die einzige stabile Größe. E-Mails
+ *    ändern sich, und Apples „Private Relay" liefert für dieselbe Person
+ *    pro App eine andere Adresse.
+ *  • Ein eindeutiger Index über (Anbieter, Kennung) macht das Verknüpfen
+ *    atomar — ohne ihn könnten zwei gleichzeitige Anmeldungen zwei Konten
+ *    anlegen.
+ */
+export const userIdentities = pgTable(
+  "user_identities",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** "google" | "apple" */
+    provider: varchar("provider", { length: 16 }).notNull(),
+    /** Die `sub`-Kennung aus dem ID-Token des Anbieters. */
+    providerUserId: varchar("provider_user_id", { length: 255 }).notNull(),
+    /** Die E-Mail, die der Anbieter mitgeschickt hat — nur zur Nachvollzieh-
+     *  barkeit. Verknüpft wird über `providerUserId`, nie über die E-Mail. */
+    email: varchar("email", { length: 255 }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    /** Verhindert doppelte Verknüpfungen UND macht das Anlegen wettlauffest. */
+    providerUnique: uniqueIndex("uq_user_identities_provider_uid").on(
+      t.provider,
+      t.providerUserId,
+    ),
+    userIdx: index("idx_user_identities_user").on(t.userId),
   }),
 );
 

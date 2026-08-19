@@ -12,6 +12,9 @@
       },
       "ios": {
         "simulator": false
+      },
+      "env": {
+        "GOOGLE_WEB_CLIENT_ID": "735863677388-nlbbh1a4mnson93cshn038ehkp1gfapk.apps.googleusercontent.com"
       }
     },
     "preview": {
@@ -21,13 +24,15 @@
       },
       "env": {
         "COMMENT_apiBaseUrl": "Sobald der Hetzner-Server steht: EXPO_PUBLIC_API_BASE_URL auf die https-Domain setzen (Release-Builds blocken cleartext-HTTP, LAN-IP geht dort nie).",
-        "EXPO_PUBLIC_API_BASE_URL": "http://192.168.2.84:3000"
+        "EXPO_PUBLIC_API_BASE_URL": "http://192.168.2.84:3000",
+        "GOOGLE_WEB_CLIENT_ID": "735863677388-nlbbh1a4mnson93cshn038ehkp1gfapk.apps.googleusercontent.com"
       }
     },
     "production": {
       "autoIncrement": true,
       "env": {
-        "EXPO_PUBLIC_API_BASE_URL": "http://192.168.2.84:3000"
+        "EXPO_PUBLIC_API_BASE_URL": "http://192.168.2.84:3000",
+        "GOOGLE_WEB_CLIENT_ID": "735863677388-nlbbh1a4mnson93cshn038ehkp1gfapk.apps.googleusercontent.com"
       }
     }
   },

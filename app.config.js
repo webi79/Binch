@@ -25,7 +25,17 @@ module.exports = {
   expo: {
     name: "Binch",
     slug: "binch-mobile",
-    scheme: "binch",
+    /**
+     * ZWEI Schemata.
+     *
+     * `binch` ist das der App (Verlinkungen, Rücksprung aus dem Browser).
+     * `com.binch.mobile` kommt für die Google-Anmeldung dazu: Google verlangt
+     * für installierte Apps eine Rücklauf-Adresse in Reverse-DNS-Form, und die
+     * App muss dieses Schema auch selbst beanspruchen — sonst leitet Google
+     * zwar korrekt weiter, aber auf dem Gerät fängt niemand den Rücklauf auf,
+     * und der Browser bleibt einfach stehen.
+     */
+    scheme: ["binch", "com.binch.mobile"],
     version: "1.0.0",
     orientation: "portrait",
     icon: "./assets/icon.png",
@@ -34,11 +44,14 @@ module.exports = {
     splash: {
       image: "./assets/splash-icon.png",
       resizeMode: "contain",
-      backgroundColor: "#ffffff",
+      backgroundColor: "#000000",
     },
     ios: {
       supportsTablet: true,
       bundleIdentifier: "com.binch.mobile",
+      // Aktiviert die Berechtigung „Sign in with Apple" im iOS-Projekt. Ohne
+      // sie schlägt der Aufruf zur Laufzeit fehl, nicht beim Bauen.
+      usesAppleSignIn: true,
     },
     android: {
       adaptiveIcon: {
@@ -55,6 +68,23 @@ module.exports = {
     },
     plugins: [
       "expo-router",
+      /**
+       * Anmeldung mit Apple — nur iOS.
+       *
+       * Das Plugin setzt die nötige Berechtigung im iOS-Projekt. Auf Android
+       * bleibt es folgenlos; der Knopf wird dort ohnehin ausgeblendet, weil
+       * Apples Web-Fluss ein signiertes Client-Secret verlangt, das nur auf
+       * einen Server gehört.
+       */
+      "expo-apple-authentication",
+      /**
+       * Natives Google-Sign-In über die Play-Dienste.
+       *
+       * Das Plugin trägt die nötigen Abhängigkeiten und Manifest-Einträge ins
+       * Android-Projekt ein. Nötig, seit der Browser-Weg entfällt: Google hat
+       * eigene URI-Schemata für neue Android-Clients abgeschaltet.
+       */
+      "@react-native-google-signin/google-signin",
       // usesCleartextTraffic hängt jetzt an der Backend-URL (siehe
       // ALLOW_CLEARTEXT oben): http:// (lokaler Dev-Server) → true, damit der
       // LAN-Dev-Server auch im Release-Build erreichbar bleibt; https:// (Prod
@@ -95,6 +125,35 @@ module.exports = {
     ],
     extra: {
       apiBaseUrl: API_BASE_URL,
+      /**
+       * Client-IDs für die Anmeldung über Google.
+       *
+       * Aus der Umgebung, nicht im Code — nicht weil sie geheim wären (das sind
+       * sie nicht, sie stehen in jeder installierten App), sondern weil sie pro
+       * Projekt verschieden sind und weil der SERVER dieselben IDs als gültige
+       * Empfänger kennen muss (`GOOGLE_CLIENT_IDS` dort). Zwei Orte, ein Wert —
+       * er gehört an eine Stelle, an der man beide bedient.
+       *
+       * Fehlen sie, blendet der Anmelde-Bildschirm den Knopf aus, statt einen
+       * anzubieten, der nicht funktioniert.
+       */
+      /**
+       * EINE ID: die des WEB-Clients.
+       *
+       * Das native SDK meldet sich zwar über den Android-Client an (der
+       * autorisiert die App über Paketname und Fingerabdruck), stellt das
+       * ID-Token aber immer auf den Web-Client aus. Dessen ID steht im `aud` des
+       * Tokens und muss deshalb auch auf dem Server als gültiger Empfänger
+       * eingetragen sein (`GOOGLE_CLIENT_IDS`).
+       *
+       * Das Client-Secret des Web-Clients wird NICHT gebraucht und darf nirgends
+       * in die App: Es gehört auf einen Server, der Codes eintauscht — hier
+       * tauscht niemand etwas ein.
+       */
+      googleWebClientId: process.env.GOOGLE_WEB_CLIENT_ID ?? null,
+      // KEINE Web-Client-ID mehr: Web-Clients erlauben keinen Rücklauf über ein
+      // eigenes Schema. Als Rückfall hätte sie den Knopf sichtbar gemacht, den
+      // Google dann abgelehnt hätte — siehe googleClientId() im Client.
       eas: {
         projectId: "bb96def4-7d38-4119-8758-ea844051db4a",
       },

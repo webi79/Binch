@@ -333,27 +333,36 @@ const CURRENCY_LOCALE: Record<string, { hl: string; gl: string }> = {
  * gleichen Preis in Dollar" sieht obwohl die App EUR anzeigt. Mit `curr` ist
  * die Fallback-Seite in derselben Währung wie die App-Anzeige.
  */
+/**
+ * Ersatz-Verweis, wenn kein Anbieter-Deeplink vorliegt.
+ *
+ * Vorher wurden `f`, `t`, `d`, `tt`, `flight` und `dt` als Query-Parameter
+ * angehängt. Google Flights wertet die NICHT (mehr) aus — die heutige Oberfläche
+ * liest ihre Suche aus einem `tfs`-Parameter (base64-kodiertes Protobuf). Das
+ * alte Format landete deshalb auf einer komplett leeren Suchmaske, obwohl die
+ * Strecke in der URL stand. Genau das war das „führt auf eine leere
+ * Google-Flights-Suche".
+ *
+ * `q` funktioniert dagegen: Google liest die natürlichsprachige Anfrage und
+ * füllt Strecke und Datum vor. Kein Protobuf nötig, kein Format, das bei der
+ * nächsten Oberflächen-Änderung bricht. Die Flugnummer nehmen wir mit, wenn wir
+ * sie kennen — dann steht die konkrete Verbindung oben.
+ */
 function buildDeepLink(
   _token: string,
   input: ProviderSearchInput,
-  departIso: string | null,
+  _departIso: string | null,
   flightNumber?: string,
 ): string {
   const curr = (input.currency || "EUR").toUpperCase();
   const loc = CURRENCY_LOCALE[curr] ?? { hl: "en", gl: "US" };
+  const flight = flightNumber ? ` ${flightNumber.replace(/\s+/g, "")}` : "";
+  const q = `Flights from ${input.origin} to ${input.destination} on ${input.departDate}${flight}`;
   const params = new URLSearchParams({
-    f: input.origin,
-    t: input.destination,
-    d: input.departDate,
-    tt: "o",
+    q,
     curr,
     hl: loc.hl,
     gl: loc.gl,
   });
-  if (flightNumber) params.set("flight", flightNumber.replace(/\s+/g, ""));
-  if (departIso) {
-    const m = departIso.match(/T(\d{2}):(\d{2})/);
-    if (m) params.set("dt", `${m[1]}:${m[2]}`);
-  }
   return `https://www.google.com/travel/flights?${params.toString()}`;
 }

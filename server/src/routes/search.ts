@@ -38,6 +38,9 @@ const querySchema = z.object({
   travelClass: z.string().max(60).optional(),
   /** ?nocache=1 erzwingt frische Provider-Anfrage, sonst greift der 2h-Cache. */
   nocache: z.coerce.boolean().optional(),
+  /** ?nearby=1 erlaubt das Ausweichen auf nahegelegene Flughäfen. Nur wenn der
+   *  Nutzer das im Leerzustand ausdrücklich anfordert (siehe SearchInput). */
+  nearby: z.coerce.boolean().optional(),
   /** „Später"-Pagination: opaques Token aus der vorherigen Suche
    *  (HAFAS laterRef). Wird nur von TRAIN-Provider unterstützt; bei
    *  anderen Modes ignoriert. */
@@ -74,6 +77,9 @@ export async function searchRoutes(app: FastifyInstance) {
         ...parsed.data,
         mode,
         ip: req.ip,
+        // Query heißt `nearby`, intern `allowNearby` — explizit abbilden, ein
+        // Spread würde das Feld stillschweigend verschlucken.
+        allowNearby: parsed.data.nearby === true,
       });
       return result;
     });

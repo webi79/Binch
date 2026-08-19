@@ -86,6 +86,9 @@ function emitLayer(): void {
 
 /** Beim Fingerdruck auf „Preis vergleichen" aufrufen. */
 export function prepareHandoffLayer(): void {
+  // Neue Anforderung → der Aufschub von letztem Mal ist verbraucht.
+  // Dieselbe Symmetrie wie im Schwestermodul; hier fehlte sie.
+  releaseDeferred = false;
   scheduleRelease();
   if (layerWanted) return;
   layerWanted = true;

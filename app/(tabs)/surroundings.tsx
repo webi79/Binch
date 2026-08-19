@@ -1,5 +1,6 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { prepareLayer } from "@/lib/nav/transitionLayer";
+import { preloadLocationPicker } from "@/lib/nav/pickerPreload";
 import { View, StyleSheet, type LayoutChangeEvent } from "react-native";
 import Animated, { FadeOut } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -206,25 +207,40 @@ export default function SurroundingsScreen() {
    * einer der Gründe, warum es sich hier schlechter anfühlt als dort.
    */
   const pickerOverMap = useSearchStore((st) => st.locationPickerRequest !== null);
-  /**
-   * Auch einfrieren, sobald ÜBERHAUPT ein bildschirmfüllendes Blatt darüber
-   * liegt — nicht erst 500ms nach einem Tab-Wechsel.
-   *
-   * Der Riegel für den Tab-Wechsel wartet bewusst eine halbe Sekunde
-   * (`FREEZE_QUIET_MS`), damit ein schnelles Hin und Her nicht bei jedem
-   * Wechsel eine Karte neu aufbaut. Genau diese halbe Sekunde ist aber das
-   * Fenster, in dem jemand vom Landingscreen in die Suche und weiter in einen
-   * Wähler tippt — und solange läuft der GL-Strang der Karte samt Markern
-   * weiter, unter einem deckenden Blatt, das man ohnehin nicht durchsieht.
-   *
-   * Liegt die Suche darüber, gibt es nichts abzuwägen: Zu sehen ist die Karte
-   * dann sicher nicht.
-   */
+  /** Liegt die Suche darüber? Dann ist die Karte sicher nicht zu sehen. */
   const searchOverMap = useSearchStore((st) => st.searchOverlayMode != null);
   const frozen = (!isFocused && freezeArmed) || pickerOverMap || searchOverMap;
 
   const [mapMounted, setMapMounted] = useState(false);
+  /**
+   * Einwegs war falsch — beim Einfrieren gehört das Skelett zurück.
+   *
+   * Eingefroren verliert die GL-Fläche ihren Kontext (SurfaceView geht auf
+   * `INVISIBLE`/`GONE`). Beim Zurückkommen wird sie neu erzeugt und ist für
+   * ein bis drei Sekunden leer — und leer heißt hier exakt die Farbe des
+   * Hintergrunds, das Skelett war das einzige, was sich davon abhob. Also
+   * zurücksetzen und erst wieder freigeben, wenn MapLibre erneut fertig
+   * gemeldet hat.
+   */
   const [mapTilesRendered, setMapTilesRendered] = useState(false);
+  useEffect(() => {
+    if (frozen) {
+      setMapTilesRendered(false);
+      return;
+    }
+    if (!mapMounted) return;
+    /**
+     * Und beim Auftauen eine eigene Notbremse.
+     *
+     * Die des Kartenbauteils meldet pro Aufbau nur einmal — nach dem Auftauen
+     * ist sie also verbraucht. Meldet MapLibre nach dem Neuaufbau seiner Fläche
+     * aus irgendeinem Grund kein „fertig" mehr, läge das Skelett sonst für
+     * immer über einer funktionierenden Karte. Vier Sekunden decken den
+     * gemessenen Bereich (0,3 bis 4,7s pro Kachelsatz) mit ab.
+     */
+    const id = setTimeout(() => setMapTilesRendered(true), 4000);
+    return () => clearTimeout(id);
+  }, [frozen, mapMounted]);
   /**
    * Hat die Fläche schon eine echte Größe?
    *
@@ -260,12 +276,32 @@ export default function SurroundingsScreen() {
      * Millisekunden später zu starten ist billiger als ein kompletter
      * Kachelsatz, der niemanden interessiert.
      */
-    if (!isFocused || mapMounted || !hasSize || locationStatus === "loading") return;
+    if (!isFocused || mapMounted || !hasSize) return;
+    /**
+     * Gewartet wird nur, wenn wir NOCH GAR KEINE Koordinate haben.
+     *
+     * Vorher hing das Mounten an `locationStatus !== "loading"` — also an der
+     * KOMPLETTEN Ortungskette: Berechtigungsdialog, OS-Zwischenspeicher und
+     * eine frische Messung mit acht Sekunden Deckel. Bis dahin baute sich die
+     * Karte gar nicht erst auf, und man schaute sekundenlang auf das Skelett.
+     *
+     * Die Begründung darüber galt einer Fassung, in der `coord` bis zur ersten
+     * Ortung auf einem PLATZHALTER stand (Berlin Hbf) — dann wäre ein früher
+     * Start tatsächlich ein Kachelsatz für die falsche Stadt gewesen. Den
+     * Platzhalter gibt es nicht mehr: `useUserLocation` startet mit der
+     * gemerkten Koordinate aus der letzten Sitzung (`lastKnownCoord`, im
+     * Speicher persistiert) oder mit `null`.
+     *
+     * Also: Liegt eine Koordinate vor, ist sie die des Nutzers — losbauen.
+     * Liegt keine vor, warten wir die Ortung ab, weil ein Start ohne Ort auf
+     * die Weltansicht führt und die zeigt in diesem Kartenstil nichts.
+     */
+    if (userCoord === null && locationStatus === "loading") return;
     // Ein Frame Defer damit der erste Tab-Commit das Skelett zeichnet
     // BEVOR wir die schwere MapLibre-Initialisation triggern.
     const id = requestAnimationFrame(() => setMapMounted(true));
     return () => cancelAnimationFrame(id);
-  }, [isFocused, mapMounted, hasSize, locationStatus]);
+  }, [isFocused, mapMounted, hasSize, locationStatus, userCoord]);
 
   // Tab-Tap soll sich sofort anfühlen. Marker-Swap (100+ native Views) ist
   // teuer und blockt sonst den Tap. useDeferredValue rendert die Marker
@@ -452,7 +488,27 @@ export default function SurroundingsScreen() {
    */
   const selectStopFromList = useCallback((id: string) => focusStopRef.current(id, true), []);
   const selectStopFromMap = useCallback((id: string) => focusStopRef.current(id, false), []);
-  const onMapRendered = useCallback(() => setMapTilesRendered(true), []);
+  /**
+   * Die Freigabe des Skeletts liegt HIER, nicht im Kartenbauteil.
+   *
+   * Der Grund ist mechanisch: Solange eingefroren ist, verwirft `react-freeze`
+   * jeden Durchgang des Unterbaums — ein Prop wie „du bist gerade angehalten"
+   * käme dort nie an, das Kind behält seine alten Eigenschaften. Dieser
+   * Bildschirm selbst ist NICHT eingefroren (der Riegel gilt seinen Kindern),
+   * er weiß es also als Einziger.
+   *
+   * Und wissen muss es jemand: Eingefroren setzt Fabric den Baum nativ auf
+   * `INVISIBLE`, MapLibre verliert im SurfaceView-Modus seine Fläche samt
+   * GL-Kontext und kann nichts malen. Eine Meldung, die in diesem Zustand
+   * eintrifft (die Notbremse des Kindes läuft weiter), bedeutet nicht, dass
+   * etwas zu sehen ist.
+   */
+  const frozenRef = useRef(frozen);
+  frozenRef.current = frozen;
+  const onMapRendered = useCallback(() => {
+    if (frozenRef.current) return;
+    setMapTilesRendered(true);
+  }, []);
 
   // Beim ersten GPS-Fix auf den Standort fliegen — Zoom je nach Modus.
   // Wird übersprungen wenn eine Route aktiv ist (dann fitten wir auf die Route).
@@ -466,6 +522,8 @@ export default function SurroundingsScreen() {
   // hatte, wurde ohne Zutun zurück auf seine eigene Position gerissen. Dasselbe
   // bei jedem Antippen des Standort-Knopfes.
   const didInitialFlyRef = useRef(false);
+  /** Wohin zuletzt geflogen wurde — Bezugspunkt für die Sperre unten. */
+  const flownToRef = useRef<{ latitude: number; longitude: number } | null>(null);
   // Immer der neueste Fix — für Rückrufe, die ein await überdauern.
   const latestCoordRef = useRef(userCoord);
   latestCoordRef.current = userCoord;
@@ -488,7 +546,26 @@ export default function SurroundingsScreen() {
     if (!mapMounted || !mapRef.current) return;
     // Kein Standort, kein Flug — sonst flöge die Karte an den Platzhalter.
     if (!userCoord) return;
-    if (didInitialFlyRef.current) return;
+    /**
+     * Die Sperre gilt für DIESEN Ort, nicht für alle Zeiten.
+     *
+     * Die Koordinate kommt zweistufig: erst der Fix aus dem OS-Zwischenspeicher
+     * (bis zu einer Viertelstunde alt), bis zu acht Sekunden später der frische.
+     * Eine einmalige Sperre verbraucht der ERSTE — wer über Nacht in eine andere
+     * Stadt gefahren ist, blieb damit auf der alten stehen, obwohl der richtige
+     * Fix Sekunden später eintraf. Seit die Karte früher startet (siehe oben,
+     * sie wartet die Ortung nicht mehr ab), ist genau das der Normalfall.
+     *
+     * Also: nachfliegen, wenn der neue Ort WEIT vom angeflogenen entfernt ist.
+     * Ein Kilometer trennt sauber — GPS-Zittern und Genauigkeitssprünge liegen
+     * darunter, ein anderer Stadtteil oder eine andere Stadt darüber. Wer die
+     * Karte selbst bewegt hat, ist davon nicht betroffen: Dann steht sie
+     * ohnehin dort, wo er sie hingezogen hat, und ein Ortswechsel dieser
+     * Größenordnung passiert nicht beiläufig.
+     */
+    const flown = flownToRef.current;
+    if (flown && distanceMeters(flown, userCoord) < 1000) return;
+    flownToRef.current = userCoord;
     didInitialFlyRef.current = true;
     const zoom = mode === "transit" ? 13 : mode === "airport" ? 5 : 4;
     mapRef.current.flyTo(userCoord.latitude, userCoord.longitude, zoom);
@@ -710,7 +787,39 @@ export default function SurroundingsScreen() {
             // Textur des Pickers beim AUFSETZEN anlegen — derselbe Weg wie im
             // Such-Blatt. Ohne das öffnet der Picker von hier aus ohne Ebene und
             // wird während der ganzen Fahrt Bild für Bild neu gezeichnet.
-            onTouchStart={() => prepareLayer("pickerLocation")}
+            onTouchStart={() => {
+              /**
+               * ERST den Inhalt, DANN die Textur — dieselbe Reihenfolge wie im
+               * Such-Blatt.
+               *
+               * Hier stand nur die Textur-Anforderung. Damit entstand sie aus
+               * einem noch leeren Blatt und wurde vom Öffnungs-Commit sofort
+               * wieder ungültig — genau der Fall, den `pickerPreload` als den
+               * ursprünglichen Fehler beschreibt. Und seit der Inhalt erst beim
+               * Berühren gebaut wird, lag dieser Aufbau von hier aus sogar
+               * hinter dem Start der Fahrt.
+               */
+              preloadLocationPicker({
+                sessionKey: 0,
+                field: "from",
+                mode: "ALL",
+                suggested: POPULAR_LOCATIONS.ALL,
+                title: t("surroundings.search.title"),
+                leadingLabel: "",
+                placeholderKey: "surroundings.search.placeholder",
+                /**
+                 * Die Zeile „Aktueller Standort" gehört MIT in den Vorlauf.
+                 *
+                 * Der Wirt behält beim Schließen den zuletzt bekannten Auftrag,
+                 * damit der Inhalt während der Ausfahrt stehen bleibt. Fehlte der
+                 * Rückruf hier, fiel er beim Schließen auf diesen Vorlauf zurück —
+                 * und die Zeile verschwand im ersten Bild der Ausfahrt, also genau
+                 * das Flackern, gegen das dieses Behalten gedacht ist.
+                 */
+                onCurrentLocation: onLocate,
+              });
+              requestAnimationFrame(() => prepareLayer("pickerLocation"));
+            }}
             onPress={() =>
               openLocationPicker({
                 field: "from",

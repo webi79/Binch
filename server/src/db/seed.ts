@@ -21,7 +21,10 @@ interface Row {
   city: string;
   country: string;
   type: LocationType;
-  /** Nur die Fernbus-Bahnhöfe bringen eigene Koordinaten mit — damit
+  /** Größenklasse bei Flughäfen (LARGE/MEDIUM/SMALL/OTHER) — die Suche
+   *  sortiert danach, siehe `locationService`. */
+  subtype?: string;
+  /** Fernbus-Bahnhöfe und Flughäfen bringen eigene Koordinaten mit — damit
    *  resolveMotisPlace den echten ZOB trifft statt per Label zu raten.
    *  Drizzle bildet die numeric-Spalten auf `string` ab. */
   latitude?: string;
@@ -38,6 +41,12 @@ function buildRows(): Row[] {
       city: a.city,
       country: a.country,
       type: "FLIGHT",
+      // Größenklasse steuert die Trefferreihenfolge (siehe `locationService`),
+      // Koordinaten machen Flughäfen für die Umkreissuche auffindbar — beides
+      // kam bisher gar nicht in der Tabelle an.
+      subtype: a.size,
+      latitude: String(a.latitude),
+      longitude: String(a.longitude),
     });
   }
 
@@ -93,6 +102,7 @@ async function main() {
           city: sql`excluded.city`,
           country: sql`excluded.country`,
           type: sql`excluded.type`,
+          subtype: sql`COALESCE(excluded.subtype, ${locations.subtype})`,
           // COALESCE: Vorhandene Koordinaten (aus dem GTFS-Refresh) NICHT mit
           // NULL überschreiben, nur fehlende ergänzen.
           latitude: sql`COALESCE(excluded.latitude, ${locations.latitude})`,

@@ -61,12 +61,30 @@ const COMMON_HEADERS = () => ({
   "x-rapidapi-host": RAPIDAPI_HOST,
 });
 
-/** Per-Versuch-Timeout für RapidAPI-Calls. Bewusst knapp (statt 12s) gehalten,
- *  damit bis zu RETRY_ATTEMPTS Versuche + Backoff noch komfortabel in das 12s-
- *  Timeout passen, das der Client (getJson) auf die booking-options-Route legt.
- *  Normale Antworten kommen in <1s; ein einzelner träger Versuch wird so nach
- *  8s abgebrochen statt die ganze Retry-Kette zu blockieren. */
-const FETCH_TIMEOUT_MS = 6_000;
+/**
+ * Per-Versuch-Timeout für RapidAPI-Calls.
+ *
+ * Stand 6s — und das war der Grund, warum seit einiger Zeit GAR KEINE Anbieter
+ * mehr ankamen. Die alte Annahme im Kommentar hier („normale Antworten kommen in
+ * <1s") gilt für `getBookingDetails` längst nicht mehr. Nachgemessen am echten
+ * Endpoint, dreimal hintereinander:
+ *
+ *   Zeitlimit  6s → Abbruch
+ *   Zeitlimit 15s → Abbruch
+ *   Zeitlimit 30s → Erfolg, 14 809 Bytes, 5 Anbieter
+ *
+ * Vom Host aus: 10,7s / 10,7s / einmal 180s mit 504. Die Antwort braucht also
+ * 10-30s, gelegentlich kommt gar keine. Bei 6s lief JEDER Versuch ins Limit —
+ * fünf davon ergaben exakt die im Log sichtbaren 33,5s, danach „empty after 5
+ * attempts". Die Drossel-Erklärung war falsch: Die Schnittstelle antwortet
+ * einwandfrei (HTTP 200, 39 942 von 40 000 Anfragen im Kontingent frei), wir
+ * haben nur nie lange genug gewartet.
+ */
+// 22s statt 30s: Alle bisher erfolgreichen Antworten kamen in 10,7-17,2s. Das
+// Gateway selbst gibt erst nach 180s auf — wer darauf wartet, blockiert den
+// Nutzer sinnlos. 22s deckt jeden gemessenen Erfolg mit Reserve ab und drittelt
+// die Wartezeit im Fehlerfall.
+const FETCH_TIMEOUT_MS = 22_000;
 // Kürzeres Timeout fürs parallele Deeplink-Auflösen: ein einzelner träger
 // Anbieter soll nicht das ganze Sheet-Open blockieren (Promise wartet sonst
 // auf den langsamsten). Lieber Fallback-Preis als Hänger.
@@ -113,8 +131,62 @@ function fetchWithTimeout(
 // Deeplink-Auflösung jetzt PARALLEL läuft (~2-4s statt früher serialisiert ~9s),
 // ist Budget frei: 5 Versuche (realistisch ~1.5s je leerer/Invalid-Antwort +
 // Backoff ≈ 9s) + parallele Auflösung passen komfortabel ins 18s-Client-Timeout.
-const RETRY_ATTEMPTS = 5;
+/**
+ * Anfragen laufen PARALLEL, nicht nacheinander.
+ *
+ * Nachgemessen an sechs Aufrufen desselben Tokens (aus dem Server-Container,
+ * mit derselben Node-Laufzeit):
+ *
+ *   10,7s → Daten | 180,2s → leer | 17,2s → Daten
+ *   10,7s → leer  |  10,7s → Daten
+ *
+ * Die kurzen Antworten sind HTTP 200, enthalten aber eine Gateway-Meldung:
+ * „Your Client (working) → Gateway (working) → API (took too long to respond)".
+ * Die Schnittstelle hinter RapidAPI läuft also selbst in ihr Zeitlimit. Rund
+ * 40% der Aufrufe kommen so zurück, und jeder kostet 10-17 Sekunden.
+ *
+ * Nacheinander zu wiederholen multipliziert genau diese Wartezeit: zwei
+ * Versuche sind im Schnitt schon 18s, drei über 30s. Gleichzeitig gestartet
+ * kostet dieselbe Trefferwahrscheinlichkeit nur EINE Wartezeit — der erste
+ * brauchbare Treffer gewinnt, der Rest wird abgebrochen. Aus „60% nach 11s,
+ * sonst nochmal 11s warten" wird „94% nach 11s".
+ *
+ * ZWEI parallel, nicht drei. Drei brachten rechnerisch 94% statt 84% Trefferquote
+ * — aber zum Preis von 50% mehr Anfragen pro Öffnen, und das bei einer Quelle,
+ * die wir sparsam behandeln wollen. Mit zwei parallelen Anfragen und einer
+ * zweiten Runde (RETRY_ATTEMPTS) liegt die Trefferquote bei rund 97% und der
+ * Verbrauch im Schnitt bei 2,3 statt 3,2 Anfragen. Bessere Quote, weniger Last.
+ */
+const PARALLEL_ATTEMPTS = 2;
+const RETRY_ATTEMPTS = 2;
 const RETRY_BASE_MS = 350;
+
+/**
+ * Notventil gegen eine komplett ausgefallene Schnittstelle.
+ *
+ * ACHTUNG, die ursprüngliche Annahme dahinter war falsch: Ich hatte die leeren
+ * Antworten für eine DAUERHAFTE Kontingent-Drossel gehalten und deshalb 30
+ * Minuten gesperrt. Tatsächlich sind es Gateway-Meldungen („API took too long to
+ * respond") — also VORÜBERGEHEND. Eine halbe Stunde Sperre wäre für ein paar
+ * unglückliche Sekunden unverhältnismäßig: Alle Nutzer sähen 30 Minuten lang
+ * keine Anbieter, obwohl der nächste Versuch längst wieder geklappt hätte.
+ *
+ * Es bleibt als Ventil erhalten — ist die Schnittstelle wirklich mal weg, soll
+ * niemand pro Antippen minutenlang warten. Aber kurz: zwei Minuten. Ein
+ * einzelner Erfolg setzt es ohnehin sofort zurück.
+ *
+ * Mit drei parallelen Anfragen (siehe PARALLEL_ATTEMPTS) ist ein kompletter
+ * Fehlschlag ohnehin selten: bei 40% Leer-Rate rund 6% pro Runde.
+ */
+// Zwei statt drei Fehlrunden bis zum Notventil. Bei einem echten Ausfall (real
+// beobachtet: 6 von 6 Aufrufen liefen ins Gateway-Limit) wartete sonst jeder
+// Nutzer erst gut zwei Minuten, bevor die Sperre greift. Ein Fehlalarm ist
+// unwahrscheinlich: Eine Runde (zwei parallele Anfragen) scheitert bei 40%
+// Leer-Rate zu 16%, zwei Runden zu 2,6%, zwei Runden hintereinander zu 0,07%.
+const THROTTLE_STRIKES = 2;
+const THROTTLE_COOLDOWN_MS = 2 * 60 * 1000;
+let emptyStrikes = 0;
+let throttledUntil = 0;
 // 10min: kurz genug, dass Preise frisch bleiben (Flugpreise + booking_token-
 // Gültigkeit ändern sich schnell), lang genug, dass wiederholtes Öffnen
 // desselben Flugs nicht jedes Mal Quota verbrennt. Vorher 2h — das konnte
@@ -133,6 +205,32 @@ const MAX_RESOLVE = 30;
 // kommt zurück), sodass auch dann nicht der aufgeblähte Preis angezeigt wird.
 // Bevorzugt wird immer der dynamisch gemessene Faktor.
 const FALLBACK_PRICE_RATIO = 0.87;
+
+/**
+ * Wie viele Anbieter-Links beim Öffnen aufgelöst werden — ALLE, und das ist
+ * Absicht.
+ *
+ * Ich hatte das auf zwei gesenkt, um Anfragen zu sparen, und den Rest schätzen
+ * lassen. Das war falsch, denn die Preisquelle gibt das nicht her:
+ *
+ *   Kartenpreis aus der Suche          80 EUR
+ *   getBookingDetails, Eurowings       92 EUR
+ *   Deeplink DisplayedPrice, Eurowings 81 EUR
+ *
+ * Der Preis AUS DEM DEEPLINK ist der richtige — er deckt sich mit dem
+ * Kartenpreis. Die Anbieterliste selbst liefert systematisch rund 14% zu hoch
+ * (Verhältnis über fünf Anbieter: 0,8750-0,8804). Ohne Auflösung gäbe es für
+ * jeden nicht aufgelösten Anbieter also nur einen Schätzwert — und ein falscher
+ * Preis ist schlimmer als eine Anfrage mehr.
+ *
+ * Anders wäre es nur, wenn wir gar keine Preise pro Anbieter zeigen wollten.
+ *
+ * Beiläufig widerlegt ist die zweite alte Annahme: „der Anbieter-Token ist
+ * kurzlebig". Getestet mit Token, die 3 Stunden 6 Minuten alt waren — alle drei
+ * lösten sauber auf (HTTP 200, gültige URL, je ~0,5s). Das spielt nur keine
+ * Rolle mehr, solange wir ohnehin alle im Voraus auflösen.
+ */
+const RESOLVE_UPFRONT = MAX_RESOLVE;
 
 interface CachedOptions {
   options: FlightBookingOption[];
@@ -165,6 +263,96 @@ function writeOptionsCache(key: string, options: FlightBookingOption[]): void {
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Ein einzelner Aufruf. `null` = unbrauchbar (Netzfehler, Nicht-200, oder die
+ *  Gateway-Meldung, die als HTTP 200 mit leerem `data` ankommt). */
+async function fetchProvidersOnce(url: URL): Promise<RawProvider[] | null> {
+  try {
+    const res = await fetchWithTimeout(url, { method: "GET", headers: COMMON_HEADERS() });
+    if (!res.ok) return null;
+    const data = (await res.json()) as DetailsResponse;
+    if (!data.status || !Array.isArray(data.data) || data.data.length === 0) return null;
+    return data.data;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Nachzügler-Ablage.
+ *
+ * Die Schnittstelle ist nicht nur unzuverlässig, sondern manchmal extrem
+ * langsam: gemessen 128,8s für eine Antwort, die dann VOLLSTÄNDIG war (fünf
+ * Anbieter). Unser Zeitlimit von 22s wirft so etwas weg — der Nutzer sieht
+ * nichts, und die Arbeit war umsonst.
+ *
+ * Deshalb läuft nach einem erfolglosen Versuch EIN geduldiger Abruf im
+ * Hintergrund weiter. Niemand wartet darauf. Kommt die Antwort doch noch, legen
+ * wir sie hier ab: Beim nächsten Öffnen desselben Flugs sind die Anbieter sofort
+ * da, ohne neue Anfrage. Aus einer verlorenen Anfrage wird so ein Treffer.
+ */
+const PATIENT_TIMEOUT_MS = 170_000;
+const LATE_RAW_TTL_MS = 10 * 60 * 1000;
+const LATE_RAW_MAX = 100;
+const lateRaw = new Map<string, { providers: RawProvider[]; expiresAt: number }>();
+const patientInFlight = new Set<string>();
+
+function takeLateRaw(key: string): RawProvider[] | null {
+  const hit = lateRaw.get(key);
+  if (!hit) return null;
+  lateRaw.delete(key);
+  return hit.expiresAt > Date.now() ? hit.providers : null;
+}
+
+function startPatientFetch(key: string, url: URL): void {
+  if (patientInFlight.has(key)) return;
+  patientInFlight.add(key);
+  void (async () => {
+    try {
+      const res = await fetchWithTimeout(
+        url,
+        { method: "GET", headers: COMMON_HEADERS() },
+        PATIENT_TIMEOUT_MS,
+      );
+      if (!res.ok) return;
+      const data = (await res.json()) as DetailsResponse;
+      if (!data.status || !Array.isArray(data.data) || data.data.length === 0) return;
+      if (lateRaw.size >= LATE_RAW_MAX) {
+        const oldest = lateRaw.keys().next().value;
+        if (oldest !== undefined) lateRaw.delete(oldest);
+      }
+      lateRaw.set(key, { providers: data.data, expiresAt: Date.now() + LATE_RAW_TTL_MS });
+      console.log(
+        `[booking-options] Nachzügler eingetroffen (${data.data.length} Anbieter) — beim nächsten Öffnen ohne neue Anfrage da.`,
+      );
+    } catch {
+      /* Nachzügler dürfen scheitern, es wartet niemand. */
+    } finally {
+      patientInFlight.delete(key);
+    }
+  })();
+}
+
+/** PARALLEL_ATTEMPTS Aufrufe gleichzeitig; der erste mit Daten gewinnt. Liefert
+ *  `null`, wenn alle leer zurückkommen (siehe PARALLEL_ATTEMPTS). */
+function raceForProviders(url: URL): Promise<RawProvider[] | null> {
+  return new Promise((resolve) => {
+    let open = PARALLEL_ATTEMPTS;
+    let settled = false;
+    for (let i = 0; i < PARALLEL_ATTEMPTS; i++) {
+      void fetchProvidersOnce(url).then((r) => {
+        if (settled) return;
+        if (r) {
+          settled = true;
+          resolve(r);
+          return;
+        }
+        open -= 1;
+        if (open === 0) resolve(null);
+      });
+    }
+  });
+}
 
 /**
  * Liest den ECHTEN Website-Preis aus einem aufgelösten Buchungs-Deeplink.
@@ -259,6 +447,11 @@ export async function getFlightBookingOptions(
   const cached = readOptionsCache(cacheKey);
   if (cached) return cached;
 
+  if (Date.now() < throttledUntil) {
+    // Sicherung offen — sofort leer statt 33s warten (siehe THROTTLE_STRIKES).
+    return [];
+  }
+
   const url = new URL(DETAILS_URL);
   url.searchParams.set("departure_id", ctx.origin);
   url.searchParams.set("arrival_id", ctx.destination);
@@ -276,25 +469,14 @@ export async function getFlightBookingOptions(
     // sprengen.
     if (attempt > 0) await sleep(RETRY_BASE_MS * attempt);
 
-    let res: Response;
-    try {
-      res = await fetchWithTimeout(url, { method: "GET", headers: COMMON_HEADERS() });
-    } catch {
-      continue; // Netzwerk/Timeout → nächster Versuch
-    }
-    if (!res.ok) continue;
-
-    let data: DetailsResponse;
-    try {
-      data = (await res.json()) as DetailsResponse;
-    } catch {
-      continue;
-    }
-    if (!data.status || !Array.isArray(data.data)) continue;
+    // Erst nachsehen, ob ein Nachzügler von vorhin schon da liegt — dann ganz
+    // ohne neue Anfrage (siehe startPatientFetch).
+    const rawProviders = takeLateRaw(cacheKey) ?? (await raceForProviders(url));
+    if (!rawProviders) continue;
 
     const out: FlightBookingOption[] = [];
     const seenTokens = new Set<string>();
-    for (const p of data.data) {
+    for (const p of rawProviders) {
       if (!p.token || !p.title) continue;
       if (seenTokens.has(p.token)) continue;
       seenTokens.add(p.token);
@@ -340,13 +522,20 @@ export async function getFlightBookingOptions(
     // Kein Infinity als Platzhalter: zwei preislose Anbieter ergäben
     // `Infinity - Infinity` = NaN, und ein NaN-Comparator sortiert undefiniert.
     providers.sort((a, b) => (a.price ?? Number.MAX_SAFE_INTEGER) - (b.price ?? Number.MAX_SAFE_INTEGER));
-    const toResolve = providers.slice(0, MAX_RESOLVE);
+    const toResolve = providers.slice(0, RESOLVE_UPFRONT);
     const want = (ctx.currency ?? "EUR").toUpperCase();
 
-    const resolved = await Promise.all(toResolve.map(async (o) => {
+    const head = await Promise.all(toResolve.map(async (o) => {
       const resolvedUrl = await resolveBookingUrlOnce(o.providerToken);
       const displayed = resolvedUrl ? extractDisplayedPrice(resolvedUrl, want) : undefined;
-      return { o, resolvedUrl, displayed, raw: o.price };
+      return { resolvedUrl, displayed };
+    }));
+    // Alle Anbieter behalten; nur die ersten tragen bereits einen Link.
+    const resolved = providers.map((o, i) => ({
+      o,
+      resolvedUrl: head[i]?.resolvedUrl ?? null,
+      displayed: head[i]?.displayed,
+      raw: o.price,
     }));
 
     // Korrektur-Faktor (Median Website-Preis / getBookingDetails-Preis ~0.87)
@@ -405,6 +594,9 @@ export async function getFlightBookingOptions(
 
     // _exact ist intern — vor Cache/Rückgabe entfernen.
     const final: FlightBookingOption[] = enriched.map(({ _exact, ...o }) => o);
+    // Ein Erfolg entwertet die bisherigen Strikes — die Drossel war also nur
+    // sporadisch, genau der Fall, für den die Retries gedacht sind.
+    emptyStrikes = 0;
     writeOptionsCache(cacheKey, final);
     return final;
   }
@@ -413,9 +605,25 @@ export async function getFlightBookingOptions(
   // HTTP-/Netzwerk-Fehler werden in der Route geloggt; hier machen wir das
   // „lautlose Leer" sichtbar, damit es in den Logs von einem echten „nur
   // Airline" unterscheidbar ist.
-  console.warn(
-    `[booking-options] empty after ${RETRY_ATTEMPTS} attempts for token ${bookingToken.slice(0, 12)}…`,
-  );
+  // Nichts bekommen — einen geduldigen Abruf im Hintergrund weiterlaufen lassen.
+  // Er blockiert niemanden und macht das nächste Öffnen womöglich sofort
+  // erfolgreich. Bewusst NUR hier: Bei offenem Notventil oben wird gar nichts
+  // angefragt.
+  startPatientFetch(cacheKey, url);
+
+  emptyStrikes += 1;
+  if (emptyStrikes >= THROTTLE_STRIKES) {
+    throttledUntil = Date.now() + THROTTLE_COOLDOWN_MS;
+    emptyStrikes = 0;
+    console.warn(
+      `[booking-options] ${THROTTLE_STRIKES}× hintereinander leer — Drossel wird als dauerhaft angenommen. ` +
+        `Bis ${new Date(throttledUntil).toISOString()} wird sofort leer geantwortet statt ${RETRY_ATTEMPTS}× zu warten.`,
+    );
+  } else {
+    console.warn(
+      `[booking-options] empty after ${RETRY_ATTEMPTS} attempts for token ${bookingToken.slice(0, 12)}… (Strike ${emptyStrikes}/${THROTTLE_STRIKES})`,
+    );
+  }
   return [];
 }
 
@@ -434,11 +642,15 @@ export async function getFlightBookingUrl(providerToken: string): Promise<string
 
     let res: Response;
     try {
+      // RESOLVE_TIMEOUT_MS statt des 30s-Defaults: Dieser Endpoint antwortet
+      // nachgemessen in ~0,5s. Mit dem großzügigen Limit der Anbieterliste wäre
+      // ein hängender Aufruf hier 30s statt 4,5s — und der Nutzer starrt genau
+      // dann auf einen leeren Browser-Tab.
       res = await fetchWithTimeout(URL_URL, {
         method: "POST",
         headers: { ...COMMON_HEADERS(), "Content-Type": "application/json" },
         body: JSON.stringify({ token: providerToken }),
-      });
+      }, RESOLVE_TIMEOUT_MS);
     } catch {
       continue;
     }
@@ -474,5 +686,10 @@ export async function resolveFlightBookingUrl(
   const options = await getFlightBookingOptions(bookingToken, ctx);
   if (options.length === 0) return null;
   const first = options[0]!;
-  return getFlightBookingUrl(first.providerToken);
+  // getFlightBookingOptions hat den Link dieses Anbieters SCHON aufgelöst und in
+  // `resolvedUrl` gelegt. Ihn hier noch einmal aufzulösen war ein zweiter,
+  // vollständig überflüssiger Aufruf an dieselbe Schnittstelle — und er konnte
+  // sogar scheitern, weil der Anbieter-Token kurzlebig ist. Nur wenn die
+  // Auflösung vorhin nicht geklappt hat, versuchen wir es erneut.
+  return first.resolvedUrl ?? getFlightBookingUrl(first.providerToken);
 }

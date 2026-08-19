@@ -1,5 +1,6 @@
 import { create } from "zustand";
-import { persist, createJSONStorage, type StateStorage } from "zustand/middleware";
+import { isTransitionBusy } from "@/lib/nav/transitionBusy";
+import { persist, type PersistStorage, type StorageValue } from "zustand/middleware";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { AppState } from "react-native";
 import { SearchResult, TravelMode, Location } from "@/types/search";
@@ -14,28 +15,31 @@ import { trimPolyline } from "@/lib/routing/trimPolyline";
 export type Locale = "en" | "de" | "fr" | "es";
 
 /**
- * Debounced AsyncStorage-Adapter mit AppState-Flush.
+ * Persist-Adapter, der WEDER serialisiert NOCH schreibt, solange der Nutzer aktiv ist.
  *
- * Problem: Zustands `persist` ruft `setItem` SYNCHRON nach jedem `set()` —
- * also bei jedem Save, jedem Toggle, jeder Currency-Änderung etc. Die
- * Serialization (JSON.stringify auf einem >50kB-State) plus der Native-
- * Bridge-Roundtrip blockieren den JS-Thread für 10-30ms pro Call. Während
- * dieser Zeit stuttern Reanimated-Animations, Tab-Switches und Slide-Ins.
+ * Problem: Zustands `persist` ruft `setItem` SYNCHRON nach jedem `set()` — also
+ * bei jedem Save, jedem Toggle, jedem Öffnen eines Overlays. Die Serialisierung
+ * (JSON.stringify über einen >50kB-Zustand) blockiert den JS-Thread 10-30ms.
+ * Genau in diesen Fenstern stottern Animationen, und Tipper wirken verschluckt.
  *
- * Lösung:
- *  1. Writes 2.5s debounce'n — pendings landen in einer In-Memory-Map
- *  2. Bei App-Background wird sofort geflushed (Daten-Sicherheit)
- *  3. Reads liefern erstmal den pending In-Memory-Wert wenn vorhanden
+ * Der vorherige Adapter hat nur den SCHREIBVORGANG gebündelt: `createJSONStorage`
+ * lag darüber und hat trotzdem bei jedem einzelnen `set()` serialisiert. Damit
+ * war der teure Teil — das Stringify — nie gebündelt. Das war der eigentliche
+ * Grund, warum ein Tipp auf eine Reise im Verlauf oder auf „Preis vergleichen"
+ * spürbar hakte.
  *
- * Effekt: während aktiver Nutzung gibt's praktisch keine JS-Thread-Blocks
- * mehr durch Persistierung. Geschrieben wird wenn der User pausiert oder
- * die App in den Hintergrund geht.
+ * Jetzt merkt sich der Adapter nur die Referenz auf den Zustand und serialisiert
+ * erst beim Flush: nach 2.5s Ruhe oder sofort beim Wechsel in den Hintergrund
+ * (Datensicherheit). Während der Nutzung kostet ein `set()` damit nichts mehr
+ * außer dem React-Update.
  */
-function createDebouncedStorage(
+function createDeferredJSONStorage<S>(
   underlying: typeof AsyncStorage,
   delayMs = 2500,
-): StateStorage {
-  const pending = new Map<string, string | null>();
+): PersistStorage<S> {
+  /** Spätestens dann wird geschrieben, auch wenn der JS-Thread nie ruhig wird. */
+  const IDLE_TIMEOUT_MS = 4000;
+  const pending = new Map<string, StorageValue<S> | null>();
   let timer: ReturnType<typeof setTimeout> | null = null;
 
   const flush = () => {
@@ -45,17 +49,87 @@ function createDebouncedStorage(
     const entries = Array.from(pending.entries());
     pending.clear();
     for (const [key, value] of entries) {
+      // Fehler NICHT verschlucken: Läuft der Speicher voll oder scheitert
+      // AsyncStorage, verlöre der Nutzer sonst stillschweigend gespeicherte
+      // Reisen und Tickets — ohne dass irgendwo etwas davon zu sehen wäre.
+      const onFail = (e: unknown) => {
+        if (__DEV__) console.warn("[persist] Schreiben fehlgeschlagen", key, e);
+      };
       if (value === null) {
-        void underlying.removeItem(key);
+        underlying.removeItem(key).catch(onFail);
       } else {
-        void underlying.setItem(key, value);
+        // HIER wird serialisiert — einmal pro Ruhephase, nicht pro set().
+        underlying.setItem(key, JSON.stringify(value)).catch(onFail);
       }
     }
   };
 
+  /**
+   * Führt `fn` in einer Leerlauf-Lücke des JS-Threads aus.
+   *
+   * Der Flush selbst ist der teure Teil: `JSON.stringify` über den ganzen
+   * persistierten Zustand (gespeicherte Reisen, Tickets, Verlauf) blockt den
+   * JS-Thread 10-30ms. Bisher lag er auf einem nackten Timer — und der feuert
+   * 2,5s nach der LETZTEN Änderung, also ausgerechnet oft mittendrin: Man tippt
+   * etwas an (Änderung), navigiert kurz darauf weiter, und der Flush landet im
+   * laufenden Übergang. Das erklärt Slides, die nur MANCHMAL haken.
+   *
+   * `requestIdleCallback` wartet stattdessen auf ein Bild mit Restzeit. Das
+   * `timeout` ist die Notbremse, damit bei dauerhafter Last trotzdem geschrieben
+   * wird.
+   */
+  const runWhenIdle = (fn: () => void) => {
+    const ric = (
+      globalThis as {
+        requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => void;
+      }
+    ).requestIdleCallback;
+    /**
+     * Die Sperre wird HIER nochmal geprüft, nicht nur vor dem Einreihen.
+     *
+     * Zwischen dem Einreihen und dem Feuern des Leerlauf-Rückrufs liegen
+     * beliebig viele Bilder — die Notbremse greift erst nach vier Sekunden.
+     * In dieser Zeit kann der Nutzer längst etwas angetippt haben, und der
+     * Schreibvorgang landete dann in der frisch gestarteten Bewegung. Die
+     * Prüfung davor allein reicht also nicht.
+     */
+    const guarded = () => {
+      if (isTransitionBusy()) {
+        schedule();
+        return;
+      }
+      fn();
+    };
+    if (typeof ric === "function") ric(guarded, { timeout: IDLE_TIMEOUT_MS });
+    else guarded();
+  };
+
+  /**
+   * Zusätzlich zum Leerlauf: NICHT, während eine Bewegung läuft.
+   *
+   * `requestIdleCallback` misst die Ruhe des JS-Strangs — und genau während
+   * einer Slide ist der ruhig, weil die Kurve auf dem UI-Strang rechnet. Die
+   * Leerlauf-Bedingung war also ausgerechnet in den Fenstern erfüllt, die sie
+   * ausschließen sollte, und der 10-30ms-Schreibvorgang lief hinein. Kein Bild
+   * fiel dabei aus, aber alles, was in diesem Fenster über den JS-Strang muss —
+   * die Abschluss-Rückrufe der Bewegung, React-Commits, Berührungen — stand
+   * dahinter an.
+   *
+   * Ein erneuter Anlauf statt eines Verzichts: Die Bewegung ist nach ein paar
+   * hundert Millisekunden vorbei, und der Zeitstempel verfällt von selbst — es
+   * kann also nichts dauerhaft verstummen. Der Wechsel in den Hintergrund
+   * schreibt weiterhin sofort, ohne jede Abfrage; dort zählt nur, dass die Daten
+   * sicher sind.
+   */
   const schedule = () => {
     if (timer) clearTimeout(timer);
-    timer = setTimeout(flush, delayMs);
+    timer = setTimeout(() => {
+      if (isTransitionBusy()) {
+        schedule();
+        return;
+      }
+      runWhenIdle(flush);
+    }, delayMs);
   };
 
   // Beim Wechsel in den Hintergrund SOFORT alles flushen — sonst gehen
@@ -66,13 +140,20 @@ function createDebouncedStorage(
 
   return {
     getItem: async (key) => {
-      if (pending.has(key)) {
-        const v = pending.get(key);
-        return v ?? null;
+      if (pending.has(key)) return pending.get(key) ?? null;
+      const raw = await underlying.getItem(key);
+      if (raw == null) return null;
+      try {
+        return JSON.parse(raw) as StorageValue<S>;
+      } catch {
+        return null;
       }
-      return underlying.getItem(key);
     },
     setItem: (key, value) => {
+      // Nur die Referenz merken. Der Zustand wird ohnehin unveränderlich
+      // behandelt (jede Änderung erzeugt neue Objekte/Arrays), und ein späterer
+      // Schreibvorgang überschreibt den Eintrag hier — geflusht wird also immer
+      // der jeweils neueste Stand.
       pending.set(key, value);
       schedule();
     },
@@ -114,6 +195,16 @@ export interface SavedToast {
   destLabel: string;
   price: number;
   currency: string;
+}
+
+/** Ursprung des Home→Search Launch-Übergangs: gemessenes Kachel-Rect in
+ *  Fensterkoordinaten + dominante Kachelfarbe (für den Farb-Morph). */
+export interface SearchOverlayLaunch {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  color: string;
 }
 
 export interface StationToast {
@@ -173,13 +264,49 @@ interface SearchStore {
   showStationToast: (title: string, subtitle: string) => void;
   hideStationToast: () => void;
   searchOverlayMode: TravelMode | null;
+  /** Ursprungs-Rect (Fensterkoordinaten) + Farbe der angetippten Kategorie-
+   *  Kachel. Treibt den „aus der Kachel wachsenden"-Launch-Übergang in
+   *  SearchHeroOverlay. null = Aufruf ohne Kachel (Ziel-Karten, NotFound-
+   *  Modal) → Overlay fadet fullscreen ein statt zu wachsen. */
+  searchOverlayTileRect: SearchOverlayLaunch | null;
   /** Incrementiert bei jedem openSearchOverlay-Call. Wird als React-Key
    *  in SearchHeroOverlay genutzt um SearchHero pro Open frisch zu mounten —
    *  damit bleibt nichts an State aus einem vorherigen (nicht abgeschickten)
    *  Such-Versuch übrig. */
   searchOverlaySession: number;
-  openSearchOverlay: (mode: TravelMode) => void;
-  closeSearchOverlay: () => void;
+  /** Gemessene Höhe des Home-Inhaltsbereichs (= Fenster minus Tab-Bar). Der
+   *  Launch-Overlay endet exakt hier → die native Tab-Bar bleibt sichtbar. */
+  homeContentHeight: number;
+  setHomeContentHeight: (h: number) => void;
+  /** true, solange der Launch-Übergang läuft (inkl. Schließ-Animation). Die
+   *  DestinationCards rendern dann als Hardware-Textur, sonst clippt Android die
+   *  gerundete overflow:hidden-Karte unter dem Depth-Scale falsch
+   *  (clipToOutline-Bug). NUR währenddessen — Dauer-Textur kostet Scroll-Perf. */
+  launchActive: boolean;
+  setLaunchActive: (v: boolean) => void;
+  /** true erst NACH dem Reveal (Content sichtbar). Gatet den schweren Hero-SVG:
+   *  WÄHREND die Box wächst (Suche offen, aber noch nicht revealed) muss er weg —
+   *  react-native-svg compositet sein Hardware-Layer sonst pro Frame mit (auch
+   *  unter opacity 0, siehe [[feedback_overlay_svg_compositing_lag]]) und ruckelt
+   *  genau den Expand. Erst beim Reveal einschalten. */
+  /** Offener Unterschirm im Profil-Tab. Liegt im Speicher, weil der Tab ihn
+   *  auslöst und das Wurzel-Layout ihn anzeigt. */
+  settingsSub: "details" | "settings" | "support" | null;
+  setSettingsSub: (v: "details" | "settings" | "support" | null) => void;
+  searchContentVisible: boolean;
+  setSearchContentVisible: (v: boolean) => void;
+  openSearchOverlay: (mode: TravelMode, launch?: SearchOverlayLaunch) => void;
+  /** instant=true → ohne Schrumpf-zurück-Animation schließen (Tab-Wechsel). */
+  closeSearchOverlay: (instant?: boolean, silent?: boolean) => void;
+  searchOverlayCloseInstant: boolean;
+  /**
+   * true = ersatzlos verschwinden, ohne Deck-Fläche und ohne Ausblenden.
+   * Für den Fall, dass bereits etwas ANDERES den Bildschirm deckt — nach der
+   * Übergabe an die Ergebnis-Liste. Der Instant-Pfad ist dafür falsch: Der
+   * lässt für den Tab-Wechsel absichtlich eine deckende Fläche stehen und
+   * blendet sie aus.
+   */
+  searchOverlayCloseSilent: boolean;
   voiceOverlayOpen: boolean;
   openVoiceOverlay: () => void;
   closeVoiceOverlay: () => void;
@@ -225,6 +352,8 @@ interface SearchStore {
      *  from/to-Field-Konzept haben). Nicht persistiert — Request lebt nur
      *  in-memory. */
     onSelect?: (location: Location) => void;
+    /** „Aktueller Standort" im Picker — nur gezeigt, wenn gesetzt. */
+    onCurrentLocation?: () => void;
   } | null;
   locationPickerResult: {
     sessionKey: number;
@@ -239,7 +368,8 @@ interface SearchStore {
     leadingLabel?: string;
     placeholderKey?: string;
     onSelect?: (location: Location) => void;
-  }) => void;
+    onCurrentLocation?: () => void;
+}) => void;
   closeLocationPicker: () => void;
   confirmLocationPicker: (location: Location) => void;
   selectedResult: SearchResult | null;
@@ -252,6 +382,37 @@ interface SearchStore {
    *  Objekte liefern. Wir brauchen den Kontext aber für „Show on Map"-
    *  previousHref (Back-Navigation aus Surroundings zurück zur Ergebnis-
    *  Liste mit den gleichen Such-Params). */
+  /**
+   * Parameter der aktuell angezeigten Ergebnis-Suche.
+   *
+   * Der Ergebnis-Bildschirm zieht damit aus der Route heraus und wird dauerhaft
+   * am Root gemountet — wie die vier Detail-Überlagerungen. Grund: Beim Antippen
+   * entstand bisher ein kompletter Bildschirm, und dieser Aufbau läuft auf Fabric
+   * auf dem UI-THREAD, also demselben, auf dem die Bewegung gerechnet wird. Genau
+   * daher kommt das Hängen in den ersten Bildern — und daher auch, dass sich das
+   * ERSTE Öffnen anders anfühlt als jedes weitere.
+   *
+   * Die Route bleibt bestehen: Sie trägt weiterhin Zurück-Geste, Verlinkungen und
+   * die Karten-Route darüber. Nur das Rendern wandert nach oben.
+   */
+  resultsParams: Record<string, string> | null;
+  setResultsParams: (p: Record<string, string> | null) => void;
+  /**
+   * Noch nicht nachgeholte Navigation.
+   *
+   * Geöffnet wird die Ergebnisliste über `resultsParams` — sofort, ohne Router.
+   * Die ROUTE wird erst danach nachgezogen, wenn die Bewegung durch ist: Ein
+   * `router.push` aktualisiert den Navigationszustand und lässt
+   * react-native-screens einen nativen Container anlegen, und diese Arbeit läuft
+   * auf dem UI-Thread — also dort, wo auch die Bewegung gerechnet wird. Genau
+   * das war der letzte Unterschied zum Übergang im Saved-Tab, der ohne Router
+   * auskommt und sich deshalb richtig anfühlt.
+   *
+   * Gebraucht wird die Route weiterhin für die Zurück-Geste, für Verlinkungen
+   * und für die Karten-Route, die über den Ergebnissen aufgeht.
+   */
+  pendingResultsRoute: Record<string, string> | null;
+  setPendingResultsRoute: (p: Record<string, string> | null) => void;
   selectedResultContext: { pathname: string; params?: Record<string, string> } | null;
   selectResult: (
     r: SearchResult,
@@ -318,6 +479,20 @@ interface SearchStore {
    *  nicht erst antippbar sein. */
   invalidSuggestionCodes: string[];
   recentSpots: string[];
+  /**
+   * Zuletzt bestätigte eigene Position.
+   *
+   * Ersetzt den fest verdrahteten Platzhalter (Berlin Hbf), der bis dahin als
+   * „dein Standort" durchging, wenn die Ortung noch lief, abgelehnt war oder
+   * ins Leere lief. Ein Nutzer in Dortmund bekam damit Berlin als Ursprung —
+   * inklusive der Umkreis-Abfrage dafür.
+   *
+   * Persistiert, damit der nächste Start dort weitermacht, wo man zuletzt
+   * wirklich war, statt wieder bei einem Fremdort. `null` heißt ehrlich: Wir
+   * wissen es noch nicht.
+   */
+  lastKnownCoord: { latitude: number; longitude: number } | null;
+  setLastKnownCoord: (c: { latitude: number; longitude: number }) => void;
   addRecentSpot: (query: string) => void;
   removeRecentSpot: (query: string) => void;
   favoriteResultIds: string[];
@@ -337,6 +512,16 @@ interface SearchStore {
    *  Tagesgranularität). Wird beim App-Start und beim Öffnen des Saved-Screens
    *  aufgerufen — Trip mit Ankunft am 14. verschwindet am 15. um 00:00. */
   pruneExpiredSavedTrips: () => void;
+  /**
+   * Ist seit dem letzten Besuch des Saved-Tabs etwas dazugekommen?
+   *
+   * Treibt den roten Punkt an der Tab-Leiste. Bewusst NICHT persistiert (siehe
+   * `partialize`): Ein Hinweis auf „neu seit deinem letzten Blick" soll einen
+   * App-Neustart nicht überleben — sonst klebt er nach Tagen noch dort und
+   * bedeutet nichts mehr.
+   */
+  savedBadge: boolean;
+  clearSavedBadge: () => void;
   tickets: Ticket[];
   addTicket: (t: Omit<Ticket, "id" | "createdAt">) => void;
   removeTicket: (id: string) => void;
@@ -360,6 +545,16 @@ interface SearchStore {
   /** Vom User gespeicherte Stationen (Airports, Bahnhöfe, Bus-Stops, Häfen).
    *  Wird in den LocationPicker-Listen oben angezeigt und im StopDetailSheet
    *  über den Stern getoggled. Persistiert via AsyncStorage. */
+  /**
+   * Codes der gespeicherten Stationen als Set.
+   *
+   * Der Ortspicker prüfte pro Zeile mit `savedStations.some(...)` — also über
+   * alle gespeicherten Stationen, für jede der ~20 Zeilen, bei JEDER
+   * Store-Änderung. Dasselbe Muster ist in ResultCard als Ursache dafür
+   * dokumentiert, dass „die App mit jedem gespeicherten Trip messbar langsamer
+   * wurde"; dort wurde es genauso ersetzt.
+   */
+  savedStationCodes: ReadonlySet<string>;
   savedStations: Location[];
   toggleSavedStation: (loc: Location) => void;
 
@@ -455,10 +650,33 @@ export const useSearchStore = create<SearchStore>()(
         set({ stationToast: { key: Date.now(), title, subtitle } }),
       hideStationToast: () => set({ stationToast: null }),
       searchOverlayMode: null,
+      searchOverlayTileRect: null,
       searchOverlaySession: 0,
-      openSearchOverlay: (mode) =>
+      searchOverlayCloseInstant: false,
+      searchOverlayCloseSilent: false,
+      homeContentHeight: 0,
+      setHomeContentHeight: (h) => {
+        if (h > 0 && Math.abs(h - get().homeContentHeight) > 0.5) set({ homeContentHeight: h });
+      },
+      launchActive: false,
+      setLaunchActive: (v) => {
+        if (v !== get().launchActive) set({ launchActive: v });
+      },
+      settingsSub: null,
+      setSettingsSub: (v) => set({ settingsSub: v }),
+      searchContentVisible: false,
+      setSearchContentVisible: (v) => {
+        if (v !== get().searchContentVisible) set({ searchContentVisible: v });
+      },
+      openSearchOverlay: (mode, launch) =>
         set((state) => ({
           searchOverlayMode: mode,
+          searchOverlayTileRect: launch ?? null,
+          searchOverlayCloseInstant: false,
+          searchOverlayCloseSilent: false,
+          // SVG bleibt aus, bis der Reveal ihn einschaltet — sonst compositet er
+          // während des Box-Wachstums pro Frame mit (Expand-Ruckler).
+          searchContentVisible: false,
           activeMode: mode,
           // Bei jedem Open Session bumpen — als React-Key in der Overlay,
           // garantiert frischen SearchHero-Mount auch wenn dieselbe
@@ -470,9 +688,30 @@ export const useSearchStore = create<SearchStore>()(
           locationPickerResult: null,
           datePickerResult: null,
         })),
-      closeSearchOverlay: () =>
+      closeSearchOverlay: (instant, silent) =>
         set({
           searchOverlayMode: null,
+          // true = OHNE Schrumpf-Animation schließen. Wird beim Tab-Wechsel
+          // gesetzt: Dort wäre die Rück-Expansion sinnlos (die Kachel, zu der
+          // geschrumpft würde, ist gar nicht mehr sichtbar).
+          searchOverlayCloseInstant: !!instant,
+          searchOverlayCloseSilent: !!silent,
+          // `searchContentVisible` bleibt hier ABSICHTLICH stehen.
+          //
+          // Früher fiel es sofort auf false — der Himmel-SVG ging damit auf
+          // `display: none`. Das war richtig, solange eine Deckfläche darüber lag
+          // und der Screen zur Kachel zurückschrumpfte: Zu sehen war davon
+          // nichts. Seit das Blatt mit sichtbarem Inhalt nach unten hinausfährt,
+          // sieht man es sehr wohl — der Himmel verschwand im ersten Bild der
+          // Bewegung und übrig blieb eine schwarze Fläche, die hinausgleitet.
+          //
+          // Abgeschaltet wird der SVG jetzt am ENDE der Bewegung, im Rückruf in
+          // SearchHeroOverlay. Dass er überhaupt abgeschaltet werden MUSS, bleibt
+          // wichtig: Eine unsichtbare, aber gelayoutete SVG lässt das Scrollen im
+          // Landingscreen dauerhaft ruckeln (im Release-Build verifiziert).
+          // Rect NICHT löschen — der Overlay braucht ihn noch für die
+          // Schrumpf-zurück-zur-Kachel-Animation, die nach dem Close-Aufruf
+          // läuft. Der nächste Open überschreibt ihn ohnehin.
           // Auch beim Close clearen — der nächste Open hat dann definitiv
           // einen leeren Result-Slot, egal über welchen Pfad wieder geöffnet wird.
           locationPickerResult: null,
@@ -507,7 +746,7 @@ export const useSearchStore = create<SearchStore>()(
         }),
       locationPickerRequest: null,
       locationPickerResult: null,
-      openLocationPicker: ({ field, mode, suggested, title, leadingLabel, placeholderKey, onSelect }) =>
+      openLocationPicker: ({ field, mode, suggested, title, leadingLabel, placeholderKey, onSelect, onCurrentLocation }) =>
         set({
           locationPickerRequest: {
             sessionKey: Date.now(),
@@ -518,6 +757,7 @@ export const useSearchStore = create<SearchStore>()(
             leadingLabel,
             placeholderKey,
             onSelect,
+            onCurrentLocation,
           },
         }),
       closeLocationPicker: () => set({ locationPickerRequest: null }),
@@ -542,7 +782,13 @@ export const useSearchStore = create<SearchStore>()(
         }),
       recentHistoryOverlayOpen: false,
       openRecentHistoryOverlay: () => set({ recentHistoryOverlayOpen: true }),
-      closeRecentHistoryOverlay: () => set({ recentHistoryOverlayOpen: false }),
+      closeRecentHistoryOverlay: () => {
+        // Nur schreiben, wenn wirklich offen: Jedes set() serialisiert den
+        // persistierten Store synchron (10-30ms JS-Blockade). Der Tipp auf
+        // eine Reise im Verlauf rief das bedingungslos auf — die Blockade
+        // lag damit genau im Touch-Frame.
+        if (get().recentHistoryOverlayOpen) set({ recentHistoryOverlayOpen: false });
+      },
       selectedStop: null,
       selectStop: (s) => set({ selectedStop: s }),
       clearSelectedStop: () => set({ selectedStop: null }),
@@ -586,6 +832,10 @@ export const useSearchStore = create<SearchStore>()(
       },
       selectedResult: null,
       selectedPassengers: 1,
+      resultsParams: null,
+      pendingResultsRoute: null,
+      setPendingResultsRoute: (p) => set({ pendingResultsRoute: p }),
+      setResultsParams: (p) => set({ resultsParams: p }),
       selectedResultContext: null,
       selectResult: (r, passengers, context) =>
         // Wenn ein vorheriger Stub-Result da war (Pending), wird er hier mit
@@ -686,8 +936,25 @@ export const useSearchStore = create<SearchStore>()(
         }
         // Erst Recents prunen+labelen: Eintrag rausnehmen wenn entweder Origin
         // oder Destination nicht mehr existiert. Sonst beide Labels syncen.
+        //
+        // ANGEWANDT AUF DEN FRISCHEN STAND, nicht auf den von oben.
+        //
+        // Hier wurden bis eben `state.recentSearches` und `state.savedStations`
+        // umgeformt und als KOMPLETTE Felder zurückgeschrieben — beides aus dem
+        // `get()` ganz am Anfang, also von VOR dem Netzaufruf. Der läuft direkt
+        // nach dem Wiederherstellen und darf bis zu zehn Sekunden dauern. Wer in
+        // diesem Fenster eine Station mit dem Stern speichert oder eine Suche
+        // macht, bekam sie stillschweigend wieder gelöscht: Der alte Stand
+        // überschrieb den neuen.
+        //
+        // Das ist dieselbe Falle wie beim Wächter in `loadMore` — nur dort war
+        // die Folge ein wirkungsloser Vergleich, hier echter Datenverlust. Die
+        // Regel ist beide Male dieselbe: Nach einem `await` darf nichts mehr aus
+        // der alten Closure kommen. Die Umformung ist deshalb eine Funktion, und
+        // ihren Eingang liefert das `set((cur) => …)` ganz unten.
+        const applyRecents = (list: RecentSearch[]): RecentSearch[] => {
         const nextRecents: RecentSearch[] = [];
-        for (const r of state.recentSearches) {
+        for (const r of list) {
           const o = lookup.get(r.origin.code);
           const d = lookup.get(r.destination.code);
           // Wenn ein Code im Lookup fehlt (z.B. Server hat ihn nicht
@@ -700,25 +967,20 @@ export const useSearchStore = create<SearchStore>()(
             destination: d?.exists && d.label ? { ...r.destination, label: d.label } : r.destination,
           });
         }
+          return nextRecents;
+        };
         // Saved-Stations: Eintrag raus wenn Code weg, sonst Label syncen.
+        const applyStations = (list: Location[]): Location[] => {
         const nextStations: Location[] = [];
-        for (const s of state.savedStations) {
+        for (const s of list) {
           const hit = lookup.get(s.code);
           if (hit && !hit.exists) continue;
           nextStations.push(
             hit?.exists && hit.label ? { ...s, label: hit.label } : s,
           );
         }
-        const recentsChanged =
-          nextRecents.length !== state.recentSearches.length ||
-          nextRecents.some(
-            (r, i) =>
-              r.origin.label !== state.recentSearches[i]?.origin.label ||
-              r.destination.label !== state.recentSearches[i]?.destination.label,
-          );
-        const stationsChanged =
-          nextStations.length !== state.savedStations.length ||
-          nextStations.some((s, i) => s.label !== state.savedStations[i]?.label);
+          return nextStations;
+        };
 
         // Vorschlagsliste gegenprüfen: der Code muss existieren UND sein
         // DB-Name muss zum angezeigten Label passen. Tut er das nicht, führt
@@ -745,18 +1007,52 @@ export const useSearchStore = create<SearchStore>()(
             }
           }
         }
-        const invalidChanged =
-          invalid.length !== state.invalidSuggestionCodes.length ||
-          invalid.some((c, i) => c !== state.invalidSuggestionCodes[i]);
-
-        if (!recentsChanged && !stationsChanged && !invalidChanged) return;
-        set({
-          ...(invalidChanged ? { invalidSuggestionCodes: invalid } : {}),
-          ...(recentsChanged ? { recentSearches: nextRecents } : {}),
-          ...(stationsChanged ? { savedStations: nextStations } : {}),
+        set((cur) => {
+          // `cur` ist der Stand JETZT, nicht der von vor dem Netzaufruf.
+          const nextRecents = applyRecents(cur.recentSearches);
+          const nextStations = applyStations(cur.savedStations);
+          const recentsChanged =
+            nextRecents.length !== cur.recentSearches.length ||
+            nextRecents.some(
+              (r, i) =>
+                r.origin.label !== cur.recentSearches[i]?.origin.label ||
+                r.destination.label !== cur.recentSearches[i]?.destination.label,
+            );
+          const stationsChanged =
+            nextStations.length !== cur.savedStations.length ||
+            nextStations.some((s, i) => s.label !== cur.savedStations[i]?.label);
+          const invalidChanged =
+            invalid.length !== cur.invalidSuggestionCodes.length ||
+            invalid.some((c, i) => c !== cur.invalidSuggestionCodes[i]);
+          if (!recentsChanged && !stationsChanged && !invalidChanged) return cur;
+          return {
+            ...(invalidChanged ? { invalidSuggestionCodes: invalid } : {}),
+            ...(recentsChanged ? { recentSearches: nextRecents } : {}),
+            ...(stationsChanged
+              ? {
+                  savedStations: nextStations,
+                  savedStationCodes: new Set(nextStations.map((s) => s.code)),
+                }
+              : {}),
+          };
         });
       },
       recentSpots: [],
+      lastKnownCoord: null,
+      setLastKnownCoord: (c) =>
+        set((state) => {
+          // Nur bei nennenswerter Bewegung schreiben — sonst löst jeder GPS-Fix
+          // einen Speicher-Schreibvorgang samt Persistenz-Uhr aus.
+          const prev = state.lastKnownCoord;
+          if (
+            prev &&
+            Math.abs(prev.latitude - c.latitude) < 0.0005 &&
+            Math.abs(prev.longitude - c.longitude) < 0.0005
+          ) {
+            return state;
+          }
+          return { lastKnownCoord: c };
+        }),
       addRecentSpot: (query) =>
         set((state) => {
           const q = query.trim();
@@ -833,6 +1129,9 @@ export const useSearchStore = create<SearchStore>()(
           return {
             savedTrips: [trip, ...state.savedTrips],
             savedTripSignatures: sigs,
+            // Nur beim HINZUFÜGEN — beim Entfernen weiter oben bewusst nicht,
+            // dort ist nichts Neues zu sehen.
+            savedBadge: true,
             savedToast: {
               key: Date.now(),
               resultId: result.id,
@@ -872,6 +1171,13 @@ export const useSearchStore = create<SearchStore>()(
             savedTripSignatures: new Set(kept.map((t) => tripSignature(t))),
           };
         }),
+      savedBadge: false,
+      clearSavedBadge: () => {
+        // Nur schreiben, wenn wirklich etwas zu löschen ist: Ein ungeschütztes
+        // set() weckt ALLE Abonnenten — und das hier läuft bei jedem Fokus des
+        // Saved-Tabs, also mitten im Tab-Wechsel.
+        if (get().savedBadge) set({ savedBadge: false });
+      },
       tickets: [],
       addTicket: (t) =>
         set((state) => {
@@ -880,6 +1186,15 @@ export const useSearchStore = create<SearchStore>()(
             id: `ticket-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             createdAt: Date.now(),
           };
+          /**
+           * KEIN Punkt in der Leiste beim Hinzufügen eines Tickets.
+           *
+           * Der Punkt meldet „hier ist etwas Neues, das du noch nicht gesehen
+           * hast". Ein Ticket legt man selbst an, im Saved-Tab, und sieht es im
+           * selben Moment in der Liste stehen — es gibt nichts zu melden. Beim
+           * Speichern einer Verbindung ist das anders: Das passiert aus der
+           * Ergebnisliste heraus, also woanders.
+           */
           return { tickets: [ticket, ...state.tickets] };
         }),
       removeTicket: (id) =>
@@ -924,15 +1239,19 @@ export const useSearchStore = create<SearchStore>()(
       },
 
       savedStations: [],
+      savedStationCodes: new Set<string>(),
       toggleSavedStation: (loc) =>
         set((state) => {
-          const exists = state.savedStations.some((s) => s.code === loc.code);
-          if (exists) {
-            return { savedStations: state.savedStations.filter((s) => s.code !== loc.code) };
-          }
-          // Neu hinzugefügte Stationen vorne einsortieren — Recent-First-Order
-          // in der LocationPicker-Liste matched dann die Save-Reihenfolge.
-          return { savedStations: [loc, ...state.savedStations] };
+          // Gegen die LISTE prüfen, nicht gegen das abgeleitete Set: Die Liste ist
+          // die Wahrheit, das Set nur ihr Index. Wäre er je wieder aus dem Tritt,
+          // entstünden hier sonst Duplikate.
+          const exists = state.savedStations.some((st) => st.code === loc.code);
+          const next = exists
+            ? state.savedStations.filter((s) => s.code !== loc.code)
+            // Neu hinzugefügte Stationen vorne einsortieren — Recent-First-Order
+            // in der LocationPicker-Liste matched dann die Save-Reihenfolge.
+            : [loc, ...state.savedStations];
+          return { savedStations: next, savedStationCodes: new Set(next.map((s) => s.code)) };
         }),
 
       pendingRoute: null,
@@ -961,11 +1280,9 @@ export const useSearchStore = create<SearchStore>()(
     }),
     {
       name: "binch-search",
-      // Debounced Adapter: bündelt Writes innerhalb 600ms → ein einziger
-      // JSON.stringify + AsyncStorage-Write statt zehn. Eliminiert die
-      // 10-30ms JS-Thread-Blocks die sonst bei jedem Save/Toggle die App
-      // ruckeln lassen.
-      storage: createJSONStorage(() => createDebouncedStorage(AsyncStorage)),
+      // Siehe createDeferredJSONStorage: serialisiert erst in der Ruhephase,
+      // nicht bei jedem set().
+      storage: createDeferredJSONStorage(AsyncStorage),
       partialize: (state) => ({
         currency: state.currency,
         locale: state.locale,
@@ -977,6 +1294,7 @@ export const useSearchStore = create<SearchStore>()(
         savedToastPosition: state.savedToastPosition,
         recentSearches: state.recentSearches,
         recentSpots: state.recentSpots,
+        lastKnownCoord: state.lastKnownCoord,
         favoriteResultIds: state.favoriteResultIds,
         savedTrips: state.savedTrips,
         savedStations: state.savedStations,
@@ -993,9 +1311,26 @@ export const useSearchStore = create<SearchStore>()(
       // nicht persistieren (immer aus savedTrips berechenbar).
       onRehydrateStorage: () => (state) => {
         if (!state) return;
-        state.savedTripSignatures = new Set(
-          state.savedTrips.map((t) => tripSignature(t)),
-        );
+        /**
+         * BEIDE abgeleiteten Sets neu aufbauen — und über `setState`, nicht per
+         * Direktzuweisung.
+         *
+         * `savedStationCodes` fehlte hier. Persistiert wird nur die Liste (ein Set
+         * überlebt JSON nicht), und der Merge von `persist` ist flach — nach jedem
+         * Kaltstart war die Liste also voll und das Set leer. Sichtbar wurde das
+         * im Ortspicker: Jede gespeicherte Station zeigte einen leeren Stern,
+         * während dieselbe Station in derselben Liste unter „Gespeichert" stand.
+         * Und ein Tipp auf den Stern entfernte sie dann nicht, sondern legte eine
+         * ZWEITE Kopie an — doppelter Code in der persistierten Liste.
+         *
+         * `setState` statt Direktzuweisung, weil eine Zuweisung keine Abonnenten
+         * benachrichtigt: Bereits gemountete Bäume hätten sonst bis zum nächsten
+         * beliebigen Schreibvorgang mit dem leeren Set gerendert.
+         */
+        useSearchStore.setState({
+          savedTripSignatures: new Set(state.savedTrips.map((t) => tripSignature(t))),
+          savedStationCodes: new Set(state.savedStations.map((st) => st.code)),
+        });
       },
     }
   )

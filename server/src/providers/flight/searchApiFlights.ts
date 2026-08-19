@@ -34,6 +34,28 @@ const FLIGHT_TZ = "UTC";
 const QUOTA_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 let quotaBlockedUntil = 0;
 
+/**
+ * Die Sperre gilt für ALLE SearchAPI-Aufrufe, nicht nur für die Suche.
+ *
+ * Der Buchungs-Pfad (searchApiFlightsBooking) hatte bisher keinen Zugriff darauf
+ * und lief unabhängig weiter: Er schluckte den 429 stumm (`if (!res.ok) return
+ * null`), meldete „keine Anbieter" und verbrannte bei jedem Antippen erneut
+ * Kontingent. Deshalb liegt der Zustand hier zentral.
+ */
+export function isSearchApiQuotaBlocked(): boolean {
+  return Date.now() < quotaBlockedUntil;
+}
+
+export function noteSearchApiQuotaExhausted(source: string): void {
+  const wasBlocked = isSearchApiQuotaBlocked();
+  quotaBlockedUntil = Date.now() + QUOTA_COOLDOWN_MS;
+  if (!wasBlocked) {
+    console.warn(
+      `[searchapi/${source}] 429 — Monatskontingent aufgebraucht. Pausiert bis ${new Date(quotaBlockedUntil).toISOString()}.`,
+    );
+  }
+}
+
 export const searchApiFlightsProvider: SearchProvider = {
   name: "searchapi-flights",
   mode: "FLIGHT",
@@ -86,12 +108,7 @@ export const searchApiFlightsProvider: SearchProvider = {
       return { results: [], raw: { error: "fetch failed" }, statusCode: 0, durationMs: Date.now() - start };
     }
     const body = (await res.json().catch(() => null)) as unknown;
-    if (res.status === 429) {
-      quotaBlockedUntil = Date.now() + QUOTA_COOLDOWN_MS;
-      console.warn(
-        `[searchapi-flights] 429 — Monatskontingent aufgebraucht. Provider pausiert bis ${new Date(quotaBlockedUntil).toISOString()}; Flüge laufen solange über den Fallback (google-flights).`,
-      );
-    }
+    if (res.status === 429) noteSearchApiQuotaExhausted("search");
     const results = res.ok && body ? parseSearchApi(body, input, roundTrip) : [];
     return { results, raw: body, statusCode: res.status, durationMs: Date.now() - start };
   },

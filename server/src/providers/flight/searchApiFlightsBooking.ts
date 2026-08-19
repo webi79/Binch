@@ -1,6 +1,7 @@
 import { config } from "../../config.js";
 import type { BookingContext } from "../../services/tokenService.js";
 import type { FlightBookingOption } from "./googleFlightsBooking.js";
+import { isSearchApiQuotaBlocked, noteSearchApiQuotaExhausted } from "./searchApiFlights.js";
 
 // Booking-Optionen für SearchAPI.io. Im Gegensatz zu google-flights2:
 //   - EIN Call liefert pro Anbieter Name + ECHTER Preis + Buchungs-Request
@@ -119,6 +120,10 @@ function baseParams(ctx: BookingContext): Record<string, string> {
 /** Ein google_flights-GET gegen SearchAPI. Gibt das geparste JSON zurück (oder
  *  null bei HTTP-/Netzwerk-/Parse-Fehler). */
 async function saGet(params: Record<string, string>): Promise<SaSearchResponse | null> {
+  // Kontingent aufgebraucht → gar nicht erst anfragen. Sonst kostet jedes
+  // Antippen eines Flugs einen weiteren 429.
+  if (isSearchApiQuotaBlocked()) return null;
+
   const url = new URL(SEARCH_URL);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   try {
@@ -127,7 +132,17 @@ async function saGet(params: Record<string, string>): Promise<SaSearchResponse |
       { method: "GET", headers: { Authorization: `Bearer ${config.SEARCHAPI_API_KEY}` } },
       FETCH_TIMEOUT_MS,
     );
-    if (!res.ok) return null;
+    if (res.status === 429) {
+      noteSearchApiQuotaExhausted("booking");
+      return null;
+    }
+    if (!res.ok) {
+      // Vorher wurde JEDER Fehlerstatus stumm zu „keine Anbieter". Ein
+      // abgelaufener Schlüssel oder ein 400 sah damit exakt aus wie ein Flug
+      // ohne Buchungsoptionen — nicht diagnostizierbar.
+      console.warn(`[searchapi/booking] HTTP ${res.status} für ${params.engine ?? "?"}`);
+      return null;
+    }
     return (await res.json()) as SaSearchResponse;
   } catch {
     return null;

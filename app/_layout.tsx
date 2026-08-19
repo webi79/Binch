@@ -28,6 +28,7 @@ import { SavedToastHost } from "@/components/ui/SavedToastHost";
 import { StationSaveToastHost } from "@/components/surroundings/StationSaveToastHost";
 import { TicketDetailOverlay } from "@/components/saved/TicketDetailOverlay";
 import { BinchSplash } from "@/components/ui/BinchSplash";
+import { KeyboardHeightProbe } from "@/lib/nav/keyboardHeight";
 import { SettingsSubOverlay } from "@/app/(tabs)/settings";
 import { BinchTabBar } from "@/components/ui/BinchTabBar";
 import { BinchAuthScreen } from "@/components/auth/BinchAuthScreen";
@@ -188,6 +189,22 @@ export default function RootLayout() {
       {/* Splash liegt GANZ AUSSEN — über SafeAreaProvider und allen Tabs,
           damit sie wirklich das ganze Display einnimmt (inkl. Statusbar-
           Bereich und unteren Gesture-Inset). */}
+      {/**
+        * Meldet die Tastatur EINMAL für die ganze App an — siehe Modul.
+        *
+        * Und zwar ab dem ERSTEN Durchgang, nicht erst nach dem Startbild.
+        *
+        * Die erste Anmeldung schaltet die Fenster-Dekoration um und setzt
+        * `LayoutParams` auf der Activity-Wurzel — eine Neuvermessung des
+        * ganzen Fensters. Die will man genau einmal, und zwar bevor irgendetwas
+        * ausgemessen ist. Hinter dem Startbild gehängt fiele sie ausgerechnet
+        * in den Moment, in dem es ausblendet und die erste Bedienung beginnt.
+        *
+        * Die GL-Fläche der Karte ist davon nicht betroffen: Sie entsteht erst
+        * aus dem eigenen `onLayout` heraus, nach Fokus und Ortung — also lange
+        * nach dem Fensterumbau.
+        */}
+      <KeyboardHeightProbe />
       {!splashDone && (
         <Animated.View
           style={{ ...StyleSheet.absoluteFillObject, zIndex: 9999, elevation: 9999 }}

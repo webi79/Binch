@@ -15,7 +15,7 @@
 import { memo, useCallback, useMemo, useState, type ReactNode, useRef } from "react";
 import { subscribeLayer } from "@/lib/nav/transitionLayer";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
-import { PICKER_IN, PICKER_OUT, pickerCover } from "@/lib/nav/overlayCover";
+import { PICKER_IN, PICKER_OUT } from "@/lib/nav/overlayCover";
 import { useSheetSlide } from "@/lib/nav/sheetSlide";
 import { prepareLayer } from "@/lib/nav/transitionLayer";
 import { showAlert } from "@/lib/alert";
@@ -35,14 +35,7 @@ import {
 import { usePalette } from "@/lib/theme/appBg";
 import { FlashList } from "@shopify/flash-list";
 import { usePressBounce } from "@/lib/motion";
-import Animated, {
-  cancelAnimation,
-  Easing,
-  useAnimatedStyle,
-  useSharedValue,
-  withTiming,
-  runOnJS,
-} from "react-native-reanimated";
+import Animated, { Easing, useAnimatedStyle, useSharedValue, withTiming } from "react-native-reanimated";
 import { useEffect } from "react";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { X, Clock } from "lucide-react-native";
@@ -139,9 +132,10 @@ type CalRow =
 
 export interface BinchDatePickerProps {
   visible: boolean;
-  /** Liegt der Inhalt im Baum? Siehe Host — Aufbau beim Berühren, Abbau nach
-   *  der Ausfahrt. */
+  /** Liegt der Inhalt im Baum? Siehe Host — Aufbau im Leerlauf, danach fest. */
   mounted: boolean;
+  /** Zählt je Öffnung hoch, schon beim BERÜHREN — siehe Host. */
+  session: number;
   onClose: () => void;
   minimumDate?: Date;
   initialDate?: Date | null;
@@ -154,9 +148,22 @@ export interface BinchDatePickerProps {
   title?: string;
 }
 
-export function BinchDatePicker({
+/**
+ * GEMERKT — sonst rendert der ganze Wähler im ersten Bild der Ausfahrt neu.
+ *
+ * Der Wirt hört am Speicher; das Bestätigen schreibt Ergebnis und Auftrag in
+ * einem Zug, also genau dann, wenn die Rückfahrt losläuft. Er rendert dabei
+ * dieselben Eigenschaften noch einmal — ohne Schranke lief der komplette Baum
+ * dieses Wählers trotzdem durch, samt Einbau-Schritten auf dem UI-Strang.
+ *
+ * Alle Eigenschaften sind stabil: Speicher-Aktionen, Werte aus dem gemerkten
+ * Auftrag, und die Zahlen für Sichtbarkeit und Sitzung wechseln inzwischen
+ * ausschließlich außerhalb der Bewegung.
+ */
+const BinchDatePickerInner = function BinchDatePicker({
   visible,
   mounted,
+  session,
   onClose,
   minimumDate,
   initialDate,
@@ -179,6 +186,7 @@ export function BinchDatePicker({
     style: wrapStyle,
     run: runSheet,
     parkNow,
+    warm: warmSlide,
   } = useSheetSlide("pickerDate", PARK_Y);
   // Pre-warm: einmaliger no-op withTiming am Mount damit Reanimated v4
   // die Worklets JIT-kompiliert BEVOR der User zum ersten Mal tippt.
@@ -204,14 +212,12 @@ export function BinchDatePicker({
     // EIN BILD später — der Parkplatz-Effekt weiter unten läuft beim Aufsetzen
     // ebenfalls und bräche den Anlauf sonst im selben Durchgang ab (dieselbe
     // Begründung wie im Ortswähler).
-    const warm = requestAnimationFrame(() => {
-      offset.value = PARK_Y;
-      offset.value = withTiming(PARK_Y - 0.002, PICKER_IN, (finished) => {
-        "worklet";
-        if (finished) offset.value = PARK_Y;
-      });
-    });
-    return () => cancelAnimationFrame(warm);
+    /**
+     * Der Anlauf kommt aus der gemeinsamen Fahrt (`warmSlide`) — sonst wärmt er
+     * eine andere Funktion als die, die später wirklich fährt.
+     */
+    const id = requestAnimationFrame(() => warmSlide());
+    return () => cancelAnimationFrame(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -325,9 +331,7 @@ export function BinchDatePicker({
       const cfg = show ? PICKER_IN : PICKER_OUT;
       if (!layeredRef.current) holdLayerFor(cfg.duration + (show ? 16 : 0));
       armMovingGuard(cfg.duration);
-      runSheet(show, (s) => {
-        pickerCover.value = withTiming(s ? 1 : 0, s ? PICKER_IN : PICKER_OUT);
-      });
+      runSheet(show);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [runSheet],
@@ -357,22 +361,18 @@ export function BinchDatePicker({
    * der alte Wert stehen — und ein deckendes Blatt lugte unten ins Bild und
    * schluckte Berührungen.
    */
-  const lastScreenH = useRef(screenH);
-  useEffect(() => {
-    /**
-     * NUR bei echter Änderung des Fenstermaßes.
-     *
-     * Vorher stand `visible` mit in den Abhängigkeiten, und das war fatal: Beim
-     * Schließen kippt es auf falsch, dieser Effekt lief mit — und setzte das
-     * Blatt SOFORT auf den Parkplatz. Die Ausfahrt war damit nicht langsam oder
-     * ruckelig, sondern gar nicht mehr vorhanden: Der Bildschirm verschwand
-     * schlicht.
-     */
-    if (lastScreenH.current === screenH) return;
-    lastScreenH.current = screenH;
-    if (!visible) parkNow();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [screenH]);
+  /**
+   * KEIN Neu-Parken bei geändertem Fenstermaß mehr.
+   *
+   * Hier stand ein Effekt, der bei einer Änderung `parkNow()` rief — und der
+   * schreibt die beim Laden gemerkte Höhe zurück, also genau den Wert, den er
+   * korrigieren sollte. Er konnte nichts bewirken.
+   *
+   * Die Ausrichtung ist auf Hochkant festgelegt; die Fensterhöhe ändert sich zur
+   * Laufzeit nur durch die Tastatur, und die verkleinert sie — der Parkplatz
+   * liegt dann also weiter unten als nötig, nie zu hoch. Sichtbar werden kann
+   * dabei nichts.
+   */
 
   // Picker selbst NUR translateY, KEINE Opacity — sonst fadet er beim
   // Slide-Out (160ms) schneller weg als er translatet (280ms) und der
@@ -388,14 +388,29 @@ export function BinchDatePicker({
 
 
 
+  /**
+   * Die Zurück-Taste hängt am SPEICHER, nicht an der verzögerten Sichtbarkeit.
+   *
+   * `visible` kippt inzwischen erst nach dem Ende der Fahrt — in den 300ms
+   * davor deckte das Blatt schon den ganzen Bildschirm, hatte aber keinen
+   * Abfangring. Zuständig war dann der des Such-Blattes: Eine Zurück-Geste
+   * während der Einfahrt schloss also die SUCHE, während der Wähler deckend
+   * liegen blieb. Aus der Umgebungs-Karte gab es gar keinen — dort wurde der
+   * Reiter verlassen.
+   *
+   * Angemeldet wird, solange der Inhalt im Baum liegt; ob wirklich offen ist,
+   * entscheidet der Speicher im Moment des Drucks. Kein Rendern, keine
+   * Verzögerung.
+   */
   useEffect(() => {
-    if (Platform.OS !== "android" || !visible) return;
+    if (Platform.OS !== "android" || !mounted) return;
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      if (useSearchStore.getState().datePickerRequest === null) return false;
       onClose();
       return true;
     });
     return () => sub.remove();
-  }, [visible, onClose]);
+  }, [mounted, onClose]);
 
   return (
     <>
@@ -439,8 +454,7 @@ export function BinchDatePicker({
          * Fenster davor, und danach wieder abgeräumt, damit das Scrollen im
          * Kalender sie nicht Bild für Bild neu erzeugen muss.
          */
-        renderToHardwareTextureAndroid={Platform.OS === "android" && (layered || moving)}
-          style={[
+            style={[
           StyleSheet.absoluteFillObject,
           // KEIN elevation mehr: das Sheet ist Vollbild + opak (deckt alles ab),
           // ein 32dp-Android-Schatten ist unsichtbar (Ränder offscreen), zwingt
@@ -453,6 +467,10 @@ export function BinchDatePicker({
             // Siehe Ortswähler: `zIndex` allein reicht auf Android nicht, wenn
             // Geschwister am Wurzel-Layout eine Höhe tragen (16 bis 32).
             elevation: 40,
+            // Höhe nur für die Sortierung, kein Schatten — er wäre unsichtbar
+            // (Vollbild, deckend, Ränder offscreen), würde aber in jedem Bild
+            // der Fahrt über die ganze Kontur gerechnet. Siehe Ortswähler.
+            shadowColor: "transparent",
           },
           wrapStyle,
         ]}
@@ -463,7 +481,32 @@ export function BinchDatePicker({
           * animierten Knoten ist auf Fabric ein Commit gegen die laufende
           * Bewegung.
           */}
-        <View style={StyleSheet.absoluteFill} pointerEvents={visible ? "auto" : "none"}>
+        {/**
+          * KEIN `pointerEvents` mehr — geparkt liegt das Blatt außerhalb des
+          * Bildes und kann ohnehin nichts abfangen.
+          *
+          * Gegatet hing es an der verzögerten Sichtbarkeit: Nach dem Ende der
+          * Einfahrt stand das Blatt dadurch mehrere Bilder lang sichtbar, aber
+          * tot — kein Tippen in die Leiste, keine Zeile, kein X. Und jeder
+          * Wechsel wäre ein Commit gewesen, den wir aus der Fahrt heraushalten
+          * wollen.
+          */}
+        {/**
+          * Die Textur sitzt auf DIESER Hülle, nicht auf dem animierten Knoten.
+          *
+          * Der Schalter kippt genau dann, wenn die Fahrt anfängt — und ein
+          * Eigenschafts-Wechsel auf dem animierten Knoten ist auf Fabric ein
+          * Commit gegen ebendie Bewegung, die Reanimated dort Bild für Bild
+          * schreibt (dieselbe Begründung wie bei `pointerEvents` darüber). Auf
+          * der Hülle wirkt er unverändert: Sie trägt den gesamten schweren
+          * Inhalt, der animierte Knoten darüber zeichnet nur noch eine
+          * deckende Fläche und verschiebt die fertige Textur.
+          */}
+        <View
+          style={StyleSheet.absoluteFill}
+          collapsable={false}
+          renderToHardwareTextureAndroid={Platform.OS === "android" && (layered || moving)}
+        >
         {mounted && (
         <DatePickerContent
         accentSolid={accent.solid}
@@ -480,14 +523,17 @@ export function BinchDatePicker({
         onConfirmMonth={onConfirmMonth}
         fieldLabel={fieldLabel}
         title={title}
-          sessionKey={visible}
+          sessionKey={session}
+          open={visible}
         />
         )}
         </View>
       </Animated.View>
     </>
   );
-}
+};
+
+export const BinchDatePicker = memo(BinchDatePickerInner);
 
 interface ContentProps {
   accentSolid: string;
@@ -504,7 +550,14 @@ interface ContentProps {
   onConfirmMonth?: (v: { year: number; month: number }) => void;
   fieldLabel: string;
   title: string;
-  sessionKey: boolean;
+  sessionKey: number;
+  /**
+   * Offen? Wird NUR fürs Zurücksetzen beim Schließen gebraucht.
+   *
+   * Gefahrlos als Eigenschaft, seit der Wirt sie erst nach dem Ende der
+   * Bewegung umschaltet — der Wechsel kann also nicht mehr in die Fahrt fallen.
+   */
+  open: boolean;
 }
 
 /**
@@ -536,6 +589,7 @@ const DatePickerContent = memo(function DatePickerContent({
   fieldLabel,
   title,
   sessionKey,
+  open,
 }: ContentProps) {
   const palette = usePalette();
   const insets = useSafeAreaInsets();
@@ -547,6 +601,17 @@ const DatePickerContent = memo(function DatePickerContent({
   const [hour, setHour] = useState(initialDate?.getHours() ?? 9);
   const [minute, setMinute] = useState(initialDate?.getMinutes() ?? 30);
   const [timeOpen, setTimeOpen] = useState(false);
+  /**
+   * Stabil — sonst ist das `memo()` um `ModeTabs` wirkungslos.
+   *
+   * Als Pfeilfunktion am Ort war die Eigenschaft bei JEDEM Durchgang neu, und
+   * damit rendern die Reiter samt ihrem gleitenden Balken jedes Mal mit. Genau
+   * dieser Baum liegt beim Öffnen und Schließen neben der Fahrt.
+   */
+  const onModeChange = useCallback((m: Mode) => {
+    haptic("button");
+    setMode(m);
+  }, []);
   const confirmBounce = usePressBounce();
   const weiterBounce = usePressBounce();
   const [selMonthKey, setSelMonthKey] = useState<string | null>(null);
@@ -558,7 +623,7 @@ const DatePickerContent = memo(function DatePickerContent({
   // schon mal eine Date confirmed hat, soll die hier hervorgehoben sein.
   // Das ist nur 1 Cell-Highlight (React.memo greift) → kein Stutter.
   useEffect(() => {
-    if (!sessionKey) return;
+    if (sessionKey === 0) return;
     if (initialDate) {
       /**
        * Nur setzen, wenn sich wirklich etwas ändert.
@@ -612,10 +677,16 @@ const DatePickerContent = memo(function DatePickerContent({
    * bleiben.
    */
   useEffect(() => {
-    if (sessionKey) return;
+    // Zurückgesetzt wird beim SCHLIESSEN — und `visible` kippt inzwischen erst
+    // nach der Ausfahrt, liegt also ohnehin außerhalb der Bewegung.
+    if (open) return;
     let timer: ReturnType<typeof setTimeout>;
     const attempt = () => {
       if (isTransitionBusy()) {
+        // Dieser Wiederversuch fällt in eine laufende Fahrt — absichtlich und
+        // unbedenklich: Er vergleicht einen Zeitstempel und legt sich wieder
+        // hin. Kein Rendern, kein Einbau, kein Layout. Nur das ZURÜCKSETZEN
+        // selbst darf nicht hineinfallen, und genau davor schützt er.
         timer = setTimeout(attempt, 120);
         return;
       }
@@ -646,6 +717,10 @@ const DatePickerContent = memo(function DatePickerContent({
       setSel(null);
       setHour(9);
       setMinute(30);
+      // Gehörte nie in diese Liste: Wer die Uhrzeit-Auswahl offen hatte und den
+      // Wähler über die Zurück-Geste verließ, bekam sie beim nächsten Öffnen
+      // sofort wieder vorgesetzt.
+      setTimeOpen(false);
       setMode(initialMode);
       setLoadedMonths(INITIAL_MONTHS);
       setSelMonthKey(null);
@@ -661,7 +736,7 @@ const DatePickerContent = memo(function DatePickerContent({
      */
     timer = setTimeout(attempt, PICKER_OUT.duration + 140);
     return () => clearTimeout(timer);
-  }, [sessionKey, initialMode]);
+  }, [open, initialMode]);
 
   const today = useMemo(() => {
     const d = minimumDate ?? new Date();
@@ -845,10 +920,7 @@ const DatePickerContent = memo(function DatePickerContent({
         mode={mode}
         accentSolid={accentSolid}
         accentTextOnSolid={accentTextOnSolid}
-        onChange={(m) => {
-          haptic("button");
-          setMode(m);
-        }}
+        onChange={onModeChange}
       />
 
       {/* Pager-Style: beide Sections side-by-side in einem breiten Container

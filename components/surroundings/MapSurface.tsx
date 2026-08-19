@@ -105,7 +105,13 @@ const MapSurfaceInner = forwardRef<MapSurfaceHandle, Props>(function MapSurface(
   const markRendered = useCallback(() => {
     if (renderedFiredRef.current) return;
     renderedFiredRef.current = true;
-    if (fallbackRef.current) clearTimeout(fallbackRef.current);
+    if (fallbackRef.current) {
+      clearTimeout(fallbackRef.current);
+      // Und die Merkstelle leeren, sonst hält der Wächter in
+      // `onDidFinishRenderingMap` unten für immer eine tote Kennung fest und
+      // lässt nie wieder eine Frist zu.
+      fallbackRef.current = null;
+    }
     onMapRenderedRef.current?.();
   }, []);
   /**
@@ -117,11 +123,24 @@ const MapSurfaceInner = forwardRef<MapSurfaceHandle, Props>(function MapSurface(
    * Zappel-Fall nie, für den er gedacht ist. Über einen Ref hängt er an nichts
    * mehr.
    */
+  /**
+   * Letzte Notbremse: Kommt gar kein Signal, geben wir nach vier Sekunden frei.
+   *
+   * Der Riegel darüber bleibt einwegs — dieses Bauteil meldet pro Aufbau
+   * genau einmal. Ob die Meldung ZÄHLT, entscheidet der Aufrufer: Nur er weiß,
+   * ob die Fläche gerade eingefroren ist, und nur er kann es wissen. Ein
+   * `paused`-Prop wäre hier wirkungslos gewesen — `react-freeze` verwirft genau
+   * den Durchgang, der es liefern würde, das Kind behält also seine alten
+   * Eigenschaften. Die Entscheidung gehört deshalb nach oben.
+   */
   useEffect(() => {
     const id = setTimeout(markRendered, 4000);
     return () => {
       clearTimeout(id);
-      if (fallbackRef.current) clearTimeout(fallbackRef.current);
+      if (fallbackRef.current) {
+        clearTimeout(fallbackRef.current);
+        fallbackRef.current = null;
+      }
     };
   }, [markRendered]);
 

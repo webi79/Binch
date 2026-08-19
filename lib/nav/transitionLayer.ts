@@ -143,6 +143,17 @@ export function holdLayer(key: LayerKey): void {
  */
 export function rearmLayer(key: LayerKey): void {
   if (wanted.get(key) !== true) return;
+  /**
+   * Mit der Frist kommt auch der Aufschub zurück.
+   *
+   * Der Aufschub ist ein Einzelstück pro Fläche, und verbraucht wird er von der
+   * ERSTEN Bewegung, die zufällig läuft, wenn die Frist abläuft — auch von der
+   * eines anderen Blattes. Wer hier neu scharf stellt, meldet aber gerade eine
+   * frische Rückfahrt an: Ohne diese Zeile liefe sie ohne Netz, und ein Ablauf
+   * mittendrin reißt die Textur weg und hält genau die Fahrt an, für die sie
+   * angefordert wurde.
+   */
+  deferred.delete(key);
   const existing = timers.get(key);
   if (existing) clearTimeout(existing);
   timers.set(

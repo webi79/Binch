@@ -1,5 +1,6 @@
-import { Easing, makeMutable, withTiming } from "react-native-reanimated";
+import { Easing, makeMutable, runOnJS, withTiming } from "react-native-reanimated";
 import { markTransitionBusy } from "./transitionBusy";
+import { setSheetMoving } from "./searchHandoff";
 import { getDeviceCornerRadius } from "@/modules/screen-corners";
 
 /**
@@ -95,29 +96,6 @@ export const COVER_OUT_SPRING = POP_SPRING;
  */
 export const overlayCover = makeMutable(0);
 
-/**
- * Wie weit ein WÄHLER über dem Such-Bildschirm liegt: 0 zu, 1 offen.
- *
- * Der Grund für diesen Wert ist die zentrale Frage, an der wir lange
- * vorbeigearbeitet haben: Warum wirkt die Fahrt des Such-Blattes eleganter als
- * die der Wähler, obwohl Kurve, Dauer, Strecke, Antrieb und Textur inzwischen
- * nachweislich identisch sind?
- *
- * Weil es NICHT dasselbe ist. Das Such-Blatt fährt nicht bloß herein — es wächst
- * aus der angetippten Kachel, sein Inhalt hält über eine Gegenbewegung optisch
- * still, und die Unterlage zieht mit 30% Parallax nach. Vier abgestimmte
- * Bewegungen. Die Wähler dagegen schieben eine bildschirmfüllende Fläche über
- * eine völlig stillstehende — mehr passiert nicht. Eine Kante, die sich mit 90
- * Punkten pro Bild über ein stehendes Bild schiebt, hat nichts, woran das Auge
- * die Bewegung festmachen könnte; sie liest sich als Sprungfolge, auch wenn
- * kein einziges Bild ausfällt.
- *
- * Dieser Wert gibt der Unterlage dieselbe Rolle wie beim Such-Blatt: Sie weicht
- * ein Stück zurück, während der Wähler kommt. Er läuft auf dem UI-Strang und
- * kostet einen einzigen Transform auf einer Fläche, die währenddessen ohnehin
- * als Textur gehalten wird.
- */
-export const pickerCover = makeMutable(0);
 
 /**
  * EIN Fortschritt für die Ergebnis-Slide: 0 = ganz rechts außerhalb,
@@ -148,7 +126,6 @@ export function pushProgress(p: number): number {
   "worklet";
   return p;
 }
-
 
 /**
  * Gemeinsamer Progress des Home→Search „Launch"-Übergangs (Xiaomi-Feeling).
@@ -196,7 +173,6 @@ const FALLBACK_RADIUS = 40;
 const measuredRadius = getDeviceCornerRadius();
 export const SCREEN_CORNER_RADIUS =
   measuredRadius != null ? measuredRadius : FALLBACK_RADIUS;
-
 
 
 /**
@@ -615,11 +591,25 @@ export function markSheetMoving(durationMs: number = SHEET_IN.duration): void {
   markTransitionBusy(durationMs);
 }
 
+/**
+ * Bos Fahrt gehört in dieselbe Anmeldung wie jedes andere Blatt.
+ *
+ * `markTransitionBusy` allein reicht nicht: An `isSheetMoving()` hängt der
+ * Riegel in `transitionLayer.ts`, der eine GPU-Textur NICHT abreißen lässt,
+ * solange etwas fährt. Für Bo galt er nie — eine Textur, die kurz zuvor durch
+ * eine Berührung angefordert wurde, konnte also mitten in seiner Fahrt
+ * ablaufen und sie anhalten. Genau das „manchmal ruckelt es, manchmal nicht".
+ */
 export function startAssistantPush(): void {
   markTransitionBusy(ASSISTANT_IN.duration);
+  setSheetMoving(true, "assistant");
   assistantMoving = true;
   assistantPush.value = 0;
-  assistantPush.value = withTiming(1, ASSISTANT_IN);
+  assistantPush.value = withTiming(1, ASSISTANT_IN, (finished) => {
+    "worklet";
+    if (!finished) return;
+    runOnJS(setSheetMoving)(false, "assistant");
+  });
 }
 
 /**
@@ -633,12 +623,21 @@ export function startAssistantPush(): void {
  */
 export function resetAssistantPush(): void {
   assistantMoving = false;
+  // Auch abmelden. Wird der Bildschirm mitten in der Fahrt abgebaut, läuft der
+  // Abschluss der Kurve nie — der Schlüssel bliebe für den Rest des App-Laufs
+  // in der Menge stehen, und daran hängt die Freigabe aller Texturen.
+  setSheetMoving(false, "assistant");
   assistantPush.value = 0;
 }
 
 /** Gegenbewegung beim Schließen. Der Aufrufer navigiert erst danach zurück. */
 export function endAssistantPush(): void {
   markTransitionBusy(ASSISTANT_OUT.duration);
+  setSheetMoving(true, "assistant");
   assistantMoving = false;
-  assistantPush.value = withTiming(0, ASSISTANT_OUT);
+  assistantPush.value = withTiming(0, ASSISTANT_OUT, (finished) => {
+    "worklet";
+    if (!finished) return;
+    runOnJS(setSheetMoving)(false, "assistant");
+  });
 }

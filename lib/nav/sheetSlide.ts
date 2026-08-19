@@ -1,4 +1,4 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import {
   cancelAnimation,
   runOnJS,
@@ -48,22 +48,46 @@ export function useSheetSlide(key: string, park: number) {
 
   /**
    * @param show true = hereinfahren, false = hinausfahren
-   * @param onFrame läuft im Bild VOR dem Start — für Bewegungen, die
-   *        mitlaufen sollen (etwa das Zurückweichen der Unterlage). Bewusst
-   *        genau hier, damit sie denselben Takt bekommen.
+   * @param onFrame läuft im Bild VOR dem Start — für Bewegungen, die im selben
+   *        Takt mitlaufen sollen. Derzeit nutzt es niemand; der Haken bleibt,
+   *        weil er die einzige Stelle ist, an der so etwas den gleichen Takt
+   *        bekommt, ohne eine zweite Quelle aufzumachen.
    */
   const run = useCallback(
     (show: boolean, onFrame?: (show: boolean) => void) => {
       if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
       cancelAnimation(y);
       const cfg = show ? SHEET_IN : SHEET_OUT;
-      if (show) y.value = park;
-      markSheetMoving(cfg.duration);
+      /**
+       * Beim Wiedereintritt aus der Rückfahrt: von der aktuellen Stelle weiter,
+       * mit ANTEILIGER Dauer.
+       *
+       * `withTiming` nimmt die volle Dauer, egal wie kurz der Weg ist. Von
+       * halber Höhe aus über 300ms zurückzufahren sieht deshalb aus wie
+       * Kriechen. Die Dauer wird darum mit dem verbleibenden Anteil der Strecke
+       * skaliert — die Geschwindigkeit bleibt damit dieselbe wie bei einer
+       * vollen Fahrt, und der Wiedereintritt fühlt sich an wie deren
+       * Fortsetzung. Nach unten begrenzt, sonst zuckt es bei sehr kurzen
+       * Wegen.
+       */
+      const from = y.value;
+      const rest = show ? from : park - from;
+      /**
+       * Boden bei 0,15 statt 0,35 — sonst wird die Umkehr ZÄHER, je kürzer sie
+       * ist. Bei 35% Mindestdauer für 2% Restweg kriecht das Blatt über einen
+       * Fingerbreit. Und angemeldet wird die TATSÄCHLICHE Dauer: Mit der vollen
+       * gälte der Bildschirm nach einer 100ms-Umkehr noch 380ms als „fährt",
+       * und alles, was darauf wartet, bliebe unnötig lange liegen.
+       */
+      const frac = park > 0 ? Math.min(1, Math.max(0.15, rest / park)) : 1;
+      const dur = Math.round(cfg.duration * frac);
+      const cfgScaled = { duration: dur, easing: cfg.easing };
+      markSheetMoving(dur);
       setSheetMoving(true, key);
       rafRef.current = requestAnimationFrame(() => {
         rafRef.current = null;
         onFrame?.(show);
-        y.value = withTiming(show ? 0 : park, cfg, (finished) => {
+        y.value = withTiming(show ? 0 : park, cfgScaled, (finished) => {
           "worklet";
           if (!finished) return;
           runOnJS(setSheetMoving)(false, key);
@@ -73,12 +97,63 @@ export function useSheetSlide(key: string, park: number) {
     [key, park, y],
   );
 
-  /** Ohne Bewegung an den Ausgangspunkt — für den ersten Aufbau. */
-  const parkNow = useCallback(() => {
-    if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
-    cancelAnimation(y);
+  /**
+   * Den ECHTEN Weg einmal kalt anlaufen lassen.
+   *
+   * Reanimated übersetzt die Worklets einer Bewegung beim ersten Lauf. Vorher
+   * stand in jedem Wähler ein eigener Anlauf mit einer eigenen, winzigen
+   * Bewegung — der wärmt seit dem Zusammenlegen aber eine ANDERE Funktion als
+   * die, die später wirklich fährt. Ein Anlauf, der nicht denselben Pfad nimmt,
+   * ist keiner.
+   *
+   * Deshalb hier, in derselben Funktion: Es läuft `run` selbst, nur über eine
+   * unsichtbare Strecke und ohne Anmeldung. Danach steht das Blatt wieder exakt
+   * auf dem Ausgangspunkt.
+   */
+  const warm = useCallback(() => {
     y.value = park;
+    y.value = withTiming(park - 0.002, SHEET_IN, (finished) => {
+      "worklet";
+      if (finished) y.value = park;
+    });
   }, [park, y]);
 
-  return { y, style, run, parkNow };
+  /** Ohne Bewegung an den Ausgangspunkt — für den ersten Aufbau. */
+  const parkNow = useCallback(() => {
+    if (rafRef.current != null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    {
+      /**
+       * Und die Meldung mit zurücknehmen.
+       *
+       * Sie wird beim Anstoßen sofort gesetzt, zurückgenommen aber erst im
+       * Abschluss der Kurve — und die wird hier gerade abgebrochen, bevor sie
+       * überhaupt beginnt. Ohne diese Zeile bliebe der Schlüssel für den Rest
+       * des App-Laufs in der Menge stehen, und daran hängt die Freigabe der
+       * bildschirmfüllenden Texturen. Genau dieser Fall hat schon einmal die
+       * Ergebnisliste ruckeln lassen.
+       */
+      // IMMER, nicht nur wenn das Bild noch aussteht: Läuft die Kurve schon,
+      // bricht die Zeile darunter sie ab, ihr Abschluss meldet sich mit
+      // `finished === false` und steigt aus — der Schlüssel bliebe hängen.
+      setSheetMoving(false, key);
+    }
+    cancelAnimation(y);
+    y.value = park;
+  }, [key, park, y]);
+
+  // Beim Abbau nichts zurücklassen — dieselbe Begründung wie oben.
+  useEffect(
+    () => () => {
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+      cancelAnimation(y);
+      setSheetMoving(false, key);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [key],
+  );
+
+  return { y, style, run, parkNow, warm };
 }

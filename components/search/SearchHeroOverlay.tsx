@@ -26,7 +26,7 @@ import type { TravelMode } from "@/types/search";
 import { SearchHero } from "@/components/search/SearchHero";
 import { subscribeHandoffLayer, warmHandoffLayer, setSearchScreenOpenProbe, setSheetMoving, subscribeSheetMoving } from "@/lib/nav/searchHandoff";
 import { subscribeLayer } from "@/lib/nav/transitionLayer";
-import { resultsPush, heroClipPush, pickerCover, overlayCover as parallaxCover, pushProgress, UNDERLAY_TRAVEL_FRAC, SCREEN_CORNER_RADIUS, PUSH_SPRING, POP_SPRING, COVER_IN_SPRING, SHEET_IN, SHEET_OUT, markSheetMoving,
+import { resultsPush, heroClipPush, overlayCover as parallaxCover, pushProgress, UNDERLAY_TRAVEL_FRAC, SCREEN_CORNER_RADIUS, PUSH_SPRING, POP_SPRING, COVER_IN_SPRING, SHEET_IN, SHEET_OUT, markSheetMoving,
   warmPushCurves,
 } from "@/lib/nav/overlayCover";
 import { haptic } from "@/lib/haptics";
@@ -653,28 +653,10 @@ export function SearchHeroOverlay() {
    * Ebene, die Android bei jeder Bewegung mit-compositen müsste. Die beiden
    * Bewegungen treten ohnehin nie gleichzeitig auf.
    */
-  /**
-   * Dazu die Rücknahme, während ein WÄHLER darüber kommt — siehe `pickerCover`.
-   *
-   * Das ist die Antwort auf „warum wirkt das Such-Blatt eleganter": Es fährt
-   * nicht allein. Bei den Wählern schob sich bisher eine bildschirmfüllende
-   * Fläche über eine völlig stillstehende, und genau das liest sich als
-   * Sprungfolge — dem Auge fehlt jeder Bezugspunkt für die Bewegung.
-   *
-   * Zurückweichen statt Stillstehen gibt ihn: 4% kleiner und leicht nach oben,
-   * mit derselben Kurve und demselben Takt wie das Blatt. Es sind bewusst kleine
-   * Werte — das ist keine eigene Bewegung, sondern der Bezug, vor dem die andere
-   * abläuft.
-   *
-   * Kosten: EIN zusätzlicher Transform auf einer Fläche, die währenddessen
-   * ohnehin als Textur gehalten wird (`moving || pickerBusy` unten) — für die
-   * GPU also ein Skalieren einer fertigen Bitmap.
-   */
   const sheetStyle = useAnimatedStyle(() => ({
     transform: [
-      { translateY: sheetY.value - 10 * pickerCover.value },
+      { translateY: sheetY.value },
       { translateX: -winW * pushProgress(heroClipPush.value) },
-      { scale: 1 - 0.04 * pickerCover.value },
     ],
   }));
 

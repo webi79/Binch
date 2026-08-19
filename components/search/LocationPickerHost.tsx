@@ -3,11 +3,18 @@
  * vom App-Start an warm ist (kein Cold-Start beim ersten Open im
  * SearchHero). Gleicher Pattern wie DatePickerHost.
  */
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchStore } from "@/stores/searchStore";
 import { LocationPicker } from "./LocationPicker";
 import { subscribeLocationPreload } from "@/lib/nav/pickerPreload";
-import { PICKER_OUT } from "@/lib/nav/overlayCover";
+import { isTransitionBusy } from "@/lib/nav/transitionBusy";
+import { SHEET_IN, SHEET_OUT } from "@/lib/nav/overlayCover";
+
+/** Stabile Vorgabe — ein Literal am Ort hebelt die Merk-Schranke des Wählers aus. */
+const NO_SUGGESTED: never[] = [];
+
+/** Wie lange ein Vorlauf als „gehört zu diesem Öffnen" gilt. */
+const PRELOAD_MAX_AGE_MS = 2000;
 
 export function LocationPickerHost() {
   const request = useSearchStore((s) => s.locationPickerRequest);
@@ -68,6 +75,8 @@ export function LocationPickerHost() {
       subscribeLocationPreload((req) => {
         lastRef.current = req;
         setMounted(true);
+        preloadedAtRef.current = Date.now();
+        bumpSession();
         forceShow((n) => n + 1);
       }),
     [],
@@ -99,45 +108,148 @@ export function LocationPickerHost() {
    * die läuft unter `adjustResize` bei jeder Tastatur, also mitten in fremde
    * Fahrten hinein.
    *
-   * Aufgebaut wird beim BERÜHREN des Feldes (der Vorlauf meldet sich hier),
-   * also lange vor der Bewegung; abgebaut erst, wenn die Ausfahrt durch ist.
-   * Im Bild der Fahrt passiert damit weder das eine noch das andere.
+   * Aufgebaut wird spätestens beim BERÜHREN des Feldes (der Vorlauf meldet sich
+   * hier), meist aber schon im Leerlauf nach dem Start — siehe unten. Abgebaut
+   * wird nicht mehr; im Bild der Fahrt passiert damit weder das eine noch das
+   * andere.
    */
   const [mounted, setMounted] = useState(false);
-  const unmountTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * EINMAL bauen, dann stehen lassen — und zwar schon im Leerlauf nach dem
+   * Start.
+   *
+   * Zwei Fragen hängen daran, und beide sind vorher falsch beantwortet worden:
+   *
+   *  1. Wann bauen? Dauerhaft gemountet kostet jede Vermessung des Wurzelbaums
+   *     mit (unter `adjustResize` also jede Tastatur). Erst beim Berühren zu
+   *     bauen verlegt die Arbeit dagegen in die 80 bis 150ms zwischen Aufsetzen
+   *     und Loslassen — gut, aber beim ALLERERSTEN Mal ist dieser Aufbau kalt
+   *     und damit der teuerste. Genau deshalb fühlt sich das erste Öffnen
+   *     anders an als jedes weitere.
+   *
+   *     Also: ein paar Sekunden nach dem Start, wenn nichts läuft. Dann ist er
+   *     fertig, bevor ihn jemand braucht.
+   *
+   *  2. Wann wieder abbauen? Gar nicht. Ein Abbau nach jeder Ausfahrt hieße,
+   *     dass JEDES Öffnen wieder aufbaut — der teure Fall würde zur Regel statt
+   *     zur Ausnahme.
+   */
   useEffect(() => {
-    if (unmountTimer.current) {
-      clearTimeout(unmountTimer.current);
-      unmountTimer.current = null;
-    }
-    if (request !== null) {
+    if (mounted) return;
+    let id: ReturnType<typeof setTimeout>;
+    /**
+     * Und wirklich erst, wenn NICHTS fährt.
+     *
+     * Eine feste Wanduhr trifft irgendwann — womöglich mitten in eine Fahrt,
+     * und dann committen beide schweren Bäume im selben Bild. Dieselbe Prüfung
+     * benutzen der Anlauf der Übergabe-Textur und das Zurücksetzen des
+     * Kalenders; hier fehlte sie.
+     */
+    const attempt = () => {
+      if (isTransitionBusy()) {
+        // Wie beim Zurücksetzen des Kalenders: Der Wiederversuch selbst ist nur
+        // ein Zeitstempel-Vergleich und stört keine Bewegung.
+        id = setTimeout(attempt, 300);
+        return;
+      }
       setMounted(true);
-      return;
-    }
-    unmountTimer.current = setTimeout(() => {
-      unmountTimer.current = null;
-      setMounted(false);
-    }, PICKER_OUT.duration + 120);
-    return () => {
-      if (unmountTimer.current) clearTimeout(unmountTimer.current);
     };
+    /**
+     * ERST NACH dem Startbild, nicht mittendrin.
+     *
+     * Der Startbildschirm läuft 3,5 Sekunden und blendet danach 420ms aus. Ein
+     * Vorbau-Wecker bei 2,5s (und der Schwester-Wecker bei 3,4s) fiel damit
+     * mitten in dessen Buchstaben-Animation und ihr Ausblenden — der schwerste
+     * Baum der App committet also genau dort, wo das erste, was jemand von der
+     * App sieht, jedes Bild braucht.
+     *
+     * Kosten hat das Warten keine: Wer ein Feld antippt, bevor der Wecker
+     * fällt, baut es über den Vorlauf beim Berühren ohnehin sofort auf.
+     */
+    id = setTimeout(attempt, 4200);
+    return () => clearTimeout(id);
+  }, [mounted]);
+  /**
+   * Beim Öffnen NICHT noch einmal zählen.
+   *
+   * Der Vorlauf beim Berühren hat es längst getan. Ein zweiter Zähler-Schritt
+   * fällt genau ins Startbild der Fahrt — und er reißt beide Merk-Schranken auf
+   * (Wähler und Inhalt), also den teuersten Durchgang der Datei, mitten in die
+   * Bewegung. Nachgezählt wird nur, wenn es gar keinen Vorlauf gab: aus der
+   * Umgebungs-Karte, per Sprachbefehl oder Verknüpfung.
+   */
+  /**
+   * Als ZEITSTEMPEL, nicht als Schalter.
+   *
+   * Ein Vorlauf entsteht beim Aufsetzen des Fingers — und der führt nicht
+   * immer zu einem Öffnen: Wer stattdessen wischt, lässt den Schalter
+   * gesetzt zurück. Der nächste Aufruf OHNE Vorlauf (Umgebungs-Karte,
+   * Sprachbefehl, Verknüpfung) verbrauchte ihn dann und zählte nicht nach —
+   * der Wähler kam mit der alten Eingabe samt Trefferliste hoch.
+   *
+   * Mit einer Frist erledigt sich das von selbst: Zwischen Aufsetzen und
+   * Loslassen liegen Zehntelsekunden, alles darüber war kein Vorlauf für
+   * dieses Öffnen.
+   */
+  const preloadedAtRef = useRef(0);
+  useEffect(() => {
+    if (request === null) return;
+    setMounted(true);
+    const fresh = Date.now() - preloadedAtRef.current < PRELOAD_MAX_AGE_MS;
+    preloadedAtRef.current = 0;
+    if (fresh) return;
+    bumpSession();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [request]);
 
+  /**
+   * Die Sitzungs-Kennung zählt beim BERÜHREN hoch, nicht beim Öffnen.
+   *
+   * Der Inhalt braucht ein Signal „neue Öffnung, übernimm die Vorgaben". Bisher
+   * war das `visible` — und das kippt erst mit der Bewegung, also mitten in
+   * ihrem zweiten Bild. Beim Datumswähler hängt daran die Memo-Schranke des
+   * ganzen Kalenders: Der baute sich damit zuverlässig WÄHREND der Fahrt neu
+   * auf. Genau das sind die verschluckten Bilder.
+   *
+   * Über den Vorlauf gezählt passiert dasselbe im Berührungsfenster, lange
+   * davor.
+   */
+  const [session, setSession] = useState(0);
+  const bumpSession = useCallback(() => setSession((n) => n + 1), []);
+
+  /**
+   * Sichtbarkeit erst NACH der Bewegung.
+   *
+   * Sie war ein Bild verzögert, damit der Commit nicht ins Startbild fällt —
+   * nur lag er dann im zweiten. Alles, was daran hängt, hat Zeit: die
+   * Zurück-Taste, die Abfrage, die Berührungsdurchlässigkeit. Keines davon
+   * braucht während der Fahrt zu stimmen, und so rendert der Baum in diesen
+   * 300ms überhaupt nicht mehr.
+   */
   const [visible, setVisible] = useState(false);
   useEffect(() => {
-    const id = requestAnimationFrame(() => setVisible(request !== null));
-    return () => cancelAnimationFrame(id);
+    const open = request !== null;
+    const id = setTimeout(
+      () => setVisible(open),
+      // +80, nicht +20: Die Kurve ENDET bei `duration`, das letzte Bild wird
+      // aber erst danach gezeichnet. Mit 20ms Abstand fiele der Commit noch in
+      // dieses Bild — dieselbe Marge, die `markSheetMoving` für die Anmeldung
+      // benutzt.
+      (open ? SHEET_IN.duration : SHEET_OUT.duration) + 80,
+    );
+    return () => clearTimeout(id);
   }, [request]);
 
   return (
     <LocationPicker
       visible={visible}
       mounted={mounted}
+      session={session}
       onClose={closeLocationPicker}
       onSelect={confirmLocationPicker}
       field={shown?.field ?? "from"}
       mode={shown?.mode ?? "ALL"}
-      suggested={shown?.suggested ?? []}
+      suggested={shown?.suggested ?? NO_SUGGESTED}
       title={shown?.title}
       leadingLabel={shown?.leadingLabel}
       placeholderKey={shown?.placeholderKey ?? "search.location.placeholder"}

@@ -175,6 +175,27 @@ async function main() {
     return { place: best, dist: bestDist };
   }
 
+  /** Gemeinde-Ebene: admin1/2/3 ohne admin4. In Italien der ISTAT-Gemeindecode. */
+  function adminKey3(p: CityPoint): string | null {
+    if (!p.admin1 || !p.admin2 || !p.admin3) return null;
+    return `${p.admin1}|${p.admin2}|${p.admin3}`;
+  }
+  /**
+   * Größter NICHT-Bezirk je Gemeinde-Kennung.
+   *
+   * Bezirke (`PPLX`) fallen raus — sonst gewänne in Rom wieder ein Rione.
+   * Die Einwohnerzahl entscheidet, weil die Gemeinde selbst praktisch immer
+   * der größte Eintrag ihrer eigenen Kennung ist.
+   */
+  const townByAdmin3 = new Map<string, CityPoint>();
+  for (const p of allPoints) {
+    if ((p.featureCode ?? "") === "PPLX") continue;
+    const k = adminKey3(p);
+    if (!k) continue;
+    const prev = townByAdmin3.get(k);
+    if (!prev || (p.population ?? 0) > (prev.population ?? 0)) townByAdmin3.set(k, p);
+  }
+
   // Liefert für einen Place den Namen der zuständigen Gemeinde:
   //   - Wenn der Place selbst ein PPLA-*-/PPLC ist → eigener Name (er ist
   //     selbst der Gemeindesitz)
@@ -188,6 +209,30 @@ async function main() {
     if (k) {
       const seat = seatByAdminKey.get(k);
       if (seat) return seat.name;
+    }
+    /**
+     * Zweite Stufe: über admin3 (die GEMEINDE) statt admin4.
+     *
+     * Ohne diese Stufe bekamen Stops in Rom als Stadt „Campitelli", „Celio"
+     * oder „Centro Storico" — das sind Rioni, also Stadtbezirke. Der Grund
+     * steht in den Daten: Rom selbst ist ein `PPLC` mit admin3=058091 und
+     * OHNE admin4; seine Rioni sind `PPLX` mit demselben admin3 und einem
+     * eigenen admin4=05809101. Ein `PPLA4`-Gemeindesitz zu diesem admin4
+     * existiert nicht, also blieb der Bezirksname stehen.
+     *
+     * In Italien ist admin3 der ISTAT-Code der Gemeinde — alle Rioni Roms
+     * teilen ihn mit Rom. Dasselbe Muster tragen andere Großstädte mit
+     * Bezirksgliederung. Gesucht wird deshalb der größte Ort mit derselben
+     * admin1/2/3-Kennung, der selbst kein Bezirk ist; das ist verlässlich die
+     * Gemeinde.
+     *
+     * Ohne Wirkung, wo Stufe 1 schon greift (Deutschland, Österreich): Dort
+     * gibt es die PPLA4-Sitze, und die werden oben gefunden.
+     */
+    const k3 = adminKey3(p);
+    if (k3) {
+      const town = townByAdmin3.get(k3);
+      if (town) return town.name;
     }
     return p.name;
   }

@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { locations, providerResponses, searchRequests, searchResults } from "../db/schema.js";
 import type { TravelMode } from "../db/schema.js";
@@ -12,13 +12,22 @@ import type {
   SearchProvider,
 } from "../providers/types.js";
 import { sha256 } from "../util/hash.js";
-import { issueRedirectToken } from "./tokenService.js";
+import { issueRedirectToken, issueRedirectTokens } from "./tokenService.js";
 import { enqueueRefresh as enqueueDbVendoRefresh } from "./dbVendoQueue.js";
 
 export interface SearchInput extends ProviderSearchInput {
   mode: TravelMode;
   ip?: string;
   nocache?: boolean;
+  /**
+   * true = bei null Treffern auf die nächstgelegenen Flughäfen ausweichen.
+   *
+   * Bewusst NICHT automatisch: Wer „Bern" sucht, soll nicht stillschweigend
+   * Basler Flüge untergeschoben bekommen. Der Client sagt zuerst, dass es für
+   * die gewählte Strecke nichts gibt, und fragt hiermit erst nach, wenn der
+   * Nutzer die Alternativen ausdrücklich möchte.
+   */
+  allowNearby?: boolean;
 }
 
 export interface ClientResult {
@@ -231,22 +240,34 @@ async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
 
   if (rows.length === 0) return null;
 
-  const out: ClientResult[] = [];
-  for (const row of rows) {
-    const token = await issueRedirectToken(row.id, row.deepLink, {
-      // bookingToken aus dem persistierten Result → Cache-Hits können auch
-      // den Direct-Purchase-Flow (SerpAPI 2nd-stage) bedienen.
-      bookingToken: row.bookingToken ?? undefined,
-      bookingContext: {
-        mode: row.mode,
-        origin: input.origin,
-        destination: input.destination,
-        departDate: input.departDate,
-        returnDate: input.returnDate,
-        passengers: input.passengers,
-        currency: input.currency,
+  // Alle Token in EINEM Insert statt einem pro Treffer — siehe
+  // issueRedirectTokens. Vorher war selbst ein Cache-Treffer langsam, weil er
+  // pro Zeile eine eigene Runde zur Datenbank drehte.
+  const tokens = await issueRedirectTokens(
+    rows.map((row) => ({
+      resultId: row.id,
+      deepLink: row.deepLink,
+      opts: {
+        // bookingToken aus dem persistierten Result → Cache-Hits können auch
+        // den Direct-Purchase-Flow (SerpAPI 2nd-stage) bedienen.
+        bookingToken: row.bookingToken ?? undefined,
+        bookingContext: {
+          mode: row.mode,
+          origin: input.origin,
+          destination: input.destination,
+          departDate: input.departDate,
+          returnDate: input.returnDate,
+          passengers: input.passengers,
+          currency: input.currency,
+        },
       },
-    });
+    })),
+  );
+
+  const out: ClientResult[] = [];
+  for (let ri = 0; ri < rows.length; ri++) {
+    const row = rows[ri]!;
+    const token = tokens[ri]!;
     out.push({
       id: row.id,
       mode: row.mode,
@@ -546,26 +567,36 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
       )
       .returning();
 
+    // EIN Insert für alle Token (siehe issueRedirectTokens) — vorher eine
+    // Datenbank-Runde pro Treffer, bei 190 Flügen rund zehn Sekunden.
+    const tokens = await issueRedirectTokens(
+      inserted.map((row, i) => ({
+        resultId: row.id,
+        deepLink: row.deepLink,
+        opts: {
+          bookingToken: outboundCandidates[i]?.result?.bookingToken,
+          bookingContext: {
+            mode: row.mode,
+            origin: input.origin,
+            destination: input.destination,
+            departDate: input.departDate,
+            returnDate: input.returnDate,
+            passengers: input.passengers,
+            currency: input.currency,
+            // Für den Zug-Direkt-Buchungslink („Reise teilen"): Station-Namen +
+            // die konkrete Verbindungs-Abfahrt als hinfahrtDatum.
+            originLabel: input.originLabel,
+            destLabel: input.destLabel,
+            departTime: row.departTime.toISOString(),
+          },
+        },
+      })),
+    );
+
     for (let i = 0; i < inserted.length; i++) {
       const row = inserted[i]!;
+      const token = tokens[i]!;
       const candidate = outboundCandidates[i]?.result;
-      const token = await issueRedirectToken(row.id, row.deepLink, {
-        bookingToken: candidate?.bookingToken,
-        bookingContext: {
-          mode: row.mode,
-          origin: input.origin,
-          destination: input.destination,
-          departDate: input.departDate,
-          returnDate: input.returnDate,
-          passengers: input.passengers,
-          currency: input.currency,
-          // Für den Zug-Direkt-Buchungslink („Reise teilen"): Station-Namen +
-          // die konkrete Verbindungs-Abfahrt als hinfahrtDatum.
-          originLabel: input.originLabel,
-          destLabel: input.destLabel,
-          departTime: row.departTime.toISOString(),
-        },
-      });
       flatResults.push({
         id: row.id,
         mode: row.mode,
@@ -733,9 +764,91 @@ function applyRequestedTime(out: SearchOutput, rawInput: SearchInput): SearchOut
   return results.length > 0 ? { ...out, results } : out;
 }
 
+/** Wie weit ein Ausweich-Flughafen höchstens entfernt sein darf. */
+const NEARBY_MAX_KM = 150;
+/** Wie viele Ausweich-Flughäfen höchstens probiert werden. */
+const NEARBY_MAX_TRIES = 2;
+
+/**
+ * Nächstgelegene Flughäfen zu einem Code — Luftlinie, aufsteigend.
+ *
+ * Rechnung in SQL, weil die Tabelle für alle 390 Flughäfen Koordinaten hat und
+ * ein einzelner Roundtrip billiger ist als 390 Zeilen zu laden.
+ */
+async function nearbyAirports(code: string): Promise<{ code: string; label: string }[]> {
+  const rows = await db.execute(sql`
+    WITH origin AS (
+      SELECT latitude AS lat, longitude AS lng FROM ${locations}
+      WHERE code = ${code} AND type = 'FLIGHT' AND latitude IS NOT NULL
+    )
+    SELECT l.code, l.label
+    FROM ${locations} l, origin o
+    WHERE l.type = 'FLIGHT'
+      AND l.latitude IS NOT NULL
+      AND l.code <> ${code}
+      AND 6371 * acos(least(1, cos(radians(o.lat)) * cos(radians(l.latitude))
+            * cos(radians(l.longitude) - radians(o.lng))
+          + sin(radians(o.lat)) * sin(radians(l.latitude)))) <= ${NEARBY_MAX_KM}
+    ORDER BY 6371 * acos(least(1, cos(radians(o.lat)) * cos(radians(l.latitude))
+            * cos(radians(l.longitude) - radians(o.lng))
+          + sin(radians(o.lat)) * sin(radians(l.latitude)))) ASC
+    LIMIT ${NEARBY_MAX_TRIES}
+  `);
+  const list = (rows as unknown as { rows?: unknown[] }).rows ?? (rows as unknown as unknown[]);
+  return (list as { code: string; label: string }[]).filter((r) => r?.code && r?.label);
+}
+
+/**
+ * Findet die Suche zu einem Flughafen NICHTS, wird bei den nächstgelegenen
+ * Flughäfen nachgesehen.
+ *
+ * Hintergrund: Ein Teil der angebotenen Flughäfen hat schlicht keinen
+ * Linienverkehr, den unsere Datenquelle kennt — nachgemessen an allen 390
+ * Einträgen sind es 19, darunter Bern und Lugano (beide auch nach Frankfurt UND
+ * London konstant leer, also nicht bloß eine fehlende Einzelstrecke). Wer „Bern"
+ * eingibt, bekam damit garantiert null Treffer, während andere Portale Flüge
+ * zeigen — die suchen nämlich die REGION und nicht den einen Flugplatz.
+ *
+ * Die Treffer tragen den Code und das Label des tatsächlichen Flughafens, nicht
+ * den eingegebenen. Wer von Bern sucht, sieht also ehrlich „Zürich (ZRH)" auf der
+ * Karte und nicht etwa Bern.
+ */
+async function searchNearbyFallback(rawInput: SearchInput): Promise<SearchOutput | null> {
+  const alts = await nearbyAirports(rawInput.origin).catch(() => []);
+  if (alts.length === 0) return null;
+
+  // NACHEINANDER, nicht parallel — und beim ersten Treffer aufhören.
+  //
+  // Parallel wäre ein paar Sekunden schneller, würde aber IMMER beide Suchen
+  // ausführen, also jedes Mal die doppelte Last bei der Datenquelle erzeugen.
+  // In der Praxis liefert schon der nächstgelegene Flughafen (Bern → Basel,
+  // 77 km) Ergebnisse; die zweite Suche liefe fast immer umsonst mit. Der
+  // Nutzer hat diesen Weg ohnehin ausdrücklich angefordert und wartet bereits
+  // — ein paar Sekunden mehr wiegen weniger als dauerhaft doppelte Anfragen.
+  for (const alt of alts) {
+    const out = await runSearchUncut({
+      ...rawInput,
+      origin: alt.code,
+      originLabel: alt.label,
+    }).catch(() => null);
+    if (out && out.results.length > 0) return out;
+  }
+  return null;
+}
+
 export async function runSearch(rawInput: SearchInput): Promise<SearchOutput> {
   const out = await runSearchUncut(rawInput);
-  return applyRequestedTime(out, rawInput);
+  const primary = applyRequestedTime(out, rawInput);
+  if (rawInput.mode !== "FLIGHT" || primary.results.length > 0) return primary;
+
+  if (!rawInput.allowNearby) return primary;
+
+  const fallback = await searchNearbyFallback(rawInput);
+  if (!fallback) return primary;
+  console.log(
+    `[flights] ${rawInput.origin} ohne Treffer — ausgewichen auf ${fallback.results[0]?.origin ?? "?"} (${fallback.results.length} Treffer)`,
+  );
+  return applyRequestedTime(fallback, rawInput);
 }
 
 async function runSearchUncut(rawInput: SearchInput): Promise<SearchOutput> {

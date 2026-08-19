@@ -1,0 +1,11 @@
+{
+  "// Binch ist ein React-Native/Expo-Projekt (JS/TS)": "Die Red-Hat-Java-Extension soll NICHT versuchen, das native android/-Gradle-Projekt zu importieren — das erzeugt sonst Falsch-Fehler wie 'Plugin com.android.library not found'. Der echte Build läuft über die CLI (cd android && ./gradlew assembleDebug) und funktioniert. Native Builds nie über die IDE-Gradle-Sync.",
+  "java.import.gradle.enabled": false,
+  "java.import.maven.enabled": false,
+  "java.configuration.updateBuildConfiguration": "disabled",
+  "java.import.exclusions": [
+    "**/android/**",
+    "**/node_modules/**",
+    "**/ios/**"
+  ]
+}

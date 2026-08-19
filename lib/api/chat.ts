@@ -10,7 +10,7 @@
  * AbortController: XHR hat `abort()` direkt; wir bridgen den AbortSignal
  * darauf.
  */
-import { API_BASE_URL } from "./client";
+import { API_BASE_URL, type StopBoardResponse } from "./client";
 import type { SearchResult } from "@/types/search";
 
 export type ChatMood = "idle" | "waving" | "thinking" | "talking" | "happy" | "error";
@@ -40,8 +40,21 @@ export type ChatStreamEvent =
   | { type: "mood"; mood: ChatMood }
   | { type: "text"; delta: string }
   | { type: "tool_use"; name: string }
-  | { type: "search_result"; result: SearchResult; params: LastSearchParams }
-  | { type: "stop_board"; stop: { code: string; label: string }; board: "departures" | "arrivals" }
+  | {
+      type: "search_result";
+      result: SearchResult;
+      params: LastSearchParams;
+      /** Bei mehrteiligen Reisen: das Bein, auf das sich „speichern"/„alle
+       *  Treffer" beziehen. Fehlt bei einer einfachen Suche. */
+      isMain?: boolean;
+    }
+  | {
+      type: "stop_board";
+      stop: { code: string; label: string };
+      board: "departures" | "arrivals";
+      /** Bereits vom Server geladene Tafel — spart die eigene Abfrage. */
+      data?: StopBoardResponse;
+    }
   | {
       type: "action";
       action: "save_trip" | "unsave_trip" | "open_results";

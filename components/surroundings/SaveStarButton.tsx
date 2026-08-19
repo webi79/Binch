@@ -32,6 +32,7 @@ import Animated, {
 import Svg, { Circle, Defs, LinearGradient, Path, RadialGradient, Stop } from "react-native-svg";
 import { haptic } from "@/lib/haptics";
 import { useAccent, type AccentPalette } from "@/lib/theme/accent";
+import { subscribeSheetMoving } from "@/lib/nav/searchHandoff";
 import { scaledStyles } from "@/lib/ui/compact";
 
 // Stern-Pfad (viewBox 0 0 24 24)
@@ -199,6 +200,29 @@ export function SaveStarButton({ size = 46, starSize = 30, saved: savedProp, onC
       if (burstTimer.current) clearTimeout(burstTimer.current);
     };
   }, []);
+
+  /**
+   * Funken weg, sobald ein Blatt fährt.
+   *
+   * Sie leben 1,4 Sekunden — lang genug, dass die üblichen Wege sie mitnehmen:
+   * Stern antippen, dann eine Zeile wählen, und die Ausfahrt läuft, während 15
+   * SVG-Pfade animiert werden. Animierte SVG-Eigenschaften machen die ganze
+   * Fläche ungültig (dazu gibt es hier eigene Notizen), und die Fläche ist in
+   * dem Moment das bildschirmfüllende Blatt, das als Textur gehalten wird —
+   * die müsste damit in jedem Bild der Fahrt neu entstehen.
+   *
+   * Der Stern selbst behält seinen Zustand; nur der Nachschlag entfällt. Zu
+   * sehen ist davon nichts: Die Bewegung verdeckt ihn ohnehin.
+   */
+  useEffect(
+    () =>
+      subscribeSheetMoving((on) => {
+        if (!on) return;
+        if (burstTimer.current) clearTimeout(burstTimer.current);
+        setBurst((b) => (b === null ? b : null));
+      }),
+    [],
+  );
 
   const handlePress = useCallback(() => {
     const willSave = !saved;

@@ -117,3 +117,47 @@ Oder als Container: `Dockerfile` ist im Repo. Beispiel (Fly.io / Railway):
 docker build -t binch-server .
 docker run -p 3000:3000 --env-file .env binch-server
 ```
+
+## Anmeldung über Apple und Google
+
+Der Endpunkt `POST /api/auth/oauth` nimmt ein **ID-Token** des Anbieters
+entgegen und prüft es gegen dessen öffentlichen Schlüsselsatz
+(`src/services/oauthVerify.ts`). Ohne Konfiguration antwortet er mit `503` —
+lieber gar keine Anmeldung als eine ungeprüfte.
+
+### Umgebungsvariablen (`server/.env`)
+
+```bash
+# Kommagetrennt. ALLE Client-IDs, die zu dieser App gehören — Google vergibt
+# pro Plattform eine eigene, und das Token trägt die der Plattform, auf der es
+# entstanden ist. Es dürfen nur die eigenen drinstehen: Diese Liste ist die
+# Prüfung, die verhindert, dass ein gültiges Token einer FREMDEN App als
+# Anmeldung durchgeht.
+GOOGLE_CLIENT_IDS=1234-android.apps.googleusercontent.com,1234-ios.apps.googleusercontent.com
+
+# Für Apple die Bundle-ID der App (bei nativer Anmeldung ist sie der Empfänger).
+APPLE_CLIENT_IDS=com.binch.mobile
+```
+
+Dieselben IDs müssen auf der Client-Seite stehen (`app.config.js` → `extra`),
+gefüllt aus `GOOGLE_CLIENT_ID_ANDROID`, `GOOGLE_CLIENT_ID_IOS`,
+`GOOGLE_CLIENT_ID_WEB`. Fehlen sie dort, blendet der Anmelde-Bildschirm den
+Knopf aus, statt einen anzubieten, der nicht funktioniert.
+
+### Was der Endpunkt tut
+
+1. Prüft Signatur, Aussteller (`iss`), Empfänger (`aud`) und Gültigkeit.
+2. Sucht die Verknüpfung über `(provider, sub)` — **nie** über die E-Mail.
+3. Ist sie neu und meldet der Anbieter die E-Mail als **bestätigt**, hängt er
+   sie an ein bestehendes Konto mit dieser Adresse. Ohne Bestätigung nicht —
+   das wäre sonst eine Konto-Übernahme.
+4. Sonst legt er ein Konto ohne Passwort an (`password_hash` ist `NULL`).
+
+### Migration
+
+`src/db/migrations/0013_*.sql` legt `user_identities` an und macht
+`users.password_hash` nullable. Vor dem Start einspielen:
+
+```bash
+npm run db:migrate
+```

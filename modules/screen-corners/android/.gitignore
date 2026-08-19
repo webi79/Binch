@@ -1,0 +1,8 @@
+# Gradle-/Build-Output des screen-corners Native-Moduls.
+# Wird bei JEDEM (Release-)Build neu erzeugt und gehört nie ins Repo — sonst
+# tauchen nach jedem Build hunderte/tausende Artefakt-Dateien als „pending
+# changes" auf (genau das war passiert). Der Root-.gitignore-Eintrag `/android`
+# deckt nur den CNG-Root-Ordner ab, nicht diesen verschachtelten Modul-Pfad.
+build/
+.gradle/
+.cxx/

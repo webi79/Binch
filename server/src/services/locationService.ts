@@ -194,6 +194,38 @@ async function searchLocalDb(
   //   - Label „Wien Blumental"    → Score 1 (nur „wien")
   // Damit kann der prominente Hauptbahnhof nicht durch kürzeren Tiebreaker
   // von z.B. „Wien Blumental" überholt werden.
+  /**
+   * GANZE Wörter, in Label ODER Stadt. Läuft VOR der Teilstring-Wertung.
+   *
+   * Die Wertung darunter sucht mit `%wort%`, also mitten im Wort. Bei einer
+   * kuratierten Liste ging das durch; mit allen Flughäfen weltweit nicht mehr:
+   * Auf „Rome" zählten „Romeu Zema" (Brasilien), „Split Saint Jerome" und
+   * „…Óscar Arnulfo Romero…" als Treffer und standen damit vor Rom Ciampino —
+   * das aus der Liste komplett verschwand, obwohl sein Stadtfeld exakt „Rome"
+   * lautet. Es stand nur nicht im NAMEN, und die Stadt kam in der Wertung gar
+   * nicht vor.
+   *
+   * `\m` und `\M` sind Postgres' Wortgrenzen. Wichtig ist die Grenze auf
+   * BEIDEN Seiten: Nur links gesetzt, wäre „Romeu" weiterhin ein Treffer.
+   *
+   * Diese Stufe kann die vorhandene Reihenfolge nicht durcheinanderbringen,
+   * denn sie ist ein reiner Zugewinn: Tippt jemand noch („Frankf"), trifft sie
+   * nirgends, alle Zeilen stehen gleich, und es entscheidet die Kette darunter
+   * genau wie vorher. Sie schlägt nur an, wenn ein Wort wirklich fertig
+   * getippt ist — und dann ist Vorziehen immer richtig.
+   */
+  const escapeRe = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const wholeWordParts = words.map((word) => {
+    const variants = SYNONYMS[word] ?? [word];
+    const ors = variants.flatMap((v) => {
+      const re = `\\m${escapeRe(v)}\\M`;
+      return [sql`${locations.label} ~* ${re}`, sql`${locations.city} ~* ${re}`];
+    });
+    return sql`(CASE WHEN ${sql.join(ors, sql` OR `)} THEN 1 ELSE 0 END)`;
+  });
+  const wholeWordScore =
+    wholeWordParts.length > 0 ? sql.join(wholeWordParts, sql` + `) : sql`0`;
+
   const labelWordScoreParts = words.map((word) => {
     const variants = SYNONYMS[word] ?? [word];
     const ors = variants.map((v) => sql`${locations.label} ILIKE ${`%${v}%`}`);
@@ -206,6 +238,31 @@ async function searchLocalDb(
       ? sql.join(labelWordScoreParts, sql` + `)
       : sql`0`;
 
+  /**
+   * Größenklasse der Flughäfen (LARGE/MEDIUM/SMALL, aus OurAirports).
+   *
+   * Steht zweimal in der Sortierung, und das ist Absicht:
+   *
+   * Im FLUG-Modus früh, direkt nach der Ganzwort-Stufe. Dort besteht die
+   * Trefferliste ausschließlich aus Flughäfen, also kann die Größe gefahrlos
+   * vor der Namens-Wertung entscheiden — und sie MUSS es, sonst gewinnt der
+   * Name über die Bedeutung: „Paris-Le Bourget" (Geschäftsflieger) stand vor
+   * Charles de Gaulle und „New York Stewart" vor JFK, jeweils nur, weil der
+   * gesuchte Ortsname zufällig im Flughafennamen steht und bei den großen
+   * nicht.
+   *
+   * In allen anderen Modi spät. Früh wäre dort schädlich: Zeilen ohne
+   * Größenangabe — also jeder Bahnhof und jede Haltestelle — fallen in die
+   * Klasse 0, ein mittelgroßer Flughafen läge damit hinter sämtlichen
+   * Bushaltestellen der Stadt.
+   */
+  const sizeRank = sql`CASE ${locations.subtype}
+        WHEN 'LARGE' THEN 0
+        WHEN 'MEDIUM' THEN 1
+        WHEN 'SMALL' THEN 2
+        ELSE 0
+      END`;
+
   const rows = await db
     .select()
     .from(locations)
@@ -214,6 +271,10 @@ async function searchLocalDb(
       // 1. Type=ALL mit exaktem Label-Match: das ist DIE Stadt selbst — IMMER
       //    ganz oben.
       sql`CASE WHEN ${locations.type} = 'ALL' AND LOWER(${locations.label}) = ${fullQuery} THEN 0 ELSE 1 END`,
+      // 1.5 GANZE Wörter in Label oder Stadt — siehe `wholeWordScore`.
+      sql`(${wholeWordScore}) DESC`,
+      // 1.6 Nur im Flug-Modus: Größe schlägt Namensähnlichkeit — siehe `sizeRank`.
+      ...(type === "FLIGHT" ? [sizeRank] : []),
       // 2. ALLE Query-Wörter im LABEL — verhindert dass „Wien Blumental" über
       //    „Wien Hauptbahnhof" gerankt wird (beide haben „wien", aber nur
       //    Hauptbahnhof matched auch „hbf"/„hauptbahnhof"). DESC: mehr Wörter
@@ -247,7 +308,19 @@ async function searchLocalDb(
       sql`CASE WHEN ${locations.label} ILIKE ${prefixLabelLike} THEN 0
                WHEN ${locations.city} ILIKE ${prefixCityLike} THEN 1
                ELSE 2 END`,
-      // 8. Tiebreaker: kürzeres Label
+      // 8. Unter Flughäfen: Größe vor Namenslänge.
+      //
+      // Ohne diese Stufe entschied direkt darunter „kürzeres Label gewinnt",
+      // und das ist bei Flughäfen schlicht das falsche Kriterium: Auf „London"
+      // stand damit „London City Airport (LCY)" vor „London Heathrow Airport
+      // (LHR)" — der kleinere Flughafen zuerst, nur weil sein Name kürzer ist.
+      // Aufgefallen ist es erst, als die Liste von 391 kuratierten auf alle
+      // 4163 Flughäfen mit Linienverkehr wuchs; vorher war das Feld zu dünn
+      // besetzt, um sich zu widersprechen. Zeilen ohne Größenangabe (alles
+      // außer FLIGHT) landen einheitlich in derselben Klasse und werden von
+      // dieser Stufe damit nicht umsortiert.
+      sizeRank,
+      // 9. Tiebreaker: kürzeres Label
       sql`length(${locations.label}) asc`,
     )
     .limit(limit);

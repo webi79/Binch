@@ -28,16 +28,22 @@ import {
   Keyboard,
   ActivityIndicator,
   BackHandler,
-  useWindowDimensions,
+  Dimensions,
 } from "react-native";
 import { useAppBg, usePalette } from "@/lib/theme/appBg";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useIsFocused } from "@react-navigation/native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { keyboardHeight } from "@/lib/nav/keyboardHeight";
+import {
+  appendStreamText,
+  peekStreamText,
+  subscribeStreamText,
+  takeStreamText,
+} from "@/lib/assistant/streamText";
 import Animated, {
   Extrapolation,
   interpolate,
-  useAnimatedKeyboard,
   useAnimatedStyle,
   useSharedValue,
   withDelay,
@@ -48,6 +54,7 @@ import Animated, {
   cancelAnimation,
   useAnimatedScrollHandler,
   useDerivedValue,
+  runOnUI,
   type SharedValue,
 } from "react-native-reanimated";
 import { Send, Mic, AlertTriangle, RotateCw, X } from "lucide-react-native";
@@ -73,11 +80,12 @@ import { haptic } from "@/lib/haptics";
 import { ScreenHeading, HEADING_LINE_HEIGHT } from "@/components/ui/ScreenHeading";
 import { GUTTER, HEADING_TOP } from "@/lib/theme/spacing";
 import { useSearchStore } from "@/stores/searchStore";
+import { type StopBoardResponse } from "@/lib/api/client";
 import { streamChat, todayLocal, ChatApiError, type ChatStreamEvent, type LastSearchParams } from "@/lib/api/chat";
 import { pickWelcome } from "@/lib/assistant/welcomes";
 import { StopBoardCard } from "@/components/assistant/StopBoardCard";
 import type { SearchResult } from "@/types/search";
-import { scaledStyles } from "@/lib/ui/compact";
+import { ms, scaledStyles } from "@/lib/ui/compact";
 
 // expo-speech-recognition optional laden — fehlt in Expo Go ohne Dev-Client.
 let ExpoSpeechRecognitionModule: any = null;
@@ -121,6 +129,8 @@ type Msg =
       kind: "board";
       stop: { code: string; label: string };
       board: "departures" | "arrivals";
+      /** Vom Server schon geladen — die Karte holt dann nicht selbst. */
+      data?: StopBoardResponse;
       botId: string;
     }
   | { id: string; kind: "action"; params: LastSearchParams; botId: string }
@@ -152,6 +162,41 @@ type Msg =
  *    frisch sein — sonst belastet alter Kontext den nächsten Cold-Start).
  *  - Reine In-Memory-Persistenz reicht für den Tab-Wechsel-Use-Case.
  */
+/**
+ * Die Fahrstrecke EINMAL beim Laden, aus der Fenster-Höhe.
+ *
+ * Vorher `useWindowDimensions()`. Beide Hälften davon waren falsch, und
+ * `lib/nav/sheetSlide.ts` schreibt beide ausdrücklich anders vor:
+ *
+ *  - LAUFEND gelesen schrumpft der Wert unter `adjustResize` mit der Tastatur.
+ *    Genau die wird beim Schließen heruntergefahren — die verbleibende Strecke
+ *    `(1-p) * screenH` sprang also mitten in der Ausfahrt um die Tastaturhöhe.
+ *  - Und jedes Maß-Ereignis rendert dabei den GANZEN Bildschirm neu, samt aller
+ *    gemounteten Zeilen. Bei vollem Verlauf sind das Dutzende.
+ *
+ * Die Ausrichtung ist auf Hochkant festgelegt (`app.config.js`), der Wert
+ * ändert sich also auch sonst nicht.
+ */
+const PARK_Y = Dimensions.get("window").height;
+
+/**
+ * Takt des Text-Puffers — 100ms statt 50.
+ *
+ * Jeder Durchgang ist nicht bloß ein `setState`: Der Text der laufenden Blase
+ * ändert sich, Yoga zieht den Inhalts-Behälter der Liste durch, und dabei
+ * bekommt JEDES Kind `hasNewLayout` gesetzt — auch bei unverändertem Maß, der
+ * Fall wird bewusst nicht verglichen. Daraus wird ein `onLayout` pro
+ * gemounteter Zeile, und in jedem davon steckten zwei Schreibzugriffe über die
+ * Laufzeit-Grenze. Die Kosten eines Durchgangs wachsen also mit dem Verlauf,
+ * und sie fielen zwanzigmal pro Sekunde an — das ist der Grund, warum sich
+ * schon der Sprung von zwei auf drei Nachrichten anfühlt.
+ *
+ * Zehn Aktualisierungen pro Sekunde sind für den Lesefluss weiterhin nicht von
+ * einem Zeichenstrom zu unterscheiden; jede Chat-Oberfläche liegt in dieser
+ * Gegend. Die Hälfte der Arbeit fällt damit ersatzlos weg.
+ */
+const TEXT_FLUSH_MS = 100;
+
 let persistedMessages: Msg[] = [];
 let persistedMood: BoMood = "waving";
 /**
@@ -200,7 +245,6 @@ export default function AssistantScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const isFocused = useIsFocused();
-  const { height: screenH } = useWindowDimensions();
 
   /**
    * Erst zurückfahren, dann zurücknavigieren.
@@ -213,10 +257,82 @@ export default function AssistantScreen() {
    * `closingRef` fängt den zweiten Druck ab: Ohne ihn setzt jeder weitere Tipper
    * eine neue Gegenbewegung an und schiebt die Rückkehr weiter nach hinten.
    */
+  /**
+   * Stil-Objekte EINMAL, nicht bei jedem Durchgang neu.
+   *
+   * Die beiden ersten sitzen auf ANIMIERTEN Knoten, und dort ist ein frisches
+   * Objekt nicht bloß Arbeit für den Vergleicher: Es ist ein Fabric-Commit auf
+   * genau dem Knoten, den Reanimated gerade Bild für Bild beschreibt. Der
+   * Bildschirm rendert währenddessen aus mehreren Gründen neu — Scrollbeginn
+   * und -ende, gemessene Leistenhöhe, jede Nachricht —, und jedes Mal liefen
+   * diese Literale gegen die laufende Bewegung.
+   */
+  const screenShellStyle = useMemo(
+    () => ({
+      backgroundColor: palette.bg,
+      borderRadius: SCREEN_CORNER_RADIUS,
+      elevation: 24,
+    }),
+    [palette.bg],
+  );
+  const inputbarWrapStyle = useMemo(() => ({ backgroundColor: appBg }), [appBg]);
+  const closeBtnStyle = useMemo(
+    () => [styles.closeBtn, { backgroundColor: palette.s2 }],
+    [palette.s2],
+  );
+
   const closingRef = useRef(false);
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Das Bild Vorlauf der Ausfahrt — muss beim Abbau mit weg, sonst stellt es
+   *  danach noch einen Wecker, der irgendwohin zurücknavigiert. */
+  const closeRafRef = useRef<number | null>(null);
+  /**
+   * Was das Schließen kostet, passiert schon beim BERÜHREN des Knopfes.
+   *
+   * Derselbe Weg wie im Ortswähler, wo er ausführlich begründet steht: Zwischen
+   * Aufsetzen und Loslassen liegen 80 bis 150ms, die ohnehin verstreichen. Zwei
+   * Dinge gehören dorthin und nicht in den Start der Ausfahrt:
+   *
+   *  - Die GPU-Textur. Ihr Aufbau ist im Projekt mit 66ms vermessen, bei einem
+   *    Bildbudget von 8,3ms. Bisher kippte sie im selben Commit wie die Kurve
+   *    und fiel damit in deren erste Bilder.
+   *  - Das Schließen der Tastatur. Unter `adjustResize` verkleinert das das
+   *    Fenster und erzwingt eine Neuvermessung des GESAMTEN Baums — und der
+   *    enthält jede gemountete Nachrichten-Zeile. Genau deshalb wird das
+   *    Schließen mit dem Verlauf immer schlechter.
+   *
+   * Die Textur beim Aufsetzen (kostenlos, jederzeit zurücknehmbar), die
+   * Tastatur erst im gedrückten Zustand — ein abgebrochener Tipp soll sie nicht
+   * schließen.
+   */
+  const disarmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const armClose = useCallback(() => {
+    if (disarmTimerRef.current) {
+      clearTimeout(disarmTimerRef.current);
+      disarmTimerRef.current = null;
+    }
+    setClosing(true);
+    // Bo hält auch schon an. Sonst fällt sein Anhalten — Abbruch von 15 Werten,
+    // Neustart von nichts, aber ein Render des ganzen Bildschirms — in genau
+    // den Durchgang, in dem die Ausfahrt losläuft.
+    setSliding(true);
+  }, []);
+  const disarmClose = useCallback(() => {
+    if (disarmTimerRef.current) clearTimeout(disarmTimerRef.current);
+    // Mit Abstand: Beim echten Tipp läuft `onPressOut` VOR `onPress`, ein
+    // sofortiges Zurücknehmen würde die Textur also genau dem Fall wegnehmen,
+    // für den sie angelegt wurde.
+    disarmTimerRef.current = setTimeout(() => {
+      disarmTimerRef.current = null;
+      if (closingRef.current) return;
+      setClosing(false);
+      setSliding(false);
+    }, 400);
+  }, []);
   useEffect(() => () => {
     if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
+    if (disarmTimerRef.current) clearTimeout(disarmTimerRef.current);
+    if (closeRafRef.current !== null) cancelAnimationFrame(closeRafRef.current);
   }, []);
   const closeScreen = useCallback(() => {
     if (closingRef.current) return;
@@ -269,18 +385,46 @@ export default function AssistantScreen() {
       clearTimeout(windowTimerRef.current);
       windowTimerRef.current = null;
     }
-    // Siehe `kbFreeze`: ab hier steht die Tastatur-Zahl still.
-    kbFreeze.value = kbShift.value;
-    endAssistantPush();
-    setSliding(true);
-    setClosing(true);
-    closeTimerRef.current = setTimeout(() => {
-      // Kein `canGoBack`-Zweig mehr nötig? Doch: Wer über eine Verknüpfung
-      // direkt hier landet, hat keine Vorgeschichte zum Zurückgehen.
-      if (router.canGoBack()) router.back();
-      else router.navigate("/");
-    }, ASSISTANT_OUT.duration);
-  }, [router]);
+    /**
+     * Siehe `kbFreeze`: ab hier steht die Tastatur-Zahl still — aber das
+     * Ablesen gehört auf den UI-Strang.
+     *
+     * `kbShift.value` aus React zu lesen ist in Reanimated 4 ein SYNCHRONER
+     * Sprung in die UI-Laufzeit, der beide Stränge gegeneinander sperrt. Genau
+     * das verbieten die Notizen in `overlayCover.ts` an zwei Stellen wörtlich,
+     * und hier lag es im Berührungs-Bild des Schließens — direkt vor dem Start
+     * der Ausfahrt. Als Worklet gelesen und geschrieben passiert beides dort,
+     * wo die Werte ohnehin leben.
+     */
+    runOnUI(() => {
+      "worklet";
+      kbFreeze.value = kbShift.value;
+    })();
+    // Falls über die Zurück-Geste gekommen: die Vorarbeit nachholen, sie hat
+    // dort keinen Berührungs-Moment. Beim X-Knopf ist das ein No-Op.
+    armClose();
+    /**
+     * EIN Bild dazwischen, dann fahren — wie bei jeder anderen Fahrt der App.
+     *
+     * `useSheetSlide` schiebt zwischen Anmelden und Losfahren bewusst ein Bild
+     * ein, und der Kommentar dort sagt auch, warum die AUSFAHRT das besonders
+     * nötig hat: Sie hatte diesen Vorlauf lange nicht, und genau deshalb war sie
+     * die schlechtere der beiden Richtungen. Hier liegen im Tipp-Durchgang das
+     * Schließen der Tastatur, zwei Zustandswechsel und die Textur — alles das
+     * bekommt jetzt sein eigenes Bild, bevor die Kurve anläuft.
+     */
+    closeRafRef.current = requestAnimationFrame(() => {
+      closeRafRef.current = null;
+      endAssistantPush();
+      closeTimerRef.current = setTimeout(() => {
+        // Kein `canGoBack`-Zweig mehr nötig? Doch: Wer über eine Verknüpfung
+        // direkt hier landet, hat keine Vorgeschichte zum Zurückgehen.
+        if (router.canGoBack()) router.back();
+        else router.navigate("/");
+      }, ASSISTANT_OUT.duration);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [router, armClose]);
 
   /**
    * Die Systemtaste „zurück" nimmt denselben Weg.
@@ -374,6 +518,13 @@ export default function AssistantScreen() {
   // Wir tracken die ID der aktuell streamenden Bot-Message — Text-Deltas
   // landen alle dort. Wenn search_result kommt, hängen wir's an dieselbe ID.
   const streamingBotIdRef = useRef<string | null>(null);
+  /**
+   * Für welche Antwort die Blase schon in der Liste steht.
+   *
+   * Steht bewusst HIER und nicht beim Text-Puffer: Das Aufräumen beim Abbau und
+   * der Abschluss von `send` greifen darauf zu, und beide stehen weiter oben.
+   */
+  const bubbleReadyRef = useRef<string | null>(null);
   /** Siehe `flushText` — hier nur deklariert, damit `send` drankommt. */
   const flushTextRef = useRef<(() => void) | null>(null);
   // Letzte Such-Params aus einem vorherigen Turn — Server ist stateless,
@@ -448,7 +599,25 @@ export default function AssistantScreen() {
 
   /** Für das ausdrückliche Abmelden beim Schließen — siehe `closeScreen`. */
   const chatInputRef = useRef<TextInput>(null);
-  const [inputbarHeight, setInputbarHeight] = useState(64);
+  /**
+   * Der Startwert wird GERECHNET, nicht geraten.
+   *
+   * Hier stand 64. Die Leiste ist aber nie 64 hoch — sie ist oberer Abstand
+   * plus Trennlinie plus Feld plus unterer Abstand, je nach Gerät 79 bis 111.
+   * Die Berichtigung nach der ersten Messung fiel damit IMMER an, und zwar in
+   * den ersten Bildern der Einfahrt. Sie ändert den Innenabstand des
+   * Listeninhalts, und der steht nicht auf Reanimateds Liste der schnellen
+   * Eigenschaften: Das ist ein Yoga-Durchgang über alle gemounteten Zeilen,
+   * genau während die Bewegung jedes Bild braucht — und er wird teurer, je
+   * länger der Verlauf ist.
+   *
+   * Mit der richtigen Zahl greift `Math.abs(h - inputbarHeight) > 1` gar nicht
+   * erst. Bleibt eine Abweichung (anderer Schriftgrad, mehrzeiliges Feld),
+   * berichtigt sie sich wie bisher — nur eben nicht mehr jedes Mal.
+   */
+  const [inputbarHeight, setInputbarHeight] = useState(
+    () => ms(10) + 1 + ms(44) + Math.max(12, insets.bottom + 8),
+  );
   // Tor vor kb.height: 1 = Bar folgt dem Keyboard, 0 = Bar bleibt unten.
   //
   // Nötig, weil useAnimatedKeyboard die Schließ-Transition VERPASST, wenn das
@@ -597,7 +766,36 @@ export default function AssistantScreen() {
    * (`kbLift`). Zwischen beiden kann sich nichts mehr verschieben, und es gibt
    * keinen Wettlauf, den man gewinnen oder verlieren könnte.
    */
-  const kbPad = kbOffset > 0 ? kbOffset + BAR_LIFT_FROM_KB : 0;
+  /**
+   * Der Zuschlag am oberen Ende folgt VERZÖGERT — und das ist der Hebel gegen
+   * „die Tastatur schiebt die Nachrichten ruckelig hoch".
+   *
+   * An dieser Zahl hängt der Innenabstand des Listeninhalts. Ändert er sich,
+   * ändert sich der Inhalts-Container: Die `thread`-Merkschranke bricht, die
+   * Liste rendert komplett neu, Yoga läuft über den ganzen Container, und
+   * JEDE gemountete Zeile bekommt eine neue Lage und meldet sie. Das wächst mit
+   * dem Verlauf — und es fiel bisher exakt in den Moment, in dem die Tastatur
+   * losfährt: `onInputFocus` greift dem echten Wert vor, um den Inhalt
+   * „gemeinsam mit der Tastatur hochwandern" zu lassen.
+   *
+   * Dieser Vorgriff ist seit dem Umbau nicht mehr nötig. Die Bewegung kommt
+   * nicht mehr aus dem Layout, sondern aus dem Transform der Hülle
+   * (`threadShiftStyle`) und läuft bildgenau auf dem UI-Strang. Was dieser
+   * Zuschlag noch leistet, ist allein die SCROLL-STRECKE: Ganz oben angekommen
+   * wären die ältesten Zeilen sonst um die Hebe-Strecke aus dem Bild geschoben
+   * und nicht mehr erreichbar. Und die braucht niemand, solange die Tastatur
+   * noch fährt.
+   *
+   * Also erst danach. 320ms decken die Einblend-Animation ab; schließt sie
+   * vorher wieder, wird der Wecker zurückgenommen und es passiert gar nichts.
+   */
+  const [kbPadOffset, setKbPadOffset] = useState(initialKbHeight);
+  useEffect(() => {
+    if (kbOffset === kbPadOffset) return;
+    const id = setTimeout(() => setKbPadOffset(kbOffset), 320);
+    return () => clearTimeout(id);
+  }, [kbOffset, kbPadOffset]);
+  const kbPad = kbPadOffset > 0 ? kbPadOffset + BAR_LIFT_FROM_KB : 0;
   const contentPaddingBottom = inputbarHeight + MSG_GAP_FROM_BAR;
 
   // Die BAR selbst folgt dem Keyboard FRAME-SYNCED via useAnimatedKeyboard
@@ -609,7 +807,19 @@ export default function AssistantScreen() {
   // zur keyboardDidShow-Höhe (ime - systemBars) auf der die alte Position
   // getunt war. Der BAR_LIFT wird über die ersten 80px eingeblendet statt
   // hart addiert — kein 16px-Hop am Animationsstart.
-  const kb = useAnimatedKeyboard();
+  /**
+   * Die Tastaturhöhe kommt aus dem Wurzel-Layout, nicht aus diesem Bildschirm.
+   *
+   * Der Aufruf stand hier im Render-Körper — also im ersten Durchgang, der
+   * mitten in der laufenden Einfahrt liegt. Die erste Anmeldung erzwingt eine
+   * Neuvermessung des GESAMTEN nativen Baums (Begründung in
+   * `lib/nav/keyboardHeight.ts`), und die wird mit jeder Nachricht teurer, weil
+   * mehr Zeilen gemountet sind. Beim Abbau dasselbe noch einmal, am Ende der
+   * Ausfahrt.
+   *
+   * Angemeldet wird jetzt einmal beim App-Start. Gelesen wird derselbe Wert,
+   * an derselben einen Stelle (`kbShift`) — an der Rechnung ändert sich nichts.
+   */
   const navInset = insets.bottom;
   /**
    * Wie weit Leiste UND Liste der Tastatur folgen — EINE Quelle für beide.
@@ -646,7 +856,7 @@ export default function AssistantScreen() {
   const kbFreeze = useSharedValue(-1);
   const kbShift = useDerivedValue(() => {
     if (kbFreeze.value >= 0) return kbFreeze.value;
-    const kbHeight = kbGate.value === 0 ? 0 : Math.max(0, kb.height.value - navInset);
+    const kbHeight = kbGate.value === 0 ? 0 : Math.max(0, keyboardHeight.value - navInset);
     const lift = interpolate(kbHeight, [0, 80], [0, BAR_LIFT_FROM_KB], Extrapolation.CLAMP);
     return kbHeight + lift;
   });
@@ -935,8 +1145,36 @@ export default function AssistantScreen() {
        * der nächste Aufbau liest.
        */
       if (streamingBotIdRef.current) {
+        /**
+         * ZUERST den Puffer leeren.
+         *
+         * Stücke sammeln sich bis zu `TEXT_FLUSH_MS` an, bevor sie in den
+         * Strom-Speicher wandern. Wer genau in diesem Fenster schließt, verlor
+         * den letzten Satzteil — und zwar nicht nur auf dem Schirm: Der
+         * Modul-Speicher ist die Quelle für den Verlauf, den der NÄCHSTE Turn
+         * an den Server schickt. Bos eigene vorige Antwort wäre dort still
+         * abgeschnitten gewesen.
+         */
+        flushTextRef.current?.();
+        /**
+         * Auch den halben Text retten.
+         *
+         * Er liegt im Strom-Speicher, und die Übernahme läuft über
+         * `setMessages` — nach dem Abbau wirkungslos. Ohne diese Zeilen stünde
+         * beim nächsten Öffnen eine leere Blase da, und im Verlauf an den
+         * Server fehlte die angefangene Antwort ganz.
+         */
+        const streamed = takeStreamText(streamingBotIdRef.current);
+        if (streamed !== null && streamed.length > 0) {
+          persistedMessages = commitBotText(
+            persistedMessages,
+            streamingBotIdRef.current,
+            streamed,
+          );
+        }
         persistedMessages = persistedMessages.filter((m) => m.kind !== "typing");
         persistedMood = "idle";
+        bubbleReadyRef.current = null;
         streamingBotIdRef.current = null;
       }
       /**
@@ -1173,6 +1411,20 @@ export default function AssistantScreen() {
          * einfach stuck": Der eine Fall, für den die Notbremse da ist, hat sie
          * selbst entschärft.
          */
+        /**
+         * Den fertigen Text aus dem Strom-Speicher in die Nachricht übernehmen.
+         *
+         * Hier und nicht bei `done`: Dieser Block läuft am Ende JEDES Turns,
+         * also auch nach einem Fehler und nach einem Abbruch. Was der Nutzer
+         * schon gelesen hat, bleibt damit stehen und geht in den Verlauf ein,
+         * den der nächste Turn an den Server schickt — sonst wäre eine
+         * abgebrochene Antwort für Bo nie passiert.
+         */
+        const streamed = takeStreamText(botId);
+        if (streamed !== null && streamed.length > 0) {
+          setMessages((prev) => commitBotText(prev, botId, streamed));
+        }
+        if (bubbleReadyRef.current === botId) bubbleReadyRef.current = null;
         if (streamingBotIdRef.current === botId) {
           if (busyGuardRef.current) {
             clearTimeout(busyGuardRef.current);
@@ -1218,7 +1470,22 @@ export default function AssistantScreen() {
     const buf = textBufRef.current;
     if (!buf || buf.text.length === 0) return;
     textBufRef.current = null;
-    setMessages((prev) => appendBotText(prev, buf.botId, buf.text));
+    /**
+     * Der Text geht in den Strom-Speicher, NICHT in die Liste.
+     *
+     * Begründung ausführlich in `lib/assistant/streamText.ts`. Kurz: Solange er
+     * in `messages` steht, ist jedes Stück eine Änderung an den Daten der
+     * Liste — und die rendert daraufhin komplett neu, mit Referenz-Wechsel auf
+     * jeder gemounteten Zelle. Zehnmal pro Sekunde, mal Verlaufslänge.
+     *
+     * Die Liste wird nur noch ein einziges Mal pro Antwort angefasst: um die
+     * (leere) Blase anzulegen. Ab da schreibt der Strom an ihr vorbei, und beim
+     * Ende wird der fertige Text übernommen.
+     */
+    appendStreamText(buf.botId, buf.text);
+    if (bubbleReadyRef.current === buf.botId) return;
+    bubbleReadyRef.current = buf.botId;
+    setMessages((prev) => appendBotText(prev, buf.botId, ""));
   }, []);
   flushTextRef.current = flushText;
 
@@ -1235,7 +1502,7 @@ export default function AssistantScreen() {
           if (buf && buf.botId === botId) buf.text += event.delta;
           else textBufRef.current = { botId, text: event.delta };
           if (!flushTimerRef.current) {
-            flushTimerRef.current = setTimeout(flushText, 50);
+            flushTimerRef.current = setTimeout(flushText, TEXT_FLUSH_MS);
           }
           return;
         }
@@ -1243,14 +1510,31 @@ export default function AssistantScreen() {
           // Such-Params merken — der nächste Request schickt sie zurück,
           // damit Tools wie open_all_results den Kontext der vorigen Suche
           // wieder zur Verfügung haben.
-          lastSearchRef.current = event.params;
+          /**
+           * Bei einer mehrteiligen Reise gilt der HAUPTLAUF, nicht das letzte
+           * Bein.
+           *
+           * Der Server schickt pro Bein ein Ereignis, in Reisereihenfolge. Hier
+           * stand ein schlichtes Überschreiben — zuletzt gewann damit der
+           * Zubringer am Ziel, und beim nächsten Zug bezog sich „speicher das"
+           * oder „zeig alle Treffer" auf den Flughafen-Shuttle statt auf den
+           * Flug. Serverseitig war der Hauptlauf längst bestimmt, er stand nur
+           * nicht im Ereignis.
+           *
+           * `isMain` fehlt bei einer einfachen Suche — dort gibt es genau ein
+           * Ergebnis, und das wird wie bisher übernommen.
+           */
+          if (event.isMain !== false) lastSearchRef.current = event.params;
           setMessages((prev) => appendFlightMessage(prev, botId, event.result));
           return;
         case "stop_board":
-          // Stop-Board-Hint vom Server — Karte inline rendern. Die Live-
-          // Daten holt die Karte selbst direkt über /api/stops/:code/{board}.
+          // Der Server hat die Tafel bereits geladen (Bo liest sie mit) und
+          // schickt sie mit — die Karte übernimmt sie, statt ein zweites Mal zu
+          // holen. Fehlt sie, holt die Karte wie bisher selbst.
           if (__DEV__) console.log("[chat] stop_board:", event.stop.code, event.stop.label, event.board);
-          setMessages((prev) => appendBoardMessage(prev, botId, event.stop, event.board));
+          setMessages((prev) =>
+            appendBoardMessage(prev, botId, event.stop, event.board, event.data),
+          );
           return;
         case "action":
           // Bo löst eine App-State-Mutation oder eine Navigation aus.
@@ -1527,12 +1811,30 @@ export default function AssistantScreen() {
    */
   const firstY = useSharedValue(0);
   const padBottomSV = useSharedValue(0);
-  // Beim Übernehmen setzen, nicht beim Rendern: Ein Schreibzugriff während des
-  // Renderns ist bei Reanimated nicht zulässig. Ein Wettlauf droht hier nicht —
-  // der Abstand hängt nur noch an der Höhe der Leiste, nicht an der Tastatur.
-  useLayoutEffect(() => {
-    padBottomSV.value = contentPaddingBottom;
-  }, [contentPaddingBottom, padBottomSV]);
+  /**
+   * Beide Zahlen MÜSSEN aus demselben Bild stammen — hier lag der Ruckler beim
+   * Absenden.
+   *
+   * `free` ist die Differenz aus beiden. Der Abstand wurde bisher beim
+   * Übernehmen geschrieben (also sofort), die Lage der obersten Zeile kommt
+   * aber aus deren Messung, also mindestens ein Bild später. Beim Absenden
+   * springt das mehrzeilige Feld auf eine Zeile zurück — der Abstand schrumpft
+   * um bis zu 66 Punkt, die Lage folgt erst danach. Für genau ein Bild ist
+   * `free` deshalb um diesen Betrag zu groß, und daran hängt über `kbLift` →
+   * `slideShift` die Hülle um die GANZE Liste: Der Stapel rutscht ein Bild
+   * lang herunter und im nächsten zurück.
+   *
+   * Dass es nur „gelegentlich" auftrat, passt genau: Beim WACHSEN des Feldes
+   * wird die Differenz negativ und von `max(0, …)` aufgefangen. Nur die
+   * Schrumpf-Richtung glitcht — und die gibt es ausschließlich beim Absenden
+   * einer umgebrochenen Nachricht.
+   *
+   * Also wird der Abstand dort geschrieben, wo auch die Lage herkommt: im Maß
+   * der obersten Zeile. Ändert sich der Abstand, ändert sich der Innenabstand
+   * des Inhalts, und damit misst diese Zeile ohnehin neu.
+   */
+  const padBottomRef = useRef(contentPaddingBottom);
+  padBottomRef.current = contentPaddingBottom;
   const kbLift = useDerivedValue(() => {
     const free = Math.max(0, firstY.value - padBottomSV.value);
     return Math.max(0, kbShift.value - free);
@@ -1555,7 +1857,17 @@ export default function AssistantScreen() {
    * kennt sie aus ihrer ersten Messung, und weil sie bis dahin unsichtbar ist,
    * gibt es kein Bild, in dem etwas an der falschen Stelle steht.
    */
-  const allowEnter = useSharedValue(0);
+  /**
+   * Als einfacher Merker, NICHT als geteilter Wert.
+   *
+   * Gelesen wird er ausschließlich aus JS (in `handleLayout`), geschrieben
+   * ebenso. Ein `.value`-Lesezugriff von dort ist bei Reanimated 4 aber ein
+   * synchroner Sprung in die UI-Laufzeit, der beide Stränge gegeneinander
+   * sperrt — und er lag beim ersten Maß JEDER Zeile, beim Öffnen mit vollem
+   * Verlauf also dutzendfach mitten in der Einfahrt. Für einen Wert, den die
+   * UI-Seite nie anfasst, ist das reiner Verlust.
+   */
+  const allowEnter = useRef(false);
   const slideShift = useDerivedValue(() => -kbLift.value);
 
   const threadScrollY = useSharedValue(0);
@@ -1580,11 +1892,26 @@ export default function AssistantScreen() {
    * es dabei. Der Zuschlag zöge dann den freien Platz auf und schöbe die
    * Unterhaltung hinter die Tastatur: genau das, wogegen die Prüfung da ist.
    */
+  /**
+   * Während der Einfahrt gemerkt, nicht geschaltet.
+   *
+   * Der Merker hängt am Innenabstand des Listeninhalts. Bei langem Verlauf
+   * kippt er beim Aufbau zwangsläufig von falsch auf wahr — und das ist ein
+   * neues Stil-Objekt, ein neuer Listen-Baum und ein Yoga-Durchgang, mitten in
+   * der Bewegung. Nachgeholt wird er, sobald sie durch ist; zu sehen ist davon
+   * nichts, denn er betrifft nur den Abstand am oberen Rand.
+   */
+  const flowingPendingRef = useRef<boolean | null>(null);
+  const enteringRef = useRef(true);
   const updateFlowing = useCallback((contentH: number, listHeight: number) => {
     if (listHeight === 0 || contentH === 0) return;
     const isFlowing = contentH > listHeight + 1;
     if (isFlowing === flowingRef.current) return;
     flowingRef.current = isFlowing;
+    if (enteringRef.current) {
+      flowingPendingRef.current = isFlowing;
+      return;
+    }
     setFlowing(isFlowing);
   }, []);
 
@@ -1622,8 +1949,17 @@ export default function AssistantScreen() {
   // Einmal erzeugen — eine neue Kennung würde jede Zelle neu aufbauen.
   const RecedingCell = useMemo(
     () =>
-      makeRecedingCell(threadScrollY, threadHeight, slideShift, firstY, allowEnter),
-    [threadScrollY, threadHeight, slideShift, firstY, allowEnter],
+      makeRecedingCell(
+        threadScrollY,
+        threadHeight,
+        slideShift,
+        firstY,
+        padBottomSV,
+        padBottomRef,
+        allowEnter,
+      ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [threadScrollY, threadHeight, slideShift, firstY, padBottomSV, allowEnter],
   );
 
   /**
@@ -1655,26 +1991,85 @@ export default function AssistantScreen() {
    * Die Slide von rechts — dieselbe wie zur Ergebnisliste und zu den
    * Profil-Unterseiten.
    *
-   * Die Bewegung startet schon im Tipp-Handler (`startAssistantPush`), nicht
-   * hier: Wenn dieser Bildschirm zum ersten Mal zeichnet, läuft sie bereits. Wir
-   * lesen den Wert nur ab. Deshalb steht hier auch kein `useEffect` mit Start —
-   * das wäre genau die Verzögerung, die wir loswerden wollten.
+   * Angestoßen wird sie unten, ein Bild nach dem ersten Zeichnen — die
+   * Begründung steht dort. Hier wird der Wert nur abgelesen.
    *
-   * Der Notausgang darunter ist für den Fall, dass jemand direkt hier landet
-   * (Verknüpfung, Wiederherstellung nach Absturz): Dann hat niemand die
-   * Bewegung angestoßen, der Wert steht auf 0 — und ohne diese Zeile bliebe der
-   * Bildschirm für immer neben dem Sichtfeld stehen.
+   * Bis dahin steht der Bildschirm auf 0, also eine volle Höhe unter dem Bild.
+   * Das ist zugleich der Notausgang für den Fall, dass jemand direkt hier
+   * landet (Verknüpfung, Wiederherstellung): Auch dann stößt der Haken unten
+   * an, sonst bliebe der Bildschirm für immer neben dem Sichtfeld stehen.
    */
-  const slideStyle = useAnimatedStyle(() => ({
-    transform: [{ translateY: (1 - assistantPush.value) * screenH }],
+  /**
+   * Die Tastatur-Verschiebung liegt auf EINEM Knoten, nicht auf jeder Zeile.
+   *
+   * Sie ist für alle Zeilen dieselbe Zahl — trotzdem stand sie im Stil JEDER
+   * gemounteten Zeile. Und ein Stil, der ein `transform`-Array zurückgibt, gilt
+   * bei Reanimated immer als geändert (der Vergleich ist flach, das Array ist
+   * jedes Mal neu). Pro Bild der Tastatur ging damit ein nativer Schreibvorgang
+   * an jede Zeile hinaus — bei zwanzig gemounteten Zeilen zwanzig statt einem,
+   * und das ist genau das „die Tastatur wird mit jeder Nachricht zäher".
+   *
+   * Geklammert wird die Liste von einem Kasten, der STEHEN BLEIBT und schneidet.
+   * Damit bewegt sich innen genau das, was sich vorher bewegt hat, und der
+   * sichtbare Ausschnitt bleibt derselbe — es ist Bild für Bild dasselbe
+   * Ergebnis, nur mit einem Schreibvorgang statt zwanzig.
+   *
+   * In der Tiefen-Rechnung (`progress`) bleibt die Zahl drin: Dort geht es
+   * darum, wo eine Zeile AUF DEM SCHIRM steht, und das ändert die Verschiebung
+   * weiterhin.
+   */
+  const threadShiftStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: slideShift.value }],
   }));
+
+  const slideStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: (1 - assistantPush.value) * PARK_Y }],
+  }));
+  /**
+   * Die Fahrt startet ERST, wenn dieser Bildschirm einmal gezeichnet ist.
+   *
+   * Das ist der Unterschied zu allen anderen Blättern der App — und der Grund,
+   * warum ausgerechnet dieses hier ruckelt. Ortswähler, Datumswähler und
+   * Such-Blatt sind dauerhaft gemountet und AUSSERHALB des Bildes geparkt; für
+   * sie ist eine Fahrt reines Verschieben. `useSheetSlide` lässt trotzdem noch
+   * ein Bild dazwischen zeichnen, und der Kommentar dort nennt den Grund
+   * wörtlich: der Unterschied zwischen „die Bewegung läuft gegen den Aufbau an"
+   * und „sie hat den Strang für sich".
+   *
+   * Bo hatte weder das eine noch das andere. Die Kurve lief im Tipp-Handler des
+   * Landingscreens los, der Bildschirm mountete danach — Kopfzeile, Bos SVG,
+   * die Liste samt ihrer ersten Zeilen und die Eingabeleiste entstanden also
+   * MITTEN in der Bewegung. Und dieser Aufbau wächst mit dem Verlauf: Je mehr
+   * Nachrichten, desto mehr Zeilen liegen im ersten Fenster.
+   *
+   * Jetzt: mounten, EIN Bild zeichnen lassen, dann fahren. Solange steht der
+   * Bildschirm geparkt eine volle Höhe unter dem Bild — zu sehen ist davon
+   * nichts, es beginnt nur um den Aufbau später. Dafür läuft die Fahrt danach
+   * gegen nichts mehr an.
+   */
   useEffect(() => {
     // Über ein Modul-Flag, NICHT über `assistantPush.value`. Ein Lesezugriff aus
     // React ist ein synchroner Sprung in die UI-Laufzeit, der beide Stränge
     // gegeneinander sperrt — und dieser hier lag mitten in Bos laufender Kurve.
     // Die beiden anderen Bewegungen haben ihr Gegenstück längst.
-    if (!isAssistantPushStarted()) startAssistantPush();
+    /**
+     * ZWEI Bilder, nicht eins.
+     *
+     * Nach dem ersten Commit ist der Baum gemountet, aber noch nicht vermessen:
+     * Die native Layout-Runde läuft danach, und ihre `onLayout`-Meldungen
+     * kommen erst im Bild darauf in JS an. An denen hängt hier alles Weitere —
+     * die Lage und Höhe jeder Zeile, die Listenhöhe, die Buchhaltung der
+     * Virtualisierung. Mit nur einem Bild Vorlauf fiel diese Rückrunde exakt in
+     * die ersten Bilder der Kurve.
+     */
+    let raf: number | null = requestAnimationFrame(() => {
+      raf = requestAnimationFrame(() => {
+        raf = null;
+        if (!isAssistantPushStarted()) startAssistantPush();
+      });
+    });
     return () => {
+      if (raf !== null) cancelAnimationFrame(raf);
       // Beim Verschwinden zurücksetzen — ohne Animation, der Bildschirm ist ja
       // weg. Sonst bliebe der Landingscreen darunter für immer um seine
       // Parallax-Strecke verschoben, wenn Bo je auf einem anderen Weg als über
@@ -1732,11 +2127,28 @@ export default function AssistantScreen() {
      * ausgerechnet dorthin, wo man einen Ruckler am ehesten sieht. Ein bisschen
      * Luft dahinter kostet nichts: Solange steht nur weniger im Voraus bereit.
      */
+    /**
+     * Und zwar SPÄTER als der Wecker darunter, nicht gleichzeitig.
+     *
+     * Beide standen zuletzt auf derselben Zahl — und beide sind teuer: Hier
+     * wächst die gehaltene Strecke von einer auf fünf Bildschirmhöhen, die
+     * Liste mountet also auf einen Schlag einen Schwung Zeilen, jede davon mit
+     * zwei Reanimated-Zuordnungen. Und jede neue Zuordnung wirft die sortierte
+     * Reihenfolge weg, die beim nächsten Bild komplett neu aufgebaut wird. Im
+     * selben Bild lief zusätzlich Bo wieder an. Das ist der Ruckler AM ENDE der
+     * Einfahrt, und er wird mit dem Verlauf schlimmer, weil mehr Zeilen
+     * nachrücken.
+     */
     windowTimerRef.current = setTimeout(() => {
       windowTimerRef.current = null;
       if (closingRef.current) return;
+      enteringRef.current = false;
       setEntering(false);
-    }, ASSISTANT_IN.duration + 220);
+      if (flowingPendingRef.current !== null) {
+        setFlowing(flowingPendingRef.current);
+        flowingPendingRef.current = null;
+      }
+    }, ASSISTANT_IN.duration + 560);
     enterTimerRef.current = setTimeout(() => {
       enterTimerRef.current = null;
       // Nicht mehr, wenn schon geschlossen wird: Sonst hebt genau dieser Wecker
@@ -1747,8 +2159,18 @@ export default function AssistantScreen() {
       setSliding(false);
       // Ab jetzt ziehen neu eintreffende Zeilen ein — vorher fährt der ganze
       // Bildschirm, da wäre es Bewegung in der Bewegung.
-      allowEnter.value = 1;
-    }, ASSISTANT_IN.duration);
+      allowEnter.current = true;
+      /**
+       * Dieselben 220ms Luft wie beim Wecker darüber.
+       *
+       * Er lag exakt auf dem Ende der Fahrt — und `setTimeout` ist nicht
+       * bildgenau, traf also regelmäßig noch deren letzte Bilder. Was dort
+       * losgeht, ist nicht wenig: Der ganze Bildschirm rendert neu, Bos Wirkung
+       * bricht 15 Werte ab und startet rund zehn Endlos-Ketten, darunter vier
+       * animierte SVG-Eigenschaften — und die machen die ganze Fläche ungültig.
+       * Der Nachbar-Wecker hat seine Luft aus genau demselben Grund bekommen.
+       */
+    }, ASSISTANT_IN.duration + 220);
     return () => {
       if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
       if (windowTimerRef.current) clearTimeout(windowTimerRef.current);
@@ -1854,8 +2276,46 @@ export default function AssistantScreen() {
        * Vier Zeilen füllen den sichtbaren Bereich; der Rest kommt in Häppchen
        * nach, oberhalb des Bildrands.
        */
-      initialNumToRender={4}
+      /**
+       * Wieder größer — und jetzt ist das richtig herum.
+       *
+       * Die Zahl ist beides: die erste Region UND die Untergrenze, die dauerhaft
+       * gemountet bleibt. Sie stand auf 4, weil der erste Aufbau mit der
+       * Einfahrt zusammenfiel und deshalb so klein wie möglich sein sollte.
+       * Seit die Fahrt erst nach dem ersten Bild startet, ist genau das Gegenteil
+       * richtig: Was hier entsteht, entsteht VOR der Bewegung. Was dagegen in
+       * Häppchen nachrückt, fällt mitten hinein — und bei langem Verlauf ist die
+       * Fläche über den letzten vier Nachrichten nicht leer, sondern voll.
+       *
+       * Fünfzehn — und das ist eine Untergrenze mit Grund, keine Schätzung.
+       *
+       * `VirtualizedList` hat einen Eil-Pfad: Liegt die unterste gerenderte
+       * Zelle noch INNERHALB des Fensters, rendert sie sofort und synchron
+       * nach und übergeht den gedehnten Takt darunter komplett
+       * (`_shouldRenderWithPriority`). Deckt der Anfangsbereich das Fenster
+       * nicht, mountet die Liste also trotzdem mitten in der Fahrt weiter.
+       * Erst wenn er darüber hinausreicht, greift der Takt.
+       *
+       * Zehn deckte auf einem hohen Gerät eine Bildschirmhöhe ab
+       * (einzeilige Blasen ~53 Punkt, dazu der reservierte Platz für die
+       * Leiste). Das ist wichtig, weil das Nachrücken für die Dauer der Fahrt
+       * gedehnt wird: Was die erste Region nicht abdeckt, bliebe solange leer.
+       * Zusammen mit `windowSize={1}` bleibt danach ohnehin fast nichts mehr
+       * nachzuladen. Mehr wäre nur Vorrat, der dauerhaft gemountet bliebe.
+       */
+      initialNumToRender={15}
       maxToRenderPerBatch={6}
+      /**
+       * Und was danach noch fehlt, rückt erst NACH der Fahrt nach.
+       *
+       * Die Liste füllt ihr Fenster in Häppchen, standardmäßig alle 50ms — bei
+       * einer 300ms-Fahrt also fünf- bis sechsmal mittendrin, jedes Mal mit
+       * Rendern, Vermessen, nativem Einhängen und zwei Reanimated-Zuordnungen
+       * pro Zeile. Während der Einfahrt wird der Takt deshalb so weit gedehnt,
+       * dass nichts mehr hineinfällt; danach steht er wieder auf dem
+       * Normalwert.
+       */
+      updateCellsBatchingPeriod={entering ? 700 : 50}
       onScrollBeginDrag={onDragStart}
       onScrollEndDrag={onDragStop}
       onMomentumScrollBegin={onDragStart}
@@ -1903,16 +2363,30 @@ export default function AssistantScreen() {
          * Android die Schatten-Kontur aus den eckigen Grenzen und füllt die runde
          * Aussparung wieder mit einem dunklen Quadrat.
          */
-        {
-          backgroundColor: palette.bg,
-          borderRadius: SCREEN_CORNER_RADIUS,
-          elevation: 24,
-        },
+        screenShellStyle,
         slideStyle,
       ]}
-      // Siehe `closing`: die Fläche für die Ausfahrt einmal rastern statt bei
-      // jedem Bild sämtliche Kinder neu zu zeichnen.
-      renderToHardwareTextureAndroid={closing}
+      /**
+       * Textur für BEIDE Richtungen — die Einfahrt kann das jetzt auch.
+       *
+       * Hier stand nur `closing`, mit der ausdrücklichen Begründung, für die
+       * Einfahrt tauge das nicht: Dort baue sich der Baum gerade erst auf, die
+       * Textur wäre sofort wieder ungültig und müsste neu hochgeladen werden.
+       * Das stimmte — solange die Kurve im Tipp-Handler losfuhr und der Aufbau
+       * in sie hineinfiel.
+       *
+       * Seit die Fahrt erst nach dem ersten Bild startet, ist der Baum fertig,
+       * bevor sie beginnt: Die erste Region ist gemountet, das Nachrücken ist
+       * für die Dauer der Fahrt gedehnt, und Bo steht still (`sliding`). Der
+       * Inhalt ändert sich während der Einfahrt also nicht mehr — und damit
+       * gilt hier dieselbe Rechnung wie überall sonst im Projekt: ohne Ebene
+       * werden bei jedem Bild sämtliche Kinder neu gezeichnet (gemessene 14,7ms
+       * gegen ein Budget von 8,3ms), mit Ebene ist ein Bild ein Blit.
+       *
+       * `sliding` ist schon beim ersten Rendern wahr, die Ebene entsteht also
+       * im selben Durchgang wie der Aufbau — vor der Bewegung, nicht in ihr.
+       */
+      renderToHardwareTextureAndroid={sliding || closing}
     >
         {/* Slim Top-Bar: Binch-Logo links, Close-Button rechts. Da wir die
             FloatingTabBar im Chat verstecken, ist X der einzige Weg zurück
@@ -1955,9 +2429,15 @@ export default function AssistantScreen() {
           {moodLabel.toUpperCase()}
         </Text>
         <Pressable
+          onTouchStart={armClose}
+          onPressIn={() => {
+            chatInputRef.current?.blur();
+            Keyboard.dismiss();
+          }}
+          onPressOut={disarmClose}
           onPress={closeScreen}
           hitSlop={10}
-          style={[styles.closeBtn, { backgroundColor: palette.s2 }]}
+          style={closeBtnStyle}
           accessibilityLabel="Close"
         >
           <X size={20} color="#E5E7EB" strokeWidth={2} />
@@ -1978,7 +2458,14 @@ export default function AssistantScreen() {
           Damit ist ZERO scroll-Synchronisation nötig: die letzte Bubble
           steht IMMER über der Bar, weil sie strukturell dort hingerendert
           wird, nicht weil wir hin-scrollen müssen. */}
-      {thread}
+      {/* Steht still und schneidet — bewegt wird die Hülle darin. So bleibt der
+          sichtbare Ausschnitt exakt der von vorher, als jede Zeile sich einzeln
+          verschoben hat. */}
+      <View style={styles.threadClip}>
+        <Animated.View style={[styles.threadFill, threadShiftStyle]}>
+          {thread}
+        </Animated.View>
+      </View>
 
       {/* Bo + Mood-Label.
           `paused={!isFocused}` schaltet Bo's Reanimated-Worklets ab wenn der
@@ -1994,7 +2481,7 @@ export default function AssistantScreen() {
           UI-Thread). onLayout misst die echte Bar-Höhe für die
           contentPaddingBottom-Berechnung. */}
       <Animated.View
-        style={[styles.inputbarWrap, { backgroundColor: appBg }, barAnimStyle]}
+        style={[styles.inputbarWrap, inputbarWrapStyle, barAnimStyle]}
         onLayout={(e) => {
           const h = e.nativeEvent.layout.height;
           if (Math.abs(h - inputbarHeight) > 1) setInputbarHeight(h);
@@ -2231,7 +2718,9 @@ function makeRecedingCell(
   listH: SharedValue<number>,
   slide: SharedValue<number>,
   firstY: SharedValue<number>,
-  allowEnter: SharedValue<number>,
+  padBottomSV: SharedValue<number>,
+  padBottomRef: { current: number },
+  allowEnter: { current: boolean },
 ) {
   /**
    * Maße über das Ab- und Wiederaufbauen hinweg merken — gegen das Flackern.
@@ -2250,6 +2739,10 @@ function makeRecedingCell(
    * ihm — die Kennung kommt aus dem Schlüssel der Zeile.
    */
   const known = new Map<string, { y: number; h: number }>();
+  /** JS-Spiegel von `firstY` — nur zum Vergleichen, siehe unten. */
+  const firstYRef = { current: -1 };
+  /** Dasselbe für den unteren Abstand. */
+  const padBottomSeenRef = { current: -1 };
 
   return function RecedingCell({
     children,
@@ -2270,27 +2763,71 @@ function makeRecedingCell(
      * sofort, sonst blitzte beim Scrollen alles ein.
      */
     const isNew = seen === undefined;
-    const enter = useSharedValue(isNew ? 0 : 1);
+    /**
+     * Unsichtbar starten nur, wenn auch wirklich eingezogen wird.
+     *
+     * Der Maß-Speicher entsteht beim Aufbau des Bildschirms neu — beim Öffnen
+     * ist also JEDE Zeile „neu" und startete damit auf Deckkraft null. Das
+     * erste gezeichnete Bild zeigte einen leeren Verlauf, und erst wenn die
+     * Messungen eintrudeln, wurde Zeile für Zeile sichtbar geschrieben: N
+     * native Schreibvorgänge, mitten in der Einfahrt, und sie entwerten dabei
+     * die GPU-Ebene, die genau dafür angelegt wurde.
+     *
+     * Während der Einfahrt ist der Einzug ohnehin gesperrt (`allowEnter`) — die
+     * Zeilen wurden also auf null gesetzt, um dann ohne Kurve auf eins zu
+     * springen. Reine Arbeit ohne Wirkung. Für später eintreffende Nachrichten
+     * ändert sich nichts.
+     */
+    const enter = useSharedValue(isNew && allowEnter.current ? 0 : 1);
     const y = useSharedValue(seen?.y ?? 0);
     const h = useSharedValue(seen?.h ?? 0);
 
+    /**
+     * Der Rang gehört in einen Merker, nicht in die Abhängigkeiten.
+     *
+     * Die Liste zählt beim Voranstellen einer Nachricht JEDEN Rang hoch. Stand
+     * er in der Liste darunter, bekam damit jede gemountete Zeile eine neue
+     * Funktions-Kennung — und die animierte Hülle darum hängt daran ihre
+     * Eigenschaften neu ein. Gebraucht wird der Rang aber nur zum Vergleich mit
+     * null, und dafür reicht der jeweils letzte Stand.
+     */
+    const indexRef = useRef(index);
+    indexRef.current = index;
+    /** Schon eingezogen? Als JS-Wert — siehe `allowEnter`. */
+    const enteredRef = useRef(!isNew);
+
     const handleLayout = useCallback(
       (e: LayoutChangeEvent) => {
-        y.value = e.nativeEvent.layout.y;
-        h.value = e.nativeEvent.layout.height;
-        const first = !known.has(key);
-        known.set(key, {
-          y: e.nativeEvent.layout.y,
-          h: e.nativeEvent.layout.height,
-        });
+        const ny = e.nativeEvent.layout.y;
+        const nh = e.nativeEvent.layout.height;
+        const prev = known.get(key);
+        const first = prev === undefined;
+        /**
+         * NUR schreiben, was sich wirklich geändert hat.
+         *
+         * Das ist der Hebel. Ein Maß-Ereignis feuert hier nicht, weil sich
+         * etwas bewegt hat, sondern weil Yoga den Behälter durchgelaufen ist —
+         * und das tut er bei jedem Text-Zuwachs der laufenden Blase, für JEDE
+         * gemountete Zeile. Ein Schreibzugriff auf einen geteilten Wert ist von
+         * JS aus kein Feldzugriff, sondern ein Auftrag über die Laufzeit-Grenze
+         * mit Closure und Warteschlange. Zwei davon pro Zeile, zehnmal pro
+         * Sekunde, mal Verlaufslänge.
+         *
+         * Die HÖHE einer bestehenden Zeile ändert sich praktisch nie — die
+         * fällt damit vollständig weg. Die Lage verschiebt sich, solange über
+         * ihr etwas wächst, aber auch nur dann.
+         */
+        if (first || prev.y !== ny) y.value = ny;
+        if (first || prev.h !== nh) h.value = nh;
+        if (first || prev.y !== ny || prev.h !== nh) known.set(key, { y: ny, h: nh });
         // Erst JETZT einblenden: Ab hier steht die Zeile an ihrer Stelle, und
         // die Strecke ist ihre eigene, gerade gemessene Höhe. Beim Aufbau des
         // Bildschirms nicht — dort fährt ohnehin alles schon.
-        if (first && enter.value === 0) {
-          enter.value =
-            allowEnter.value === 1
-              ? withTiming(1, { duration: 220, easing: Easing.out(Easing.cubic) })
-              : 1;
+        if (first && !enteredRef.current) {
+          enteredRef.current = true;
+          enter.value = allowEnter.current
+            ? withTiming(1, { duration: 220, easing: Easing.out(Easing.cubic) })
+            : 1;
         }
         /**
          * Die neueste Zeile meldet den Anfang des Stapels.
@@ -2300,12 +2837,24 @@ function makeRecedingCell(
          * von anderer Stelle verändern — daran ist dieselbe Rechnung schon
          * einmal gescheitert.
          */
-        if (index === 0) firstY.value = e.nativeEvent.layout.y;
+        // Auch hier nur bei echter Änderung: Daran hängt die Hebe-Rechnung der
+        // Tastatur, und die weckt ihrerseits den Stil JEDER gemounteten Zeile.
+        if (indexRef.current === 0) {
+          if (firstYRef.current !== ny) {
+            firstYRef.current = ny;
+            firstY.value = ny;
+          }
+          // Im SELBEN Bild — siehe `padBottomRef` oben.
+          if (padBottomSeenRef.current !== padBottomRef.current) {
+            padBottomSeenRef.current = padBottomRef.current;
+            padBottomSV.value = padBottomRef.current;
+          }
+        }
         // Die eigene Buchhaltung der Liste MUSS weiterlaufen — sie misst hier
         // ihre Zellen. Ohne das Durchreichen bricht die Virtualisierung.
         onLayout?.(e);
       },
-      [onLayout, y, h, key, index, firstY, enter, allowEnter],
+      [onLayout, y, h, key, firstY, enter, allowEnter],
     );
 
     /**
@@ -2384,7 +2933,10 @@ function makeRecedingCell(
           // Der Einzug kommt von unten und ist an die eigene Höhe gebunden —
           // eine hohe Karte legt damit denselben Anteil zurück wie eine kurze
           // Zeile und wirkt nicht schneller.
-          { translateY: slide.value + (1 - inn) * (h.value * 0.5 + 12) },
+          //
+          // OHNE die Tastatur-Verschiebung: Die ist für alle Zeilen gleich und
+          // sitzt deshalb auf der Hülle um die Liste (siehe `threadShiftStyle`).
+          { translateY: (1 - inn) * (h.value * 0.5 + 12) },
           { scale: 1 - (1 - RECEDE_MIN_SCALE) * e },
         ],
       };
@@ -2442,6 +2994,20 @@ function appendBotText(messages: Msg[], botId: string, delta: string): Msg[] {
   );
 }
 
+/**
+ * Den fertigen Strom-Text in die Blase schreiben.
+ *
+ * Angehängt, nicht ersetzt: `appendBotText` legt die Blase mit leerem Text an,
+ * es kann aber auch ein Rest aus einem früheren Weg darin stehen.
+ */
+function commitBotText(messages: Msg[], botId: string, text: string): Msg[] {
+  const idx = messages.findIndex((m) => m.id === botId);
+  if (idx === -1) return insertBotBefore(messages, botId, { id: botId, kind: "bot", text });
+  return messages.map((m, i) =>
+    i === idx && m.kind === "bot" ? { ...m, text: m.text + text } : m,
+  );
+}
+
 function appendFlightMessage(
   messages: Msg[],
   botId: string,
@@ -2470,10 +3036,11 @@ function appendBoardMessage(
   botId: string,
   stop: { code: string; label: string },
   board: "departures" | "arrivals",
+  data?: StopBoardResponse,
 ): Msg[] {
   const rest = messages.filter((m) => m.kind !== "typing");
   if (rest.some((m) => m.kind === "board" && m.botId === botId)) return rest;
-  return [...rest, { id: `${botId}:board`, kind: "board", stop, board, botId }];
+  return [...rest, { id: `${botId}:board`, kind: "board", stop, board, data, botId }];
 }
 
 function appendActionMessage(
@@ -2550,7 +3117,7 @@ function BubbleInner({ msg, accent, onRetry, onOpenResults, t }: BubbleProps) {
   if (msg.kind === "board") {
     return (
       <View style={styles.flightWrap}>
-        <StopBoardCard stop={msg.stop} initialBoard={msg.board} />
+        <StopBoardCard stop={msg.stop} initialBoard={msg.board} initialData={msg.data} />
       </View>
     );
   }
@@ -2587,14 +3154,42 @@ function BubbleInner({ msg, accent, onRetry, onOpenResults, t }: BubbleProps) {
   // damit sie volle Breite haben.
   return (
     <View style={styles.botMessageWrap}>
-      {msg.text.length > 0 && (
-        <View style={[styles.bubble, styles.botBubble]}>
-          <RichText text={msg.text} accent={accent} />
-        </View>
-      )}
+      <BotText id={msg.id} text={msg.text} accent={accent} />
     </View>
   );
 }
+
+/**
+ * Die Blase einer Bot-Antwort — mit eigenem Draht zum laufenden Text.
+ *
+ * Solange die Antwort läuft, steht ihr Text nicht in der Nachricht, sondern im
+ * Strom-Speicher (siehe `lib/assistant/streamText.ts`). Diese Blase hört dort
+ * selbst zu und rendert sich allein neu; die Liste darüber merkt davon nichts.
+ * Ist der Strom durch, ist der Speicher leer und der Text steht in der
+ * Nachricht — dieselbe Anzeige, nur aus der anderen Quelle.
+ *
+ * Sichtbar ändert sich dadurch nichts: gleiche Blase, gleiche Stile, gleiche
+ * Auszeichnung, und leer bleibt sie wie zuvor unsichtbar.
+ */
+const BotText = memo(function BotText({
+  id,
+  text,
+  accent,
+}: {
+  id: string;
+  text: string;
+  accent: string;
+}) {
+  const [live, setLive] = useState(() => peekStreamText(id));
+  useEffect(() => subscribeStreamText(id, setLive), [id]);
+  const shown = live ?? text;
+  if (shown.length === 0) return null;
+  return (
+    <View style={[styles.bubble, styles.botBubble]}>
+      <RichText text={shown} accent={accent} />
+    </View>
+  );
+});
 
 /** Rendert `**bold**` als Accent-farbenen Bold-Text. */
 function RichText({ text, accent }: { text: string; accent: string }) {
@@ -2780,6 +3375,8 @@ const styles = scaledStyles({
   },
 
   thread: { flex: 1 },
+  threadClip: { flex: 1, overflow: "hidden" },
+  threadFill: { ...StyleSheet.absoluteFillObject },
   // Mit inverted FlatList: flexGrow:1 + justifyContent:'flex-end' ankert
   // bei wenigen Messages die Children am visuellen TOP (statt am Bottom
   // anhäufen). Kurze Chats: Welcome + paar Messages unter Bo, Empty-Space

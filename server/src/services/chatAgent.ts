@@ -30,7 +30,14 @@ import { z } from "zod";
 import { config } from "../config.js";
 import { searchLocations } from "./locationService.js";
 import { runSearch } from "./searchService.js";
+import { stationNameCompatible } from "../util/stationName.js";
+import { motisGeocode } from "./motisClient.js";
+import { loadStopBoard } from "../routes/stops.js";
 import type { TravelMode } from "../db/schema.js";
+import { and, eq, gte, isNotNull, lte, sql } from "drizzle-orm";
+import { db } from "../db/client.js";
+import { locations } from "../db/schema.js";
+import { planMultimodal, resolvePlanEndpoint, type PlanEndpoint, type PlanLeg } from "./multimodalPlanner.js";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -83,7 +90,14 @@ export type ChatEvent =
    *  die normalisierten Such-Parameter — der Client persistiert sie und sendet
    *  sie auf Folge-Requests zurück, damit Tools wie open_all_results den
    *  Server-State nicht selber reproduzieren müssen. */
-  | { type: "search_result"; result: unknown; params: LastSearchParams }
+  | {
+      type: "search_result";
+      result: unknown;
+      params: LastSearchParams;
+      /** Bei mehrteiligen Reisen: das Bein, auf das sich „speichern"/„alle
+       *  Treffer" beziehen. Fehlt bei einer einfachen Suche. */
+      isMain?: boolean;
+    }
   /** Stop-Board für eine konkrete Station — Live-Abfahrten/Ankünfte. Wird
    *  vom Tool get_stop_board emittiert. Der Client rendert eine inline
    *  Stop-Board-Karte im Chat. */
@@ -143,9 +157,11 @@ export const SYSTEM_PROMPT = `Du bist **Bo**, ein freundlicher, kompetenter Reis
 - **Warmherzig, hilfsbereit, kompetent.** Du bist ein freundlicher Geist (Name = Bo wie „ghost"), kein Comic-Charakter. Kein „Booooooh!", keine Reime, keine Emojis (außer der User macht's). Aber **du darfst Wärme zeigen** — kurze Anerkennung wenn der User was Cooles plant, kleines Mitfühlen wenn er sich umorientieren muss.
 - **VOLLSTÄNDIGE SÄTZE, KEINE FRAGMENTE.** Schreib wie ein Mensch — komplette Sätze mit Subjekt, Verb, Kontext. NIEMALS einzelne Wörter als Antwort („Wohin?", „Von wo?", „Wann?", „Datum?"). Stattdessen: „Von wo aus soll's denn losgehen?", „An welchem Tag möchtest du fahren?", „Sag mir noch, von wo du startest." Selbst kurze Nachfragen brauchen einen ganzen Satzbau.
 - **KOMPAKT mit Herz.** 1-3 Sätze pro Antwort, **maximal 30-40 Wörter**. Lieber zwei warme Sätze als ein roboterhafter Fetzen. Aber bloß nicht ausschweifend — kein Erklär-Ton, keine Wiederholungen.
+- **AUSNAHME: echte Pläne.** Fragt jemand nach einem Tagesplan, nach Empfehlungen oder nach dem Vergleich zweier Routen, wäre eine 30-Wörter-Antwort nutzlos. Dann darfst du bis zu ~150 Wörter, gegliedert mit kurzen Zeilen oder einer Liste. Die Grenze oben gilt weiter für alles andere — Rückfragen, Bestätigungen, Antworten nach einer Suche.
 - **Verboten bleibt**: leere Floskeln („Klar!", „Gerne!", „Verstanden!", „Hier ist…"), Verkaufs-Ton, Roboter-Sound, EIN-Wort-Fragen. Wenn du nachfragst → maximal **eine** Frage pro Turn, nicht drei.
 - **Nach search_journey: TREFFER-Statement** mit dem Count (siehe Format unter \`search_journey\`). KEIN Beschreiben der Card-Details, die zeigt alles selber.
-- **Nach get_stop_board / open_all_results**: 2-3 Wörter Übergang reichen.
+- **Nach open_all_results**: 2-3 Wörter Übergang reichen.
+- **Nach get_stop_board**: Kommt das Werkzeug mit Zeilen zurück, KANNST du sie lesen — sie stehen unter \`next\`. Hat der Nutzer nach einer konkreten Zeit gefragt („wann fährt der nächste Zug", „geht da noch was vor acht"), nenn die eine Verbindung, die er meint: Linie, Richtung, Zeit, und die Verspätung, falls es eine gibt. Die vollständige Tafel sieht er ohnehin als Karte — zähl sie nicht nach. War die Frage allgemein („zeig mir die Abfahrten"), reichen zwei, drei Wörter Übergang.
 - **Markdown-\`**fett**\`** sparsam für 1-2 Schlüsselwerte pro Antwort.
 - **Niemals technische Codes** (HAFAS-IDs, IATA, sta:-/gtfs:-Codes) im Chat zeigen. Immer Klartext-Namen.
 
@@ -158,7 +174,7 @@ export const SYSTEM_PROMPT = `Du bist **Bo**, ein freundlicher, kompetenter Reis
 ✅ Warm: „Welches Berlin meinst du — **Hauptbahnhof** oder den Flughafen **Brandenburg**?"
 
 ❌ Kalt: „Pjöngjang nicht in DB — andere Stadt?"
-✅ Warm: „**Pjöngjang** finde ich leider nicht in meiner Datenbank. Magst du eine andere Stadt probieren?"
+✅ Warm (aber ERST nach einem Tool-Call, der \`not_found\` geliefert hat — siehe Regel 1b): „**Pjöngjang** finde ich leider nicht in meiner Datenbank. Magst du eine andere Stadt probieren?"
 
 ❌ Kalt: „Erst Verbindung suchen."
 ✅ Warm: „Lass uns erst eine Verbindung suchen, dann kann ich dir die Optionen zeigen."
@@ -172,15 +188,41 @@ export const SYSTEM_PROMPT = `Du bist **Bo**, ein freundlicher, kompetenter Reis
 ❌ Trocken nach Result: „Gefunden."
 ✅ Warm: „Hab eine schöne Verbindung gefunden — schau mal:"
 
+# Pläne und Empfehlungen
+
+Du bist nicht nur eine Suchmaske mit Sprachbedienung. Fragt jemand „was kann ich morgen in Dortmund machen?", ist die richtige Antwort ein konkreter Vorschlag — keine Gegenfrage nach seinen Interessen.
+
+**So sieht das aus:**
+- **Konkret werden.** Namen nennen, keine Kategorien. „Das Dortmunder U und danach der Phoenixsee" statt „ein Museum und ein Park". Zwei bis vier Stationen für einen Tag reichen; ein Plan mit acht Punkten wird nicht befolgt.
+- **In eine Reihenfolge bringen**, die geografisch aufgeht — Vormittag, Mittagessen, Nachmittag. Wer quer durch die Stadt und zurück schickt, hat nicht geplant, sondern aufgezählt.
+- **Und dann die Verbindung dazu.** Genau das ist der Unterschied zu einem Reiseführer: Sag, wie man hinkommt. Zwischen zwei Punkten in einer Stadt ist das \`search_journey\` mit mode TRAIN (deckt auch Bus, Tram und U-Bahn ab), für eine einzelne Haltestelle \`get_stop_board\`.
+- **Nicht für jeden Schritt eine Suche.** Ein Tagesplan mit vier Punkten braucht keine vier Abfragen. Such die Verbindung, nach der wirklich gefragt ist — meist die Anreise oder der eine längere Sprung —, und beschreib den Rest in einem Satz („vom Hauptbahnhof sind es mit der U49 zehn Minuten").
+
+**Wobei du ehrlich bleiben musst:** Empfehlungen kommen aus deinem eigenen Wissen, nicht aus einer Live-Datenbank. Öffnungszeiten, Preise und ob es einen Laden überhaupt noch gibt, kannst du nicht prüfen. Sag das dazu, wenn es drauf ankommt („ob das noch geöffnet hat, schaust du besser kurz nach"), und erfinde keine Adressen, Telefonnummern oder Preise. Ein Restaurant, bei dem du dir unsicher bist, nennst du lieber gar nicht — ein erfundener Tipp ist schlimmer als keiner.
+
+Fahrzeiten, Preise und Verbindungen dagegen kommen IMMER aus einem Tool. Die schätzt du nie.
+
 # Welche Sprache
 
 Du antwortest in der Sprache des Users. Default ist Deutsch. Wenn der User auf Englisch/Französisch/Spanisch schreibt, switche entsprechend. Bei gemischten Eingaben (z.B. deutsche Frage mit englischen Städtenamen) bleib bei der Sprache der Frage.
 
 # Tools — Verhalten
 
-Du hast 5 Tools. Vier Grundregeln, sonst nichts:
+Du hast 6 Tools. Vier Grundregeln, sonst nichts:
 
 **1. TOOL ZUERST, TEXT DANACH.** Behauptungen über Live-Daten, Treffer, Gespeichert-Status MÜSSEN aus einem Tool-Call kommen. Kein „Live-Board:" ohne get_stop_board, kein „Treffer!" ohne search_journey, kein „Gespeichert!" ohne save_trip.
+
+**1b. Und das gilt GENAUSO für das Gegenteil.** „Da fährt nichts", „die Strecke gibt es nicht", „so spät geht keiner mehr", „den Ort kenne ich nicht", „das ist zu klein für einen Bahnhof" — das sind alles Aussagen über Live-Daten, und sie brauchen denselben Beleg wie ein Treffer. Aus deinem eigenen Wissen weißt du NICHT, welche Orte im Fahrplan stehen, welche Züge heute fahren oder ob eine Verbindung existiert. Das weiß nur das Tool.
+
+Wenn Start, Ziel, Datum und Mode dastehen, **suchst du** — auch wenn dir der Ort klein, unbekannt oder unwahrscheinlich vorkommt. Gerade dann: Kleine Orte sind der Normalfall im Regionalverkehr. Erst wenn ein Tool \`not_found\` oder ein leeres Ergebnis zurückgibt, darfst du sagen, dass es nichts gibt — und dann sagst du es als Ergebnis der Suche, nicht als Vorwissen.
+
+Ein Beispiel, das genau so nicht passieren darf:
+
+❌ **User:** „morgen von Werl nach Dortmund Hbf mit dem Zug ab 14 Uhr"
+   **Bo (ohne Tool):** „Von Werl nach Dortmund gibt es leider keine direkte Zugverbindung."
+✅ **Tool-Call:** search_journey("Werl" → "Dortmund Hbf", morgen, TRAIN, departAfter 14:00) — und DANN das Ergebnis berichten, wie es ist.
+
+Alles, was nach „vermutlich", „normalerweise", „da dürfte" oder „so etwas gibt es nicht" klingt, ist an dieser Stelle verboten. Du hast ein Tool dafür. Benutz es.
 
 **2. Shortcut-Wörter → direkt das Tool, ohne Rückfrage:**
 - „speicher / save / merk / bookmark" → \`save_trip\` (nimmt automatisch das letzte Result)
@@ -188,7 +230,7 @@ Du hast 5 Tools. Vier Grundregeln, sonst nichts:
 - „alle Treffer / mehr / cheaper / andere Optionen" → \`open_all_results\`
 - „Live-Board / Abfahrten / departures + Station" → \`get_stop_board\`
 
-**3. Wenn was Wichtiges fehlt → EINE kurze Frage stellen, NICHT raten.**
+**3. Wenn was Wichtiges fehlt → EINE kurze Frage stellen, NICHT raten.** (Aber nur EINMAL — kommt darauf keine brauchbare Antwort, siehe 4b: dann entscheidest du.)
 Wichtig sind nur: Origin-Stadt, Destination-Stadt, Datum, Mode (Zug/Bus/Flug/Cruise).
 - „Nach Berlin morgen" → fehlt Origin → frag „Von wo aus?"
 - „Berlin nach München" → fehlt Datum + Mode → frag „Wann und womit?"
@@ -196,6 +238,19 @@ Wichtig sind nur: Origin-Stadt, Destination-Stadt, Datum, Mode (Zug/Bus/Flug/Cru
 - „Hauptbahnhof" = „Hbf" (Synonyme, nie nachfragen).
 
 **4. Anti-Loop:** Wenn deine vorherige Antwort eine Klärungsfrage war und der User antwortet kurz („Hbf", „beide", „ja"), INTERPRETIERE die Antwort im Kontext deiner Frage — keine neuen Tool-Calls für die gleiche Frage. „Hbf" nach Frage über zwei Städte = Hbf für BEIDE Städte. „Ja" nach Bestätigungsfrage = SOFORT search_journey.
+
+**4b. Umgangssprache und „weiß nicht" verstehen.** Antworten kommen selten in ganzen Sätzen. Kurzformen sind ganz normale Antworten, keine Rätsel:
+
+- **„kp", „kA", „keine ahnung", „weiß nicht", „idk"** = der User weiß es nicht. Das ist eine ANTWORT, keine leere Zeile. Frag NICHT dieselbe Frage noch einmal. Nimm ihm die Entscheidung ab: Bei der Startstadt schlägst du selbst etwas vor („Sollen wir von Dortmund aus schauen?"), beim Datum nimmst du einen naheliegenden Zeitraum („Dann guck ich mal fürs kommende Wochenende"). Er kann immer noch korrigieren.
+- **„egal", „such du aus", „mach mal"** = er überlässt dir die Wahl. Also triff sie und such, statt zurückzufragen.
+- **„ne", „nö", „passt nicht", „was anderes"** = Ablehnung des Vorschlags, nicht der ganzen Idee. Bring eine Alternative, frag nicht von vorne.
+- Auch **„jo", „jop", „klar", „passt", „hau rein"** heißen ja. **„hmm", „mal schauen"** heißen unentschlossen — dann hilf mit einem konkreten Vorschlag.
+
+Die Regel dahinter: Zweimal dieselbe Frage ist immer ein Fehler. Wenn du nach EINER Nachfrage nicht weiterkommst, entscheide selbst und sag, was du angenommen hast.
+
+**5. Tür-zu-Tür statt Bahnhof-zu-Bahnhof.** Fragt jemand nach einer Reise, deren Start oder Ziel keinen eigenen Flughafen hat („von Werl nach Mallorca"), ist das \`plan_multimodal\` — NICHT search_journey mit geratenem Flughafen. Der Server wählt die Flughäfen, ordnet die Beine und prüft die Umsteigezeiten. Such NICHT selbst in mehreren Schritten: Drei einzelne search_journey kosten dreimal so viel und ergeben trotzdem keine geprüfte Kette.
+
+Bei „vergleich Route A mit Route B" rufst du \`plan_multimodal\` zweimal mit unterschiedlichem \`viaOriginAirport\` und stellst die Unterschiede gegenüber — Gesamtdauer, Umsteigezeit, Preis, Anzahl der Wechsel. Sag ehrlich, was für welche spricht, statt beide gleich gut zu finden.
 
 **Ortsnamen immer MIT Stadt:** Niemals nur „Hbf" / „Bahnhof" / „Flughafen" als Ortsangabe — immer mit Stadtnamen kombinieren („Hbf" als Antwort auf eine Berlin-Frage = „Berlin Hbf").
 
@@ -246,6 +301,22 @@ Modus-Plural pro Sprache:
 - CRUISE → Kreuzfahrten / cruises / croisières / cruceros
 
 **KEIN Beschreiben der Route, KEIN Preis-Nennen, KEINE Empfehlung im Text** — die Card zeigt alles. Wer mehr Details will, tappt drauf. (Einzige Ausnahme: Vergleichs-Anfragen, siehe oben.) Wenn totalResults = 1, sag „Eine günstige Verbindung gefunden:" (analog in anderen Sprachen). Bei \`directOnly\` sag „Direktflüge" / „Direktverbindungen" statt nur „Flüge"/„Verbindungen". Wenn \`found: false\` → siehe „Fehlerbehandlung" unten.
+
+## plan_multimodal
+Baut eine **Tür-zu-Tür-Kette** aus mehreren Verkehrsmitteln — Zubringer, Hauptlauf, Weiterfahrt. Der Server sucht die Flughäfen selbst, prüft die Umsteigezeiten und liefert jedes Bein mit echten Zeiten und Preisen.
+
+**Wann aufrufen:**
+- Start oder Ziel hat keinen eigenen Flughafen: „von Werl nach Mallorca", „von Soest nach Lissabon".
+- Der User fragt, wie er tatsächlich hinkommt, nicht nur was ein Flug kostet.
+- Vergleich zweier Varianten: zweimal aufrufen, unterschiedliches \`viaOriginAirport\`.
+
+**Wann NICHT:** Zwei gut angebundene Orte in einem Modus („Berlin nach München mit dem Zug") — das ist \`search_journey\` und deutlich günstiger.
+
+**Was du danach sagst:** Beschreib die FORM der Reise, nicht die Zahlen — die Karten stehen unter deinem Text und zeigen Zeiten und Preise selbst. Also: „Mit dem Zug nach Düsseldorf, von dort direkt nach Palma — gut sechs Stunden insgesamt." Nicht die Abfahrtszeiten jedes Beins herunterbeten.
+
+**Preise:** Kommt \`totalPrice: null\` zurück, hat mindestens ein Bein keinen Preis (steht in \`unpricedLegs\`). Dann nennst du KEINE Gesamtsumme und rechnest auch nichts hoch — sag, für welches Bein der Preis fehlt. Eine Summe, in der ein Bein fehlt, sieht vollständig aus und ist damit schlimmer als gar keine.
+
+**Hinweise:** Was in \`notes\` steht, gehört in deine Antwort, wenn es die Reise betrifft — eine knappe Umsteigezeit oder eine fehlende Weiterfahrt darf der User nicht erst am Bahnsteig merken.
 
 ## get_stop_board
 Zeigt eine **Live-Abfahrts-/Ankunftstafel** für **EINE bestimmte Station** (Bahnhof, Flughafen, Bushaltestelle, Kreuzfahrthafen).
@@ -457,6 +528,28 @@ Bei Wochenenden / mehreren möglichen Tagen IMMER kurz rückfragen welcher Tag k
 - Wenn search_journey leere Results liefert: Erkläre kurz dass keine Verbindung gefunden wurde, schlag eine Alternative vor (anderes Datum? anderer Mode?).
 - Wenn ein Tool einen Error wirft: Sag dem User dass „gerade was schief läuft, probier's in einem Moment nochmal".
 - NIEMALS eine Verbindung halluzinieren wenn search_journey nichts liefert.
+- Und ebenso NIEMALS das Fehlen einer Verbindung behaupten, ohne gesucht zu haben. Beides ist dieselbe Regel: Was im Fahrplan steht, entscheidet das Tool, nicht dein Vorwissen. Im Zweifel suchst du — eine Suche zu viel ist harmlos, eine falsche Auskunft schickt jemanden nicht zum Zug.
+
+# Nahverkehr in der Stadt ist DEIN Auftrag
+
+Das ist keine Randnotiz, sondern eine der häufigsten Fragen — und du hast sie wiederholt abgelehnt mit „dafür bin ich nicht da" und auf Karten-Apps verwiesen. Das ist falsch und darf nicht mehr vorkommen.
+
+**Bus zu Bus, Zug zu Metro, Tram, S-Bahn, U-Bahn — alles davon kannst du.** Der Suchdienst dahinter fragt für \`mode: TRAIN\` ausdrücklich Schiene, S-Bahn, Tram, U-Bahn UND Bus gemeinsam ab. Eine Fahrt von einer Haltestelle zur anderen innerhalb von Rom, Berlin oder Wien ist also genau dieselbe Anfrage wie eine Fahrt zwischen zwei Städten: \`search_journey\` mit \`mode: TRAIN\`.
+
+**Verboten:**
+- „Dafür bin ich nicht da" / „Ich suche nur Fernverbindungen" / „Dafür brauchst du eine Karten-App"
+- Auf Google Maps, Apple Karten, Citymapper oder Ähnliches verweisen
+- Behaupten, für Stadtverkehr keine Daten zu haben
+
+**Erst suchen, dann urteilen.** Wenn du nach der Suche wirklich nichts findest, sagst du das — als Ergebnis, nicht als Absage. Eine Absage ohne Suche ist immer ein Fehler (siehe Regel 1b).
+
+# Von einem ORT zur nächsten Haltestelle
+
+Nutzer sagen „vom Kolosseum zum Rathaus", nicht „von Colosseo (MB) nach Piazza del Campidoglio". Beides ist gemeint als: die Fahrt zwischen den Haltestellen, die dort liegen.
+
+Du übergibst \`search_journey\` die **Ortsnamen als Klartext** — der Server löst sie selbst auf und sucht die passende Haltestelle. Übergib also, was der Nutzer gesagt hat, gern mit der Stadt davor, wenn sie aus dem Zusammenhang klar ist („Kolosseum" → \`origin: "Rom Kolosseum"\`). Das hilft der Auflösung, weil derselbe Name in mehreren Städten vorkommt.
+
+Findet der Server den Ort nicht, bekommst du \`not_found\` ZURÜCK — dann, und erst dann, fragst du nach einer nahegelegenen Haltestelle („Welche Station ist dir am nächsten? Ich kenne dort zum Beispiel Colosseo und Circo Massimo."). Nicht vorher raten und nicht vorher ablehnen.
 
 # Was du NICHT tust
 
@@ -465,7 +558,7 @@ Bei Wochenenden / mehreren möglichen Tagen IMMER kurz rückfragen welcher Tag k
 - Visa- oder Reisepass-Auskünfte geben
 - Spezifische Preise nennen die nicht aus search_journey kommen
 - Tool-Codes (HAFAS, IATA, GTFS) im Klartext zeigen
-- Aktuelle Echtzeit-Daten ohne search_journey (du hast keinen direkten Live-Zugang außerhalb der Tools)
+- Aktuelle Echtzeit-Daten ohne Tool-Aufruf (du hast keinen direkten Live-Zugang außerhalb der Tools — mit \`get_stop_board\` und \`search_journey\` hast du ihn sehr wohl)
 
 Wenn der User eines davon fragt: höflich erklären was du kannst, und auf die Reise-Suche umlenken.
 
@@ -550,6 +643,44 @@ export const TOOLS: Anthropic.Messages.Tool[] = [
     },
   },
   {
+    name: "plan_multimodal",
+    description:
+      "Plan a DOOR-TO-DOOR journey that chains several modes — e.g. 'Werl to Mallorca' = train to the airport, then the flight, then onward transit. Use this whenever origin or destination is a place WITHOUT its own airport/station for the main leg, or when the user asks how to actually get there end-to-end. The server picks the airports, orders the legs and checks that the connections work; it returns every leg with real times and prices. The client renders one card per leg automatically — do NOT repeat times or prices in your reply, summarise the SHAPE of the trip instead ('Zug nach Düsseldorf, dann Flug'). For a single mode between two well-connected places, use search_journey — it is cheaper. To COMPARE two variants, call this twice with different viaOriginAirport values and contrast the outcomes.",
+    input_schema: {
+      type: "object",
+      properties: {
+        origin: {
+          type: "string",
+          description: "Origin as plain text — a town is fine, it needs no airport ('Werl', 'Soest', 'Berlin').",
+        },
+        destination: {
+          type: "string",
+          description: "Destination as plain text ('Mallorca', 'Palma', 'Lissabon').",
+        },
+        departDate: {
+          type: "string",
+          description: "Departure date as yyyy-MM-dd. Absolute only — resolve 'tomorrow' yourself from today's date in your instructions.",
+        },
+        passengers: {
+          type: "integer",
+          minimum: 1,
+          maximum: 9,
+          description: "Number of passengers, default 1.",
+        },
+        viaOriginAirport: {
+          type: "string",
+          description: "Force the departure airport by IATA code (e.g. 'DUS'). Only for comparisons or when the user names one — omit otherwise, the server picks better than a guess.",
+        },
+        viaDestAirport: {
+          type: "string",
+          description: "Force the arrival airport by IATA code. Same rule as viaOriginAirport.",
+        },
+      },
+      required: ["origin", "destination", "departDate"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "search_journey",
     description:
       "Search concrete trips between two locations. Pass origin/destination as PLAIN-TEXT place names (city, station or airport) — the server resolves them itself. May return ambiguous candidates (ask the user, then re-call with the candidate's label VERBATIM or its code) or not_found (retry once with the English/local spelling yourself). The client renders the best result as a card automatically — don't repeat price or times in your reply.",
@@ -627,6 +758,16 @@ const toolInputSchemas = {
       mode: z.enum(["FLIGHT", "TRAIN", "BUS", "CRUISE", "ALL"]).optional(),
     })
     .strict(),
+  plan_multimodal: z
+    .object({
+      origin: z.string().min(1),
+      destination: z.string().min(1),
+      departDate: z.string().min(1),
+      passengers: z.number().int().min(1).max(9).optional(),
+      viaOriginAirport: z.string().min(2).max(4).optional(),
+      viaDestAirport: z.string().min(2).max(4).optional(),
+    })
+    .strict(),
   search_journey: z
     .object({
       origin: z.string().min(1),
@@ -654,6 +795,62 @@ function formatDurationText(min: number): string {
 
 /** Lokale Abfahrtszeit (HH:MM) eines Results in seiner Origin-Zeitzone —
  *  departTime ist ISO-UTC, „ab 15 Uhr" meint aber Ortszeit am Startort. */
+/**
+ * Der Reisetag wird in Europe/Berlin abgegrenzt — dieselbe Annahme, die der
+ * MOTIS-Anbieter für seinen Tagesbeginn trifft (Kernmarkt; CH/AT/FR/ES liegen
+ * in derselben Zone).
+ */
+const DAY_TZ = "Europe/Berlin";
+
+/**
+ * „14:00" am Reisetag als echter Zeitpunkt.
+ *
+ * Der Zonen-Offset wird an genau diesem Datum aus der Differenz zweier
+ * Formatierungen abgeleitet — derselbe Kniff wie in `providers/train/motis.ts`,
+ * damit Sommer- und Winterzeit von selbst stimmen.
+ */
+/** Verschiebung der Zone gegenüber UTC an einem konkreten Zeitpunkt, in ms. */
+function zoneOffsetMs(at: Date): number {
+  return (
+    new Date(at.toLocaleString("en-US", { timeZone: DAY_TZ })).getTime() -
+    new Date(at.toLocaleString("en-US", { timeZone: "UTC" })).getTime()
+  );
+}
+
+function isoAtLocalTime(date: string, hhmm: string): string | null {
+  const parts = hhmm.split(":");
+  const h = Number(parts[0]);
+  const m = Number(parts[1]);
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+  const wall = Date.parse(`${date.slice(0, 10)}T00:00:00Z`);
+  if (Number.isNaN(wall)) return null;
+  const target = wall + (h * 60 + m) * 60_000;
+  /**
+   * Gemessen wird am ZIEL-Zeitpunkt, nicht um Mitternacht UTC.
+   *
+   * Die erste Fassung las die Verschiebung um 00:00 UTC des Reisetags ab und
+   * rechnete damit eine Uhrzeit am Nachmittag um. An den beiden Umstelltagen
+   * liegt zwischen beiden aber eine Stunde: Am 30.03. ist es um 00:00 UTC noch
+   * Winterzeit, um 14:00 Ortszeit längst Sommerzeit. Die Suche wäre also
+   * ausgerechnet an diesen Tagen eine Stunde daneben gestartet — und der
+   * Kommentar behauptete, genau das sei abgedeckt.
+   *
+   * Zwei Durchgänge: erst mit der Verschiebung um die Mittagszeit schätzen (die
+   * liegt nie in der Umstellstunde), dann am Ergebnis gegenprüfen und bei
+   * Abweichung einmal nachziehen. Mehr braucht es nicht — Sprünge sind höchstens
+   * eine Stunde groß.
+   */
+  const noon = new Date(wall + 12 * 3_600_000);
+  let offset = zoneOffsetMs(noon);
+  let instant = target - offset;
+  const check = zoneOffsetMs(new Date(instant));
+  if (check !== offset) {
+    offset = check;
+    instant = target - offset;
+  }
+  return new Date(instant).toISOString();
+}
+
 function localDepartHHMM(departTime: string, originTz?: string): string | null {
   try {
     // hourCycle h23 explizit — `hour12: false` allein kann je nach Engine
@@ -697,19 +894,160 @@ type EndpointResolution =
   | { status: "ambiguous"; candidates: ResolvedLoc[] }
   | { status: "not_found" };
 
+/**
+ * Koordinaten und Typ zu einem bereits aufgelösten Code nachladen.
+ *
+ * `resolveJourneyEndpoint` liefert bewusst nur Code, Label, Stadt und Land —
+ * das reicht der einfachen Suche. Der multimodale Planer braucht zusätzlich die
+ * Lage, um überhaupt entscheiden zu können, welcher Flughafen in Frage kommt
+ * und ob es einen Zubringer braucht. Ein Treffer ohne Koordinaten ist kein
+ * Fehler: Der Planer behandelt ihn dann als „Lage unbekannt" und fällt auf die
+ * Flug-Kette zurück, statt eine Entfernung zu erfinden.
+ */
+async function loadEndpointCoords(
+  code: string,
+): Promise<{ latitude?: number; longitude?: number; type: string }> {
+  const rows = await db
+    .select({
+      latitude: locations.latitude,
+      longitude: locations.longitude,
+      type: locations.type,
+    })
+    .from(locations)
+    .where(eq(locations.code, code))
+    .limit(1);
+  const row = rows[0];
+  if (!row) return { type: "ALL" };
+  return {
+    latitude: row.latitude == null ? undefined : Number(row.latitude),
+    longitude: row.longitude == null ? undefined : Number(row.longitude),
+    type: row.type,
+  };
+}
+
+/**
+ * Ein ORT ist keine Haltestelle — also die nächstgelegene dazu suchen.
+ *
+ * „Vom Kolosseum zum Rathaus" ist die normale Art, wie Menschen das sagen. Im
+ * Bestand steht aber keine Haltestelle „Rathaus", sondern die Halte drumherum.
+ * Bisher endete das in `not_found`, und Bo musste zurückfragen oder — schlimmer —
+ * hat abgelehnt.
+ *
+ * Zwei Schritte, beide bereits vorhanden:
+ *   1. Den Ortsnamen geokodieren. `motisGeocode` liefert auch PLACE-Treffer,
+ *      also Sehenswürdigkeiten und Plätze, nicht nur Halte. Der Länderfilter
+ *      dort ist wichtig und bleibt aktiv (sonst landet „Paris" in Brasilien).
+ *   2. Von dieser Koordinate aus den nächsten Halt AUS UNSEREM Bestand
+ *      nehmen — wir haben für jeden Halt Koordinaten, und seit der
+ *      Städte-Anreicherung auch die Stadt.
+ *
+ * Der Deckel von 1200 m ist bewusst eng: Was weiter weg liegt, ist nicht mehr
+ * „die Haltestelle an diesem Ort", und eine erfundene Nähe wäre wieder die
+ * Fehlerklasse, die `stationNameCompatible` verhindert.
+ */
+const POI_MAX_STOP_DISTANCE_M = 1200;
+
+async function resolvePoiToStop(q: string, mode: TravelMode): Promise<ResolvedLoc | null> {
+  let place: Awaited<ReturnType<typeof motisGeocode>> = null;
+  try {
+    place = await motisGeocode(q);
+  } catch {
+    return null;
+  }
+  if (!place || place.lat == null || place.lon == null) return null;
+
+  const latDelta = POI_MAX_STOP_DISTANCE_M / 111_000;
+  const lngDelta =
+    POI_MAX_STOP_DISTANCE_M /
+    (111_000 * Math.max(Math.cos((place.lat * Math.PI) / 180), 0.01));
+
+  const rows = await db
+    .select({
+      code: locations.code,
+      label: locations.label,
+      city: locations.city,
+      country: locations.country,
+      latitude: locations.latitude,
+      longitude: locations.longitude,
+    })
+    .from(locations)
+    .where(
+      and(
+        isNotNull(locations.latitude),
+        isNotNull(locations.longitude),
+        gte(locations.latitude, String(place.lat - latDelta)),
+        lte(locations.latitude, String(place.lat + latDelta)),
+        gte(locations.longitude, String(place.lon - lngDelta)),
+        lte(locations.longitude, String(place.lon + lngDelta)),
+        // Der Modus entscheidet, welcher Anbieter gefragt wird — ein Flughafen
+        // als Ersatz für einen Platz in der Innenstadt wäre unbrauchbar.
+        // `search_journey` übergibt immer einen konkreten Modus, nie „ALL".
+        eq(locations.type, mode),
+      ),
+    )
+    .orderBy(
+      sql`(${locations.latitude} - ${place.lat})*(${locations.latitude} - ${place.lat}) + (${locations.longitude} - ${place.lon})*(${locations.longitude} - ${place.lon}) ASC`,
+    )
+    .limit(1);
+
+  const row = rows[0];
+  if (!row || row.latitude == null || row.longitude == null) return null;
+  return {
+    code: row.code,
+    label: row.label,
+    city: row.city ?? null,
+    country: row.country ?? null,
+  };
+}
+
 async function resolveJourneyEndpoint(
   q: string,
   mode: TravelMode,
 ): Promise<EndpointResolution> {
   const results = await searchLocations(q, mode);
-  const trimmed: ResolvedLoc[] = results.slice(0, 8).map((r) => ({
+  const all: ResolvedLoc[] = results.slice(0, 8).map((r) => ({
     code: r.code,
     label: r.label,
     city: r.city ?? null,
     country: r.country ?? null,
   }));
+  /**
+   * NAMENSPRÜFUNG — hier fehlte sie, und das ist die gefährlichste Fehlerklasse,
+   * die dieses Projekt kennt.
+   *
+   * `searchLocations` sortiert nach Relevanz und liefert IMMER etwas, solange
+   * irgendetwas entfernt ähnlich ist. Blind `results[0]` zu nehmen heißt: Wer
+   * „Colosseo" sucht und dessen Haltestelle nicht im Bestand hat, bekommt den
+   * besten Fuzzy-Treffer — und die Suche lief dann nachweislich von Köln nach
+   * München, ausgewiesen als die Strecke des Nutzers. Es sieht nicht kaputt
+   * aus, es ist einfach falsch.
+   *
+   * `util/stationName.ts` gibt es genau dafür, und die anderen Provider
+   * benutzen es längst (MOTIS, FlixBus, der multimodale Planer). Der Weg über
+   * den Chat-Agenten war der einzige ohne. Die Regel dort gilt hier genauso:
+   * Lieber kein Ergebnis als eins aus der falschen Stadt.
+   *
+   * Geprüft wird gegen Bezeichnung UND Stadt — „Colosseo" darf auf
+   * „Roma Colosseo" passen, „Rom" auf eine Station in der Stadt Rom.
+   */
+  const named = all.filter(
+    (r) => stationNameCompatible(q, r.label) || stationNameCompatible(q, r.city),
+  );
+  /**
+   * Bleibt nichts übrig, ist es ein NICHT-GEFUNDEN — kein Notnagel.
+   *
+   * Ein Rückfall auf die ungeprüfte Liste wäre derselbe Fehler mit mehr
+   * Schritten. Bo sagt dann ehrlich, dass er den Ort nicht kennt, und der
+   * Nutzer kann anders formulieren.
+   */
+  const trimmed = named;
   const top = trimmed[0];
-  if (!top) return { status: "not_found" };
+  if (!top) {
+    // Kein Halt dieses Namens — vielleicht ist es gar keiner, sondern ein ORT.
+    const poi = await resolvePoiToStop(q, mode);
+    if (poi) return { status: "ok", loc: poi };
+    return { status: "not_found" };
+  }
   if (trimmed.length === 1) return { status: "ok", loc: top };
 
   const queryNorm = q.trim().toLowerCase();
@@ -754,12 +1092,23 @@ interface ToolExecResult {
   /** Optional: Wenn search_journey ein Result hatte, geben wir's an den Client
    *  separat raus (für die FlightCard). */
   searchResult?: unknown;
+  /**
+   * Mehrere Karten aus EINEM Werkzeug — für die multimodale Kette.
+   *
+   * `searchResult` bleibt für die einfache Suche; hier hängen die Beine in
+   * Reisereihenfolge, und der Chat stapelt sie in dieselbe Blase (die
+   * Anhänge-Funktion im Client hängt an, statt zu ersetzen). Ein eigener
+   * Kartentyp war dafür nicht nötig.
+   */
+  searchResults?: { result: unknown; params: LastSearchParams; isMain?: boolean }[];
   /** Optional: Wenn get_stop_board lief, schicken wir Code+Label+Board an
    *  den Client damit der die StopBoardCard inline rendert (Live-Daten
    *  holt der Client selbst direkt über /api/stops/:code/{board}). */
   stopBoard?: {
     stop: { code: string; label: string };
     board: "departures" | "arrivals";
+    /** Bereits geladene Tafel — spart dem Client die eigene Abfrage. */
+    data?: unknown;
   };
   /** Optional: Client-Side-Action die ausgeführt werden soll. */
   action?: {
@@ -976,16 +1325,57 @@ async function execTool(
         }
       }
 
+      /**
+       * Die Tafel WIRKLICH laden — Bo soll sie lesen können.
+       *
+       * Bisher stand hier nur „gefunden, hier ist der Halt", und die Daten holte
+       * der Client selbst. Bo hat sie damit nie gesehen: Auf „wann fährt der
+       * nächste Zug" konnte er nur eine Karte einblenden und den Nutzer selbst
+       * nachschauen lassen.
+       *
+       * Kontingent bleibt gleich: Die geladenen Zeilen gehen unten mit an den
+       * Client, der holt sie also NICHT ein zweites Mal. Fällt das Laden aus,
+       * bleibt es beim alten Verhalten — die Karte kommt, der Client holt selbst.
+       */
+      const liveBoard = await loadStopBoard(top.code, board).catch(() => null);
+      const rows = (liveBoard?.results ?? []).slice(0, 8).map((r) => ({
+        line: r.line,
+        direction: r.direction,
+        plannedTime: r.plannedTime,
+        delayMinutes: r.delayMinutes ?? 0,
+        platform: r.platform ?? null,
+        product: r.product ?? null,
+      }));
       return {
         resultJson: JSON.stringify({
           found: true,
           stop: { code: top.code, label: top.label },
           board,
+          fetchedAt: liveBoard?.fetchedAt ?? null,
+          /**
+           * Die nächsten acht — mehr braucht keine Antwort, und mehr würde nur
+           * Kontext kosten. Zeiten sind ISO mit Zonenangabe; rechne sie in die
+           * Ortszeit am Halt um, wenn du sie nennst.
+           */
+          next: rows,
+          instruction:
+            rows.length === 0
+              ? "No live rows available. Say so plainly; do not invent departures."
+              : "You CAN read these rows. If the user asked for a specific time (\"when does the next train go\"), answer with the concrete departure from `next` — line, direction, time, and delay if any. The card with the full board is shown to the user anyway, so do not repeat the whole list; name the one they asked for and offer the rest ONLY if it helps.",
         }),
         // Der Client fetcht die Live-Daten selber direkt gegen
         // /api/stops/:code/{board} — Tab-Switch (Departures↔Arrivals) kann
         // dann inline ohne neuen Chat-Roundtrip passieren.
-        stopBoard: { stop: { code: top.code, label: top.label }, board },
+        stopBoard: {
+          stop: { code: top.code, label: top.label },
+          board,
+          /**
+           * Die schon geladene Tafel geht MIT — sonst holt der Client sie ein
+           * zweites Mal, und das DB-Kontingent (60/min) hängt genau daran.
+           * Fehlt sie (Laden fehlgeschlagen), holt er wie bisher selbst.
+           */
+          data: liveBoard ?? undefined,
+        },
         isError: false,
       };
     }
@@ -1008,6 +1398,133 @@ async function execTool(
           action: "open_results",
           payload: { ...turnState.lastSearch },
         },
+        isError: false,
+      };
+    }
+
+    if (name === "plan_multimodal") {
+      const input = toolInputSchemas.plan_multimodal.parse(rawInput);
+      /**
+       * Beide Enden im ALL-Modus auflösen.
+       *
+       * Nicht im FLIGHT-Modus: Der ganze Zweck des Werkzeugs ist, dass die
+       * Enden KEINE Flughäfen sein müssen. „Werl" gibt es dort nicht, und die
+       * Auflösung liefe in die Ausrede „nicht gefunden", statt einen Zubringer
+       * zu bauen.
+       */
+      /**
+       * EIGENE Auflösung, nicht die der einfachen Suche.
+       *
+       * `resolveJourneyEndpoint` ist auf einen Modus zugeschnitten und nimmt
+       * sonst den bestplatzierten Treffer. Für Reise-Enden ist das zu wenig:
+       * „Mallorca" liefert drei gleichnamige Bushaltestellen vor Palma. Die
+       * Auflösung im Planer sortiert deshalb nach Art des Ortes und prüft
+       * vorher, dass der Name überhaupt passt — siehe dort.
+       */
+      const [originEp, destEp] = await Promise.all([
+        resolvePlanEndpoint(input.origin),
+        resolvePlanEndpoint(input.destination),
+      ]);
+      for (const [which, ep] of [
+        ["origin", originEp],
+        ["destination", destEp],
+      ] as const) {
+        if (!ep) {
+          return {
+            resultJson: JSON.stringify({
+              error: "not_found",
+              which,
+              message: `Could not resolve the ${which}. Ask the user for a nearby larger town, or retry once with the local spelling.`,
+            }),
+            isError: true,
+          };
+        }
+      }
+
+      const plan = await planMultimodal({
+        origin: originEp as PlanEndpoint,
+        destination: destEp as PlanEndpoint,
+        departDate: input.departDate,
+        passengers: input.passengers ?? 1,
+        currency: ctx.currency,
+        ip: ctx.ip,
+        viaOriginAirport: input.viaOriginAirport,
+        viaDestAirport: input.viaDestAirport,
+      });
+
+      if (plan.status === "no_result") {
+        return {
+          resultJson: JSON.stringify({
+            error: plan.reason,
+            notes: plan.notes,
+            message:
+              "No end-to-end chain could be built. Tell the user what was tried (the notes say it) and offer a nearby larger city as origin, or another date.",
+          }),
+          isError: true,
+        };
+      }
+
+      // Letztes Bein als „letzte Suche" merken — Speichern und „alle Treffer"
+      // beziehen sich damit auf den Hauptlauf, nicht auf den Zubringer.
+      const mainLeg = plan.legs.find((l: PlanLeg) => l.role === "MAIN") ?? plan.legs[0]!;
+      turnState.lastSearch = {
+        origin: mainLeg.result.origin,
+        destination: mainLeg.result.destination,
+        originLabel: mainLeg.result.originLabel ?? "",
+        destLabel: mainLeg.result.destLabel ?? "",
+        mode: mainLeg.mode,
+        departDate: input.departDate,
+        passengers: input.passengers ?? 1,
+        currency: ctx.currency,
+      };
+
+      return {
+        resultJson: JSON.stringify({
+          ok: true,
+          legs: plan.legs.map((l: PlanLeg) => ({
+            role: l.role,
+            mode: l.mode,
+            from: l.result.originLabel ?? l.result.origin,
+            to: l.result.destLabel ?? l.result.destination,
+            departTime: l.result.departTime,
+            arriveTime: l.result.arriveTime,
+            durationMinutes: l.result.durationMinutes,
+            price: l.result.price > 0 ? l.result.price : null,
+            provider: l.result.provider,
+          })),
+          totalDurationMinutes: plan.totalDurationMinutes,
+          // null heißt NICHT „kostenlos", sondern „mindestens ein Bein hat
+          // keinen Preis". Bo darf die Lücke nicht überschlagen.
+          totalPrice: plan.totalPrice ?? null,
+          unpricedLegs: plan.unpricedLegs,
+          currency: plan.currency,
+          notes: plan.notes,
+        }),
+        searchResults: plan.legs.map((l: PlanLeg) => ({
+          result: l.result,
+          /**
+           * Welches Bein der Hauptlauf ist, muss MIT nach draußen.
+           *
+           * Serverseitig steht es längst fest (`turnState.lastSearch` oben
+           * nimmt bewusst das MAIN-Bein), aber der Client bekam pro Bein ein
+           * Ereignis mit eigenen Parametern und überschrieb seinen Merker
+           * damit der Reihe nach — zuletzt gewann also der Zubringer AM ZIEL.
+           * Beim nächsten Zug schickt er den zurück, und „speicher das" oder
+           * „zeig alle Treffer" bezog sich auf den Flughafen-Shuttle statt
+           * auf den Flug.
+           */
+          isMain: l.role === "MAIN",
+          params: {
+            origin: l.result.origin,
+            destination: l.result.destination,
+            originLabel: l.result.originLabel ?? "",
+            destLabel: l.result.destLabel ?? "",
+            mode: l.mode,
+            departDate: input.departDate,
+            passengers: input.passengers ?? 1,
+            currency: ctx.currency,
+          },
+        })),
         isError: false,
       };
     }
@@ -1053,6 +1570,31 @@ async function execTool(
       // wir einen klaren Error an Claude zurück, der dem User dann sagt
       // „Suche hat zu lange gedauert, probier nochmal" statt endlos zu warten.
       const SEARCH_TIMEOUT_MS = 15_000;
+      /**
+       * „ab 14 Uhr" muss in die SUCHE, nicht bloß in den Filter danach.
+       *
+       * Der Nachfilter unten allein war für Zug und Bus schlicht falsch: Deren
+       * Anbieter bekommen einen Startzeitpunkt und liefern die nächsten
+       * Verbindungen AB DA — ohne Uhrzeit ab 8 Uhr morgens. Auf einer Strecke
+       * im Stundentakt sind die ersten zehn Treffer damit alle vormittags, und
+       * der Filter „ab 14:00" wirft anschließend restlos alles weg. Ergebnis:
+       * „Keine Verbindungen ab 14 Uhr" auf einer Strecke, auf der stündlich
+       * ein Zug fährt. Nachstellbar mit Werl → Dortmund.
+       *
+       * Nur für die Modi, deren Anbieter den Zeitpunkt auch auswerten
+       * (`MODES_USING_DEPART_TIME` im Suchdienst). Flüge und Kreuzfahrten
+       * liefern ohnehin den ganzen Tag — dort bliebe es beim Nachfilter, und
+       * ein gesetzter Zeitpunkt würde nur `unfilteredTotal` verfälschen, mit
+       * dem Bo die Alternativen anbietet.
+       *
+       * `departBefore` steuert nichts: Eine Obergrenze sagt nichts darüber, wo
+       * die Suche beginnen soll.
+       */
+      const timedModes = mode === "TRAIN" || mode === "BUS";
+      const departTime =
+        timedModes && input.departAfter
+          ? (isoAtLocalTime(input.departDate, input.departAfter) ?? undefined)
+          : undefined;
       const searchPromise = runSearch({
         origin: originRes.loc.code,
         destination: destRes.loc.code,
@@ -1060,6 +1602,7 @@ async function execTool(
         originLabel: originRes.loc.label,
         destLabel: destRes.loc.label,
         departDate: input.departDate,
+        departTime,
         passengers: input.passengers ?? 1,
         currency: ctx.currency,
         mode,
@@ -1110,16 +1653,37 @@ async function execTool(
         filtered = filtered.filter((r) => r.price > 0 && r.price <= cap);
         applied.push(`maxPrice=${cap}`);
       }
-      if (input.departAfter || input.departBefore) {
+      /**
+       * `departAfter` wird NICHT nachgefiltert, wenn die Suche schon ab dieser
+       * Zeit gelaufen ist.
+       *
+       * Der Vergleich hier ist ein Zeichenketten-Vergleich auf „HH:MM" und
+       * kennt keinen Tageswechsel. Sucht jemand „heute ab 22 Uhr", liefert der
+       * Anbieter genau richtig die 23:4x und die 00:35 des Folgetages — und
+       * dieser Filter wirft „00:35" weg, weil es kleiner ist als „22:00". Bei
+       * dünnem Takt bleibt nichts übrig, und Bo meldet „da fährt nichts mehr"
+       * auf einer Strecke, auf der etwas fährt. Genau die Fehlklasse, gegen die
+       * Regel 1b im Prompt steht.
+       *
+       * Nötig ist er dort auch nicht mehr: Für Zug und Bus IST die Uhrzeit der
+       * Suchbeginn (siehe `departTime` oben), der Anbieter liefert also gar
+       * nichts Früheres. Für Flug und Kreuzfahrt bleibt er, denn dort kommt
+       * immer der ganze Tag zurück.
+       *
+       * `departBefore` ist davon unberührt — eine Obergrenze steuert die Suche
+       * nicht und muss nachgefiltert werden.
+       */
+      const filterDepartAfter = input.departAfter != null && departTime === undefined;
+      if (filterDepartAfter || input.departBefore) {
         filtered = filtered.filter((r) => {
           if (r.dateOnly) return true; // Kreuzfahrten ohne Uhrzeit nicht wegfiltern
           const hhmm = localDepartHHMM(r.departTime, r.originTz);
           if (!hhmm) return true;
-          if (input.departAfter && hhmm < input.departAfter) return false;
+          if (filterDepartAfter && input.departAfter && hhmm < input.departAfter) return false;
           if (input.departBefore && hhmm > input.departBefore) return false;
           return true;
         });
-        if (input.departAfter) applied.push(`departAfter=${input.departAfter}`);
+        if (filterDepartAfter) applied.push(`departAfter=${input.departAfter}`);
         if (input.departBefore) applied.push(`departBefore=${input.departBefore}`);
       }
 
@@ -1428,6 +1992,23 @@ export async function runChatTurn(
                 result: exec.searchResult,
                 params: turnState.lastSearch,
               });
+              setMood("happy");
+              foundSearchResult = true;
+            }
+            if (exec.searchResults?.length) {
+              // Reihenfolge = Reisereihenfolge. Gepuffert aus demselben
+              // Chronologie-Grund wie oben.
+              for (const item of exec.searchResults) {
+                pendingAttachments.push({
+                  type: "search_result",
+                  result: item.result,
+                  params: item.params,
+                  // Nur beim Hauptlauf gesetzt — siehe `isMain` oben. Bei einer
+                  // einfachen Suche gibt es nur ein Ergebnis, dort bleibt es weg
+                  // und der Client übernimmt es wie bisher.
+                  isMain: item.isMain,
+                });
+              }
               setMood("happy");
               foundSearchResult = true;
             }

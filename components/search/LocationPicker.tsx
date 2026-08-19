@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useState, useRef } from "react";
-import { PICKER_IN, PICKER_OUT, pickerCover } from "@/lib/nav/overlayCover";
+import { PICKER_IN, PICKER_OUT } from "@/lib/nav/overlayCover";
 import { useSheetSlide } from "@/lib/nav/sheetSlide";
 import { setSheetMoving } from "@/lib/nav/searchHandoff";
 import { prepareLayer, releaseLayer } from "@/lib/nav/transitionLayer";
@@ -20,19 +20,11 @@ import {
 import { usePalette } from "@/lib/theme/appBg";
 import { useQuery } from "@tanstack/react-query";
 import { X, Navigation, Plane, Train, Bus, Ship, Flag } from "lucide-react-native";
-import Animated, {
-  cancelAnimation,
-  Easing,
-  useAnimatedStyle,
-  useSharedValue,
-  withTiming,
-  runOnJS,
-} from "react-native-reanimated";
+import Animated, { withTiming } from "react-native-reanimated";
 import { Location, TravelMode } from "@/types/search";
 import { fetchLocations } from "@/lib/api/client";
 import { useT } from "@/lib/i18n/useT";
 import { SearchBar } from "@/components/SearchBar";
-import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useSearchStore } from "@/stores/searchStore";
 import { useAccent } from "@/lib/theme/accent";
 import { SaveStarButton } from "@/components/surroundings/SaveStarButton";
@@ -42,9 +34,10 @@ type Field = "from" | "to";
 
 interface Props {
   visible: boolean;
-  /** Liegt der Inhalt im Baum? Siehe Host — Aufbau beim Berühren, Abbau nach
-   *  der Ausfahrt. */
+  /** Liegt der Inhalt im Baum? Siehe Host — Aufbau im Leerlauf, danach fest. */
   mounted: boolean;
+  /** Zählt je Öffnung hoch, schon beim BERÜHREN — siehe Host. */
+  session: number;
   onClose: () => void;
   onSelect: (loc: Location) => void;
   field?: Field;
@@ -91,9 +84,22 @@ type SuggestItem =
   | { kind: "row"; key: string; loc: Location; suggested?: boolean };
 const LIST_PAD = { paddingBottom: 32 } as const;
 
-export function LocationPicker({
+/**
+ * GEMERKT — sonst rendert der ganze Wähler im ersten Bild der Ausfahrt neu.
+ *
+ * Der Wirt hört am Speicher; das Bestätigen schreibt Ergebnis und Auftrag in
+ * einem Zug, also genau dann, wenn die Rückfahrt losläuft. Er rendert dabei
+ * dieselben Eigenschaften noch einmal — ohne Schranke lief der komplette Baum
+ * dieses Wählers trotzdem durch, samt Einbau-Schritten auf dem UI-Strang.
+ *
+ * Alle Eigenschaften sind stabil: Speicher-Aktionen, Werte aus dem gemerkten
+ * Auftrag, und die Zahlen für Sichtbarkeit und Sitzung wechseln inzwischen
+ * ausschließlich außerhalb der Bewegung.
+ */
+const LocationPickerInner = function LocationPicker({
   visible,
   mounted,
+  session,
   onClose,
   onSelect,
   field = "from",
@@ -146,54 +152,24 @@ export function LocationPicker({
   );
 
   /**
-   * Die Eingabe wird ERST NACH der Ausfahrt geleert — nicht mit ihr.
+   * Geleert wird bei einer NEUEN Öffnung, nicht über einen Zeitgeber nach dem
+   * Schließen.
    *
-   * Sofort geleert kippt der gesamte Listeninhalt im ersten Bild der Bewegung:
-   * `showSearchResults` fällt von wahr auf falsch, die Trefferliste weicht den
-   * drei Vorschlags-Abschnitten, alles wird neu aufgebaut und neu vermessen.
-   * Und 200ms später feuert die Entprellung mit dem leeren Wert ein zweites
-   * Mal — mitten in dieselbe Fahrt. Das ist das Ruckeln beim Ausfahren.
+   * Der Zeitgeber hatte ein Loch: Öffnet man innerhalb der Ausfahrt erneut,
+   * räumt das Aufräumen ihn weg und die Sichtbarkeit kippt nie — der Wähler
+   * stand dann mit der alten Eingabe und der alten Trefferliste da, obwohl
+   * inzwischen das andere Feld gemeint war.
    *
-   * Sichtbar ist von der Verzögerung nichts: Zu dem Zeitpunkt steht das Blatt
-   * längst unterhalb des Bildrands. Der Datumswähler macht es an derselben
-   * Stelle seit jeher so.
-   *
-   * Die Tastatur dagegen MUSS sofort herunter, sonst gibt sie den Blick auf die
-   * darüber gehobene Tab-Leiste frei.
+   * Die Sitzungs-Kennung kennt diesen Fall nicht: Sie zählt bei jedem Berühren
+   * hoch, also auch beim schnellen Zweiten. Und sie tut es im Berührungsfenster,
+   * lange vor der Fahrt.
    */
-  const resetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  /**
-   * Eigener Merker statt des Zeitgebers — der war beim Nachholen schon weg.
-   *
-   * Das Nachholen prüfte `resetTimer.current`. Beim Wiederöffnen läuft aber
-   * ZUERST das Aufräumen des vorigen Durchgangs, und das setzt genau diesen
-   * Wert auf null. Die Prüfung war damit immer falsch: Wer den Wähler
-   * innerhalb der 320ms wieder öffnete, sah seine alte Suche samt Trefferliste
-   * stehen.
-   */
-  const resetPending = useRef(false);
+  const lastSessionRef = useRef(session);
   useEffect(() => {
-    if (visible) {
-      if (resetPending.current) {
-        resetPending.current = false;
-        setQuery("");
-      }
-      return;
-    }
-    Keyboard.dismiss();
-    resetPending.current = true;
-    resetTimer.current = setTimeout(() => {
-      resetTimer.current = null;
-      resetPending.current = false;
-      setQuery("");
-    }, PICKER_OUT.duration + 60);
-    return () => {
-      if (resetTimer.current) {
-        clearTimeout(resetTimer.current);
-        resetTimer.current = null;
-      }
-    };
-  }, [visible]);
+    if (session === lastSessionRef.current) return;
+    lastSessionRef.current = session;
+    setQuery("");
+  }, [session]);
 
   const { data: results, isLoading, isError, error } = useQuery({
     queryKey: ["locations", mode, debounced],
@@ -231,6 +207,7 @@ export function LocationPicker({
     style: overlayStyle,
     run: runSheet,
     parkNow,
+    warm: warmSlide,
   } = useSheetSlide("pickerLocation", PARK_Y);
 
   // Pre-warm: einmaliger no-op withTiming am Mount damit Reanimated v4
@@ -260,13 +237,11 @@ export function LocationPicker({
      * laufende Kurve ab; der Anlauf war damit tot, und das erste echte Öffnen
      * zahlte genau die Kosten, gegen die er gedacht ist.
      */
-    const id = requestAnimationFrame(() => {
-      offset.value = PARK_Y;
-      offset.value = withTiming(PARK_Y - 0.002, PICKER_IN, (finished) => {
-        "worklet";
-        if (finished) offset.value = PARK_Y;
-      });
-    });
+    /**
+     * Der Anlauf kommt aus der gemeinsamen Fahrt (`warmSlide`) — sonst wärmt er
+     * eine andere Funktion als die, die später wirklich fährt.
+     */
+    const id = requestAnimationFrame(() => warmSlide());
     return () => cancelAnimationFrame(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -379,11 +354,20 @@ export function LocationPicker({
   const slide = useCallback(
     (show: boolean) => {
       const cfg = show ? PICKER_IN : PICKER_OUT;
+      /**
+       * Beim Schließen ZUERST die Tastatur — vor allem anderen.
+       *
+       * Unter `adjustResize` verkleinert das Fenster sich dabei, und der
+       * gesamte Wurzelbaum wird neu vermessen. Diese Arbeit gehört vor die
+       * Bewegung, nicht mitten hinein. Die häufigsten Wege dorthin (Zeile
+       * antippen, X-Knopf) verlegen sie schon aufs Aufsetzen des Fingers; hier
+       * werden die übrigen mitgenommen — Zurück-Geste, Verdunkelungs-Tipp,
+       * Auswahl über die Umgebungs-Karte.
+       */
+      if (!show) Keyboard.dismiss();
       if (!layeredRef.current) holdLayerFor(cfg.duration + (show ? 16 : 0));
       armMovingGuard(cfg.duration);
-      runSheet(show, (s) => {
-        pickerCover.value = withTiming(s ? 1 : 0, s ? PICKER_IN : PICKER_OUT);
-      });
+      runSheet(show);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [runSheet],
@@ -413,22 +397,18 @@ export function LocationPicker({
    * der alte Wert stehen — und ein deckendes Blatt lugte unten ins Bild und
    * schluckte Berührungen.
    */
-  const lastScreenH = useRef(screenH);
-  useEffect(() => {
-    /**
-     * NUR bei echter Änderung des Fenstermaßes.
-     *
-     * Vorher stand `visible` mit in den Abhängigkeiten, und das war fatal: Beim
-     * Schließen kippt es auf falsch, dieser Effekt lief mit — und setzte das
-     * Blatt SOFORT auf den Parkplatz. Die Ausfahrt war damit nicht langsam oder
-     * ruckelig, sondern gar nicht mehr vorhanden: Der Bildschirm verschwand
-     * schlicht.
-     */
-    if (lastScreenH.current === screenH) return;
-    lastScreenH.current = screenH;
-    if (!visible) parkNow();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [screenH]);
+  /**
+   * KEIN Neu-Parken bei geändertem Fenstermaß mehr.
+   *
+   * Hier stand ein Effekt, der bei einer Änderung `parkNow()` rief — und der
+   * schreibt die beim Laden gemerkte Höhe zurück, also genau den Wert, den er
+   * korrigieren sollte. Er konnte nichts bewirken.
+   *
+   * Die Ausrichtung ist auf Hochkant festgelegt; die Fensterhöhe ändert sich zur
+   * Laufzeit nur durch die Tastatur, und die verkleinert sie — der Parkplatz
+   * liegt dann also weiter unten als nötig, nie zu hoch. Sichtbar werden kann
+   * dabei nichts.
+   */
 
   // Picker selbst NUR translateY, KEINE Opacity — sonst fadet er beim
   // Slide-Out (160ms) schneller weg als er translatet (280ms) und der
@@ -492,14 +472,29 @@ export function LocationPicker({
   // BackHandler: hardware-back/Geste schließt den Picker statt den ganzen
   // SearchHero zu verlassen. Vorher hat das Modal das automatisch gemacht
   // via onRequestClose — jetzt müssen wir's manuell intercepten.
+  /**
+   * Die Zurück-Taste hängt am SPEICHER, nicht an der verzögerten Sichtbarkeit.
+   *
+   * `visible` kippt inzwischen erst nach dem Ende der Fahrt — in den 300ms
+   * davor deckte das Blatt schon den ganzen Bildschirm, hatte aber keinen
+   * Abfangring. Zuständig war dann der des Such-Blattes: Eine Zurück-Geste
+   * während der Einfahrt schloss also die SUCHE, während der Wähler deckend
+   * liegen blieb. Aus der Umgebungs-Karte gab es gar keinen — dort wurde der
+   * Reiter verlassen.
+   *
+   * Angemeldet wird, solange der Inhalt im Baum liegt; ob wirklich offen ist,
+   * entscheidet der Speicher im Moment des Drucks. Kein Rendern, keine
+   * Verzögerung.
+   */
   useEffect(() => {
-    if (!visible) return;
+    if (Platform.OS !== "android" || !mounted) return;
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      if (useSearchStore.getState().locationPickerRequest === null) return false;
       onClose();
-      return true; // prevent default
+      return true;
     });
     return () => sub.remove();
-  }, [visible, onClose]);
+  }, [mounted, onClose]);
 
   const handleSelect = useCallback(
     (loc: Location) => {
@@ -600,16 +595,12 @@ export function LocationPicker({
         Blatt oben steht, deckt es alles ab.
       */}
 
-      {/* Slide-Wrap mit elevation 32 → Android hebt diesen View auf einen
-          eigenen Hardware-Layer. translateY läuft damit GPU-only und der
-          Compositor muss NICHT pro Frame den ganzen Subtree (Searchbar,
-          FlatList, alle Rows) neu rasterisieren. Ohne elevation hatten wir
-          spürbare Frame-Drops während des Slide-Ins. Zusätzlich
-          renderToHardwareTextureAndroid + shouldRasterizeIOS als Belt-and-
-          Suspenders gegen Sub-Pixel-Jitter. */}
+      {/* Der bewegte Knoten: NUR Verschiebung, deckende Fläche, Sortierung.
+          Alles Schwere (Suchleiste, Listen, Zeilen) liegt in der Hülle
+          darunter, und die trägt auch die Textur — sonst müsste der
+          Compositor in jedem Bild den ganzen Unterbaum neu rastern. */}
       <Animated.View
       collapsable={false}
-      renderToHardwareTextureAndroid={Platform.OS === "android" && (layered || moving)}
       style={[
         StyleSheet.absoluteFillObject,
         {
@@ -630,6 +621,18 @@ export function LocationPicker({
            * Höhe damals entfernt — nur ist dabei die Sortierung mitgegangen.
            */
           elevation: 40,
+          /**
+           * Höhe ja, Schatten nein.
+           *
+           * Gebraucht wird von `elevation` hier nur die SORTIERUNG gegen die
+           * Geschwister am Wurzel-Layout. Der Schatten selbst ist unsichtbar —
+           * das Blatt ist bildschirmfüllend und deckend, seine Ränder liegen
+           * außerhalb. Gezeichnet wurde er trotzdem: Android rechnet für eine
+           * 40er Höhe einen Umgebungs- und einen Spot-Schatten über die
+           * gesamte Kontur, in jedem Bild der Fahrt. Durchsichtig gesetzt
+           * entfällt der Durchgang, die Reihenfolge bleibt.
+           */
+          shadowColor: "transparent",
         },
         overlayStyle,
       ]}
@@ -646,11 +649,45 @@ export function LocationPicker({
         * Auf einer vollflächigen Hülle darunter hat es dieselbe Wirkung für die
         * Berührungen — nur abseits des animierten Knotens.
         */}
-      <View style={StyleSheet.absoluteFill} pointerEvents={visible ? "auto" : "none"}>
+      {/**
+          * KEIN `pointerEvents` mehr — geparkt liegt das Blatt außerhalb des
+          * Bildes und kann ohnehin nichts abfangen.
+          *
+          * Gegatet hing es an der verzögerten Sichtbarkeit: Nach dem Ende der
+          * Einfahrt stand das Blatt dadurch mehrere Bilder lang sichtbar, aber
+          * tot — kein Tippen in die Leiste, keine Zeile, kein X. Und jeder
+          * Wechsel wäre ein Commit gewesen, den wir aus der Fahrt heraushalten
+          * wollen.
+          */}
+        {/**
+          * Die Textur sitzt auf DIESER Hülle, nicht auf dem animierten Knoten.
+          *
+          * Der Schalter kippt genau dann, wenn die Fahrt anfängt — und ein
+          * Eigenschafts-Wechsel auf dem animierten Knoten ist auf Fabric ein
+          * Commit gegen ebendie Bewegung, die Reanimated dort Bild für Bild
+          * schreibt (dieselbe Begründung wie bei `pointerEvents` darüber). Auf
+          * der Hülle wirkt er unverändert: Sie trägt den gesamten schweren
+          * Inhalt, der animierte Knoten darüber zeichnet nur noch eine
+          * deckende Fläche und verschiebt die fertige Textur.
+          */}
+        <View
+          style={StyleSheet.absoluteFill}
+          collapsable={false}
+          renderToHardwareTextureAndroid={Platform.OS === "android" && (layered || moving)}
+        >
         {mounted && (
         <>
         <View className="flex-row items-center gap-3 px-5 pt-14 pb-4">
-          <RippleTouch
+          {/**
+            * `Pressable` statt `RippleTouch` — dieselbe Begründung wie bei den
+            * Zeilen weiter unten, nur schärfer: Dieser Knopf STARTET die
+            * Ausfahrt. Der native Wellen-Effekt ist eine 300 bis 400ms lange
+            * Zeichen-Animation mitten auf dem Blatt, das für genau diese
+            * Ausfahrt als GPU-Textur gehalten wird — und eine Ebene, deren
+            * Inhalt sich ändert, muss in jedem Bild neu gerastert werden. Die
+            * Welle lief also über die volle Dauer der Rückfahrt gegen sie an.
+            */}
+          <Pressable
             hitSlop={12}
             /**
              * Die Ebene schon beim AUFSETZEN des Fingers anlegen.
@@ -682,11 +719,10 @@ export function LocationPicker({
             }}
             onPress={onClose}
             accessibilityLabel={t("search.close")}
-            borderless
             style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
           >
             <X color="#E5E7EB" size={26} />
-          </RippleTouch>
+          </Pressable>
           <Text className="text-2xl font-semibold text-white">
             {title ?? t(field === "from" ? "search.location.title.from" : "search.location.title.to")}
           </Text>
@@ -718,15 +754,31 @@ export function LocationPicker({
              * Abgeleitet bleibt der Abstand erhalten, egal was mit PICKER_IN
              * passiert.
              */
+            /**
+             * `visible` kippt jetzt ERST NACH der Fahrt (siehe Wirt) — der
+             * eigene Nachlauf hier wäre also doppelt gezählt und die Tastatur
+             * käme über eine halbe Sekunde zu spät.
+             */
             autoFocus={visible}
-            autoFocusDelay={PICKER_IN.duration + 80}
+            autoFocusDelay={0}
           />
         </View>
 
         {showSearchResults ? (
           isLoading ? (
             <View className="py-8 items-center">
-              <ActivityIndicator color={accent.solid} />
+              {/**
+                * Während der Fahrt steht der Kreisel STILL statt zu
+                * verschwinden.
+                *
+                * Er dreht sich nativ, also ändert er in jedem Bild den Inhalt
+                * der Hülle — und die wird für die Fahrt als Textur gehalten,
+                * die damit in jedem Bild neu gerastert werden müsste. Ihn
+                * auszubauen wäre die schlechtere Lösung: Das ist ein Commit
+                * plus Neuvermessung mitten in der Bewegung, und die Liste
+                * darunter springt.
+                */}
+              <ActivityIndicator color={accent.solid} animating={!moving} />
             </View>
           ) : isError ? (
             <View className="px-5 py-6">
@@ -742,6 +794,10 @@ export function LocationPicker({
               data={results ?? []}
               keyExtractor={keyExtractor}
               keyboardShouldPersistTaps="handled"
+              // Wie bei der Vorschlagsliste: Beim Wischen die Ebene freigeben.
+              // Aufsetzen, kurz liegen bleiben, dann ziehen hätte sonst eine
+              // bildschirmfüllende Textur über eine scrollende Fläche gelegt.
+              onScrollBeginDrag={() => releaseLayer("pickerLocation")}
               // Kein seitlicher Abstand mehr hier — er sitzt in den Zeilen,
               // damit ihr Wellen-Effekt bis an beide Ränder läuft (siehe dort).
               contentContainerStyle={LIST_PAD}
@@ -779,6 +835,11 @@ export function LocationPicker({
             windowSize={5}
             initialNumToRender={12}
             maxToRenderPerBatch={8}
+            // Wie in der Trefferliste: Zeilen außerhalb des Bildes werden vom
+            // nativen Baum abgehängt. Ohne das hielt diese Liste ihre Ansichten
+            // durchgehend gemountet — die Grenzen oben wirken dann nur auf das
+            // Nachladen, nicht auf das, was tatsächlich gezeichnet wird.
+            removeClippedSubviews
             /**
              * Beim Wischen die Ebene sofort freigeben.
              *
@@ -813,7 +874,9 @@ export function LocationPicker({
                   tote.
                 */}
                 {onCurrentLocation && (
-                  <RippleTouch
+                  /* Schließt ebenfalls → kein nativer Wellen-Effekt, siehe X-Knopf. */
+                  <Pressable
+                    unstable_pressDelay={50}
                     onPress={() => {
                       haptic("button");
                       onClose();
@@ -831,7 +894,7 @@ export function LocationPicker({
                         {t("search.location.usecurrent")}
                       </Text>
                     </View>
-                  </RippleTouch>
+                  </Pressable>
                 )}
 
               </>
@@ -844,7 +907,9 @@ export function LocationPicker({
       </Animated.View>
     </>
   );
-}
+};
+
+export const LocationPicker = memo(LocationPickerInner);
 
 // Icon pro Result aus seinem Typ ableiten — HAFAS liefert für „Train" auch
 // Bushaltestellen (type=BUS), Cities sind type=ALL → Flag.

@@ -14,16 +14,25 @@
  * Map-Marker-Kontext. Im Chat tappt der User nur — wer Details will, sucht
  * die Verbindung über Bo direkt oder im Search-Tab.
  */
-import { memo, useEffect, useState } from "react";
+import { memo, useState } from "react";
 import { View, Text, Pressable, StyleSheet, ActivityIndicator } from "react-native";
 import { useQuery } from "@tanstack/react-query";
 import { useIsFocused } from "@react-navigation/native";
+import { useSearchStore } from "@/stores/searchStore";
+import { openStopSheet } from "@/components/surroundings/stopSheetAnimation";
+import { haptic } from "@/lib/haptics";
+import { useNowTicker } from "@/lib/ui/nowTicker";
 import Svg, { Circle } from "react-native-svg";
-import { Plane, Train, Bus, Ship, type LucideIcon } from "lucide-react-native";
+import { Plane, Train, Bus, Ship, ChevronRight, type LucideIcon } from "lucide-react-native";
 import { useAccent } from "@/lib/theme/accent";
 import { useT } from "@/lib/i18n/useT";
 import { usePalette } from "@/lib/theme/appBg";
-import { fetchStopDepartures, fetchStopArrivals, type StopBoardItem } from "@/lib/api/client";
+import {
+  fetchStopDepartures,
+  fetchStopArrivals,
+  type StopBoardItem,
+  type StopBoardResponse,
+} from "@/lib/api/client";
 import { scaledStyles } from "@/lib/ui/compact";
 
 const C = {
@@ -41,6 +50,8 @@ type BoardKind = "departures" | "arrivals";
 interface Props {
   stop: { code: string; label: string };
   initialBoard: BoardKind;
+  /** Vom Server bereits geladene Tafel — spart die eigene Abfrage. */
+  initialData?: StopBoardResponse;
 }
 
 function formatTime(iso: string): string {
@@ -64,7 +75,7 @@ function iconForProduct(product: string | null): LucideIcon {
   return Train;
 }
 
-function StopBoardCardInner({ stop, initialBoard }: Props) {
+function StopBoardCardInner({ stop, initialBoard, initialData }: Props) {
   const accent = useAccent();
   const t = useT();
   const palette = usePalette();
@@ -78,6 +89,20 @@ function StopBoardCardInner({ stop, initialBoard }: Props) {
     queryFn: () =>
       board === "departures" ? fetchStopDepartures(stop.code) : fetchStopArrivals(stop.code),
     staleTime: 30_000,
+    /**
+     * Was der Server schon geholt hat, wird nicht noch einmal geholt.
+     *
+     * Der Chat-Agent lädt die Tafel inzwischen selbst — er muss sie lesen
+     * können, um „wann fährt der nächste Zug" zu beantworten. Diese Zeilen
+     * kommen mit der Nachricht mit; ohne sie hier einzusetzen, liefe für
+     * dieselbe Tafel eine ZWEITE Abfrage nach oben, und daran hängt das
+     * DB-Kontingent von 60 Anfragen pro Minute.
+     *
+     * Nur für die Richtung, die der Server geladen hat — der Wechsel auf die
+     * andere Registerkarte holt wie bisher frisch.
+     */
+    initialData: board === initialBoard ? initialData : undefined,
+    initialDataUpdatedAt: initialData ? Date.now() : undefined,
   });
 
   const items = data?.results ?? [];
@@ -88,10 +113,32 @@ function StopBoardCardInner({ stop, initialBoard }: Props) {
 
   return (
     <View style={[styles.card, { backgroundColor: palette.s1, borderColor: palette.border }]}>
-      {/* Header: Station-Name */}
-      <Text style={styles.stopLabel} numberOfLines={1}>
-        {stop.label}
-      </Text>
+      {/**
+        * Kopfzeile ÖFFNET das Halt-Blatt — das war das einzige Element im Chat,
+        * das auf einen Tipp nicht reagiert hat.
+        *
+        * Dasselbe Blatt wie auf der Karte: Es liegt global im Wurzel-Layout,
+        * also auch über Bo. Die Bewegung wird im Berührungs-Bild angestoßen
+        * (`openStopSheet` läuft auf dem UI-Strang), der Inhalt parallel über den
+        * Speicher — genau der Weg, den der Marker-Tipp auf der Karte nimmt.
+        */}
+      <Pressable
+        onPress={() => {
+          haptic("button");
+          useSearchStore.getState().selectStop({ code: stop.code, label: stop.label });
+          openStopSheet();
+        }}
+        style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
+        accessibilityRole="button"
+        accessibilityLabel={stop.label}
+      >
+        <View style={styles.headRow}>
+          <Text style={styles.stopLabel} numberOfLines={1}>
+            {stop.label}
+          </Text>
+          <ChevronRight size={18} color={C.sub} strokeWidth={2.2} />
+        </View>
+      </Pressable>
 
       {/* Tab-Switcher Departures / Arrivals */}
       <View style={styles.tabs}>
@@ -154,20 +201,34 @@ function Hero({
   const ModeIcon = iconForProduct(item.product);
   const isFocused = useIsFocused();
 
-  // Countdown-Ticker. WICHTIG: nur tickern wenn der Assistant-Tab fokussiert
-  // ist — sonst läuft das setState pro Sekunde auch wenn der User längst auf
-  // Home/Saved/Settings ist, weil StopBoardCards in der Bubble-Liste
-  // permanent mounted bleiben. Bei mehreren Bo-Boards (User hat mehrere
-  // Stationen abgefragt) ist das viel JS-Thread-Arbeit für 0 sichtbare
-  // Wirkung → erklärt die App-weiten Lags.
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!isFocused) return;
-    const id = setInterval(() => setNow(Date.now()), 1_000);
-    return () => clearInterval(id);
-  }, [isFocused]);
-
   const expectedMs = Date.parse(item.plannedTime) + delay * 60_000;
+  /**
+   * Countdown über den GEMEINSAMEN Zeitgeber, und nur solange es etwas zu
+   * zählen gibt.
+   *
+   * Der Riegel auf den Fokus war richtig, aber zu kurz gegriffen: Er hielt das
+   * Zählen im Hintergrund an, nicht aber im Vordergrund — und dort bleibt jede
+   * jemals abgefragte Tafel im Verlauf gemountet. Bei zehn Stationen liefen
+   * zehn eigene Sekunden-Zeitgeber, jeder mit eigenem Zustand und eigenem
+   * SVG-Render. Das wächst mit jeder Frage an Bo.
+   *
+   * Der zweite Riegel ist die Abfahrt selbst: Ist sie über eine Minute durch,
+   * steht die Anzeige ohnehin fest (0 Min, Ring voll). Weiterzurechnen ändert
+   * dann nichts mehr.
+   */
+  const ticking = isFocused && Date.now() - expectedMs < 60_000;
+  const ticked = useNowTicker(ticking);
+  /**
+   * Läuft nicht mitgezählt, wird frisch abgelesen.
+   *
+   * Sonst hängen die beiden Zeilen darüber schief zueinander: Der Riegel prüft
+   * gegen die echte Uhr, die Anzeige rechnete mit dem letzten Takt. Wer die
+   * Karte um 10:01 verlässt und um 10:40 zurückkommt, hat einen abgefahrenen
+   * Zug — der Riegel greift korrekt, aber die Anzeige stand noch auf 10:01 und
+   * behauptete „in 4 Min". Mit der echten Uhr kommt heraus, was der Kommentar
+   * beim Riegel ohnehin annimmt: 0 Min, Ring voll.
+   */
+  const now = ticking ? ticked : Date.now();
   const mins = Math.max(0, Math.ceil((expectedMs - now) / 60_000));
   const baselineMs = fetchedAt ? Date.parse(fetchedAt) : Number.NaN;
   const baseline = Number.isFinite(baselineMs) ? baselineMs : now;
@@ -281,7 +342,15 @@ const styles = scaledStyles({
     padding: 14,
     gap: 10,
   },
+  headRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
   stopLabel: {
+    // Nimmt den Platz neben dem Pfeil — sonst schiebt ein langer Name ihn raus.
+    flex: 1,
     color: C.text,
     fontSize: 15,
     fontWeight: "700",

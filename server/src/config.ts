@@ -109,6 +109,18 @@ const schema = z.object({
   // senden keinen Origin-Header — CORS betrifft nur Browser-Clients.
   // Beim Hetzner-Prod-Deployment setzen!
   CORS_ORIGINS: z.string().optional(),
+
+  /**
+   * Gültige Empfänger der ID-Tokens von Google und Apple, kommagetrennt.
+   *
+   * Hier aufgeführt, obwohl `oauthVerify.ts` direkt aus `process.env` liest —
+   * damit sie beim Start sichtbar sind und in der Typprüfung auftauchen. Ohne
+   * sie antwortet `/api/auth/oauth` mit 503; das ist gewollt (lieber keine
+   * Anmeldung als eine ungeprüfte), fällt sonst aber erst beim ersten Nutzer
+   * auf statt beim Deployment.
+   */
+  GOOGLE_CLIENT_IDS: z.string().optional(),
+  APPLE_CLIENT_IDS: z.string().optional(),
 });
 
 export type Config = z.infer<typeof schema>;

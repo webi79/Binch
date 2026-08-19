@@ -146,148 +146,172 @@ async function tryFlightBoard(code: string, board: StopBoard): Promise<StopBoard
   }
 }
 
+/**
+ * Eine Abfahrts-/Ankunftstafel laden — die EINE Stelle dafür.
+ *
+ * Stand bisher als Rückruf in der Route und war damit nur über HTTP
+ * erreichbar. Der Chat-Agent brauchte sie aber ebenfalls: Ohne die echten
+ * Daten kann Bo „wann fährt der nächste Zug" nicht beantworten, er konnte nur
+ * eine Karte einblenden und den Nutzer selbst lesen lassen.
+ *
+ * Wichtig fürs Kontingent: Wer hier lädt, reicht das Ergebnis an den Client
+ * durch, statt ihn ein zweites Mal holen zu lassen. Unterm Strich bleibt es
+ * bei EINER Abfrage nach oben — und das DB-Kontingent von 60/min gehört
+ * weiterhin der Suche, nicht den Tafeln.
+ *
+ * @returns null, wenn es den Halt nicht gibt.
+ */
+export async function loadStopBoard(
+  code: string,
+  board: StopBoard,
+  log?: { warn: (obj: unknown, msg: string) => void },
+): Promise<StopBoardApiResponse | null> {
+  // Airport-Codes: direkter AeroDataBox-Lookup, kein DB-Row nötig.
+  // (Pattern: `airport:IATA` — Legacy-Format aus dem alten Airport-Suchindex.)
+  const flight = await tryFlightBoard(code, board);
+  if (flight) return flight;
+
+  const stop = await loadStopRow(code);
+  if (!stop) return null;
+
+  // FLIGHT-Typ-Locations sind Airports in der DB mit reinem IATA-Code
+  // (z.B. „AMS", „BER", „CDG") — kein `airport:`-Prefix. tryFlightBoard
+  // hat den nicht erkannt, jetzt wo wir den Stop-Typ kennen können wir
+  // direkt die Flight-API aufrufen. Code IST der IATA.
+  if (stop.type === "FLIGHT") {
+    try {
+      const data = await getFlightBoard(code, board);
+      return {
+        ...data,
+        stop: { code: code, label: stop.label, hafasId: null },
+      } satisfies StopBoardApiResponse;
+    } catch (err) {
+      log?.warn({ err, code: code }, `flight ${board} upstream failed`);
+      return emptyResponse(stop.label, code);
+    }
+  }
+
+  // GTFS-Schedule-Fallback ZUERST: für Länder ohne HAFAS-Profile (NL/FR/IT/
+  // ES/CZ/BE/HU/SK/UK/PT) haben wir den offiziellen GTFS-Feed lokal in der
+  // Datenbank und können daraus planmäßige Departures liefern. Wenn der
+  // Feed für das Land nicht importiert ist, returnt das `null` und wir
+  // fallen auf den HAFAS-Pfad zurück.
+  const scheduled = await getScheduledStopBoard({
+    stopCode: code,
+    country: stop.country,
+    board,
+    latitude: stop.latitude != null ? Number(stop.latitude) : null,
+    longitude: stop.longitude != null ? Number(stop.longitude) : null,
+  });
+  if (scheduled) {
+    return {
+      ...scheduled,
+      stop: { code: code, label: stop.label, hafasId: stop.hafasId },
+    } satisfies StopBoardApiResponse;
+  }
+
+  // Country-Routing: ÖPNV-Coverage hängt am richtigen HAFAS-Profile.
+  // DE → dbrest (Live-Daten, bewährt). AT/PL/LU/DK → hafas-client npm
+  // in-process. Stops aus nicht-unterstützten Ländern (CH/NL/FR/CZ/...)
+  // bekommen ein leeres Result statt eines 500 — der User sieht
+  // „Keine Abfahrten" statt einer Fehlermeldung.
+  // Lat/Lon mit reichen: brauchen wir für AT-Bundesland-Routing (Verbund-
+  // Profile vor/vvt/svv/stv/etc.) — sonst landet alles auf oebb das nur in
+  // Wien Bus/Tram-Daten hat.
+  const profile = profileForStop({
+    code: code,
+    country: stop.country,
+    latitude: stop.latitude != null ? Number(stop.latitude) : null,
+    longitude: stop.longitude != null ? Number(stop.longitude) : null,
+  });
+  if (!profile) {
+    // Kein HAFAS-Profil (CH/NL/FR/…) → MOTIS deckt diese Länder via GTFS ab.
+    return motisFallback(stop.label, code, stop.hafasId, board);
+  }
+
+  // Deutsche Stops: MOTIS ZUERST, DB nur als Rückfall.
+  //
+  // DB lässt uns pro IP nur ~60 req/min. Die Tafeln sind der Volumentreiber
+  // (die Umgebungs-/Kartenansicht fragt viele Stops auf einmal), die SUCHE ist
+  // der wertvolle Verbraucher — dort liefert DB Preise, echte Gleise und echte
+  // Zugnamen, die MOTIS prinzipbedingt nicht hat. Also gehört das Kontingent
+  // der Suche, nicht den Tafeln.
+  //
+  // Bis heute landeten die Tafeln nur DESHALB auf MOTIS, weil dbrest geblockt
+  // war und der DB-Versuch immer ins Leere lief. Seit der Sidecar wieder
+  // antwortet (TLS-Cipher-Fix, siehe docker-compose.yml) würde die alte
+  // Reihenfolge „DB zuerst" das Kontingent sofort leer fahren. Darum hier
+  // explizit gedreht — MOTIS ist unlimitiert und self-hostbar.
+  //
+  // Preis dafür: In DE fehlen auf den Tafeln öfter Gleise (DELFI meldet für
+  // Köln Hbf „Gleis 85-91" statt 1-11 → wir verwerfen solche Werte lieber,
+  // siehe util/platform.ts). DB bleibt der Rückfall, wenn MOTIS nichts hat.
+  if (profile === "db") {
+    const motis = await getMotisStopBoard(code, stop.label, board).catch(() => null);
+    if (motis && motis.results.length > 0) {
+      return { ...motis, stop: { code: code, label: stop.label, hafasId: stop.hafasId } };
+    }
+  }
+
+  const resolvedId = await resolveStopHafasId(stop, profile);
+  if (!resolvedId) {
+    return motisFallback(stop.label, code, stop.hafasId, board);
+  }
+  try {
+    const data = await getStopBoard(resolvedId, board, profile);
+    // Product-Filter passend zum Stop-Typ.
+    // HAFAS-Stops aggregieren oft mehrere Verkehrsmittel pro ID — z.B. der
+    // Bus-Stop „Westtünnen Bahnhof" liefert RB89-Train-Departures vom
+    // benachbarten Bahnhof mit. Bus-Stop → nur Bus/Taxi/Ferry zeigen.
+    // Train-Stop → keine reinen Bus-Lines (die kommen vom Bus-Stop nebenan).
+    // ALL/Unbekannt → unverändert.
+    // Filter auf Basis von stop.kinds. HAFAS-IDs aggregieren oft mehrere
+    // nahegelegene Stops (Tram-Haltestelle + 50m daneben Bus-Stop bekommen
+    // manchmal dieselbe Stop-ID). Wir wollen aber NUR die Departures
+    // zeigen die zu DIESEM Stop-Eintrag passen — bei einer reinen Tram-
+    // Station (kinds=["tram"]) keine Busse.
+    let results = data.results;
+    const stopKinds = (stop.kinds ?? []) as string[];
+    if (stopKinds.length > 0) {
+      results = results.filter((r) => {
+        const k = productToKind(r.product ?? "");
+        // Unbekanntes Product (taxi, leer, exotisches HAFAS-Produkt):
+        // durchlassen — lieber zu inklusiv als sichtbare Lücken.
+        if (k === null) return true;
+        return stopKinds.includes(k);
+      });
+    } else if (stop.type === "TRAIN") {
+      // Fallback für DB-Rows ohne kinds-Info (Legacy/StaDa-only): TRAIN-
+      // Stops haben sicher keine Bus/Taxi-Lines.
+      results = results.filter((r) => {
+        const p = (r.product ?? "").toLowerCase();
+        return p !== "bus" && p !== "taxi";
+      });
+    }
+    // dbrest/HAFAS lieferte nichts (z.B. DB-OPS_BLOCK) → MOTIS-Fallback.
+    if (results.length === 0) {
+      return motisFallback(stop.label, code, stop.hafasId, board);
+    }
+    return {
+      ...data,
+      results,
+      stop: { code: code, label: stop.label, hafasId: resolvedId },
+    } satisfies StopBoardApiResponse;
+  } catch (err) {
+    log?.warn({ err, code: code }, `${board} upstream failed → MOTIS-Fallback`);
+    return motisFallback(stop.label, code, stop.hafasId, board);
+  }
+  }
+
 export async function stopsRoutes(app: FastifyInstance) {
   // Abfahrtstafeln: db-vendo/MOTIS — das DB-60/min-Kontingent hängt hier dran.
   const preHandler = ipLimiter("stops", [{ limit: 60, windowMs: 60 * 1000 }]);
   async function handle(req: FastifyRequest, reply: FastifyReply, board: StopBoard) {
     const parsed = paramsSchema.safeParse(req.params);
     if (!parsed.success) return reply.code(400).send({ error: "Bad request" });
-
-    // Airport-Codes: direkter AeroDataBox-Lookup, kein DB-Row nötig.
-    // (Pattern: `airport:IATA` — Legacy-Format aus dem alten Airport-Suchindex.)
-    const flight = await tryFlightBoard(parsed.data.code, board);
-    if (flight) return flight;
-
-    const stop = await loadStopRow(parsed.data.code);
-    if (!stop) return reply.code(404).send({ error: "Stop not found" });
-
-    // FLIGHT-Typ-Locations sind Airports in der DB mit reinem IATA-Code
-    // (z.B. „AMS", „BER", „CDG") — kein `airport:`-Prefix. tryFlightBoard
-    // hat den nicht erkannt, jetzt wo wir den Stop-Typ kennen können wir
-    // direkt die Flight-API aufrufen. Code IST der IATA.
-    if (stop.type === "FLIGHT") {
-      try {
-        const data = await getFlightBoard(parsed.data.code, board);
-        return {
-          ...data,
-          stop: { code: parsed.data.code, label: stop.label, hafasId: null },
-        } satisfies StopBoardApiResponse;
-      } catch (err) {
-        req.log.warn({ err, code: parsed.data.code }, `flight ${board} upstream failed`);
-        return emptyResponse(stop.label, parsed.data.code);
-      }
-    }
-
-    // GTFS-Schedule-Fallback ZUERST: für Länder ohne HAFAS-Profile (NL/FR/IT/
-    // ES/CZ/BE/HU/SK/UK/PT) haben wir den offiziellen GTFS-Feed lokal in der
-    // Datenbank und können daraus planmäßige Departures liefern. Wenn der
-    // Feed für das Land nicht importiert ist, returnt das `null` und wir
-    // fallen auf den HAFAS-Pfad zurück.
-    const scheduled = await getScheduledStopBoard({
-      stopCode: parsed.data.code,
-      country: stop.country,
-      board,
-      latitude: stop.latitude != null ? Number(stop.latitude) : null,
-      longitude: stop.longitude != null ? Number(stop.longitude) : null,
-    });
-    if (scheduled) {
-      return {
-        ...scheduled,
-        stop: { code: parsed.data.code, label: stop.label, hafasId: stop.hafasId },
-      } satisfies StopBoardApiResponse;
-    }
-
-    // Country-Routing: ÖPNV-Coverage hängt am richtigen HAFAS-Profile.
-    // DE → dbrest (Live-Daten, bewährt). AT/PL/LU/DK → hafas-client npm
-    // in-process. Stops aus nicht-unterstützten Ländern (CH/NL/FR/CZ/...)
-    // bekommen ein leeres Result statt eines 500 — der User sieht
-    // „Keine Abfahrten" statt einer Fehlermeldung.
-    // Lat/Lon mit reichen: brauchen wir für AT-Bundesland-Routing (Verbund-
-    // Profile vor/vvt/svv/stv/etc.) — sonst landet alles auf oebb das nur in
-    // Wien Bus/Tram-Daten hat.
-    const profile = profileForStop({
-      code: parsed.data.code,
-      country: stop.country,
-      latitude: stop.latitude != null ? Number(stop.latitude) : null,
-      longitude: stop.longitude != null ? Number(stop.longitude) : null,
-    });
-    if (!profile) {
-      // Kein HAFAS-Profil (CH/NL/FR/…) → MOTIS deckt diese Länder via GTFS ab.
-      return motisFallback(stop.label, parsed.data.code, stop.hafasId, board);
-    }
-
-    // Deutsche Stops: MOTIS ZUERST, DB nur als Rückfall.
-    //
-    // DB lässt uns pro IP nur ~60 req/min. Die Tafeln sind der Volumentreiber
-    // (die Umgebungs-/Kartenansicht fragt viele Stops auf einmal), die SUCHE ist
-    // der wertvolle Verbraucher — dort liefert DB Preise, echte Gleise und echte
-    // Zugnamen, die MOTIS prinzipbedingt nicht hat. Also gehört das Kontingent
-    // der Suche, nicht den Tafeln.
-    //
-    // Bis heute landeten die Tafeln nur DESHALB auf MOTIS, weil dbrest geblockt
-    // war und der DB-Versuch immer ins Leere lief. Seit der Sidecar wieder
-    // antwortet (TLS-Cipher-Fix, siehe docker-compose.yml) würde die alte
-    // Reihenfolge „DB zuerst" das Kontingent sofort leer fahren. Darum hier
-    // explizit gedreht — MOTIS ist unlimitiert und self-hostbar.
-    //
-    // Preis dafür: In DE fehlen auf den Tafeln öfter Gleise (DELFI meldet für
-    // Köln Hbf „Gleis 85-91" statt 1-11 → wir verwerfen solche Werte lieber,
-    // siehe util/platform.ts). DB bleibt der Rückfall, wenn MOTIS nichts hat.
-    if (profile === "db") {
-      const motis = await getMotisStopBoard(parsed.data.code, stop.label, board).catch(() => null);
-      if (motis && motis.results.length > 0) {
-        return { ...motis, stop: { code: parsed.data.code, label: stop.label, hafasId: stop.hafasId } };
-      }
-    }
-
-    const resolvedId = await resolveStopHafasId(stop, profile);
-    if (!resolvedId) {
-      return motisFallback(stop.label, parsed.data.code, stop.hafasId, board);
-    }
-    try {
-      const data = await getStopBoard(resolvedId, board, profile);
-      // Product-Filter passend zum Stop-Typ.
-      // HAFAS-Stops aggregieren oft mehrere Verkehrsmittel pro ID — z.B. der
-      // Bus-Stop „Westtünnen Bahnhof" liefert RB89-Train-Departures vom
-      // benachbarten Bahnhof mit. Bus-Stop → nur Bus/Taxi/Ferry zeigen.
-      // Train-Stop → keine reinen Bus-Lines (die kommen vom Bus-Stop nebenan).
-      // ALL/Unbekannt → unverändert.
-      // Filter auf Basis von stop.kinds. HAFAS-IDs aggregieren oft mehrere
-      // nahegelegene Stops (Tram-Haltestelle + 50m daneben Bus-Stop bekommen
-      // manchmal dieselbe Stop-ID). Wir wollen aber NUR die Departures
-      // zeigen die zu DIESEM Stop-Eintrag passen — bei einer reinen Tram-
-      // Station (kinds=["tram"]) keine Busse.
-      let results = data.results;
-      const stopKinds = (stop.kinds ?? []) as string[];
-      if (stopKinds.length > 0) {
-        results = results.filter((r) => {
-          const k = productToKind(r.product ?? "");
-          // Unbekanntes Product (taxi, leer, exotisches HAFAS-Produkt):
-          // durchlassen — lieber zu inklusiv als sichtbare Lücken.
-          if (k === null) return true;
-          return stopKinds.includes(k);
-        });
-      } else if (stop.type === "TRAIN") {
-        // Fallback für DB-Rows ohne kinds-Info (Legacy/StaDa-only): TRAIN-
-        // Stops haben sicher keine Bus/Taxi-Lines.
-        results = results.filter((r) => {
-          const p = (r.product ?? "").toLowerCase();
-          return p !== "bus" && p !== "taxi";
-        });
-      }
-      // dbrest/HAFAS lieferte nichts (z.B. DB-OPS_BLOCK) → MOTIS-Fallback.
-      if (results.length === 0) {
-        return motisFallback(stop.label, parsed.data.code, stop.hafasId, board);
-      }
-      return {
-        ...data,
-        results,
-        stop: { code: parsed.data.code, label: stop.label, hafasId: resolvedId },
-      } satisfies StopBoardApiResponse;
-    } catch (err) {
-      req.log.warn({ err, code: parsed.data.code }, `${board} upstream failed → MOTIS-Fallback`);
-      return motisFallback(stop.label, parsed.data.code, stop.hafasId, board);
-    }
+    const data = await loadStopBoard(parsed.data.code, board, req.log);
+    if (!data) return reply.code(404).send({ error: "Stop not found" });
+    return data;
   }
 
   app.get("/api/stops/:code/departures", { preHandler }, (req, reply) => handle(req, reply, "departures"));

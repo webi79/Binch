@@ -29,7 +29,6 @@ import { useRouter } from "expo-router";
 import { OnFocusLost } from "@/lib/nav/FocusSentinel";
 import {
   resultsPush,
-  startAssistantPush,
   pushProgress,
   UNDERLAY_TRAVEL_FRAC,
 } from "@/lib/nav/overlayCover";
@@ -52,7 +51,7 @@ import { HomeContentDepth } from "@/components/search/HomeLaunchDepth";
 import { GUTTER, SPACE, HEADING_TOP, HEADING_GAP, useNavbarSpace } from "@/lib/theme/spacing";
 import { ScreenHeading, HEADING_LINE_HEIGHT } from "@/components/ui/ScreenHeading";
 import { MOTION } from "@/lib/motion";
-import { subscribeLayer } from "@/lib/nav/transitionLayer";
+import { subscribeLayer, prepareLayer } from "@/lib/nav/transitionLayer";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { RecentCard } from "@/components/home/RecentCard";
@@ -821,13 +820,30 @@ export default function HomeScreen() {
 
             <SearchBar
               style={[styles.searchBarSpacing, { borderWidth: 1.5, borderColor: "rgba(255,255,255,0.14)" }]}
-              // Bewegung zuerst, Navigation danach — siehe startAssistantPush.
+              /**
+               * Die Textur für den Landingscreen beim AUFSETZEN anlegen.
+               *
+               * Bo liegt als durchsichtiges Blatt über dem Stapel, dieser
+               * Bildschirm bleibt darunter also sichtbar UND wird in jedem Bild
+               * seiner Einfahrt neu gezeichnet. Der Weg zur Ergebnisliste macht
+               * das seit Längerem (`RecentCard`), der zu Bo nicht — dabei ist
+               * hier mehr zu zeichnen.
+               */
+              onTouchStart={() => prepareLayer("home")}
+              /**
+               * NUR navigieren — die Fahrt startet Bo selbst, nach seinem
+               * ersten Bild.
+               *
+               * Vorher lief die Kurve hier los und der Bildschirm baute sich
+               * mitten in ihr auf. Die Begründung steht ausführlich am
+               * Gegenstück in `app/assistant.tsx`; kurz: Jedes andere Blatt der
+               * App fährt erst, wenn es fertig gezeichnet ist, und genau daran
+               * lag es, dass sich dieses hier anders anfühlte.
+               */
               onPress={() => {
-                startAssistantPush();
                 router.navigate("/assistant");
               }}
               onMicPress={() => {
-                startAssistantPush();
                 router.navigate({ pathname: "/assistant", params: { autoVoice: "1" } });
               }}
             />
