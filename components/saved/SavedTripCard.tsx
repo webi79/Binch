@@ -11,7 +11,11 @@
  */
 
 import { memo, useMemo } from "react";
+import { preloadDetails } from "@/lib/nav/detailsPreload";
+import { startDetailsPush } from "@/lib/nav/overlayCover";
+import { prepareLayer } from "@/lib/nav/transitionLayer";
 import { View, Text, StyleSheet, Pressable } from "react-native";
+import { usePalette } from "@/lib/theme/appBg";
 import { Heart, Plane, Train, Bus, Ship, ChevronRight } from "lucide-react-native";
 import type { SavedTrip } from "@/types/saved";
 import type { TravelMode } from "@/types/search";
@@ -21,6 +25,7 @@ import { useAccent } from "@/lib/theme/accent";
 import { formatTimeInZone, formatDateInZone } from "@/lib/time-format";
 import { displayCode } from "@/lib/results/logos";
 import { haptic } from "@/lib/haptics";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const C = {
   card: "#242425",
@@ -52,6 +57,7 @@ interface Props {
 }
 
 function SavedTripCardInner({ trip }: Props) {
+  const palette = usePalette();
   const t = useT();
   const accent = useAccent();
   const ModeIcon = MODE_ICON[trip.mode] ?? Plane;
@@ -91,7 +97,14 @@ function SavedTripCardInner({ trip }: Props) {
 
   const onTap = () => {
     haptic("important");
-    useSearchStore.getState().selectResult(trip, trip.passengers ?? 1);
+    // Bewegung zuerst, Speicher ein Bild danach — dieselbe Begründung wie an
+    // der Ergebnis-Karte: Der Commit läuft synchron zu Ende, die Bewegung wird
+    // nur eingereiht. Ohne den Abstand steht der Aufbau des Detail-Blattes vor
+    // ihr statt neben ihr.
+    startDetailsPush();
+    requestAnimationFrame(() => {
+      useSearchStore.getState().selectResult(trip, trip.passengers ?? 1);
+    });
   };
 
   const onUnsave = () => {
@@ -100,7 +113,7 @@ function SavedTripCardInner({ trip }: Props) {
   };
 
   return (
-    <View style={styles.card}>
+    <View style={[styles.card, { backgroundColor: palette.s2 }]}>
       <View style={styles.headerRow}>
         <View style={[styles.modeBadge, { backgroundColor: modeColor.bg }]}>
           <ModeIcon color={modeColor.fg} size={16} />
@@ -152,6 +165,24 @@ function SavedTripCardInner({ trip }: Props) {
           <Text style={styles.priceCurrency}>  {trip.currency.toUpperCase()}</Text>
         </Text>
         <Pressable
+          /**
+           * Die Textur des Reiters entsteht beim AUFSETZEN des Fingers.
+           *
+           * Sie fehlte hier VOLLSTÄNDIG — als einziger der Wege in ein
+           * Detail-Blatt. Der Saved-Reiter wurde damit während der ganzen
+           * Bewegung jedes Bild neu gezeichnet, während er als Unterlage
+           * mitwandert. Das ist der Unterschied zum Landingscreen, wo es
+           * funktioniert: Dort wird sie angefordert, hier nicht.
+           *
+           * `onTouchStart` und nicht `onPressIn`: Die Karte liegt in einer
+           * Liste, und ein Druck-Beginn dort wird oft ein Scrollen. Das reine
+           * Berührungs-Ereignis beansprucht die Geste nicht.
+           */
+          onTouchStart={() => {
+            prepareLayer("saved");
+            // Detail-Blatt im Berührungsfenster bauen, nicht im Loslass-Bild.
+            preloadDetails(trip);
+          }}
           onPress={onTap}
           style={({ pressed }) => [
             styles.cta,
@@ -170,7 +201,7 @@ function SavedTripCardInner({ trip }: Props) {
 // savedTrips Array-Update mit dem gleichen Trip wäre derselbe Ref).
 export const SavedTripCard = memo(SavedTripCardInner);
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   card: {
     backgroundColor: C.card,
     borderRadius: 18,

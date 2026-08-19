@@ -1,7 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { View, Text, ScrollView, useWindowDimensions } from "react-native";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  Platform,
+  View,
+  Text,
+  ScrollView,
+  FlatList,
+  SectionList,
+  useWindowDimensions,
+  type StyleProp,
+  type ViewStyle,
+} from "react-native";
 import Animated, { useAnimatedStyle } from "react-native-reanimated";
-import type { SavedTrip } from "@/types/saved";
+import type { SavedTrip, Ticket } from "@/types/saved";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useIsFocused } from "@react-navigation/native";
 import { useT } from "@/lib/i18n/useT";
@@ -12,11 +22,13 @@ import { AddTicketModal } from "@/components/saved/AddTicketModal";
 import { EmptyState } from "@/components/saved/EmptyState";
 import { AddTicketButton } from "@/components/saved/AddTicketButton";
 import { SegmentedToggle } from "@/components/ui/SegmentedToggle";
-import { RevealScrollView, ScreenEntrance, ScrollReveal } from "@/lib/motion";
-import { GUTTER } from "@/lib/theme/spacing";
+import { GUTTER, SPACE, HEADING_TOP, HEADING_GAP, useNavbarSpace } from "@/lib/theme/spacing";
+import { ScreenHeading } from "@/components/ui/ScreenHeading";
 import { SlidingPanels } from "@/components/ui/SlidingPanels";
 import { useAccent } from "@/lib/theme/accent";
+import { useAppBg } from "@/lib/theme/appBg";
 import { overlayCover, UNDERLAY_TRAVEL_FRAC } from "@/lib/nav/overlayCover";
+import { subscribeLayer } from "@/lib/nav/transitionLayer";
 
 /**
  * Subscribe-only-when-focused. Subscribt nur an `useSearchStore` wenn
@@ -54,53 +66,31 @@ function useFocusedStoreSnapshot<T>(
 type Tab = "trips" | "tickets";
 
 /**
- * Hintergrund des Screens — der Vorhang, mit dem die Karten einblenden, muss
- * exakt diese Farbe haben (siehe `scrim` in lib/motion.tsx). Karten per opacity
- * zu faden hieße Offscreen-Compositing pro Karte, und genau das machte den
- * Tab-Wechsel hierher träge.
+ * Trägt den Parallax-Transform — und für die Dauer eines Übergangs eine
+ * GPU-Textur.
+ *
+ * Eigene Komponente, damit der Zustandswechsel beim Fingerdruck NUR diesen
+ * Knoten neu rendert. Läge er im Tab selbst, rendete dessen kompletter Baum im
+ * Berührungs-Frame neu — genau die Sorte Arbeit, die dieser Übergang vermeiden
+ * soll. Die Kinder kommen unverändert von außen und bleiben stehen.
  */
-const SAVED_BG = "#1A1A1A";
-
-/**
- * Skeleton-Karte mit ähnlicher Höhe wie eine ResultCard. Während der Saved-
- * Tab nach Focus für ~220ms aufwacht, zeigen wir Skelett-Boxen statt die
- * echten ResultCards zu mounten — die messen sich sonst alle gleichzeitig
- * im Tab-Switch-Frame, was visuell als "Karten springen rum" rüberkommt.
- */
-function SkeletonCard() {
+function ParallaxLayer({
+  style,
+  children,
+}: {
+  style: StyleProp<ViewStyle>;
+  children: ReactNode;
+}) {
+  const [layered, setLayered] = useState(false);
+  useEffect(() => subscribeLayer("saved", setLayered), []);
   return (
-    <View className="mx-5 mb-3">
-      <View
-        style={{
-          height: 132,
-          borderRadius: 18,
-          backgroundColor: "#242425",
-          borderWidth: 1,
-          borderColor: "#2E2E30",
-        }}
-      />
-    </View>
-  );
-}
-
-function SkeletonList() {
-  return (
-    <View>
-      <View
-        style={{
-          height: 14,
-          width: 80,
-          marginLeft: 20,
-          marginTop: 2,
-          marginBottom: 12,
-          borderRadius: 4,
-          backgroundColor: "#242425",
-        }}
-      />
-      <SkeletonCard />
-      <SkeletonCard />
-      <SkeletonCard />
-    </View>
+    <Animated.View
+      style={style}
+      renderToHardwareTextureAndroid={Platform.OS === "android" && layered}
+      collapsable={false}
+    >
+      {children}
+    </Animated.View>
   );
 }
 
@@ -117,21 +107,60 @@ function isToday(timestamp: number): boolean {
 export default function SavedScreen() {
   const t = useT();
   const accent = useAccent();
+  const appBg = useAppBg();
   const [tab, setTab] = useState<Tab>("trips");
   const [showModal, setShowModal] = useState(false);
   const isFocused = useIsFocused();
+  const navbarSpace = useNavbarSpace();
+  /**
+   * Beim Betreten den roten Punkt löschen.
+   *
+   * Nicht beim Verlassen und nicht per Zeitgeber: Er bedeutet „seit deinem
+   * letzten Blick ist etwas dazugekommen", und der Blick ist genau dieser
+   * Moment. Der Store-Aufruf prüft selbst, ob überhaupt etwas zu löschen ist —
+   * sonst liefe bei JEDEM Fokus ein Schreibvorgang durch den Speicher.
+   */
+  const clearSavedBadge = useSearchStore((st) => st.clearSavedBadge);
+  useEffect(() => {
+    if (isFocused) clearSavedBadge();
+  }, [isFocused, clearSavedBadge]);
 
   // Parallax: dieser Screen wandert ein Stück mit, während das
   // TicketDetailOverlay darüber reinslidet (nur DIESER Baum wird transformiert).
-  // BEWUSST ohne renderToHardwareTextureAndroid und ohne Store-Subscription:
-  // Der Layer-Flip erzwang ein 66ms-Record-View#draw() über den ganzen Tree
-  // (Perfetto), und die Subscription re-renderte bei jedem Ticket-Open den
-  // kompletten Tab (38 Text-Updates/Commit). Der reine Transform läuft auf
-  // dem UI-Thread und kostet React nichts — wie beim Results-Parallax.
+  //
+  // Hier stand lange „BEWUSST ohne renderToHardwareTextureAndroid: Der Layer-Flip
+  // erzwang ein 66ms-Record-View#draw() über den ganzen Tree (Perfetto)". Der
+  // Befund stimmt — die Schlussfolgerung war nur unvollständig. Ohne Textur wird
+  // dieser Baum in JEDEM Bild der Bewegung neu gezeichnet; die Messung am
+  // Ticket-Blatt beziffert das mit ~14,7ms gegen ein 8,3ms-Budget, also fällt
+  // jedes zweite Bild aus. Genau das ist das Ruckeln der Unterlage.
+  //
+  // Der Widerspruch löst sich über den ZEITPUNKT: Die 66ms entstanden, weil die
+  // Ebene eingeschaltet wurde, als die Animation schon lief. Sie wird jetzt beim
+  // Fingerdruck auf die Karte vorbereitet (siehe transitionLayer) — da ist Zeit
+  // dafür, und danach ist ein Bild nur noch ein Kopiervorgang.
   const { width: screenW } = useWindowDimensions();
-  const parallaxStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: overlayCover.value * screenW * UNDERLAY_TRAVEL_FRAC }],
-  }));
+  /**
+   * Nur ausweichen, wenn dieser Reiter überhaupt zu sehen ist.
+   *
+   * Der Parallax-Wert ist geteilt: Ihn treibt jedes Detail-Blatt, auch das aus
+   * der Ergebnisliste. Der Saved-Reiter bleibt aber dauerhaft gemountet (native
+   * Bottom-Tabs, siehe direkt darunter) — er bekam also bei JEDER Slide im
+   * Ergebnis-Bildschirm in jedem Bild einen Transform geschrieben, obwohl ihn
+   * niemand sieht. Ein vollflächiger Auswerter pro Bild, für nichts.
+   *
+   * Die Abfrage steht IM Worklet-Aufbau, nicht darin: Ist der Reiter nicht
+   * fokussiert, liest das Worklet den geteilten Wert gar nicht erst — und was
+   * nicht gelesen wird, wird auch nicht abonniert. Der Auswerter läuft dann
+   * überhaupt nicht mit.
+   */
+  const parallaxStyle = useAnimatedStyle(
+    () =>
+      isFocused
+        ? { transform: [{ translateX: overlayCover.value * screenW * UNDERLAY_TRAVEL_FRAC }] }
+        : NO_PARALLAX,
+    [isFocused, screenW],
+  );
 
   // Native-Bottom-Tabs halten die Saved-Tab IMMER mounted (auch wenn der
   // User auf Home ist). Mit `useSearchStore((s) => s.savedTrips)` würde
@@ -155,33 +184,84 @@ export default function SavedScreen() {
   const tickets = ticketsSnapshot;
   const addTicket = useSearchStore.getState().addTicket;
 
-  // Defer-Pattern für die ResultCard/TicketCard-Listen: NUR beim ERSTEN
-  // Focus (= erster Besuch des Saved-Tabs) zeigen wir 220ms ein Skelett.
-  const [listReady, setListReady] = useState(false);
-  useEffect(() => {
-    if (!isFocused || listReady) return;
-    const id = setTimeout(() => setListReady(true), 220);
-    return () => clearTimeout(id);
-  }, [isFocused, listReady]);
+  // Früher stand hier ein Skelett, das beim ERSTEN Besuch 220ms lang anstelle
+  // der echten Karten lief — damit sich nicht alle gleichzeitig im Wechsel-Frame
+  // vermessen. Dieser Frame gehört ihnen inzwischen gar nicht mehr: Mit
+  // lazy={false} (siehe _layout.tsx) entsteht der Tab schon beim App-Start,
+  // hinter der Splash. Das Skelett hätte also nur noch genau den sichtbaren
+  // Umbau beigesteuert, den es eigentlich verhindern sollte.
 
   const today = useMemo(() => savedTrips.filter((tr) => isToday(tr.savedAt)), [savedTrips]);
   const earlier = useMemo(() => savedTrips.filter((tr) => !isToday(tr.savedAt)), [savedTrips]);
 
+  /**
+   * Beide Listen sind jetzt VIRTUALISIERT — vorher `.map()` in einer ScrollView.
+   *
+   * Damit lagen bei 30 gespeicherten Reisen 30 vollständige `ResultCard`s im
+   * Baum, jede mit eigenem Reanimated-Stil und zwei Store-Abos. Und sie lagen
+   * dort DAUERHAFT: Der Reiter bleibt gemountet, auch wenn man ihn nie öffnet.
+   * Aufgebaut wurde alles gemeinsam im Bild des Reiter-Wechsels.
+   *
+   * Schwerer wiegt der zweite Fall: Beim Öffnen eines Tickets ist genau diese
+   * Fläche die Unterlage, die mitwandert — und über ihr liegt für die Dauer der
+   * Bewegung eine GPU-Textur. Deren Aufbau kostet einmalig, und er kostet umso
+   * mehr, je größer der Baum darunter ist. Die Kosten skalierten also mit der
+   * Zahl gespeicherter Reisen; genau deshalb wurde die Slide „mit der Zeit
+   * schlechter".
+   */
+  const tripSections = useMemo(
+    () =>
+      [
+        ...(today.length > 0 ? [{ key: "today", title: t("saved.section.today"), data: today }] : []),
+        ...(earlier.length > 0
+          ? [{ key: "earlier", title: t("saved.section.earlier"), data: earlier }]
+          : []),
+      ],
+    [today, earlier, t],
+  );
+  const renderTrip = useCallback(
+    ({ item }: { item: SavedTrip }) => (
+      <View style={rowGap}>
+        <ResultCard result={item} passengers={item.passengers} underlay="saved" />
+      </View>
+    ),
+    [],
+  );
+  const renderTripSection = useCallback(
+    ({ section }: { section: { title: string } }) => (
+      <Text className="text-[15px] font-semibold text-white mt-1 mb-2.5">{section.title}</Text>
+    ),
+    [],
+  );
+  const tripKey = useCallback((item: SavedTrip) => item.id, []);
+  const renderTicket = useCallback(
+    ({ item }: { item: Ticket }) => <TicketCard ticket={item} />,
+    [],
+  );
+  const ticketKey = useCallback((item: Ticket) => item.id, []);
+  const openAddTicket = useCallback(() => setShowModal(true), []);
+
   const ticketCountKey = tickets.length === 1 ? "saved.tickets.count.one" : "saved.tickets.count.many";
   const ticketCountLine = t(ticketCountKey).replace("{count}", String(tickets.length));
 
+  // Keine gestaffelte Einblend-Welle mehr — siehe Landingscreen.
   return (
-    <ScreenEntrance>
-    <SafeAreaView className="flex-1 bg-[#1A1A1A]" edges={["top"]}>
-      <Animated.View style={[{ flex: 1 }, parallaxStyle]}>
-      {/* Titel = Chrome, bleibt stehen (siehe Home). */}
-      <View className="px-5 pt-6">
-        <Text className="text-[26px] font-black text-white tracking-tight">
-          Saved
-        </Text>
+    <SafeAreaView style={{ flex: 1, backgroundColor: appBg }} edges={["top"]}>
+      <ParallaxLayer style={[{ flex: 1 }, parallaxStyle]}>
+      {/* Titel = Chrome, bleibt stehen (siehe Home). Abstände über das geteilte
+          Raster — dieser Screen ist die Vorlage, an der die anderen ausgerichtet
+          sind (siehe HEADING_TOP/HEADING_GAP in lib/theme/spacing.ts). */}
+      <View style={{ paddingHorizontal: GUTTER, paddingTop: HEADING_TOP }}>
+        <ScreenHeading>Saved</ScreenHeading>
       </View>
-      <ScrollReveal index={0}>
-      <View className="px-5 pt-4 pb-4">
+
+      <View
+        style={{
+          paddingHorizontal: GUTTER,
+          paddingTop: HEADING_GAP,
+          paddingBottom: SPACE.lg,
+        }}
+      >
         <SegmentedToggle
           items={[
             { id: "trips", label: t("saved.tab.trips") },
@@ -193,7 +273,6 @@ export default function SavedScreen() {
           segmentHeight={36}
         />
       </View>
-      </ScrollReveal>
 
       {/* Pager-Style Slide — beide Panels in EINEM breiten Container, der
           als Ganzes translateX'd wird. Wirkt wie eine durchgehende
@@ -201,117 +280,77 @@ export default function SavedScreen() {
           unabhängige Slides. */}
       <SlidingPanels activeIndex={tab === "trips" ? 0 : 1}>
         {/* TRIPS */}
-        {!listReady ? (
+        {savedTrips.length === 0 ? (
           <ScrollView
             className="flex-1"
-            contentContainerStyle={{ paddingBottom: 98 }}
+            contentContainerStyle={{ paddingBottom: navbarSpace }}
             showsVerticalScrollIndicator={false}
           >
-            <SkeletonList />
-          </ScrollView>
-        ) : savedTrips.length === 0 ? (
-          <ScrollView
-            className="flex-1"
-            contentContainerStyle={{ paddingBottom: 98 }}
-            showsVerticalScrollIndicator={false}
-          >
-            <ScrollReveal index={1}>
+
               <EmptyState tab="trips" active={tab === "trips"} />
-            </ScrollReveal>
+
           </ScrollView>
         ) : (
-          <RevealScrollView
-            className="flex-1"
-            contentContainerStyle={{ paddingBottom: 98, paddingHorizontal: GUTTER }}
+          <SectionList
+            /**
+             * Ausdrücklicher Stil, KEIN `className`.
+             *
+             * NativeWind bildet `className` nur auf die Komponenten ab, die es
+             * ausdrücklich anmeldet — `FlatList` steht in dieser Liste,
+             * `SectionList` nicht. Die Angabe wäre hier also stillschweigend
+             * ins Leere gelaufen, und ohne `flex: 1` füllt die Liste ihren
+             * Bereich im Blätter-Container nicht aus.
+             */
+            style={FILL}
+            sections={tripSections}
+            keyExtractor={tripKey}
+            renderItem={renderTrip}
+            renderSectionHeader={renderTripSection}
+            stickySectionHeadersEnabled={false}
+            contentContainerStyle={{ paddingBottom: navbarSpace, paddingHorizontal: GUTTER }}
             showsVerticalScrollIndicator={false}
-          >
-            {/* Die Karten laufen in derselben Welle weiter wie der Umschalter
-                darüber (Index 0) — vorher animierte NUR der Umschalter und die
-                Liste stand einfach da. Genau deshalb fühlte sich der Tab anders
-                an als Home. Der Index läuft über beide Sektionen durch, damit die
-                Welle nicht in der Mitte neu anfängt. */}
-            {today.length > 0 && (
-              <>
-                <ScrollReveal index={1}>
-                  <Text className="text-[15px] font-semibold text-white mt-1 mb-2.5">
-                    {t("saved.section.today")}
-                  </Text>
-                </ScrollReveal>
-                {today.map((tr, i) => (
-                  <ScrollReveal
-                    key={tr.id}
-                    index={2 + i}
-                    scrim={SAVED_BG}
-                    style={{ marginBottom: 12 }}
-                  >
-                    <ResultCard result={tr} passengers={tr.passengers} />
-                  </ScrollReveal>
-                ))}
-              </>
-            )}
-            {earlier.length > 0 && (
-              <>
-                <ScrollReveal index={2 + today.length}>
-                  <Text className="text-[15px] font-semibold text-white mt-1 mb-2.5">
-                    {t("saved.section.earlier")}
-                  </Text>
-                </ScrollReveal>
-                {earlier.map((tr, i) => (
-                  <ScrollReveal
-                    key={tr.id}
-                    index={3 + today.length + i}
-                    scrim={SAVED_BG}
-                    style={{ marginBottom: 12 }}
-                  >
-                    <ResultCard result={tr} passengers={tr.passengers} />
-                  </ScrollReveal>
-                ))}
-              </>
-            )}
-          </RevealScrollView>
+            // Nur das Sichtbare aufbauen. Eine gespeicherte Reise ist eine große
+            // Karte — mehr als sechs passen ohnehin nicht auf den Bildschirm.
+            windowSize={5}
+            initialNumToRender={6}
+            maxToRenderPerBatch={4}
+            removeClippedSubviews
+          />
         )}
 
         {/* TICKETS */}
-        {!listReady ? (
-          <ScrollView
-            className="flex-1"
-            contentContainerStyle={{ paddingBottom: 98 }}
-            showsVerticalScrollIndicator={false}
-          >
-            <SkeletonList />
-          </ScrollView>
-        ) : (
-          <RevealScrollView
-            className="flex-1"
-            contentContainerStyle={{ paddingBottom: 98 }}
-            showsVerticalScrollIndicator={false}
-          >
-            <ScrollReveal index={1}>
-              <AddTicketButton onPress={() => setShowModal(true)} />
-            </ScrollReveal>
-
-            {tickets.length === 0 ? (
-              <ScrollReveal index={2}>
-                <EmptyState tab="tickets" />
-              </ScrollReveal>
-            ) : (
-              <>
-                <ScrollReveal index={2}>
-                  <Text className="text-[13px] text-[#56565C] font-medium mx-5 mb-2.5">
-                    {ticketCountLine}
-                  </Text>
-                </ScrollReveal>
-                {tickets.map((tk, i) => (
-                  <ScrollReveal key={tk.id} index={3 + i} scrim={SAVED_BG}>
-                    <TicketCard ticket={tk} />
-                  </ScrollReveal>
-                ))}
-              </>
-            )}
-          </RevealScrollView>
-        )}
+        <FlatList
+          // Ausdrücklich, aus demselben Grund wie bei der Liste darüber —
+          // hier würde `className` zwar greifen, aber zwei Schreibweisen für
+          // dasselbe nebeneinander laden nur zum nächsten Irrtum ein.
+          style={FILL}
+          data={tickets}
+          keyExtractor={ticketKey}
+          renderItem={renderTicket}
+          ListHeaderComponent={
+            <>
+              <AddTicketButton onPress={openAddTicket} bgColor={appBg} />
+              {tickets.length > 0 && (
+                <Text className="text-[13px] text-[#56565C] font-medium mx-5 mb-2.5">
+                  {ticketCountLine}
+                </Text>
+              )}
+            </>
+          }
+          // `active` MUSS mit: Beide Panels bleiben gleichzeitig gemountet, und ohne
+          // die Angabe steht der Vorgabewert `true` — die drei Endlos-Schleifen der
+          // Herzen liefen dann im verdeckten Panel weiter, während man nebenan
+          // arbeitet. Die Doku der Eigenschaft beschreibt genau diesen Fall.
+          ListEmptyComponent={<EmptyState tab="tickets" active={tab === "tickets"} />}
+          contentContainerStyle={{ paddingBottom: navbarSpace }}
+          showsVerticalScrollIndicator={false}
+          windowSize={5}
+          initialNumToRender={5}
+          maxToRenderPerBatch={4}
+          removeClippedSubviews
+        />
       </SlidingPanels>
-      </Animated.View>
+      </ParallaxLayer>
 
       <AddTicketModal
         visible={showModal}
@@ -319,6 +358,16 @@ export default function SavedScreen() {
         onAdd={addTicket}
       />
     </SafeAreaView>
-    </ScreenEntrance>
   );
 }
+
+/** Zeilenabstand der Reise-Liste — als Konstante, nicht als Literal im JSX.
+ *  Ein Objektliteral dort ist bei jedem Bild ein NEUES Objekt, also für jede
+ *  Zeile ein Stil-Vergleich, der garantiert scheitert. */
+const rowGap = { marginBottom: 12 } as const;
+
+/** Füllt den Bereich im Blätter-Container. Siehe Begründung an der SectionList. */
+const FILL = { flex: 1 } as const;
+
+/** Ruhestellung — als Konstante, damit das Worklet kein neues Objekt pro Bild baut. */
+const NO_PARALLAX = { transform: [{ translateX: 0 }] } as const;

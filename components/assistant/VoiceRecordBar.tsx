@@ -28,7 +28,9 @@ import Animated, {
 } from "react-native-reanimated";
 import { Trash2, ArrowRight } from "lucide-react-native";
 import { useAccent } from "@/lib/theme/accent";
+import { usePalette } from "@/lib/theme/appBg";
 import { haptic } from "@/lib/haptics";
+import { scaledStyles } from "@/lib/ui/compact";
 
 interface Props {
   recording: boolean;
@@ -65,16 +67,27 @@ interface BarProps {
   index: number;
   total: number;
   bufSV: SharedValue<number[]>;
-  phase: SharedValue<number>;
   color: string;
 }
 
-function Bar({ index, total, bufSV, phase, color }: BarProps) {
+/**
+ * DIE VERSCHIEBUNG IST BEI ALLEN BALKEN DIESELBE — sie gehört nach oben.
+ *
+ * Jeder Balken hatte einen eigenen Auswerter, der `phase` las. `phase` wächst in
+ * JEDEM Bild (Bild-Rückruf), also liefen bei rund 330 Punkt Breite etwa 57
+ * Auswerter plus 57 native Aktualisierungen pro Bild — für eine Verschiebung,
+ * die überall gleich ist. Unterschiedlich ist nur die Höhe, und die ändert sich
+ * bloß alle 80ms.
+ *
+ * Jetzt trägt der gemeinsame Rahmen die Verschiebung (ein Auswerter, der
+ * `phase` liest), und die Balken lesen nur noch `bufSV`. Sichtbar ändert sich
+ * nichts — es ist dieselbe Bewegung, nur einmal statt 57-mal gerechnet.
+ */
+function Bar({ index, total, bufSV, color }: BarProps) {
   const opacity = 0.5 + 0.5 * ((index + 1) / total);
 
   const style = useAnimatedStyle(() => {
     "worklet";
-    const sub = phase.value - Math.floor(phase.value);
     const buf = bufSV.value;
     // Bar index 0 = ganz links (älteste Samples), total-1 = ganz rechts
     // (neueste). Buffer wächst am Ende.
@@ -82,12 +95,7 @@ function Bar({ index, total, bufSV, phase, color }: BarProps) {
     const sampleIdx = head - (total - 1 - index);
     const raw = sampleIdx >= 0 ? buf[sampleIdx] ?? 0 : 0;
     const amp = Math.max(MIN_AMP, Math.min(1, raw));
-    return {
-      transform: [
-        { translateX: -sub * PITCH },
-        { scaleY: amp },
-      ],
-    };
+    return { transform: [{ scaleY: amp }] };
   });
 
   return (
@@ -136,7 +144,7 @@ function Waveform({
     recordingSV.value = recording;
   }, [recording, recordingSV]);
 
-  useFrameCallback((info) => {
+  const frameCb = useFrameCallback((info) => {
     "worklet";
     const ts = info.timestamp;
     if (lastFrameTs.value === 0) {
@@ -163,22 +171,39 @@ function Waveform({
     }
   }, true);
 
+  // Nur laufen lassen, wenn wirklich aufgenommen wird.
+  //
+  // `useFrameCallback` startet standardmäßig sofort und feuert dann JEDES Bild —
+  // auch ohne Aufnahme. Solange der Assistent offen war, hing damit dauerhaft ein
+  // Worklet im Bild-Takt, das nichts zu tun hatte.
+  useEffect(() => {
+    frameCb.setActive(recording);
+  }, [frameCb, recording]);
+
+  const scrollStyle = useAnimatedStyle(() => {
+    "worklet";
+    const sub = phase.value - Math.floor(phase.value);
+    return { transform: [{ translateX: -sub * PITCH }] };
+  });
+
   return (
     <View style={styles.waveClip} onLayout={(e) => setWidth(e.nativeEvent.layout.width)}>
       {/* Mittellinie (subtil) als Referenz für die +/- Auslenkung */}
       <View style={[styles.centerLine, { backgroundColor: accent.solid, opacity: 0.15 }]} />
-      {total > 0
-        ? Array.from({ length: total }).map((_, i) => (
-            <Bar
-              key={i}
-              index={i}
-              total={total}
-              bufSV={bufSV}
-              phase={phase}
-              color={accent.solid as string}
-            />
-          ))
-        : null}
+      {/* Der gemeinsame Rahmen trägt die Verschiebung — siehe Begründung an `Bar`. */}
+      <Animated.View style={[StyleSheet.absoluteFill, scrollStyle]} pointerEvents="none">
+        {total > 0
+          ? Array.from({ length: total }).map((_, i) => (
+              <Bar
+                key={i}
+                index={i}
+                total={total}
+                bufSV={bufSV}
+                color={accent.solid as string}
+              />
+            ))
+          : null}
+      </Animated.View>
     </View>
   );
 }
@@ -223,6 +248,7 @@ export function VoiceRecordBar({
   micVolumeSV,
 }: Props) {
   const accent = useAccent();
+  const palette = usePalette();
   const [seconds, setSeconds] = useState(0);
 
   useEffect(() => {
@@ -232,7 +258,7 @@ export function VoiceRecordBar({
   }, [recording]);
 
   return (
-    <View style={[styles.panel, { paddingBottom: bottomInset }]}>
+    <View style={[styles.panel, { backgroundColor: palette.s1, borderColor: palette.border }, { paddingBottom: bottomInset }]}>
       <View style={styles.topRow}>
         <View style={styles.timeBox}>
           <RecordingDot recording={recording} />
@@ -293,7 +319,7 @@ function fmtTime(s: number): string {
   return `${m}:${ss}`;
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   panel: {
     backgroundColor: C.panel,
     borderTopWidth: 1,

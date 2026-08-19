@@ -13,7 +13,7 @@ const WELCOMES: Record<Locale, string[]> = {
     "Hallo! Ich bin **Bo**, dein Reise-Geist. Wohin soll die Reise heute gehen?",
     "Hey, schön dass du da bist! Wo darf ich dich denn hinbringen?",
     "Hi! Bereit für die nächste Reise? Sag einfach, wo's hingehen soll.",
-    "Servus! Ich bin **Bo** und plan dir gleich was Feines — wohin denn?",
+    "Servus! Ich bin **Bo** und plan dir gleich was Feines — wohin gehts heute?",
     "Schön dich zu sehen! Was hast du dir denn für deine nächste Reise überlegt?",
     "Hallo! Steht heute eine neue Reise an? Erzähl mal, wo du hin willst.",
     "Tach! **Bo** am Apparat — wo soll's für dich hingehen?",

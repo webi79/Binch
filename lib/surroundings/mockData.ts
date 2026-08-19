@@ -30,11 +30,6 @@ export interface MapMarker {
   big?: boolean;
 }
 
-export interface POI {
-  coord: Coord;
-  kind: "park" | "shop" | "food";
-}
-
 export interface StopListItem {
   /** Stabile ID — Pflicht damit FlatList Rows korrekt diff-en kann. */
   id: string;
@@ -45,15 +40,6 @@ export interface StopListItem {
   distance: string;
   selected?: boolean;
 }
-
-/** Default-Standort (Berlin Hbf) — wird im Screen durch echtes GPS überschrieben. */
-export const USER_LOC: Coord = { latitude: 52.5251, longitude: 13.3669 };
-
-export const INITIAL_REGION = {
-  ...USER_LOC,
-  latitudeDelta: 0.04,
-  longitudeDelta: 0.04,
-};
 
 /** Haversine-Distanz in Metern zwischen zwei Lat/Lng-Punkten. */
 export function distanceMeters(a: Coord, b: Coord): number {
@@ -72,26 +58,6 @@ function formatDistance(m: number): string {
   if (m < 100_000) return `${(m / 1000).toFixed(1)} km`;
   return `${Math.round(m / 1000)} km`;
 }
-
-// =============================================================
-// MOCK-Daten für TRANSIT (Fallback wenn Backend keine Antwort liefert)
-// =============================================================
-
-const TRANSIT_MOCK: MapMarker[] = [
-  { id: "t1", type: "train", coord: { latitude: 52.5251, longitude: 13.3694 }, label: "5", big: true, selected: true },
-  { id: "t2", type: "bus", coord: { latitude: 52.5202, longitude: 13.3878 }, label: "3" },
-  { id: "t3", type: "tram", coord: { latitude: 52.5226, longitude: 13.4022 } },
-];
-
-const TRANSIT_LIST_MOCK: StopListItem[] = [
-  {
-    id: "mock:berlin-hbf",
-    name: "Berlin Hauptbahnhof",
-    kinds: ["train", "tram", "bus"],
-    distance: "180 m",
-    selected: true,
-  },
-];
 
 // =============================================================
 // AIRPORT + CRUISE — alle als Marker auf der Karte
@@ -117,18 +83,72 @@ function cruiseMarkers(): MapMarker[] {
   }));
 }
 
+/**
+ * Einmal rechnen, nicht bei jedem Aufruf.
+ *
+ * Die Zeile darunter sagte schon immer „Airport/Cruise sind statisch" —
+ * zwischengespeichert wurde trotzdem nichts. Jeder Aufruf baute 3276
+ * Flughafen-Objekte neu auf, samt Zeichenketten-Verkettung fürs Label. Und
+ * aufgerufen wird das nicht selten: Der Umgebungs-Bildschirm leitet seine
+ * Marker aus der Antwort ab, und deren Kennung wechselt bei jedem Stillstand
+ * der Karte. Daran hängt die ganze Kette — 3276 Objekte, daraus 3276
+ * GeoJSON-Merkmale, daraus eine neue Sammlung, und weil sich damit die Kennung
+ * der Quelle ändert, baut MapLibre nativ die komplette Häufung neu auf.
+ *
+ * Träge berechnet, nicht beim Laden des Moduls: Wer die App öffnet und nie in
+ * den Umgebungs-Reiter geht, soll dafür keine Startzeit zahlen.
+ */
+let airportCache: MapMarker[] | null = null;
+let cruiseCache: MapMarker[] | null = null;
+
 /** Liefert alle Marker für den aktuellen Modus. Airport/Cruise sind statisch. */
 export function markersForMode(mode: SheetMode): MapMarker[] {
-  if (mode === "airport") return airportMarkers();
-  if (mode === "cruise") return cruiseMarkers();
-  return TRANSIT_MOCK;
+  if (mode === "airport") return (airportCache ??= airportMarkers());
+  if (mode === "cruise") return (cruiseCache ??= cruiseMarkers());
+  /**
+   * Für den Nahverkehr gibt es hier nichts.
+   *
+   * Hier standen drei erfundene Marker mit Berliner Koordinaten. Der Bildschirm
+   * ruft diesen Zweig zwar nicht mehr auf (er gibt bei fehlenden Serverdaten
+   * selbst eine leere Liste zurück, mit ausgeschriebener Begründung), aber ein
+   * erreichbarer Rückfall auf Berlin ist genau die Art Rest, die irgendwann
+   * wieder auf der Karte landet.
+   */
+  return [];
 }
 
-/** Liefert die Liste sortiert nach Distanz zum User. */
-export function listForMode(mode: SheetMode, user: Coord = USER_LOC): StopListItem[] {
-  if (mode === "airport") return airportListSorted(AIRPORT_PINS, user);
-  if (mode === "cruise") return cruiseListSorted(CRUISE_PORT_PINS, user);
-  return TRANSIT_LIST_MOCK;
+/**
+ * Liefert die Liste sortiert nach Distanz zum User.
+ *
+ * Zwischengespeichert auf eine GERUNDETE Position, nicht auf die exakte: Hier
+ * werden 3276 Entfernungen gerechnet, sortiert und abgebildet. Der Ortungs-Fix
+ * kommt zweistufig (erst aus dem Zwischenspeicher des Systems, bis zu acht
+ * Sekunden später der frische), und jede Karten-Bewegung löst ohnehin einen
+ * neuen Durchlauf aus. Auf zwei Nachkommastellen — rund einen Kilometer — ändert
+ * sich an der Reihenfolge nichts, was jemand bemerkt.
+ */
+let listCache: { key: string; items: StopListItem[] } | null = null;
+
+/**
+ * Der Standort ist PFLICHT, und ohne ihn gibt es keine Liste.
+ *
+ * Hier stand der Berliner Platzhalter als Vorgabewert. Die Flughafen- und
+ * Hafenliste wird nach Entfernung sortiert — ohne echten Standort bekam also
+ * jeder Nutzer die Nähe von Berlin als „in deiner Nähe" ausgegeben. Eine leere
+ * Liste ist die richtige Antwort auf eine Frage, die sich ohne Standort nicht
+ * beantworten lässt; die Karte zeigt die Punkte ohnehin.
+ */
+export function listForMode(mode: SheetMode, user: Coord | null): StopListItem[] {
+  if (mode !== "airport" && mode !== "cruise") return [];
+  if (!user) return [];
+  const key = `${mode}|${user.latitude.toFixed(2)}|${user.longitude.toFixed(2)}`;
+  if (listCache?.key === key) return listCache.items;
+  const items =
+    mode === "airport"
+      ? airportListSorted(AIRPORT_PINS, user)
+      : cruiseListSorted(CRUISE_PORT_PINS, user);
+  listCache = { key, items };
+  return items;
 }
 
 function airportListSorted(pins: AirportPin[], user: Coord): StopListItem[] {
@@ -165,10 +185,10 @@ function cruiseListSorted(pins: CruisePortPin[], user: Coord): StopListItem[] {
     }));
 }
 
-// POIs werden weiterhin nur im Transit-Mode angezeigt (Cafés/Shops um den User)
-export const POIS: POI[] = [
-  { coord: { latitude: 52.5306, longitude: 13.3477 }, kind: "park" },
-  { coord: { latitude: 52.5184, longitude: 13.3993 }, kind: "park" },
-  { coord: { latitude: 52.5018, longitude: 13.3414 }, kind: "shop" },
-  { coord: { latitude: 52.5180, longitude: 13.3909 }, kind: "food" },
-];
+/**
+ * Hier standen vier fest eingetragene Punkte mit Berliner Koordinaten — zwei
+ * Parks, ein Laden, ein Restaurant. Sie stammten aus der Aufbauphase und wurden
+ * jedem Nutzer auf die Karte gezeichnet, egal wo er sich befand: zwei Bäume,
+ * eine Tasche und ein Besteck mitten in Berlin. Es gibt keine Datenquelle
+ * dahinter, also sind sie ersatzlos entfallen.
+ */

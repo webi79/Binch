@@ -41,6 +41,7 @@ const CARRIER_DOMAINS: Record<string, string> = {
 // fetcht die Quelle mit korrekten Headern und liefert eine PNG-Konversion
 // in der gewünschten Größe. Stabiler Free-Service, dafür entworfen.
 // Clearbit Logo-API ist 2024 abgeschaltet worden → fliegt raus.
+// Reihenfolge im Flug-Zweig: avs.io (echtes Logo) → DuckDuckGo → Google-Favicon.
 const DB_LOGO_URLS = [
   "https://wsrv.nl/?url=upload.wikimedia.org%2Fwikipedia%2Fcommons%2Fd%2Fd5%2FDeutsche_Bahn_AG-Logo.svg&output=png&w=200",
   "https://icons.duckduckgo.com/ip3/bahn.de.ico",
@@ -52,10 +53,6 @@ const FLIXBUS_LOGO_URLS = [
   "https://icons.duckduckgo.com/ip3/flixbus.com.ico",
   "https://www.google.com/s2/favicons?domain=flixbus.com&sz=128",
 ];
-
-function clearbit(domain: string): string {
-  return `https://logo.clearbit.com/${domain}`;
-}
 
 export function airlineCode(flightNumber?: string): string | null {
   if (!flightNumber) return null;
@@ -77,11 +74,19 @@ export function logoUrls(result: SearchResult, carrier: string): string[] {
     const code = airlineCode(result.flightNumber);
     if (code) urls.push(`https://pics.avs.io/200/200/${code}.png`);
     const key = carrier.toLowerCase().trim();
-    if (key && CARRIER_DOMAINS[key]) urls.push(clearbit(CARRIER_DOMAINS[key]));
-    const slug = key
-      .replace(/\s+(airlines|airline|airways|gmbh|ag|sa|nv|inc|ltd|co)\.?$/g, "")
-      .replace(/[^a-z0-9]/g, "");
-    if (slug.length >= 3) urls.push(clearbit(`${slug}.com`));
+    // Clearbit ist raus — die API ist 2024 abgeschaltet, der Kommentar oben sagt
+    // das seit damals, im Flug-Zweig standen die Kandidaten aber noch drin. Jede
+    // dieser Adressen war ein garantierter Fehlschlag: Bild laden, `onError`,
+    // Zustand hochzählen, Karte neu rendern — bis zu zwei überflüssige Runden pro
+    // Flugkarte, bevor sie beim Favicon landete.
+    if (key && CARRIER_DOMAINS[key]) {
+      urls.push(`https://icons.duckduckgo.com/ip3/${CARRIER_DOMAINS[key]}.ico`);
+    }
+    // Der geratene Slug ist RAUS. Solange dahinter Clearbit stand, war er ein
+    // garantierter Fehlschlag und damit harmlos. Über einen funktionierenden
+    // Dienst liefert er dagegen, was auf `<slug>.com` steht — bei Carriern
+    // außerhalb der gepflegten Zuordnung also möglicherweise das Logo einer
+    // wildfremden Firma. Lieber kein Logo als ein falsches.
     if (key && CARRIER_DOMAINS[key]) {
       urls.push(`https://www.google.com/s2/favicons?domain=${CARRIER_DOMAINS[key]}&sz=128`);
     }

@@ -223,7 +223,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         filter={["has", "point_count"]}
         layout={{
           "text-field": ["get", "point_count_abbreviated"],
-          "text-font": ["Noto Sans Bold"],
+          "text-font": ["Noto Sans Regular"],
           "text-size": 12,
         }}
         paint={{
@@ -593,7 +593,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         filter={["has", "point_count"]}
         layout={{
           "text-field": ["get", "point_count_abbreviated"],
-          "text-font": ["Noto Sans Bold"],
+          "text-font": ["Noto Sans Regular"],
           "text-size": 12,
         }}
         paint={{

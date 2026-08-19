@@ -11,15 +11,16 @@
  * sich bewegenden View. Wirkt wie ein durchgehender Pager (Shazam-Style).
  */
 import { Children, useEffect, useState } from "react";
+import { SHEET_OUT } from "@/lib/nav/overlayCover";
 import { Platform, StyleSheet, useWindowDimensions, View } from "react-native";
 import Animated, {
-  Easing,
   runOnJS,
   useAnimatedStyle,
   useSharedValue,
   withTiming,
 } from "react-native-reanimated";
 import type { ReactNode } from "react";
+import { scaledStyles } from "@/lib/ui/compact";
 
 interface Props {
   /** Welches Panel ist aktiv (0-indexed). */
@@ -44,14 +45,34 @@ export function SlidingPanels({ activeIndex, children }: Props) {
   const [rasterize, setRasterize] = useState(false);
 
   useEffect(() => {
+    /**
+     * Rasterung ein Bild VOR der Bewegung, nicht im selben Durchlauf.
+     *
+     * Beides stand hier direkt untereinander. Der Aufbau einer
+     * bildschirmfüllenden Ebene ist im Projekt mit 66ms vermessen — bei 120Hz
+     * acht Bilder, in ein Fenster von einem. Jeder andere Textur-Nutzer der App
+     * hat mindestens ein Bild Vorlauf oder rastert schon beim Fingerdruck; hier
+     * fehlte es, und zwar an drei Stellen gleichzeitig (Saved-Reiter,
+     * Ergebnis-Richtung, Datums-Modus).
+     */
     setRasterize(true);
+    const id = requestAnimationFrame(() => {
     tx.value = withTiming(
       -activeIndex * screenW,
-      { duration: 280, easing: Easing.bezier(0.4, 0, 0.2, 1) },
+      // Gehörte vorher keiner Familie an: 280ms mit der Kurve der
+      // Seitwärts-Slides. Das hier ist ein Blatt-artiger Wechsel innerhalb einer
+      // Fläche, also die Blatt-Vorgabe.
+      SHEET_OUT,
       (finished) => {
+        // `finished` prüfen ist hier RICHTIG, ich hatte es fälschlich entfernt:
+        // Bei einem Wechsel während einer laufenden Slide bricht die neue die alte
+        // ab, deren Rückruf feuert mit false — und hätte die Ebene damit direkt
+        // nach dem Einschalten wieder abgeräumt. Die neue Slide liefe dann ohne.
         if (finished) runOnJS(setRasterize)(false);
       },
     );
+    });
+    return () => cancelAnimationFrame(id);
   }, [activeIndex, screenW, tx]);
 
   const style = useAnimatedStyle(() => ({
@@ -83,7 +104,7 @@ export function SlidingPanels({ activeIndex, children }: Props) {
   );
 }
 
-const s = StyleSheet.create({
+const s = scaledStyles({
   viewport: { flex: 1, overflow: "hidden" },
   slot: { flex: 1 },
 });

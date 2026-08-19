@@ -19,6 +19,8 @@ import Animated, { FadeIn, FadeOut, ZoomIn, ZoomOut } from "react-native-reanima
 import Svg, { Circle, Path } from "react-native-svg";
 import { haptic } from "@/lib/haptics";
 import { useAccent } from "@/lib/theme/accent";
+import { usePalette } from "@/lib/theme/appBg";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const tokens = {
   surface2: "#242425",
@@ -55,6 +57,7 @@ export function ClearSearchHistoryAlert({
   cancelLabel,
 }: ClearSearchHistoryAlertProps) {
   const accent = useAccent();
+  const palette = usePalette();
   function handleConfirm() {
     haptic("important");
     onConfirm();
@@ -90,7 +93,7 @@ export function ClearSearchHistoryAlert({
         >
           {/* Inner Pressable schluckt Taps damit das Tap auf die Card nicht
               das Scrim-onPress (= Schließen) triggert. */}
-          <Pressable style={styles.card} onPress={() => {}}>
+          <Pressable style={[styles.card, { backgroundColor: palette.s2 }]} onPress={() => {}}>
             {/* Roter Solid-Kreis um's Icon — bewusst KEIN gefadeter Halo,
                 ein einziger satter Kreis im Destructive-Rot. */}
             <View style={styles.iconCircle}>
@@ -160,7 +163,7 @@ function AlertIcon() {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   scrim: {
     flex: 1,
     backgroundColor: tokens.scrim,

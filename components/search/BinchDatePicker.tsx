@@ -12,8 +12,16 @@
  *  - Beim Scrollen ans untere Ende werden mehr Monate nachgeladen
  *  - DayCell als React.memo damit Selection-Changes nur 2 Cells re-rendern
  */
-import { memo, useCallback, useMemo, useState, type ReactNode } from "react";
+import { memo, useCallback, useMemo, useState, type ReactNode, useRef } from "react";
+import { subscribeLayer } from "@/lib/nav/transitionLayer";
+import { isTransitionBusy } from "@/lib/nav/transitionBusy";
+import { PICKER_IN, PICKER_OUT, pickerCover } from "@/lib/nav/overlayCover";
+import { useSheetSlide } from "@/lib/nav/sheetSlide";
+import { prepareLayer } from "@/lib/nav/transitionLayer";
+import { showAlert } from "@/lib/alert";
+import { setSheetMoving } from "@/lib/nav/searchHandoff";
 import {
+  Dimensions,
   BackHandler,
   Modal,
   Platform,
@@ -24,13 +32,16 @@ import {
   useWindowDimensions,
   View,
 } from "react-native";
+import { usePalette } from "@/lib/theme/appBg";
 import { FlashList } from "@shopify/flash-list";
+import { usePressBounce } from "@/lib/motion";
 import Animated, {
   cancelAnimation,
   Easing,
   useAnimatedStyle,
   useSharedValue,
   withTiming,
+  runOnJS,
 } from "react-native-reanimated";
 import { useEffect } from "react";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -38,6 +49,8 @@ import { X, Clock } from "lucide-react-native";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
 import { SlidingPanels } from "@/components/ui/SlidingPanels";
+import { scaledStyles } from "@/lib/ui/compact";
+import { useSearchStore } from "@/stores/searchStore";
 
 const C = {
   bg: "#1A1A1A",
@@ -87,7 +100,34 @@ function monthFrom(y: number, m: number): number {
   return 50 + (seed % 52);
 }
 
+/**
+ * Der Parkplatz — EXAKT wie beim Such-Blatt.
+ *
+ * Dort steht `Dimensions.get("window").height`, einmal beim Laden gelesen
+ * (`SearchHeroOverlay`: `const { height: SH } = Dimensions.get("window")`).
+ * Ich hatte hier die GERÄTE-höhe genommen, um sicher unter den Bildrand zu
+ * kommen — das sind auf einem üblichen Gerät 72 Punkte mehr. Bei gleicher Dauer
+ * heißt mehr Weg schlicht mehr Geschwindigkeit: 92 statt 85 Punkte pro Bild.
+ * Genau solche 9% sind der Unterschied zwischen „läuft wie das andere" und
+ * „wirkt hektischer".
+ *
+ * Einmal beim Laden gelesen ist auch die Fenster-Höhe unbedenklich: Zu dem
+ * Zeitpunkt gibt es keine Tastatur, die sie verkleinern könnte.
+ */
+const PARK_Y = Dimensions.get("window").height;
+
 type Mode = "specific" | "flexible";
+
+/**
+ * Der Text der Preis-Meldung.
+ *
+ * Bewusst vorsichtig formuliert: Es sind Schätzungen aus vergangenen Suchen,
+ * keine buchbaren Preise. Im Projekt gilt „wir schätzen keine Preise" für
+ * ANGEBOTE — hier steht ausdrücklich dabei, dass es welche sind, und genau
+ * deshalb ist der Hinweis überhaupt nötig.
+ */
+const ESTIMATED_PRICE_NOTE =
+  "Geschätzte günstigste Preise pro Person, ohne Gewähr. Der tatsächliche Preis steht erst in den Suchergebnissen.";
 type Sel = { y: number; m: number; d: number } | null;
 type MonthBlock = { y: number; m: number; weeks: ({ d: number } | null)[][] };
 // Für FlashList flachgeklopft: jede Zeile ist entweder ein Monats-Label ODER
@@ -99,6 +139,9 @@ type CalRow =
 
 export interface BinchDatePickerProps {
   visible: boolean;
+  /** Liegt der Inhalt im Baum? Siehe Host — Aufbau beim Berühren, Abbau nach
+   *  der Ausfahrt. */
+  mounted: boolean;
   onClose: () => void;
   minimumDate?: Date;
   initialDate?: Date | null;
@@ -113,6 +156,7 @@ export interface BinchDatePickerProps {
 
 export function BinchDatePicker({
   visible,
+  mounted,
   onClose,
   minimumDate,
   initialDate,
@@ -124,52 +168,225 @@ export function BinchDatePicker({
   fieldLabel = "Abreise",
   title = "Reisedatum",
 }: BinchDatePickerProps) {
+  const palette = usePalette();
   const accent = useAccent();
   const { height: screenH } = useWindowDimensions();
 
   // Slide-Pattern wie LocationPicker — always-mounted, offset/opacity via
   // SharedValue + withTiming. Tap → useEffect → withTiming auf UI-Thread.
-  const offset = useSharedValue(screenH);
-  const opacity = useSharedValue(0);
+  const {
+    y: offset,
+    style: wrapStyle,
+    run: runSheet,
+    parkNow,
+  } = useSheetSlide("pickerDate", PARK_Y);
   // Pre-warm: einmaliger no-op withTiming am Mount damit Reanimated v4
   // die Worklets JIT-kompiliert BEVOR der User zum ersten Mal tippt.
   // Ohne pre-warm ist der erste richtige Slide messbar stuttery (cold
   // start kann auf Android 50-100ms kosten).
   useEffect(() => {
-    offset.value = withTiming(screenH, { duration: 1 });
-    opacity.value = withTiming(0, { duration: 1 });
+    /**
+     * Kalt-Anlauf mit der ECHTEN Vorgabe, nicht mit `{ duration: 1 }`.
+     *
+     * Hier stand eine 1ms-Bewegung mit Standardkurve. Die parkt das Blatt zwar
+     * korrekt, läuft aber durch einen ANDEREN Code-Pfad als die spätere echte
+     * Fahrt: `PICKER_IN` trägt eine Bézier-Kurve, und deren Aufbau passiert dann
+     * beim ersten echten Öffnen. Genau deshalb ruckelt es beim ersten Mal am
+     * stärksten.
+     *
+     * Das Such-Blatt macht das seit Längerem richtig und begründet es wörtlich:
+     * „Beide laufen mit den ECHTEN Konfigurationen, damit wirklich derselbe Pfad
+     * durchlaufen wird und nicht bloß ein ähnlicher."
+     *
+     * Der Weg ist verschwindend klein und liegt außerhalb des Bildes — sichtbar
+     * ist davon nichts, gewärmt wird trotzdem der richtige Pfad.
+     */
+    // EIN BILD später — der Parkplatz-Effekt weiter unten läuft beim Aufsetzen
+    // ebenfalls und bräche den Anlauf sonst im selben Durchgang ab (dieselbe
+    // Begründung wie im Ortswähler).
+    const warm = requestAnimationFrame(() => {
+      offset.value = PARK_Y;
+      offset.value = withTiming(PARK_Y - 0.002, PICKER_IN, (finished) => {
+        "worklet";
+        if (finished) offset.value = PARK_Y;
+      });
+    });
+    return () => cancelAnimationFrame(warm);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /**
+   * Die Ebene gilt für die DAUER DER BEWEGUNG — in beide Richtungen.
+   *
+   * Vorher hing sie allein an `prepareLayer` (Berührung des Feldes). Das deckt
+   * das Hereinfahren ab, aber nicht das Hinausfahren: Die Vorbereitung verfällt
+   * nach 1,4 Sekunden von selbst, und in einem Picker ist man länger. Jedes
+   * Schließen lief damit ganz ohne Ebene — und über der Ansicht steht
+   * ausdrücklich, dass genau das schon einmal messbare Bildverluste erzeugt hat.
+   *
+   * Beides zusammen ist richtig: `prepareLayer` legt sie im Berührungsfenster an
+   * (dort sind die 66ms Aufbau umsonst), und dieser Zustand hält sie über beide
+   * Fahrten. Was die Vorbereitung schon angelegt hat, wird dadurch nicht neu
+   * gebaut — es bleibt einfach bestehen.
+   *
+   * DAUERHAFT darf sie nicht sein, und das ist der Grund, warum hier vorher
+   * `elevation: 32` stand und wieder wegmusste: Unter ihr scrollt eine Liste.
+   * Eine Ebene über einer scrollenden Fläche muss bei jedem Scroll-Bild neu
+   * entstehen — schlimmer als gar keine.
+   */
+  // KEIN eigenes Bild-Handle mehr: Das Warten auf das nächste Bild steckt
+  // in `useSheetSlide` — beide Wähler nutzen dasselbe.
+  const [moving, setMoving] = useState(false);
+  const moveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const holdLayerFor = (ms: number) => {
+    setMoving(true);
+    if (moveTimer.current) clearTimeout(moveTimer.current);
+    moveTimer.current = setTimeout(() => setMoving(false), ms + 80);
+  };
+  /**
+   * Sicherheitsnetz für die Fahrt-Meldung.
+   *
+   * Der Rückruf am Ende der Kurve läuft NICHT, wenn die Bewegung abgebrochen
+   * wird (zweiter Tipp, Schließen mittendrin). Ohne dieses Netz bliebe die
+   * Meldung dauerhaft auf „fährt", und die Übergabe-Textur würde nie wieder
+   * freigegeben — der Such-Bildschirm bliebe eine bildschirmfüllende GPU-Fläche,
+   * die bei jeder Eingabe neu rastert. Genau dieser Fehler ist in
+   * `searchHandoff` für den anderen Weg schon ausformuliert.
+   */
+  const movingGuard = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const armMovingGuard = (ms: number) => {
+    if (movingGuard.current) clearTimeout(movingGuard.current);
+    movingGuard.current = setTimeout(() => setSheetMoving(false, "pickerDate"), ms + 200);
+  };
+  useEffect(
+    () => () => {
+      if (moveTimer.current) clearTimeout(moveTimer.current);
+      if (movingGuard.current) clearTimeout(movingGuard.current);
+    },
+    [],
+  );
+
+  /**
+   * Nur auf einen echten WECHSEL reagieren — nicht auf jedes Auslösen.
+   *
+   * Zwei Fälle liefen hier bisher falsch mit:
+   *
+   *  1. Der allererste Durchgang. Beide Wähler hängen dauerhaft am Baum, und
+   *     beide fielen beim Start in den Schließen-Zweig: Sie meldeten „fährt",
+   *     forderten eine Ebene an und gaben sie 420ms später wieder frei —
+   *     mitten in den Start der App hinein, ohne dass sich etwas bewegt hätte.
+   *  2. `screenH` steht in den Abhängigkeiten. Ändert sich das Fenstermaß,
+   *     während der Wähler OFFEN ist (Tastatur mit `adjustResize`,
+   *     geteilter Bildschirm), lief der Zweig erneut — und schob das Blatt
+   *     einmal komplett aus dem Bild und wieder herein.
+   */
+  const wasVisible = useRef<boolean | null>(null);
+  /**
+   * Die Bewegung startet DIREKT aus dem Speicher — ohne auf ein Rendern zu
+   * warten. Das ist der Weg des Such-Blattes.
+   *
+   * Sie hing bisher am `visible`-Prop, also am Ergebnis eines Durchgangs durch
+   * React: Speicher schreiben → Host rendert → Wähler rendert (kompletter Baum)
+   * → Effekt → ein Bild → Kurve. Der teure Teil lag damit unmittelbar vor dem
+   * Start, und auf Fabric fallen die Einbau-Schritte dazu auf denselben Strang
+   * wie die Bewegung.
+   *
+   * Jetzt hört das Blatt selbst zu. Der Rückruf läuft in DEMSELBEN Aufruf, der
+   * den Speicher beschreibt — noch vor jedem Rendern. Das Prop kommt ein Bild
+   * später nach und trägt nur noch, was React braucht (siehe Host).
+   */
+  const runSlide = useRef<(v: boolean) => void>(() => {});
+  useEffect(
+    () =>
+      useSearchStore.subscribe((st, prev) => {
+        const now = st.datePickerRequest !== null;
+        const was = prev.datePickerRequest !== null;
+        if (now !== was) runSlide.current(now);
+      }),
+    [],
+  );
+
+  /**
+   * Die eigentliche Fahrt — aufgerufen vom Speicher-Abonnement oben, nicht von
+   * einem Rendern. Beide Richtungen laufen identisch aufgebaut: Ebene halten,
+   * anmelden, EIN Bild zeichnen lassen, dann die Kurve. Genau die Reihenfolge
+   * des Such-Blattes.
+   */
+  /**
+   * Die Fahrt selbst kommt aus `useSheetSlide` — EINE Quelle für alle Blätter.
+   *
+   * Hier bleibt nur, was diesem Wähler eigen ist: die Ebene halten, den
+   * Wächter scharf stellen und die Unterlage mitnehmen. Strecke, Kurve, Dauer,
+   * Reihenfolge und Anmeldung stecken in der gemeinsamen Fahrt und können
+   * dadurch nicht mehr abweichen.
+   */
+  const slide = useCallback(
+    (show: boolean) => {
+      const cfg = show ? PICKER_IN : PICKER_OUT;
+      if (!layeredRef.current) holdLayerFor(cfg.duration + (show ? 16 : 0));
+      armMovingGuard(cfg.duration);
+      runSheet(show, (s) => {
+        pickerCover.value = withTiming(s ? 1 : 0, s ? PICKER_IN : PICKER_OUT);
+      });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [runSheet],
+  );
+  runSlide.current = slide;
+
+  /**
+   * Beim allerersten Durchgang nur PARKEN.
+   *
+   * Es bewegt sich nichts, es wird also auch nichts gemeldet — sonst gälte der
+   * Bildschirm beim Start der App als „fährt".
+   */
   useEffect(() => {
-    cancelAnimation(offset);
-    cancelAnimation(opacity);
-    if (visible) {
-      offset.value = withTiming(0, { duration: 280, easing: Easing.out(Easing.cubic) });
-      // Opacity steuert NUR den Backdrop (siehe backdropStyle). Sync mit
-      // offset-Duration damit Backdrop in derselben Zeit ein-/ausfadet wie
-      // der Picker rein-/rausslidet.
-      opacity.value = withTiming(1, { duration: 280 });
-    } else {
-      offset.value = withTiming(screenH, { duration: 280, easing: Easing.in(Easing.cubic) });
-      opacity.value = withTiming(0, { duration: 280 });
+    if (wasVisible.current !== null) {
+      wasVisible.current = visible;
+      return;
     }
-  }, [visible, offset, opacity, screenH]);
+    wasVisible.current = visible;
+    if (!visible) parkNow();
+  }, [visible, offset, screenH]);
+
+  /**
+   * Bei geändertem Fenstermaß neu parken, solange geschlossen.
+   *
+   * Der Parkplatz ist die Fensterhöhe. Ändert die sich, während der Wähler
+   * unten steht (Tastatur unter `adjustResize`, geteilter Bildschirm), bliebe
+   * der alte Wert stehen — und ein deckendes Blatt lugte unten ins Bild und
+   * schluckte Berührungen.
+   */
+  const lastScreenH = useRef(screenH);
+  useEffect(() => {
+    /**
+     * NUR bei echter Änderung des Fenstermaßes.
+     *
+     * Vorher stand `visible` mit in den Abhängigkeiten, und das war fatal: Beim
+     * Schließen kippt es auf falsch, dieser Effekt lief mit — und setzte das
+     * Blatt SOFORT auf den Parkplatz. Die Ausfahrt war damit nicht langsam oder
+     * ruckelig, sondern gar nicht mehr vorhanden: Der Bildschirm verschwand
+     * schlicht.
+     */
+    if (lastScreenH.current === screenH) return;
+    lastScreenH.current = screenH;
+    if (!visible) parkNow();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screenH]);
 
   // Picker selbst NUR translateY, KEINE Opacity — sonst fadet er beim
   // Slide-Out (160ms) schneller weg als er translatet (280ms) und der
   // User sieht nur einen Disappear-Effekt statt einem Slide. Mit reinem
   // translateY ist der Picker während der gesamten 280ms voll sichtbar
   // bis er off-screen ist.
-  const wrapStyle = useAnimatedStyle(() => ({
-    transform: [{ translateY: offset.value }],
-  }));
+  const [layered, setLayered] = useState(false);
+  // Spiegel für den Fahrt-Rückruf: Der läuft aus einem Abonnement heraus und
+  // säße sonst auf dem Stand des Durchgangs, in dem er angelegt wurde.
+  const layeredRef = useRef(false);
+  layeredRef.current = layered;
+  useEffect(() => subscribeLayer("pickerDate", setLayered), []);
 
-  // Backdrop-Style: opacity fadet von 0 auf 1 wenn Picker visible →
-  // darkens SearchHero hinter dem Picker. Verwendet `opacity` SharedValue.
-  const backdropStyle = useAnimatedStyle(() => ({
-    opacity: opacity.value,
-  }));
+
 
   useEffect(() => {
     if (Platform.OS !== "android" || !visible) return;
@@ -182,31 +399,72 @@ export function BinchDatePicker({
 
   return (
     <>
-      {/* Backdrop — abdunkelt den SearchHero hinter dem Picker während
-          des Slide-Ins. Liegt zIndex 9998 = unter dem Picker (9999).
-          pointerEvents=none, damit der User-Tap auf den Picker-Content
-          nicht blockiert wird. */}
+            {/*
+        KEINE Verdunkelungs-Ebene mehr — und das ist der zweite strukturelle
+        Unterschied zum Such-Blatt, das als Vorbild dient.
+
+        Hier lag eine bildschirmfüllende Fläche mit `rgba(0,0,0,0.75)`, deren
+        Deckkraft über die volle Fahrt von 0 auf 1 lief. Das kostet dreifach:
+
+          • ein zweiter vollflächiger Auswerter pro Bild, zusätzlich zum Blatt
+          • ein vollflächiger Alpha-Durchgang in JEDEM Bild
+          • und das Schwerste: Solange oben etwas Halbdurchsichtiges liegt, kann
+            Android die Fläche darunter nicht als verdeckt überspringen. Der
+            Himmel-und-Dünen-SVG des Such-Bildschirms musste also die ganzen
+            300ms mitgezeichnet werden, statt nach den ersten Bildern
+            wegzufallen.
+
+        Das Such-Blatt im Landingscreen hat nichts dergleichen: Es ist deckend
+        und verdeckt schlicht, was darunter liegt. Genau dieses Verhalten war
+        gewünscht.
+
+        Sichtbar war die Verdunkelung ohnehin nur während der Fahrt — sobald das
+        Blatt oben steht, deckt es alles ab.
+      */}
+
       <Animated.View
-        pointerEvents="none"
-        style={[
-          StyleSheet.absoluteFillObject,
-          { zIndex: 9998, backgroundColor: "rgba(0,0,0,0.75)" },
-          backdropStyle,
-        ]}
-      />
-      <Animated.View
-        pointerEvents={visible ? "auto" : "none"}
-        style={[
+        // Wie im Ortswähler: nicht zusammenfalten lassen, damit die
+        // Textur-Anforderung sicher an DIESEM Knoten hängt.
+        collapsable={false}
+        /**
+         * Textur NUR über das Modul — angelegt, wenn der Finger das Datumsfeld
+         * berührt, also VOR der Bewegung.
+         *
+         * Der Kommentar darunter erklärt richtig, warum `elevation` hier weg
+         * musste (unsichtbarer Schatten, aber Layer-Zwang bei jedem Scroll-Bild).
+         * Daraus wurde aber „gar keine Ebene", und damit wird dieses
+         * bildschirmfüllende Blatt in JEDEM Bild seiner Fahrt neu gezeichnet —
+         * 14,7ms gegen ein Budget von 8,3ms. Der Schatten bleibt weg, die Ebene
+         * kommt zurück: nur für die Dauer der Bewegung, angelegt im Berührungs-
+         * Fenster davor, und danach wieder abgeräumt, damit das Scrollen im
+         * Kalender sie nicht Bild für Bild neu erzeugen muss.
+         */
+        renderToHardwareTextureAndroid={Platform.OS === "android" && (layered || moving)}
+          style={[
           StyleSheet.absoluteFillObject,
           // KEIN elevation mehr: das Sheet ist Vollbild + opak (deckt alles ab),
           // ein 32dp-Android-Schatten ist unsichtbar (Ränder offscreen), zwingt
           // aber die ganze View samt scrollendem FlashList-Inhalt auf einen
           // Hardware-Layer → jeder Scroll-Frame = Layer-Recomposite + Shadow-Pass
           // = UI-Thread-Last. Stacking macht render-order + zIndex.
-          { zIndex: 9999, backgroundColor: C.bg },
+          {
+            zIndex: 9999,
+            backgroundColor: palette.s1,
+            // Siehe Ortswähler: `zIndex` allein reicht auf Android nicht, wenn
+            // Geschwister am Wurzel-Layout eine Höhe tragen (16 bis 32).
+            elevation: 40,
+          },
           wrapStyle,
         ]}
       >
+        {/**
+          * `pointerEvents` sitzt hier statt auf der animierten View — dieselbe
+          * Begründung wie im Ortswähler: Ein Eigenschafts-Wechsel auf dem
+          * animierten Knoten ist auf Fabric ein Commit gegen die laufende
+          * Bewegung.
+          */}
+        <View style={StyleSheet.absoluteFill} pointerEvents={visible ? "auto" : "none"}>
+        {mounted && (
         <DatePickerContent
         accentSolid={accent.solid}
         accentSubtle={accent.subtle}
@@ -224,6 +482,8 @@ export function BinchDatePicker({
         title={title}
           sessionKey={visible}
         />
+        )}
+        </View>
       </Animated.View>
     </>
   );
@@ -247,7 +507,20 @@ interface ContentProps {
   sessionKey: boolean;
 }
 
-function DatePickerContent({
+/**
+ * Gemerkt — sonst baut JEDER Durchgang des Elternteils den ganzen Kalender neu.
+ *
+ * Der Elternteil rendert bei jedem `setLayered` (Fingerdruck), bei jedem
+ * `setMoving` (Start und Ende beider Fahrten) und beim Umschalten von
+ * `visible`. Ohne diese Schranke hing an jedem dieser Durchgänge der komplette
+ * Inhalt: eine Liste über 84 Wochenzeilen, zwölf Monatskarten, die Reiter, die
+ * Schiebe-Ebenen und das Zeit-Blatt. Einer davon fällt beim Schließen genau in
+ * die Ausfahrt.
+ *
+ * Die Eigenschaften sind alle stabil (Speicher-Aktionen und Modul-Konstanten),
+ * nur `sessionKey` wechselt — und das soll es auch.
+ */
+const DatePickerContent = memo(function DatePickerContent({
   accentSolid,
   accentSubtle,
   accentBorder,
@@ -264,6 +537,7 @@ function DatePickerContent({
   title,
   sessionKey,
 }: ContentProps) {
+  const palette = usePalette();
   const insets = useSafeAreaInsets();
   const [mode, setMode] = useState<Mode>(initialMode);
   const [sel, setSel] = useState<Sel>(() => {
@@ -273,6 +547,8 @@ function DatePickerContent({
   const [hour, setHour] = useState(initialDate?.getHours() ?? 9);
   const [minute, setMinute] = useState(initialDate?.getMinutes() ?? 30);
   const [timeOpen, setTimeOpen] = useState(false);
+  const confirmBounce = usePressBounce();
+  const weiterBounce = usePressBounce();
   const [selMonthKey, setSelMonthKey] = useState<string | null>(null);
   // Infinite Scroll — startet bei INITIAL_MONTHS, lädt LOAD_MORE_MONTHS
   // bei jedem onEndReached.
@@ -284,11 +560,24 @@ function DatePickerContent({
   useEffect(() => {
     if (!sessionKey) return;
     if (initialDate) {
-      setSel({
-        y: initialDate.getFullYear(),
-        m: initialDate.getMonth(),
-        d: initialDate.getDate(),
-      });
+      /**
+       * Nur setzen, wenn sich wirklich etwas ändert.
+       *
+       * `setSel({...})` legte hier bei JEDEM Öffnen ein neues Objekt an — auch
+       * dann, wenn dasselbe Datum schon ausgewählt war. Ein neues Objekt heißt
+       * neue Kennung, und daran hängen sowohl die Zeichenfunktion der
+       * Kalenderliste als auch ihre Zusatzangabe: Die Liste rendert damit ALLE
+       * gemounteten Wochenzeilen neu, und zwar in genau dem Bild, in dem die
+       * Bewegung anläuft.
+       *
+       * Das erklärt auch, warum es sich „mal so, mal so" anfühlte: Beim allerersten
+       * Öffnen ist noch kein Datum gesetzt, da fällt es nicht an — ab dem zweiten
+       * jedes Mal.
+       */
+      const y = initialDate.getFullYear();
+      const m = initialDate.getMonth();
+      const d = initialDate.getDate();
+      setSel((prev) => (prev && prev.y === y && prev.m === m && prev.d === d ? prev : { y, m, d }));
       setHour(initialDate.getHours());
       setMinute(initialDate.getMinutes());
     }
@@ -300,16 +589,77 @@ function DatePickerContent({
   // "Weiter" gedrückt) verworfen. Beim nächsten Open ist State sauber.
   // 320ms = Slide-Out-Duration + Puffer → User sieht den Reset nicht
   // (Picker ist da schon off-screen).
+  /**
+   * Zurücksetzen: abgeleitete Frist UND nicht während einer Bewegung.
+   *
+   * Zwei Probleme steckten in der festen 320:
+   *
+   * 1. Die Zahl war an die Ausfahrt gekoppelt, ohne es zu sagen. Die dauert
+   *    inzwischen 260ms statt 280 — der Puffer schrumpfte still mit, und beim
+   *    nächsten Wechsel wäre er negativ geworden. Dann sähe man den Kalender
+   *    zurückspringen, während er noch sichtbar ist.
+   *
+   * 2. Schwerer: Dieses Zurücksetzen ändert sechs Zustände auf einmal und
+   *    rendert damit den gesamten Kalender neu — die Monatsliste, die geladenen
+   *    Monate, alle gemounteten Tageszellen. Der Zeitgeber lief blind. Wer den
+   *    Datumswähler schließt und gleich darauf das Startfeld antippt, bekam den
+   *    Neuaufbau des einen Blattes MITTEN in die Einfahrt des anderen — beide
+   *    hängen als Geschwister dauerhaft im Baum. Genau das Muster „meistens
+   *    flüssig, manchmal hakt es".
+   *
+   * Läuft gerade etwas, wird der Versuch verschoben statt ausgeführt. Der
+   * Zeitstempel dahinter verfällt von selbst, es kann also nichts hängen
+   * bleiben.
+   */
   useEffect(() => {
     if (sessionKey) return;
-    const timer = setTimeout(() => {
+    let timer: ReturnType<typeof setTimeout>;
+    const attempt = () => {
+      if (isTransitionBusy()) {
+        timer = setTimeout(attempt, 120);
+        return;
+      }
+      /**
+       * `sel` wird NICHT mehr geleert — und das ist die Bedingung dafür, dass
+       * der Wächter beim nächsten Öffnen überhaupt greifen kann.
+       *
+       * Er vergleicht dort `prev` mit dem neuen Datum und behält bei Gleichheit
+       * die alte Kennung. Wurde hier vorher auf `null` zurückgesetzt, war `prev`
+       * beim nächsten Öffnen immer `null`, der Vergleich lief also garantiert
+       * ins Leere und legte ein neues Objekt an — womit die gesamte
+       * Kalenderliste im Öffnungs-Commit neu rendert. Der Wächter war damit
+       * wirkungslos, obwohl er richtig geschrieben ist.
+       *
+       * Stehen bleiben darf der Wert gefahrlos: Beim nächsten Öffnen setzt ihn
+       * der Auftrag ohnehin neu, und ohne Auftrag ist das Blatt unsichtbar.
+       */
+      /**
+       * Die Auswahl gehört mit zurückgesetzt.
+       *
+       * Sie stand nicht mehr in dieser Liste, und die Übernahme beim Öffnen
+       * schreibt nur, WENN ein Datum übergeben wird. Bei einem leeren Feld
+       * blieb die alte Auswahl also stehen: Ein Datum, das jemand angetippt und
+       * dann abgebrochen hat, war beim nächsten Öffnen wieder markiert — samt
+       * freigeschaltetem „Weiter". Genau das, was der Kommentar über diesem
+       * Block als Zweck angibt.
+       */
       setSel(null);
       setHour(9);
       setMinute(30);
       setMode(initialMode);
       setLoadedMonths(INITIAL_MONTHS);
       setSelMonthKey(null);
-    }, 320);
+    };
+    /**
+     * Erst NACH dem Ende der gemeldeten Bewegung anlaufen.
+     *
+     * `markSheetMoving` meldet bis `Dauer + 80`; der erste Versuch lag mit
+     * `+60` also zwangsläufig noch mitten drin und kostete garantiert einen
+     * Nachschlag von 120ms. Damit stand das Fenster, in dem ein abgebrochenes
+     * Datum noch markiert ist, bei rund 456ms statt 320 — lang genug, um es
+     * beim schnellen Wiederöffnen zu sehen.
+     */
+    timer = setTimeout(attempt, PICKER_OUT.duration + 140);
     return () => clearTimeout(timer);
   }, [sessionKey, initialMode]);
 
@@ -468,12 +818,21 @@ function DatePickerContent({
   const keyExtractor = useCallback((item: CalRow) => item.key, []);
 
   return (
-    <View style={s.root}>
+    <View style={[s.root, { backgroundColor: "transparent" }]}>
       {/* Header — Padding-Top: safe-area + 24 (entspricht pt-6 vom Saved-
           Tab) damit alles unter der Statusbar liegt. Title-Style matched
           den "Saved"-Header (26px, font-black, tracking-tight). */}
       <View style={[s.header, { paddingTop: insets.top + 24 }]}>
-        <Pressable style={s.closeBtn} onPress={onClose} hitSlop={8}>
+        <Pressable
+          style={[s.closeBtn, { backgroundColor: palette.s2 }]}
+          // Die Ebene für die AUSFAHRT schon beim Aufsetzen anlegen — für die
+          // Einfahrt tut das `prepareLayer` beim Berühren des Feldes seit
+          // Längerem, der Rückweg hatte diesen Vorlauf nie und baute die
+          // Textur im ersten Bild der Bewegung auf.
+          onPressIn={() => prepareLayer("pickerDate")}
+          onPress={onClose}
+          hitSlop={8}
+        >
           <X color={C.white} size={18} strokeWidth={2.4} />
         </Pressable>
         <Text style={s.title}>{title}</Text>
@@ -501,7 +860,7 @@ function DatePickerContent({
           statt abrupt zu verschwinden + einen Layout-Sprung auszulösen. */}
       <SlidingPanels activeIndex={mode === "specific" ? 0 : 1}>
         <View style={{ flex: 1 }}>
-          <Pressable style={s.field} onPress={openTime}>
+          <Pressable style={[s.field, { backgroundColor: palette.s2 }]} onPress={openTime}>
             <View style={{ flex: 1 }}>
               <Text style={s.fieldLabel}>{fieldLabel}</Text>
               {hasDate ? (
@@ -517,7 +876,7 @@ function DatePickerContent({
               </View>
             )}
           </Pressable>
-          <View style={s.weekRow}>
+          <View style={[s.weekRow, { borderTopColor: palette.border }]}>
             {weekdays.map((wd) => (
               <Text key={wd} style={s.weekday}>{wd}</Text>
             ))}
@@ -552,7 +911,16 @@ function DatePickerContent({
         <View style={{ flex: 1 }}>
           <View style={s.flexHead}>
             <Text style={s.flexTitle}>Monat</Text>
-            <Text style={[s.flexLink, { color: accentSolid }]}>Jederzeit suchen</Text>
+            {/* Schließt einfach — wer „jederzeit" sucht, will kein Datum. */}
+            <Pressable
+              hitSlop={8}
+              onPress={() => {
+                haptic("button");
+                onClose();
+              }}
+            >
+              <Text style={[s.flexLink, { color: accentSolid }]}>Jederzeit suchen</Text>
+            </Pressable>
           </View>
           <ScrollView
             style={{ flex: 1 }}
@@ -570,6 +938,7 @@ function DatePickerContent({
                     key={mc.key}
                     style={[
                       s.monthCard,
+                      { backgroundColor: palette.s2 },
                       isSel && { backgroundColor: accentSubtle, borderWidth: 1, borderColor: accentBorder },
                     ]}
                     onPress={() => {
@@ -590,21 +959,77 @@ function DatePickerContent({
       </SlidingPanels>
 
       {/* Bottom Bar */}
-      <View style={s.bottomBar}>
+      {/**
+        * Der untere Abstand kommt aus der SICHEREN FLÄCHE, nicht aus einer
+        * festen Zahl.
+        *
+        * Im Stilblatt standen 28 Punkte. Die reichen bei Gesten-Navigation
+        * (rund 24) gerade so, bei einer Leiste mit drei Knöpfen (bis 48) nicht
+        * — dort lag „Weiter" schon immer halb dahinter, und mit der Skalierung
+        * auf kleinen Geräten wurde aus den 28 noch weniger. Die Leiste weiß
+        * selbst, wie hoch sie ist; genau dafür gibt es den Wert.
+        */}
+      <View
+        style={[
+          s.bottomBar,
+          { backgroundColor: palette.s1, paddingBottom: insets.bottom + 14 },
+        ]}
+      >
         <View style={{ flex: 1 }}>
           <Text style={s.bottomTitle} numberOfLines={1}>{bottomTitle}</Text>
-          <View style={s.estRow}>
+          {/**
+            * Antippbar — der Hinweis erklärt sich sonst nicht.
+            *
+            * „Geschätzte Preise" mit einem i daneben sieht aus wie etwas, das
+            * man antippen kann; bisher passierte nichts. Die Meldung läuft über
+            * dieselbe Stelle wie alle anderen in der App (`showAlert`), damit
+            * sie auch aussieht wie alle anderen — ein eigener Dialog an dieser
+            * einen Stelle wäre genau die Uneinheitlichkeit, die man später
+            * mühsam wieder einsammelt.
+            */}
+          <Pressable
+            style={s.estRow}
+            hitSlop={8}
+            onPress={() => {
+              haptic("button");
+              showAlert("Geschätzte Preise", ESTIMATED_PRICE_NOTE, [
+                { text: "Verstanden" },
+              ]);
+            }}
+          >
             <Text style={s.estTxt}>Geschätzte Preise</Text>
-            <View style={s.infoDot}><Text style={s.infoTxt}>i</Text></View>
-          </View>
+            <View style={[s.infoDot, { backgroundColor: palette.s3 }]}><Text style={s.infoTxt}>i</Text></View>
+          </Pressable>
         </View>
         {hasSelection && (
-          <Pressable
-            style={[s.weiter, { backgroundColor: accentSolid }]}
-            onPress={onWeiter}
-          >
-            <Text style={[s.weiterTxt, { color: accentTextOnSolid }]}>Weiter</Text>
-          </Pressable>
+          <Animated.View style={weiterBounce.style}>
+            <Pressable
+              style={[s.weiter, { backgroundColor: accentSolid }]}
+              onPress={onWeiter}
+              onPressIn={() => {
+                // Wie am X-Knopf: Textur für die Rückfahrt im Berührungsfenster
+                // anlegen. „Weiter" ist der häufigste Weg hier heraus.
+                prepareLayer("pickerDate");
+                weiterBounce.onPressIn();
+              }}
+              /**
+               * `settle()` statt `onPressOut` — dieser Knopf löst eine Fahrt aus.
+               *
+               * `PRESS_OUT` ist unterdämpft und schwingt rund 430ms nach, also
+               * fast die ganze Ausfahrt. Der Knopf liegt dabei auf einer Fläche,
+               * die für die Bewegung als GPU-Textur eingefroren ist — eine Ebene
+               * mit sich änderndem Inhalt muss aber in JEDEM Bild neu gerastert
+               * werden. Die Feder kostet dort also nicht nur nichts, sie macht
+               * die Textur wertlos.
+               *
+               * Genau dafür steht `settle()` in `lib/motion.tsx` bereit, samt
+               * dieser Begründung. Benutzt hat es bisher nur die Ergebniskarte.
+               */
+              onPressOut={weiterBounce.settle}
+            >
+              <Text style={[s.weiterTxt, { color: accentTextOnSolid }]}>Weiter</Text>
+            </Pressable>
+          </Animated.View>
         )}
       </View>
 
@@ -612,7 +1037,7 @@ function DatePickerContent({
       <Modal visible={timeOpen} transparent animationType="fade" onRequestClose={() => setTimeOpen(false)}>
         <Pressable style={s.backdrop} onPress={() => setTimeOpen(false)} />
         <View style={s.popupWrap} pointerEvents="box-none">
-          <View style={s.popup}>
+          <View style={[s.popup, { backgroundColor: palette.s2 }]}>
             <View style={s.grabber} />
             <Text style={s.popupLabel}>ABFAHRTSZEIT</Text>
             <View style={s.bigTimeRow}>
@@ -641,26 +1066,37 @@ function DatePickerContent({
 
             <View style={s.popupBtns}>
               <Pressable
-                style={[s.popupBtn, s.popupBtnGhost]}
+                style={[s.popupBtn, s.popupBtnGhost, { backgroundColor: palette.s3 }]}
                 onPress={() => setTimeOpen(false)}
               >
                 <Text style={s.popupBtnGhostTxt}>Abbrechen</Text>
               </Pressable>
-              <Pressable
-                style={[s.popupBtn, s.popupBtnPrimary, { backgroundColor: accentSolid }]}
-                onPress={() => setTimeOpen(false)}
-              >
-                <Text style={[s.popupBtnPrimaryTxt, { color: accentTextOnSolid }]}>
-                  Bestätigen
-                </Text>
-              </Pressable>
+              {/* Druck-Effekt wie an den Kategorie-Kacheln im Landingscreen —
+                  derselbe Baustein, also dieselben Federwerte. */}
+              {/* Die Breitenverteilung (flex 1.4 gegen 1) gehört an DIESEN
+                  Rahmen, nicht an den Knopf darin: In einer Zeile teilt der
+                  äußerste Knoten den Platz auf. Am Knopf gelassen hätte er in
+                  seinem eigenen, senkrechten Rahmen gestreckt statt in der
+                  Zeile — die beiden Knöpfe wären gleich breit geworden. */}
+              <Animated.View style={[confirmBounce.style, s.popupBtnPrimaryWrap]}>
+                <Pressable
+                  style={[s.popupBtn, s.popupBtnPrimary, { backgroundColor: accentSolid }]}
+                  onPress={() => setTimeOpen(false)}
+                  onPressIn={confirmBounce.onPressIn}
+                  onPressOut={confirmBounce.onPressOut}
+                >
+                  <Text style={[s.popupBtnPrimaryTxt, { color: accentTextOnSolid }]}>
+                    Bestätigen
+                  </Text>
+                </Pressable>
+              </Animated.View>
             </View>
           </View>
         </View>
       </Modal>
     </View>
   );
-}
+});
 
 // ----------------------------------------------------------------------
 // ModeTabs — Tabs mit slidendem Active-Indicator (SearchHero-Design).
@@ -680,6 +1116,7 @@ const ModeTabs = memo(function ModeTabs({
   accentTextOnSolid,
   onChange,
 }: ModeTabsProps) {
+  const palette = usePalette();
   const [trackWidth, setTrackWidth] = useState(0);
   // Indicator-Breite = halbe Track-Breite minus die 4px Padding auf jeder Seite
   const indicatorWidth = Math.max(0, (trackWidth - 8) / 2);
@@ -692,20 +1129,32 @@ const ModeTabs = memo(function ModeTabs({
     });
   }, [mode, progress]);
 
+  /**
+   * `width` gehört NICHT in den animierten Stil.
+   *
+   * Es ist hier gar nicht animiert — es ist eine gemessene Zahl. Steht sie
+   * trotzdem darin, fällt der ganze Stil aus Reanimateds synchronem Weg heraus:
+   * Auf Android dürfen nur bestimmte Eigenschaften direkt an die native View
+   * (`transform` gehört dazu, `width` nicht), alles andere läuft pro Bild über
+   * einen Klon des Schattenbaums samt Yoga-Durchlauf. Der Reiter-Wechsel hat
+   * damit 240ms lang den teuren Weg genommen, obwohl sich nur eine
+   * Verschiebung ändert.
+   */
   const indicatorStyle = useAnimatedStyle(() => ({
     transform: [{ translateX: progress.value * indicatorWidth }],
-    width: indicatorWidth,
   }));
+  const indicatorSize = useMemo(() => ({ width: indicatorWidth }), [indicatorWidth]);
 
   return (
     <View
-      style={s.tabs}
+      style={[s.tabs, { backgroundColor: palette.s2 }]}
       onLayout={(e) => setTrackWidth(e.nativeEvent.layout.width)}
     >
       <Animated.View
         style={[
           s.tabIndicator,
           { backgroundColor: accentSolid },
+          indicatorSize,
           indicatorStyle,
         ]}
       />
@@ -844,7 +1293,7 @@ function Wheel({
   );
 }
 
-const s = StyleSheet.create({
+const s = scaledStyles({
   root: { flex: 1, backgroundColor: C.bg },
 
   header: {
@@ -1042,6 +1491,7 @@ const s = StyleSheet.create({
   popupBtn: { paddingVertical: 15, borderRadius: 9999, alignItems: "center" },
   popupBtnGhost: { flex: 1, backgroundColor: C.surface3 },
   popupBtnGhostTxt: { color: C.gray200, fontSize: 15, fontWeight: "600" },
-  popupBtnPrimary: { flex: 1.4 },
+  popupBtnPrimaryWrap: { flex: 1.4 },
+  popupBtnPrimary: {},
   popupBtnPrimaryTxt: { fontSize: 15, fontWeight: "700" },
 });

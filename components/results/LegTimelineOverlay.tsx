@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState, useMemo } from "react";
+import { SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import {
   StyleSheet,
   View,
@@ -9,11 +10,8 @@ import {
   Platform,
   useWindowDimensions,
 } from "react-native";
+import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
-  FadeIn,
-  FadeOut,
-  SlideInDown,
-  SlideOutDown,
   useAnimatedStyle,
   useSharedValue,
   withSpring,
@@ -34,6 +32,7 @@ import { fetchTripPolylines } from "@/lib/api/client";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useAccent } from "@/lib/theme/accent";
+import { scaledStyles } from "@/lib/ui/compact";
 
 // Farbpalette aus dem App-Theme — die hellere Lime aus dem Mockup ist bewusst
 // auf unsere Brand-Lime gedimmt (#7FEA4D), Card/Surface-Stufen matchen
@@ -158,7 +157,41 @@ export function LegTimelineOverlay() {
   // selectedResult — sonst würde der vorher gewählte Trip aus der Such-
   // Liste die Timeline füllen statt der gerade getappten Bus-Abfahrt.
   const result = directTripResult ?? selectedResult;
-  if (!open || !result) return null;
+
+  // DAUERHAFT GEMOUNTET — dasselbe Muster wie beim Detail-Overlay, und aus
+  // demselben gemessenen Grund: react-native-svg gibt seine Views auf Fabric
+  // beim Abbauen nicht frei. Dieser Baum trägt mehrere Symbole und baute sich
+  // bei JEDEM Schließen ab, ließ also bei jedem Öffnen/Schließen Views zurück.
+  // Das ist einer der Wege, auf denen die App über eine Sitzung langsamer wird.
+  //
+  // Statt Ein- und Ausbauen fährt das Blatt jetzt über einen eigenen Wert rein
+  // und raus (siehe `open` unten) — sichtbar identisch, nur ohne Abbau.
+  /**
+   * Der Inhalt wird nur nachgezogen, wenn das Blatt WIRKLICH offen ist.
+   *
+   * Hier stand `if (result)` — ohne Bezug darauf, ob die Zeitleiste überhaupt
+   * jemand sehen will. Damit hing dieser ganze Baum am Auswählen einer
+   * Ticket-Karte: Jeder Druck auf „Auswählen" setzte ein anderes `selectedResult`,
+   * die Kennung änderte sich, `memo` griff nicht mehr — und der komplette,
+   * niemals sichtbare Zeitleisten-Baum wurde im Berührungs-Frame neu aufgebaut.
+   * Das sind je nach Verbindung 45 Ansichten (Direktflug) bis über 100 (drei
+   * Etappen mit Umstiegen; allein die gepunktete Linie sind acht eigene
+   * Ansichten pro Umstieg). Auf Fabric läuft das Einhängen auf dem UI-Strang —
+   * also genau gegen die Bewegung, die im selben Moment anläuft.
+   *
+   * Sichtbar war davon nichts, und genau deshalb ist es so lange
+   * durchgerutscht.
+   *
+   * Beide Eigenschaften, für die dieser Baum gebaut ist, bleiben erhalten:
+   * Einmal aufgebaut wird er nie wieder abgebaut (das SVG-Leck darunter), und
+   * beim Öffnen steht der richtige Inhalt da — `selectedResult` ist dann längst
+   * gesetzt, die Zeile hier holt ihn im selben Render nach. Solange zu ist,
+   * behält er den letzten Inhalt, und `memo` blockt jeden weiteren Durchlauf,
+   * weil die Kennung sich nicht mehr ändert.
+   */
+  const lastResultRef = useRef(result);
+  if (result && open) lastResultRef.current = result;
+  const displayResult = lastResultRef.current;
   // Wenn der Sheet aus dem Search-Flow geöffnet wurde (selectedResultContext
   // gesetzt) und wir gerade auf einer anderen Route sind (z.B. Map-Push),
   // verstecken wir den Sheet VISUELL (display:none), aber UNMOUNTEN ihn
@@ -166,10 +199,38 @@ export function LegTimelineOverlay() {
   // abspielen → laggt sichtbar während des Pop-Übergangs.
   const hiddenForOtherRoute =
     !directTripResult && context != null && pathname !== context.pathname;
-  return <LegTimelineSheet result={result} hidden={hiddenForOtherRoute} />;
+
+  // Vor dem allerersten Öffnen: nichts rendern (kein Aufwand).
+  if (!displayResult) return null;
+  return (
+    <LegTimelineSheet
+      result={displayResult}
+      open={open && result != null}
+      hidden={hiddenForOtherRoute}
+    />
+  );
 }
 
-function LegTimelineSheet({ result, hidden }: { result: SearchResult; hidden?: boolean }) {
+/**
+ * memo ist hier PFLICHT, nicht Kür — dieselbe Begründung wie beim Detail-Overlay.
+ *
+ * Seit dieser Baum dauerhaft gemountet bleibt (gegen das SVG-Leck), hängt er an
+ * einer äußeren Komponente, die `usePathname()` liest und damit bei JEDEM
+ * Routen- und Tab-Wechsel neu rendert. Ohne memo würde der komplette geparkte
+ * Baum bei jedem Wechsel mit durchgerendert — das Leck wäre gestopft und dafür
+ * ein neuer, dauernder Kostenpunkt entstanden. Alle Props sind primitiv oder
+ * stabile Referenzen, memo greift also zuverlässig.
+ */
+const LegTimelineSheet = memo(function LegTimelineSheet({
+  result,
+  open,
+  hidden,
+}: {
+  result: SearchResult;
+  open: boolean;
+  hidden?: boolean;
+}) {
+  const palette = usePalette();
   const accent = useAccent();
   const close = useSearchStore((s) => s.closeLegTimelineOverlay);
   const setRoute = useSearchStore((s) => s.setRoute);
@@ -220,21 +281,116 @@ function LegTimelineSheet({ result, hidden }: { result: SearchResult; hidden?: b
     }
   }
 
+  // Zurück NUR abfangen, solange das Blatt wirklich offen ist.
+  //
+  // Vorher hing dieser Effekt an der Existenz der Komponente — was in Ordnung
+  // war, solange sie beim Schließen abgebaut wurde. Seit sie dauerhaft steht
+  // (gegen das SVG-Leck), blieb die Anmeldung für immer aktiv und gab bei JEDEM
+  // Zurück `true` zurück. Damit war die Zurück-Geste auf ALLEN Bildschirmen
+  // geschluckt, sobald man die Zeitleiste einmal geöffnet hatte.
   useEffect(() => {
-    if (Platform.OS !== "android") return;
+    // `hidden` MIT prüfen — beim Sprung auf die Karte bleibt dieses Blatt
+    // absichtlich offen, nur unsichtbar. Ohne die Prüfung schluckte es dort den
+    // Zurück-Druck.
+    if (Platform.OS !== "android" || !open || hidden) return;
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
       close();
       return true;
     });
     return () => sub.remove();
-  }, [close]);
+  }, [close, open, hidden]);
 
-  const translateY = useSharedValue(0);
+  // Startet unten außerhalb des Bildes — der Baum steht ab jetzt dauerhaft,
+  // sichtbar wird er erst durch `open`.
+  const translateY = useSharedValue(sheetHeight);
+  const backdrop = useSharedValue(0);
   const sheetAnim = useAnimatedStyle(() => ({
     transform: [{ translateY: translateY.value }],
   }));
+  const backdropAnim = useAnimatedStyle(() => ({ opacity: backdrop.value }));
+  // Ganz unten angekommen ⇔ unsichtbar und nicht anfassbar.
+  const rootAnim = useAnimatedStyle(() => ({
+    opacity: hidden || translateY.value >= sheetHeight - 1 ? 0 : 1,
+  }));
 
-  const panGesture = Gesture.Pan()
+  /**
+   * Die Streckenliste erst NACH der Fahrt aufbauen.
+   *
+   * Sie ist der schwerste Teil dieses Blattes — pro Abschnitt zwei
+   * Stationszeilen, ein Transportstreifen, dazu bei einer Direktfahrt die
+   * ganzen Zwischenhalte, alles ohne Virtualisierung. Gebaut wird sie in genau
+   * dem Commit, der die Bewegung auslöst; das eine Bild Vorlauf darunter
+   * reicht dafür nicht, wenn die Fahrt viele Halte hat. Genau dann ruckelt das
+   * Hereinfahren — und wer aus der Live-Tafel kommt, hat fast immer viele.
+   *
+   * Kopf und Zusammenfassung stehen sofort, nur die Liste kommt am Ende der
+   * Bewegung dazu. Dasselbe Muster nutzt das Detail-Blatt seit Längerem und
+   * begründet es dort ausführlich.
+   */
+  const [atRest, setAtRest] = useState(false);
+  useEffect(() => {
+    if (!open) {
+      setAtRest(false);
+      return;
+    }
+    const id = setTimeout(() => setAtRest(true), SHEET_IN.duration + 20);
+    return () => clearTimeout(id);
+  }, [open]);
+
+  useEffect(() => {
+    if (open) {
+      // Wie bei den anderen Push-Übergängen erst starten, wenn der JS-Thread
+      // frei ist — sonst läuft die Bewegung gegen den Commit an, der den Inhalt
+      // aufbaut (gemessen: das schlechteste Bild fiel dadurch von 25ms auf 8ms).
+      // Siehe DetailsOverlay: dauerhaft gemountet, also kein Aufbau-Commit, auf
+      // den zu warten wäre. Ein Bild Vorlauf statt einer Warteschleife.
+      const id = requestAnimationFrame(() => {
+        // KRITISCH GEDÄMPFT (dampingRatio 1) — kein Überschwingen.
+        //
+        // Hier stand zuerst die Feder des Wisch-Abbruchs (damping 22,
+        // stiffness 220). Deren Dämpfungsgrad liegt bei rund 0,74, sie schwingt
+        // also über — beim Zurückschnappen nach einem Wisch ist das gewollt,
+        // beim Reinkommen federte das Blatt dadurch sichtbar nach. Vorher lag
+        // hier eine Zeitkurve über 350ms, die das nicht tat.
+        // Zeitkurve statt Feder: Eine kritisch gedämpfte Feder derselben Dauer
+        // sieht ähnlich aus, ist es aber nicht — sie nähert sich dem Ziel
+        // asymptotisch, während die Kurve des Such-Blattes exakt endet. Neben
+        // einem anderen Blatt fällt genau dieser Auslauf auf.
+        markSheetMoving();
+      translateY.value = withTiming(0, SHEET_IN);
+        backdrop.value = withTiming(1, SHEET_IN);
+      });
+      return () => cancelAnimationFrame(id);
+    }
+    /**
+     * Auch die AUSFAHRT anmelden.
+     *
+     * Sie tat es nicht — angemeldet war nur der Hinweg. Damit galt der
+     * Bildschirm während der ganzen Rückfahrt als „ruhig", und alles, was auf
+     * diese Meldung wartet, um NICHT in eine laufende Bewegung zu fallen (etwa
+     * das Zurücksetzen des Datumswählers), lief genau dort hinein. Dieselbe
+     * Asymmetrie ist in `overlayCover` für die Push-Wege schon einmal
+     * ausformuliert worden: „Angemeldet wurden anfangs nur die vier HINwege."
+     */
+    markSheetMoving(SHEET_OUT.duration);
+    translateY.value = withTiming(sheetHeight, SHEET_OUT);
+    backdrop.value = withTiming(0, SHEET_OUT);
+    return undefined;
+  }, [open, sheetHeight, translateY, backdrop]);
+
+  /**
+   * In `useMemo` — sonst entsteht der Erkenner bei jedem Render neu.
+   *
+   * Jedes neue `Gesture.Pan()`-Objekt muss der Detektor gegen seinen nativen
+   * Gegenpart abgleichen und neu einrichten. Die anderen Blätter der App haben
+   * das längst; diese drei waren übrig.
+   */
+  const panGesture = useMemo(() =>
+    Gesture.Pan()
+    // Nur aktiv, solange das Blatt offen ist. Dauerhaft gemountet hinge sonst
+    // auch dauerhaft ein nativer Gesten-Erkenner im Baum, der mit der
+    // Zurück-Geste des darunterliegenden Bildschirms konkurriert.
+    .enabled(open)
     .activeOffsetY(8)
     .failOffsetY(-8)
     .onUpdate((e) => {
@@ -242,12 +398,16 @@ function LegTimelineSheet({ result, hidden }: { result: SearchResult; hidden?: b
     })
     .onEnd((e) => {
       if (e.translationY > 110 || e.velocityY > 700) {
-        translateY.value = withTiming(sheetHeight, { duration: 220 });
+        // NUR schließen — die Ausfahrt gehört dem Effekt oben. Vorher lief hier
+        // zusätzlich ein eigenes withTiming, und `close()` startete daneben ein
+        // zweites von der aktuellen Position: zwei konkurrierende Animationen,
+        // sichtbar als Geschwindigkeitswechsel am Ende der Wischbewegung.
         runOnJS(close)();
       } else {
         translateY.value = withSpring(0, { damping: 22, stiffness: 220 });
       }
-    });
+    }),
+  [open, sheetHeight, translateY, close]);
 
   const dateLocale = DATE_LOCALES[locale] ?? enGB;
   const legs = result.legs && result.legs.length > 0 ? result.legs : buildFallbackLegs(result);
@@ -277,24 +437,19 @@ function LegTimelineSheet({ result, hidden }: { result: SearchResult; hidden?: b
   const stopsAccent = result.stops === 0 ? accent.solid : C.amber;
 
   return (
-    <View
+    <Animated.View
       style={[
         StyleSheet.absoluteFillObject,
-        { zIndex: 300, elevation: 32, opacity: hidden ? 0 : 1 },
+        { zIndex: 300, elevation: 32 },
+        rootAnim,
       ]}
-      pointerEvents={hidden ? "none" : "auto"}
+      pointerEvents={hidden || !open ? "none" : "auto"}
     >
-      <Animated.View
-        entering={FadeIn.duration(220)}
-        exiting={FadeOut.duration(180)}
-        style={styles.backdrop}
-      >
+      <Animated.View style={[styles.backdrop, backdropAnim]}>
         <Pressable style={StyleSheet.absoluteFill} onPress={close} />
       </Animated.View>
       <Animated.View
-        entering={SlideInDown.duration(350)}
-        exiting={SlideOutDown.duration(300)}
-        style={[styles.sheet, sheetAnim, { top: sheetTop }]}
+        style={[styles.sheet, { backgroundColor: palette.s1 }, sheetAnim, { top: sheetTop }]}
       >
         <GestureDetector gesture={panGesture}>
           <View style={styles.handleWrap}>
@@ -306,7 +461,7 @@ function LegTimelineSheet({ result, hidden }: { result: SearchResult; hidden?: b
             Date linksbündig, Uhrzeit zentriert, Stops rechtsbündig — gleicher
             Abstand vom linken wie vom rechten Rand. Keine Trenner-Dots, weil
             sie die Symmetrie optisch brechen würden. */}
-        <View style={styles.summaryBox}>
+        <View style={[styles.summaryBox, { backgroundColor: palette.s2 }]}>
           <SummaryStat
             label={t("details.summary.date")}
             value={summaryDateStr}
@@ -336,7 +491,7 @@ function LegTimelineSheet({ result, hidden }: { result: SearchResult; hidden?: b
                 ausgerichtet auf die Dot-Mitten via SIDE_PAD + TIME_COL_W + GAP + DOT/2 */}
             <View style={[styles.timeRail, { backgroundColor: accent.solid }]} pointerEvents="none" />
 
-            {legs.map((leg, idx) => {
+            {atRest ? legs.map((leg, idx) => {
               const next = legs[idx + 1];
               const isFirstLeg = idx === 0;
               const isLastLeg = idx === legs.length - 1;
@@ -411,22 +566,22 @@ function LegTimelineSheet({ result, hidden }: { result: SearchResult; hidden?: b
                   ) : null}
                 </View>
               );
-            })}
+            }) : null}
           </View>
 
           {/* Show-on-Map-Button — identischer Style + Press-Ripple wie der
               Details-anzeigen-Button im DetailsOverlay (Ghost-Pille mit Lime-
               Label). Liegt im ScrollView damit's mit dem Inhalt scrollt statt
               fest am Boden. */}
-          <RippleTouch onPress={onShowMap} style={styles.mapBtn}>
+          <RippleTouch onPress={onShowMap} style={[styles.mapBtn, { borderColor: palette.border }]}>
             <MapIcon size={15} color={accent.solid} strokeWidth={2.5} />
             <Text style={[styles.mapBtnLabel, { color: accent.solid }]}>{t("details.showmap")}</Text>
           </RippleTouch>
         </ScrollView>
       </Animated.View>
-    </View>
+    </Animated.View>
   );
-}
+});
 
 function SummaryStat({
   icon,
@@ -477,6 +632,7 @@ function StationRow({
   terminal?: boolean;
 }) {
   const accent = useAccent();
+  const palette = usePalette();
   return (
     <View style={styles.row}>
       {delayed ? (
@@ -487,7 +643,7 @@ function StationRow({
       ) : (
         <Text style={styles.timeLabel}>{time}</Text>
       )}
-      <View style={[styles.dot, { borderColor: accent.solid }, terminal && { backgroundColor: accent.solid }]} />
+      <View style={[styles.dot, { backgroundColor: palette.s1, borderColor: accent.solid }, terminal && { backgroundColor: accent.solid }]} />
       <View style={styles.stationBody}>
         <Text style={styles.stationName} numberOfLines={1}>
           {name}
@@ -510,6 +666,7 @@ function PlatformChip({ value }: { value: string }) {
 
 function TransportSegment({ leg }: { leg: SyntheticLeg }) {
   const accent = useAccent();
+  const palette = usePalette();
   const t = useT();
   const [open, setOpen] = useState(false);
 
@@ -527,7 +684,7 @@ function TransportSegment({ leg }: { leg: SyntheticLeg }) {
           <DottedLine />
         </View>
         <View style={styles.segmentBody}>
-          <View style={styles.transferCard}>
+          <View style={[styles.transferCard, { borderColor: palette.border }]}>
             <View style={[styles.walkBadge, { backgroundColor: accent.subtle }]}>
               <Footprints size={16} color={accent.solid} strokeWidth={2.2} />
             </View>
@@ -561,7 +718,7 @@ function TransportSegment({ leg }: { leg: SyntheticLeg }) {
       </View>
       <View style={styles.dotSpacer} />
       <View style={styles.segmentBody}>
-        <View style={styles.transportCard}>
+        <View style={[styles.transportCard, { backgroundColor: palette.s2, borderColor: palette.border }]}>
           <View style={styles.transportHeader}>
             {lineLabel ? (
               <View style={[styles.linePill, { backgroundColor: lineColor }]}>
@@ -579,7 +736,7 @@ function TransportSegment({ leg }: { leg: SyntheticLeg }) {
             </Text>
           ) : null}
           {stops > 0 ? (
-            <Pressable onPress={() => setOpen((v) => !v)} style={styles.stopsToggle} hitSlop={6}>
+            <Pressable onPress={() => setOpen((v) => !v)} style={[styles.stopsToggle, { backgroundColor: palette.s3 }]} hitSlop={6}>
               <View style={{ transform: [{ rotate: open ? "180deg" : "0deg" }] }}>
                 <ChevronDown size={13} color={accent.solid} strokeWidth={2.5} />
               </View>
@@ -610,6 +767,7 @@ function TransportSegment({ leg }: { leg: SyntheticLeg }) {
 
 function TransferSegment({ minutes, isFlight }: { minutes: number; isFlight?: boolean }) {
   const accent = useAccent();
+  const palette = usePalette();
   const t = useT();
   return (
     <View style={styles.segment}>
@@ -618,7 +776,7 @@ function TransferSegment({ minutes, isFlight }: { minutes: number; isFlight?: bo
         <DottedLine />
       </View>
       <View style={styles.segmentBody}>
-        <View style={styles.transferCard}>
+        <View style={[styles.transferCard, { borderColor: palette.border }]}>
           <View style={[styles.walkBadge, { backgroundColor: accent.subtle }]}>
             {/* Flug-Umstieg = Aufenthalt am Flughafen (Uhr), kein Fußweg zum Gleis. */}
             {isFlight ? (
@@ -653,7 +811,7 @@ function DottedLine() {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.6)" },
   sheet: {
     position: "absolute",

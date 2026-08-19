@@ -27,6 +27,15 @@ export interface AccentPalette {
   subtle: string;
   /** Border-Variante (~30% alpha) — für 1px-Borders auf Subtle-Bg. */
   border: string;
+  /**
+   * Pille hinter dem aktiven Tab-Icon.
+   *
+   * Bewusst NICHT `border` (30%): Über der dunklen Leiste ergibt das gemischt
+   * etwa #3F5F31 — ein stumpfes Oliv, das mit dem Akzent der App nichts mehr zu
+   * tun hat. 55% liegen sichtbar im Akzentton und lassen das weiße Icon
+   * trotzdem klar stehen.
+   */
+  indicator: string;
   /** 3-Stops-Gradient (für LinearGradient): light/main/dark. */
   gradient: [string, string, string];
   /** Text-Farbe AUF dem Solid-Bg (immer #000 hier — Solid sind hell genug). */
@@ -41,6 +50,7 @@ export const ACCENT_PALETTES: Record<AccentId, AccentPalette> = {
     dark: "#5DBE34",
     subtle: "rgba(127,234,77,0.16)",
     border: "rgba(127,234,77,0.30)",
+    indicator: "rgba(127,234,77,0.55)",
     gradient: ["#A6F37A", "#7FEA4D", "#4FB42B"],
     textOnSolid: "#000000",
   },
@@ -51,6 +61,7 @@ export const ACCENT_PALETTES: Record<AccentId, AccentPalette> = {
     dark: "#1FA877",
     subtle: "rgba(63,224,168,0.16)",
     border: "rgba(63,224,168,0.30)",
+    indicator: "rgba(63,224,168,0.55)",
     gradient: ["#7BFFD0", "#3FE0A8", "#1FA877"],
     textOnSolid: "#000000",
   },

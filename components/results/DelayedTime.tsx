@@ -1,4 +1,5 @@
 import { View, Text, StyleSheet, type StyleProp, type TextStyle } from "react-native";
+import { scaledStyles } from "@/lib/ui/compact";
 
 /**
  * Zeit mit optionaler Verspätung: liegt eine vor, wird die neue Ist-Zeit klein
@@ -33,7 +34,7 @@ export function DelayedTime({
   );
 }
 
-const s = StyleSheet.create({
+const s = scaledStyles({
   delayed: {
     position: "absolute",
     bottom: "100%", // direkt über die Fahrplanzeit, ohne Layout-Höhe zu ändern

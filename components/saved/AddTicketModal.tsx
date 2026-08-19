@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import {
   View,
   Text,
@@ -7,13 +8,19 @@ import {
   ScrollView,
   StyleSheet,
   ActivityIndicator,
+  type LayoutChangeEvent,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
+  Easing,
+  FadeIn,
+  FadeOut,
+  runOnJS,
   useAnimatedStyle,
   useSharedValue,
   withSpring,
   withTiming,
-  runOnJS,
 } from "react-native-reanimated";
 import {
   Gesture,
@@ -32,6 +39,7 @@ import { useSearchStore } from "@/stores/searchStore";
 import { persistTicketImages } from "@/lib/saved/ticketImages";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useAccent } from "@/lib/theme/accent";
+import { scaledStyles } from "@/lib/ui/compact";
 
 interface Props {
   visible: boolean;
@@ -47,15 +55,58 @@ const MODES: { id: TravelMode; icon: typeof Plane; labelKey: string }[] = [
 ];
 
 export function AddTicketModal({ visible, onClose, onAdd }: Props) {
+  const closeRef = useRef<() => void>(onClose);
+  closeRef.current = onClose;
+  // Feste Kennung — sonst liefe der Effekt im Blatt bei jedem Bild neu an.
+  const registerClose = useCallback((fn: () => void) => {
+    closeRef.current = fn;
+  }, []);
   return (
     <Modal
       visible={visible}
-      animationType="slide"
+      /**
+       * `none` — die Bewegung machen wir selbst, unten am Blatt.
+       *
+       * `animationType="slide"` ist Androids eigene Modal-Animation. Ihre Dauer
+       * ist vom System vorgegeben und nicht einstellbar, und sie ist deutlich
+       * schneller als alles andere in der App — das Blatt schoss herein, während
+       * dasselbe Blatt im Verlauf gemächlich hochfährt. Mit `none` gibt das
+       * Fenster nur noch die Fläche frei; die Bewegung kommt aus Reanimated und
+       * benutzt exakt dieselben Werte wie das Verlaufs-Blatt.
+       */
+      animationType="none"
       transparent
       presentationStyle="overFullScreen"
-      onRequestClose={onClose}
+      /**
+       * Bis an beide Ränder — sonst bleibt unten ein Streifen der App stehen.
+       *
+       * Ein Fenster dieser Art endet auf Android standardmäßig VOR den
+       * System-Leisten. Die Verdunkelung füllt dann nur den Bereich dazwischen,
+       * und im Streifen darunter ist weiter die App zu sehen — bei uns also die
+       * Tab-Leiste, die unter dem Blatt hervorschaut. Genau das war „unten
+       * abgeschnitten, man sieht noch Teile der Nav-Leiste".
+       *
+       * Damit reicht das Fenster über die volle Höhe; den sicheren Abstand am
+       * unteren Rand trägt jetzt das Blatt selbst (siehe `bottomPad`).
+       */
+      statusBarTranslucent
+      navigationBarTranslucent
+      /**
+       * Systemtaste „zurück" — auch die nimmt den Weg MIT Bewegung.
+       *
+       * Das Fenster meldet sie hier oben, den Weg kennt aber nur das Blatt
+       * darin. Es hinterlegt ihn beim Aufbau; bis dahin (und wenn gar kein Blatt
+       * steht) bleibt es beim direkten Schließen.
+       */
+      onRequestClose={() => closeRef.current()}
     >
-      {visible ? <AddTicketSheet onClose={onClose} onAdd={onAdd} /> : null}
+      {visible ? (
+        <AddTicketSheet
+          onClose={onClose}
+          onAdd={onAdd}
+          registerClose={registerClose}
+        />
+      ) : null}
     </Modal>
   );
 }
@@ -63,20 +114,146 @@ export function AddTicketModal({ visible, onClose, onAdd }: Props) {
 function AddTicketSheet({
   onClose,
   onAdd,
+  registerClose,
 }: {
   onClose: () => void;
   onAdd: Props["onAdd"];
+  registerClose: (fn: () => void) => void;
 }) {
+  const palette = usePalette();
   const t = useT();
   const accent = useAccent();
   const [busy, setBusy] = useState(false);
+  /** Synchrone Sperre für den Auswahl-Dialog — greift schon im selben Frame. */
+  const pickingRef = useRef(false);
 
-  const translateY = useSharedValue(0);
+  const insets = useSafeAreaInsets();
+  /**
+   * Sicherer Abstand unten, plus der bisherige Innenabstand.
+   *
+   * Nötig, seit das Fenster über die volle Höhe geht: Vorher endete es über der
+   * System-Leiste und die 40 Punkt reichten; jetzt liegt das Blatt darunter und
+   * bräuchte ohne diesen Zuschlag seine unterste Zeile hinter der Wischleiste.
+   */
+  const bottomPad = 40 + insets.bottom;
+
+  /**
+   * Die Bewegung läuft über einen eigenen Wert, nicht über `entering`.
+   *
+   * `SlideInDown` ist eine Ein-Sprung-Animation: Sie beginnt in DEM Commit, in
+   * dem der Baum entsteht — und dieser Baum entsteht komplett neu, sobald das
+   * Fenster aufgeht. Auf Fabric heißt das, dass die Ansichten zuerst an ihrem
+   * ENDplatz eingehängt und erst danach von der Animation zurückgesetzt werden.
+   * Trifft das ein Bild schlecht, sieht man den Inhalt für den Bruchteil einer
+   * Sekunde an seiner endgültigen Stelle stehen, bevor er von unten hereinfährt.
+   * Genau das war „da buggen noch irgendwelche Icons rum".
+   *
+   * Stattdessen dasselbe Vorgehen wie beim Such-Blatt: Der Inhalt wird zuerst
+   * aufgebaut — geparkt unterhalb des Bildrands, sichtbar ist davon nichts — und
+   * fährt erst ein Bild später los. Der Aufbau ist dann durch und läuft der
+   * Bewegung nicht mehr in die Quere.
+   *
+   * Die Höhe kommt aus `onLayout`; bis sie bekannt ist, steht das Blatt auf
+   * einem großzügigen Ersatzwert. `translateY` ist derselbe Wert, den auch die
+   * Wisch-Geste schreibt — es gibt nur EINE Position, und damit keine zwei
+   * Bewegungen, die sich gegenseitig überschreiben können.
+   */
+  /** Wisch-Abwurf: kürzer, die Geste hat den Weg schon halb zurückgelegt. */
+  const SWIPE_OUT = { duration: 220, easing: Easing.out(Easing.quad) } as const;
+  const translateY = useSharedValue(900);
+  /**
+   * Geteilter Wert, keine React-Ablage.
+   *
+   * Die Höhe wird an drei Stellen gebraucht, und eine davon ist die Wisch-Geste
+   * — die läuft auf dem UI-Strang. Ein `useRef` wird beim Anlegen eines Worklets
+   * KOPIERT: Was dort ankommt, ist der Stand von damals, spätere Zuweisungen an
+   * `.current` erreichen ihn nie. Die Messung passiert aber genau danach und
+   * ohne erneutes Rendern — der Wert im Worklet wäre also dauerhaft 0 gewesen
+   * und die Geste immer auf den Ersatzwert gelaufen. Ein geteilter Wert ist auf
+   * beiden Strängen derselbe.
+   */
+  const sheetH = useSharedValue(0);
+  const started = useRef(false);
+  const onSheetLayout = useCallback((e: LayoutChangeEvent) => {
+    const h = e.nativeEvent.layout.height;
+    if (h <= 0) return;
+    sheetH.value = h;
+    if (started.current) return;
+    started.current = true;
+    // Erst jetzt ist die echte Höhe bekannt — vorher stünde das Blatt entweder
+    // zu weit unten (Ersatzwert zu groß) oder ragte schon herein (zu klein).
+    translateY.value = h;
+    requestAnimationFrame(() => {
+      markSheetMoving();
+      translateY.value = withTiming(0, SHEET_IN);
+    });
+  }, [translateY, sheetH]);
+
   const sheetAnim = useAnimatedStyle(() => ({
     transform: [{ translateY: translateY.value }],
   }));
 
-  const panGesture = Gesture.Pan()
+  /**
+   * Schließen heißt: erst hinausfahren, DANN abmelden.
+   *
+   * Vorher verschwand das Blatt schlagartig. Der Grund liegt im Fenster: Sobald
+   * `visible` auf falsch fällt, ist es weg — samt allem darin. Eine
+   * Aussprung-Animation am Blatt hat dann keine Fläche mehr, auf der sie laufen
+   * könnte; sie war zwar angegeben, aber nie zu sehen.
+   *
+   * Also andersherum: Hier fährt das Blatt hinunter, und erst wenn es unten ist,
+   * wird nach oben gemeldet, dass zugemacht werden kann. Genau die Reihenfolge,
+   * die auch Bo benutzt.
+   *
+   * `closingRef` fängt den zweiten Druck ab — ohne ihn setzt jeder weitere
+   * Tipper eine neue Bewegung an und schiebt das Schließen weiter nach hinten.
+   */
+  const closingRef = useRef(false);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (closeTimer.current) clearTimeout(closeTimer.current);
+    },
+    [],
+  );
+  /**
+   * Nur den Abschluss planen — die Bewegung macht der Aufrufer.
+   *
+   * Getrennt, weil die Wisch-Geste sie selbst schon fährt: Sie läuft auf dem
+   * UI-Strang und kann den Wert ohne Umweg setzen. Ginge auch ihr Weg über
+   * diese Funktion, läge zwischen Loslassen und Losfahren ein Sprung auf den
+   * JS-Strang — ein Bild, das man bei einer Wisch-Geste spürt.
+   */
+  const scheduleClose = useCallback(
+    (afterMs: number) => {
+      if (closingRef.current) return;
+      closingRef.current = true;
+      closeTimer.current = setTimeout(onClose, afterMs);
+    },
+    [onClose],
+  );
+
+  /** Antippen: hinausfahren und danach abmelden. */
+  const requestClose = useCallback(() => {
+    if (closingRef.current) return;
+    // Auch hier: die Ausfahrt war nicht angemeldet, siehe LegTimelineOverlay.
+    markSheetMoving(SHEET_OUT.duration);
+    translateY.value = withTiming(sheetH.value || 900, SHEET_OUT);
+    scheduleClose(SHEET_OUT.duration);
+  }, [scheduleClose, translateY, sheetH]);
+  useEffect(() => registerClose(requestClose), [registerClose, requestClose]);
+
+  /**
+   * In `useMemo` — die Geste entstand bei JEDEM Render neu.
+   *
+   * Und dieses Blatt rendert währenddessen: Es fährt gerade herein, und beim
+   * Auswählen einer Datei wechselt zusätzlich `busy`. Jedes neue
+   * `Gesture.Pan()`-Objekt muss der Erkenner gegen seinen nativen Gegenpart
+   * abgleichen und neu einrichten — genau in den Bildern, in denen die Bewegung
+   * läuft.
+   */
+  const panGesture = useMemo(() =>
+    Gesture.Pan()
     .activeOffsetY(8)
     .failOffsetY(-8)
     .enabled(!busy)
@@ -85,15 +262,23 @@ function AddTicketSheet({
     })
     .onEnd((e) => {
       if (e.translationY > 110 || e.velocityY > 700) {
-        translateY.value = withTiming(600, { duration: 220 });
-        runOnJS(onClose)();
+        // Bewegung SOFORT von hier, auf dem UI-Strang — der Finger ist gerade
+        // erst weg. Abgemeldet wird erst danach; siehe scheduleClose.
+        translateY.value = withTiming(sheetH.value || 900, SWIPE_OUT);
+        runOnJS(scheduleClose)(SWIPE_OUT.duration);
       } else {
         translateY.value = withSpring(0, { damping: 22, stiffness: 220 });
       }
-    });
+    }),
+  [busy, translateY, sheetH, scheduleClose]);
 
   const pickAndParse = async (fallbackMode: TravelMode) => {
-    if (busy) return;
+    // Sperre SOFORT setzen, nicht erst nach dem Dateiauswahl-Dialog: `busy` wurde
+    // bisher erst gesetzt, wenn die Datei schon dastand. Der Zustand aus dem
+    // letzten Render sagt in den Sekunden davor noch „frei", also öffneten zwei
+    // schnelle Tipper zwei Dialoge — und beide legten am Ende ein Ticket an.
+    if (busy || pickingRef.current) return;
+    pickingRef.current = true;
     try {
       const result = await DocumentPicker.getDocumentAsync({
         type: "application/pdf",
@@ -124,9 +309,16 @@ function AddTicketSheet({
       const docDir = FileSystem.documentDirectory ?? "";
       const safeName = (asset.name ?? "ticket.pdf").replace(/[^\w.-]/g, "_");
       const persistedUri = `${docDir}tickets/${Date.now()}-${safeName}`;
+      // Ob das Kopieren geklappt hat, muss unten ausgewertet werden: Der
+      // Kommentar dort behauptete „pdfUri bleibt dann undefined", der Code hat
+      // den Pfad aber bedingungslos gespeichert. Schlug das Kopieren fehl (kein
+      // Speicher, fehlende Rechte), lag im Ticket ein Pfad auf eine Datei, die es
+      // nicht gibt — „Original-PDF öffnen" wurde angeboten und scheiterte dann.
+      let pdfCopied = false;
       try {
         await FileSystem.makeDirectoryAsync(`${docDir}tickets`, { intermediates: true });
         await FileSystem.copyAsync({ from: asset.uri, to: persistedUri });
+        pdfCopied = true;
       } catch {
         // Wenn Persistierung fehlschlägt (z.B. kein Speicherplatz), trotzdem
         // weiter — pdfUri bleibt dann undefined, der Button im Detail-Screen
@@ -164,18 +356,18 @@ function AddTicketSheet({
         pageImageRatio: ratio,
         originalName: parsed.originalName ?? asset.name,
         bookingRef: parsed.fields.bookingRef,
-        pdfUri: persistedUri,
+        pdfUri: pdfCopied ? persistedUri : undefined,
         codeImage: images.codeImage,
         codeType: parsed.codeType ?? undefined,
       });
 
-      onClose();
+      requestClose();
     } catch (err) {
       // Kontogebundener Endpoint: 401 = nicht eingeloggt → Login-Screen
       // öffnen, 429 = Tageslimit des Kontos erreicht.
       const status = err instanceof TicketParseError ? err.status : null;
       if (status === 401) {
-        onClose();
+        requestClose();
         useSearchStore.getState().openAuthOverlay();
         return;
       }
@@ -184,15 +376,41 @@ function AddTicketSheet({
         status === 429 ? t("saved.modal.error.ratelimit") : (err as Error).message,
       );
     } finally {
-      setBusy(false);
+      pickingRef.current = false;
+      /**
+       * Beim Schließen NICHT zurückschalten.
+       *
+       * Vorher war das folgenlos: Das Blatt verschwand schlagartig, niemand sah,
+       * was danach im Baum passierte. Jetzt steht es noch 300ms sichtbar da und
+       * fährt hinunter — der Wechsel von der Ladeanzeige zurück auf die Kacheln
+       * würde also mitten in der Bewegung stattfinden. Wer schließt, hat mit dem
+       * Blatt abgeschlossen; es soll so hinausfahren, wie es war.
+       */
+      if (!closingRef.current) setBusy(false);
     }
   };
 
   return (
     <GestureHandlerRootView style={styles.root}>
-      <View style={styles.backdrop}>
-        <Pressable style={StyleSheet.absoluteFill} onPress={busy ? undefined : onClose} />
-        <Animated.View style={[styles.sheet, sheetAnim]}>
+      {/* Verdunkelung und Blatt bewegen sich getrennt — 1:1 wie im
+          Verlaufs-Blatt (components/home/RecentHistoryOverlay.tsx). */}
+      <Animated.View
+        // Mit dem Blatt, nicht daneben — siehe SHEET_IN.
+        entering={FadeIn.duration(SHEET_IN.duration)}
+        exiting={FadeOut.duration(SHEET_OUT.duration)}
+        style={styles.backdrop}
+      >
+        <Pressable style={StyleSheet.absoluteFill} onPress={busy ? undefined : requestClose} />
+      </Animated.View>
+      <View style={styles.sheetWrap} pointerEvents="box-none">
+        <Animated.View
+          onLayout={onSheetLayout}
+          style={[
+            styles.sheet,
+            { backgroundColor: palette.s1, paddingBottom: bottomPad },
+            sheetAnim,
+          ]}
+        >
           <GestureDetector gesture={panGesture}>
             <View style={styles.handleWrap}>
               <View style={styles.handle} />
@@ -218,6 +436,7 @@ function AddTicketSheet({
                       onPress={() => pickAndParse(m.id)}
                       style={({ pressed }) => [
                         styles.tile,
+                        { backgroundColor: palette.s2, borderColor: palette.border },
                         { opacity: pressed ? 0.85 : 1 },
                       ]}
                     >
@@ -237,14 +456,18 @@ function AddTicketSheet({
   );
 }
 
-const styles = StyleSheet.create({
-  backdrop: { flex: 1, justifyContent: "flex-end", backgroundColor: "rgba(0,0,0,0.6)" },
+const styles = scaledStyles({
+  /** Nimmt die Fläche ein, in der das Blatt unten sitzt — nötig, seit
+   *  Verdunkelung und Blatt getrennte Geschwister sind. */
+  sheetWrap: { ...StyleSheet.absoluteFillObject, justifyContent: "flex-end" },
+  // Nur noch die Verdunkelung: `flex: 1` und die Ausrichtung sind an `sheetWrap`
+  // gewandert, weil diese Ebene das Blatt nicht mehr enthält.
+  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.6)" },
   sheet: {
     backgroundColor: "#1F1F20",
     borderTopLeftRadius: 28,
     borderTopRightRadius: 28,
     paddingHorizontal: 20,
-    paddingBottom: 40,
     minHeight: 320,
   },
   root: { flex: 1 },

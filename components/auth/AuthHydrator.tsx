@@ -58,7 +58,27 @@ export function AuthHydrator() {
       void (async () => {
         if (started.current || useSearchStore.getState().authToken) return;
         const token = await loadAuthToken();
-        if (!token || cancelled || started.current) return;
+        if (cancelled || started.current) return;
+        /**
+         * Kein Zeichen, aber ein gespeicherter Nutzer? Dann abmelden.
+         *
+         * `authUser` liegt im gewöhnlichen Speicher, das Zeichen ausschließlich
+         * im Schlüsselbund des Geräts. Die beiden können auseinanderlaufen — der
+         * gewöhnliche Speicher wird von Androids Sicherung mitgenommen, der
+         * Schlüsselbund nicht. Nach einer Wiederherstellung oder einem
+         * Gerätewechsel stand die App deshalb auf „angemeldet", während jeder
+         * Aufruf ohne Kopfzeile hinausging und mit 401 scheiterte: Das Profil war
+         * zu sehen, aber Ticket-Import und Assistent verlangten eine Anmeldung,
+         * und es gab keinen Ausweg außer von Hand abzumelden.
+         *
+         * Hier passierte in diesem Fall gar nichts — der Rücksprung stand vor
+         * jeder Prüfung. Ohne Zeichen gibt es keine Sitzung, also wird auch keine
+         * mehr vorgetäuscht.
+         */
+        if (!token) {
+          if (useSearchStore.getState().authUser) useSearchStore.getState().clearAuth();
+          return;
+        }
         started.current = true;
         try {
           const user = await authMe(token);

@@ -17,6 +17,8 @@ import { useSearchStore } from "@/stores/searchStore";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
 import { useAccent } from "@/lib/theme/accent";
+import { usePalette } from "@/lib/theme/appBg";
+import { scaledStyles } from "@/lib/ui/compact";
 
 // Binch v2 Design-Tokens — sind aus app-internem Theme abgeleitet (tailwind
 // brand.lime = #7FEA4D, brand.dark = #1A1A1A). Wir halten sie hier lokal
@@ -92,6 +94,7 @@ export function ConnectionNotFoundHost(): React.ReactElement {
   const clearSelectedStop = useSearchStore((s) => s.clearSelectedStop);
   const t = useT();
   const accent = useAccent();
+  const palette = usePalette();
 
   const title = customTitle ?? t("connectionNotFound.title");
   const message = customMessage ?? t("connectionNotFound.body");
@@ -141,7 +144,7 @@ export function ConnectionNotFoundHost(): React.ReactElement {
           style={styles.cardWrap}
         >
           {/* Card eat presses so taps inside don't close the modal */}
-          <Pressable onPress={() => {}} style={styles.card}>
+          <Pressable onPress={() => {}} style={[styles.card, { backgroundColor: palette.s2 }]}>
             <View style={styles.illustrationSlot}>
               <IllustrationHalo color={accent.solid} />
               <View style={styles.illustrationInner}>
@@ -188,7 +191,7 @@ export function ConnectionNotFoundHost(): React.ReactElement {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   backdrop: {
     flex: 1,
     backgroundColor: tokens.scrim,

@@ -6,6 +6,8 @@ import { useEffect, useRef } from "react";
 import { Animated, Easing, Pressable, StyleSheet, Text, View } from "react-native";
 import Svg, { Path } from "react-native-svg";
 import { useAccent } from "@/lib/theme/accent";
+import { usePalette } from "@/lib/theme/appBg";
+import { scaledStyles } from "@/lib/ui/compact";
 
 interface Props {
   visible: boolean;
@@ -29,6 +31,7 @@ export function SaveToast({
   onAction,
 }: Props) {
   const accent = useAccent();
+  const palette = usePalette();
   const anim = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
@@ -59,7 +62,7 @@ export function SaveToast({
       pointerEvents="box-none"
       style={[styles.wrap, { top: topOffset, opacity: anim, transform: [{ translateY }] }]}
     >
-      <View style={styles.card}>
+      <View style={[styles.card, { backgroundColor: palette.s2 }]}>
         <View style={[styles.check, { backgroundColor: accent.solid }]}>
           <Svg width={22} height={22} viewBox="0 0 24 24">
             <Path
@@ -94,7 +97,7 @@ export function SaveToast({
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   wrap: { position: "absolute", left: 14, right: 14, zIndex: 50 },
   card: {
     flexDirection: "row",

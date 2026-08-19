@@ -5,7 +5,7 @@
  * Button. Wird am Root-Level (app/_layout.tsx) mit `selectedTicket !== null`
  * gemountet, ähnlich zum DetailsOverlay-Pattern.
  */
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -18,11 +18,12 @@ import {
   Modal,
   useWindowDimensions,
 } from "react-native";
+import { usePalette } from "@/lib/theme/appBg";
 import { SafeAreaView } from "react-native-safe-area-context";
 import Animated, {
   useAnimatedStyle,
-  useSharedValue,
   withTiming,
+  runOnJS,
 } from "react-native-reanimated";
 // Gesture/GestureDetector wurden für den alten image-zoom-modal genutzt —
 // nicht mehr nötig seit react-native-pdf nativ pinch+pan handled.
@@ -34,17 +35,19 @@ import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
 import {
   overlayCover,
-  PUSH_DURATION,
-  PUSH_IN_EASING,
-  POP_DURATION,
-  POP_EASING,
-  COVER_DURATION,
-  COVER_IN_EASING,
-  COVER_OUT_EASING,
+  ticketPush,
+  isTicketPushStarted,
+  startTicketPush,
+  endTicketPush,
+  PUSH_SPRING,
+  POP_SPRING,
+  COVER_OUT_SPRING,
   SCREEN_CORNER_RADIUS,
 } from "@/lib/nav/overlayCover";
+import { holdLayer, layerGeneration, rearmLayer, releaseLayer } from "@/lib/nav/transitionLayer";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { TicketHead, Perforation, bookingRefFor } from "./TicketParts";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const C = {
   bg: "#1A1A1A",
@@ -81,6 +84,7 @@ function TicketDetailSheet({
   ticket: NonNullable<ReturnType<typeof useSearchStore.getState>["selectedTicket"]>;
   open: boolean;
 }) {
+  const palette = usePalette();
   const t = useT();
   const accent = useAccent();
   const clearSelectedTicket = useSearchStore((s) => s.clearSelectedTicket);
@@ -88,29 +92,113 @@ function TicketDetailSheet({
 
   // Park-Position +48px: Elevation-Schatten (elevation 24) darf im
   // geschlossenen Zustand nicht am rechten Rand durchscheinen.
-  const translateX = useSharedValue(screenWidth + 48);
+  /**
+   * Die Position wird nur noch ABGELESEN — geschrieben wird sie im Tipp-Handler
+   * der Karte (`startTicketPush`). Begründung dort.
+   *
+   * Park-Position +48 Punkt über den Rand hinaus: Der Schatten darf im
+   * geschlossenen Zustand nicht am rechten Bildschirmrand durchscheinen.
+   */
+  const parkX = screenWidth + 48;
   const slideStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: translateX.value }],
-    // Off-screen ⇔ unsichtbar — kein Schatten-Bleed, kein Flash.
-    opacity: translateX.value >= screenWidth ? 0 : 1,
+    transform: [{ translateX: (1 - ticketPush.value) * parkX }],
+    // Außerhalb ⇔ unsichtbar — kein Durchscheinen, kein Aufblitzen.
+    opacity: (1 - ticketPush.value) * parkX >= screenWidth ? 0 : 1,
   }));
 
-  // Sichtbarkeit store-getrieben: open → Slide-In (eine rAF nach dem Commit,
-  // damit React reconcilen kann bevor die Animation läuft), !open → Slide-Out.
+  // Sichtbarkeit store-getrieben. Die Slide-In startet NICHT mehr hier, sondern
+  // im Tipp-Handler der Karte (siehe startTicketPush) — dieser Effekt hält nur
+  // noch die Textur und fährt die Rückfahrt.
   // Kein Unmount mehr — der Tree bleibt stehen (Leak- & Mount-Hänger-Fix).
+  // Textur der Unterlage über den GANZEN Vorgang halten, Rückfahrt eingeschlossen.
+  //
+  // Vorher gab die Aufräumfunktion sie frei, sobald `open` auf false kippte —
+  // also EXAKT in dem Moment, in dem der Tab darunter anfängt zurückzuwandern.
+  // Die Rückfahrt lief damit als einzige ohne Textur, und genau dort ist das
+  // Ruckeln aufgefallen.
+  //
+  // Jetzt: solange offen, halten (die Fläche ist verdeckt, kostet also nichts);
+  // beim Schließen auf die Zeitgrenze umstellen, die sie über die Rückfahrt
+  // hinweg trägt und danach von selbst fallen lässt.
+  const [moving, setMoving] = useState(false);
+  const ownsCoverRef = useRef(false);
+  const wasOpenRef = useRef(false);
+  const closingGenRef = useRef<number | null>(null);
+  /** Gibt die Textur der Unterlage frei — am ENDE der Bewegung, nicht auf einem
+   *  blinden Zeitgeber. Sonst stand sie noch fast eine Sekunde über einer wieder
+   *  scrollbaren Liste und wurde mitten im Scrollen abgebaut. */
+  const releaseUnderlayLayer = useCallback(() => {
+    const gen = closingGenRef.current;
+    if (gen == null) return;
+    closingGenRef.current = null;
+    releaseLayer("saved", gen);
+  }, []);
   useEffect(() => {
     if (open) {
-      const id = requestAnimationFrame(() => {
-        translateX.value = withTiming(0, { duration: PUSH_DURATION, easing: PUSH_IN_EASING });
-        // Parallax: kürzer + sanfter — kommt VOR der Overlay-Landung zur Ruhe.
-        overlayCover.value = withTiming(1, { duration: COVER_DURATION, easing: COVER_IN_EASING });
-      });
-      return () => cancelAnimationFrame(id);
+      wasOpenRef.current = true;
+      // Angefordert wird sie im bestätigten Tipp (TicketCard) — hier nur halten.
+      holdLayer("saved");
+      return;
     }
-    translateX.value = withTiming(screenWidth + 48, { duration: POP_DURATION, easing: POP_EASING });
-    overlayCover.value = withTiming(0, { duration: COVER_DURATION, easing: COVER_OUT_EASING });
+    if (!wasOpenRef.current) return;
+    wasOpenRef.current = false;
+    // Fürs Zurückfahren gibt es keinen Fingerdruck — hier also anfordern.
+    // `rearmLayer` genügt: Angefordert wurde beim Antippen der Karte, die Textur
+    // ist längst da, und eine neu ANZULEGEN wäre falsch, wenn sie es nicht wäre.
+    rearmLayer("saved");
+    // Stand festhalten, den die Freigabe unten meint — sonst räumt der Rückruf
+    // dieser Rückfahrt die frische Textur des nächsten Antippens wieder ab.
+    closingGenRef.current = layerGeneration("saved");
+  }, [open]);
+
+  useEffect(() => {
+    if (open) {
+      // Nicht nach einem festen Bild starten, sondern sobald der JS-Thread frei
+      // ist (gedeckelt). Gemessen am Ergebnis-Bildschirm: Der Commit, der den
+      // Inhalt anlegt, belegt den Thread rund 80ms; ein Bild Vorlauf lag mitten
+      // drin, und die Feder lief dagegen an. Nach der Umstellung fiel dort das
+      // schlechteste Bild WÄHREND der Bewegung von 25ms auf 8ms — also auf den
+      // Takt, ohne ein einziges verpasstes Bild. Hier gilt derselbe Aufbau.
+      // Kein Warten mehr auf einen freien Thread.
+      //
+      // Die Begründung dafür („der Commit, der den Inhalt anlegt, belegt den
+      // Thread rund 80ms") galt für Overlays, die beim Öffnen aufgebaut wurden.
+      // Dieses hier bleibt dauerhaft gemountet — es gibt beim Öffnen gar keinen
+      // Aufbau-Commit, auf den zu warten wäre. Die Wartezeit war damit reine
+      // Latenz zwischen Finger und Bewegung, und sie hatte einen garantierten
+      // Boden von zwei Bildern (die Schleife kann frühestens im zweiten rAF
+      // feuern). Ein Bild Vorlauf reicht, damit die nativen Ansichten stehen.
+      /**
+       * Die Bewegung läuft bereits — gestartet im Tipp-Handler der Karte.
+       * Hier bleibt nur die Textur für ihre Dauer und der Vermerk, dass DIESES
+       * Blatt den geteilten Parallax-Wert gesetzt hat.
+       *
+       * Der Notausgang darunter greift, wenn niemand angestoßen hat (eine
+       * Verknüpfung, das Wiederherstellen nach einem Umweg).
+       */
+      setMoving(true);
+      ownsCoverRef.current = true;
+      if (!isTicketPushStarted()) startTicketPush();
+      const settle = setTimeout(() => setMoving(false), PUSH_SPRING.duration + 80);
+      return () => clearTimeout(settle);
+    }
+    setMoving(true);
+    endTicketPush();
+    ticketPush.value = withTiming(0, POP_SPRING, (finished?: boolean) => {
+      "worklet";
+      if (!finished) return;
+      runOnJS(setMoving)(false);
+      runOnJS(releaseUnderlayLayer)();
+    });
+    // Siehe DetailsOverlay: nur zurücknehmen, wenn dieses Blatt den geteilten
+    // Wert auch gesetzt hat — sonst reißt eine Größenänderung den Parallax eines
+    // anderen Overlays auf 0.
+    if (ownsCoverRef.current) {
+      ownsCoverRef.current = false;
+      overlayCover.value = withTiming(0, COVER_OUT_SPRING);
+    }
     return undefined;
-  }, [open, translateX, screenWidth]);
+  }, [open, screenWidth]);
 
   useEffect(() => () => { overlayCover.value = 0; }, []);
 
@@ -153,25 +241,38 @@ function TicketDetailSheet({
     // Statisch an (kein Mid-Flight-Toggle — der verursachte früher selbst
     // Stutter); Kosten: ~12MB GPU-Speicher solange gemountet.
     <Animated.View
-      style={[styles.root, slideStyle]}
-      renderToHardwareTextureAndroid
+      style={[styles.root, { backgroundColor: palette.bg }, slideStyle]}
+      // NUR während der Bewegung.
+      //
+      // Stand hier statisch, aus einer Zeit, in der „gemountet" gleich „offen"
+      // hieß. Seit dieses Blatt dauerhaft steht, lag die vollflächige Textur
+      // permanent über seiner eigenen Scroll-Fläche — jedes Scroll-Bild im
+      // Ticket-Detail rasterte damit den ganzen Bildschirm neu. Genau der Fall,
+      // den lib/nav/transitionLayer.ts als „schlimmer als gar keine" ausschließt.
+      renderToHardwareTextureAndroid={Platform.OS === "android" && moving}
       collapsable={false}
+      // Fehlte bisher ganz. Dieses Blatt bleibt dauerhaft gemountet, deckt die
+      // volle Fläche und liegt mit zIndex 200 über allem — nur wegen seiner
+      // Position außerhalb des Bildes fing es keine Berührungen ab. Beim
+      // Hinausfahren (rund 380ms) tut es das aber sehr wohl, und in dieser Zeit
+      // kam ein Tipp auf den Tab darunter nicht an.
+      pointerEvents={open ? "auto" : "none"}
     >
-      <SafeAreaView style={styles.safe} edges={["top"]}>
+      <SafeAreaView style={[styles.safe, { backgroundColor: palette.bg }]} edges={["top"]}>
         <View style={styles.header}>
           <Pressable
             onPress={() => {
               haptic("button");
               animateClose();
             }}
-            style={styles.roundBtn}
+            style={[styles.roundBtn, { backgroundColor: palette.s2 }]}
             hitSlop={10}
             accessibilityLabel={t("common.cancel")}
           >
             <ChevronLeft color={C.white} size={22} strokeWidth={2.2} />
           </Pressable>
           <Text style={styles.headerTitle}>{t("saved.ticket.detail.title")}</Text>
-          <View style={styles.roundBtn} />
+          <View style={[styles.roundBtn, { backgroundColor: palette.s2 }]} />
         </View>
 
         <ScrollView
@@ -180,17 +281,17 @@ function TicketDetailSheet({
         >
           <Text style={styles.boardingTitle}>{t("saved.ticket.bordkarte")}</Text>
 
-          <View style={styles.card}>
+          <View style={[styles.card, { backgroundColor: palette.s2 }]}>
             <TicketHead ticket={ticket} />
 
-            <Perforation notchColor={C.bg} />
+            <Perforation notchColor={palette.bg} />
 
             <View style={styles.stub}>
               {ticket.codeImage ? (
                 // Echter QR/Barcode aus dem PDF — pixel-genau gecroppt vom
                 // Server, KEIN Re-Encoding → bleibt scanbar. Aspect-Ratio
                 // je nach Typ: QR/Aztec/DataMatrix square, 1D-Barcode breit.
-                <View style={styles.codePanel}>
+                <View style={[styles.codePanel, { backgroundColor: palette.s1 }]}>
                   <Text style={styles.codeLabel}>
                     {t("saved.ticket.code")} · {ticketCode}
                   </Text>
@@ -214,7 +315,7 @@ function TicketDetailSheet({
                 // Wir zeigen KEIN Fake-Pattern (das wäre nicht scanbar und
                 // wäre irreführend) sondern eine ehrliche Message + Hinweis
                 // auf den PDF-Button.
-                <View style={styles.codeFallback}>
+                <View style={[styles.codeFallback, { backgroundColor: palette.s3 }]}>
                   <Text style={styles.codeFallbackText}>
                     {t("saved.ticket.codeUnreadable")}
                   </Text>
@@ -277,6 +378,7 @@ function NativePdfModal({
   pdfUri?: string;
   onClose: () => void;
 }) {
+  const palette = usePalette();
   const t = useT();
   const { width: screenW, height: screenH } = useWindowDimensions();
 
@@ -285,7 +387,7 @@ function NativePdfModal({
       <Pressable
         onPress={onClose}
         hitSlop={12}
-        style={styles.pdfClose}
+        style={[styles.pdfClose, { backgroundColor: palette.s2 }]}
       >
         <X size={20} color="#FFFFFF" />
       </Pressable>
@@ -323,7 +425,7 @@ function NativePdfModal({
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   root: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: C.bg,

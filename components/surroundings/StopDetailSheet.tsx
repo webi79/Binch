@@ -1,4 +1,5 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useState, useRef } from "react";
+import { SHEET_IN, SHEET_OUT } from "@/lib/nav/overlayCover";
 import {
   View,
   Text,
@@ -8,6 +9,7 @@ import {
   StyleSheet,
   useWindowDimensions,
 } from "react-native";
+import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
   useAnimatedStyle,
   useSharedValue,
@@ -39,6 +41,7 @@ import { showConnectionNotFound } from "@/lib/connectionNotFoundAlert";
 import type { SearchResult, TravelMode } from "@/types/search";
 import { useAccent } from "@/lib/theme/accent";
 import { SaveStarButton } from "@/components/surroundings/SaveStarButton";
+import { scaledStyles } from "@/lib/ui/compact";
 
 /**
  * Slide-Up-Sheet mit Abfahrten/Ankünften zur ausgewählten Haltestelle.
@@ -480,6 +483,7 @@ function NextHero({
   onPress: () => void;
 }) {
   const accent = useAccent();
+  const palette = usePalette();
   const delay = item.delayMinutes ?? 0;
   const ModeIcon = iconForProduct(item.product);
 
@@ -531,7 +535,7 @@ function NextHero({
       disabled={loading}
       onPressIn={() => setPressed(true)}
       onPressOut={() => setPressed(false)}
-      style={[styles.hero, pressed ? styles.heroPressed : null]}
+      style={[styles.hero, { backgroundColor: palette.s2 }, pressed ? styles.heroPressed : null]}
     >
       <View style={styles.heroRing}>
         <Svg width={84} height={84} viewBox="0 0 84 84">
@@ -598,6 +602,7 @@ function NextHero({
  * der Inhalt während der Slide-Out-Animation noch sichtbar bleibt.
  */
 function StopDetailSheetInner() {
+  const palette = usePalette();
   const t = useT();
   const insets = useSafeAreaInsets();
   const { height: screenHeight } = useWindowDimensions();
@@ -617,6 +622,8 @@ function StopDetailSheetInner() {
   // Wir tracken nur EINEN aktiven Search gleichzeitig — Doppel-Taps blockt
   // das `disabled`-Prop in der Row.
   const [loadingDepartureId, setLoadingDepartureId] = useState<string | null>(null);
+  /** Laufende Nummer des zuletzt angetippten Abfahrts-Eintrags. */
+  const departureReqRef = useRef(0);
 
   // displayStop = der zuletzt sichtbare Stop. Beim Slide-Out hilft das, den
   // Inhalt sichtbar zu halten bis die Animation durch ist.
@@ -775,6 +782,7 @@ function StopDetailSheetInner() {
 
     // Background-Search — fire-and-forget, kein await blockiert den Slide.
     void (async () => {
+      const reqId = ++departureReqRef.current;
       let match: SearchResult | undefined;
       let failed = false;
       try {
@@ -803,6 +811,16 @@ function StopDetailSheetInner() {
         failed = true;
       }
       setLoadingDepartureId(null);
+      // Ist dieser Tap überhaupt noch der aktuelle?
+      //
+      // Der Block läuft ohne Rückkanal: Vor dem Netz-Aufruf lag ein Tipp, danach
+      // wird bedingungslos in den GLOBALEN Auswahl-Zustand geschrieben. Wer
+      // zwischenzeitlich das Overlay geschlossen oder eine andere Abfahrt
+      // angetippt hat, bekam damit ein Overlay, das Sekunden später von selbst
+      // wieder aufspringt — oder im Fehlerfall eines, das sich schließt, obwohl
+      // es zu einer ANDEREN Verbindung gehört (`clearSelectedResult` nullt auch
+      // die Bein-Zeitleiste mit).
+      if (reqId !== departureReqRef.current) return;
       if (match) {
         // Stub durch echtes Result ersetzen — DetailsOverlay re-rendert mit
         // den korrekten Daten + dem bookingToken (für Multi-Provider-Liste).
@@ -883,29 +901,51 @@ function StopDetailSheetInner() {
     });
   }, [snap.mid, snap.sheetHeight]);
 
-  // bodyReady-Gate + close-Animation. Beim Öffnen läuft die translateY-
-  // Animation schon (vom Tap-Handler getriggert), wir setzen hier nur den
-  // bodyReady-Timer. Beim Schließen müssen wir die Animation selbst feuern.
+  // bodyReady-Riegel + Schließ-Bewegung. Beim Öffnen läuft die Bewegung schon
+  // (aus dem Tipp-Handler, siehe openStopSheet) — hier wird nur der Inhalt
+  // freigegeben. Beim Schließen fahren wir sie selbst.
   useLayoutEffect(() => {
     if (selectedStop) {
       setBodyReady(false);
-      translateY.value = withTiming(snap.mid, { duration: 350 }, (finished) => {
-        if (finished) runOnJS(setBodyReady)(true);
-      });
+      /**
+       * Die Einfahrt wird hier NICHT mehr gestartet.
+       *
+       * Sie läuft schon — `openStopSheet()` schickt sie im Berührungs-Frame los.
+       * Ein zweiter Start setzte die Kurve von der inzwischen erreichten
+       * Position neu an, mit anderer Dauer: sichtbar als Sprung mitten in der
+       * Bewegung. Der Kommentar hier behauptete genau das, was der Code daneben
+       * nicht tat.
+       *
+       * Bleibt der Riegel für den Inhalt. Er hing am Abschluss-Rückruf der
+       * Bewegung, den es hier nicht mehr gibt — deshalb über die Dauer. Der
+       * Zeitgeber wird beim Wechsel abgeräumt.
+       */
+      const id = setTimeout(() => setBodyReady(true), SHEET_IN.duration);
+      return () => clearTimeout(id);
     } else {
       setBodyReady(false);
       translateY.value = withTiming(
         snap.sheetHeight,
-        { duration: 350 },
+        SHEET_OUT,
         (finished) => {
           if (finished) runOnJS(setDisplayStop)(null);
         },
       );
+      return undefined;
     }
   }, [selectedStop, snap.mid, snap.sheetHeight]);
 
   const startY = useSharedValue(0);
-  const pan = Gesture.Pan()
+  /**
+   * In `useMemo` — und hier fällt es besonders ins Gewicht.
+   *
+   * Dieses Blatt hängt dauerhaft am Wurzel-Layout und rendert, solange es offen
+   * ist, jede Sekunde neu (der Ticker für die Abfahrtszeiten). Bei jedem
+   * Durchlauf entstand bisher ein neues `Gesture.Pan()`-Objekt, das der Erkenner
+   * gegen seinen nativen Gegenpart abgleichen und neu einrichten muss.
+   */
+  const pan = useMemo(() =>
+    Gesture.Pan()
     .onStart(() => {
       startY.value = translateY.value;
     })
@@ -934,7 +974,8 @@ function StopDetailSheetInner() {
       if (e.velocityY < -800) closest = snap.full;
       else if (e.velocityY > 200 && final > snap.mid * 0.6) closest = snap.mid;
       translateY.value = withTiming(closest, { duration: 180, easing: Easing.out(Easing.quad) });
-    });
+    }),
+  [snap, startY, translateY]);
 
   // Sheet bleibt PERMANENT gemountet — auch wenn nichts ausgewählt ist
   // (translateY = sheetHeight = off-screen). Dadurch entfällt der React-
@@ -959,6 +1000,7 @@ function StopDetailSheetInner() {
         pointerEvents={selectedStop ? "auto" : "none"}
         style={[
           styles.sheet,
+          { backgroundColor: palette.s1 },
           {
             top: Math.max(60, insets.top + 12),
             height: snap.sheetHeight,
@@ -1094,7 +1136,7 @@ function StopDetailSheetInner() {
                 <View style={styles.empty}>
                   <Text style={styles.emptyTitle}>{t("stop.error.title")}</Text>
                   <Text style={styles.emptyBody}>{t("results.error.body")}</Text>
-                  <Pressable onPress={() => void refetch()} style={styles.retryBtn} hitSlop={8}>
+                  <Pressable onPress={() => void refetch()} style={[styles.retryBtn, { backgroundColor: palette.s3 }]} hitSlop={8}>
                     <Text style={styles.retryText}>{t("results.retry")}</Text>
                   </Pressable>
                 </View>
@@ -1183,7 +1225,7 @@ export const StopDetailSheet = memo(function StopDetailSheet() {
   return <StopDetailSheetInner />;
 });
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   sheet: {
     position: "absolute",
     left: 0,

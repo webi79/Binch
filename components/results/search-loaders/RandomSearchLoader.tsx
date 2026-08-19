@@ -14,6 +14,7 @@ import { GreetingScene } from "./GreetingScene";
 import { WeatherScene } from "./WeatherScene";
 import { useT } from "@/lib/i18n/useT";
 import { LoaderPausedContext, SpruecheLine } from "./SearchSceneChrome";
+import { scaledStyles } from "@/lib/ui/compact";
 
 interface Props {
   originLabel: string;
@@ -112,7 +113,7 @@ function abbreviate(label: string): string {
   return first.slice(0, 3).toUpperCase() || "—";
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   wrap: {
     flex: 1,
     alignItems: "center",

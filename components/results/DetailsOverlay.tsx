@@ -1,4 +1,5 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { subscribeDetailsPreload } from "@/lib/nav/detailsPreload";
+import { memo, useCallback, useEffect, useRef, useState, useMemo } from "react";
 import {
   View,
   Text,
@@ -12,12 +13,16 @@ import {
   Platform,
   useWindowDimensions,
 } from "react-native";
+import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
   cancelAnimation,
   useAnimatedStyle,
   useSharedValue,
   withRepeat,
+  withSpring,
   withTiming,
+  useAnimatedReaction,
+  runOnJS,
 } from "react-native-reanimated";
 import { SafeAreaView } from "react-native-safe-area-context";
 import {
@@ -44,17 +49,18 @@ import { de, enGB, es, fr } from "date-fns/locale";
 import { formatTimeInZone, shiftIsoByMinutes } from "@/lib/time-format";
 import { DelayedTime } from "@/components/results/DelayedTime";
 import { useT } from "@/lib/i18n/useT";
+import { holdLayer, layerGeneration, rearmLayer, releaseLayer } from "@/lib/nav/transitionLayer";
 import { useSearchStore } from "@/stores/searchStore";
 import { haptic } from "@/lib/haptics";
 import {
   overlayCover,
-  PUSH_DURATION,
-  PUSH_IN_EASING,
-  POP_DURATION,
-  POP_EASING,
-  COVER_DURATION,
-  COVER_IN_EASING,
-  COVER_OUT_EASING,
+  detailsPush,
+  isDetailsPushStarted,
+  setDetailsPushStopped,
+  startDetailsPush,
+  POP_SPRING,
+  COVER_IN_SPRING,
+  COVER_OUT_SPRING,
   SCREEN_CORNER_RADIUS,
 } from "@/lib/nav/overlayCover";
 import { usePathname } from "expo-router";
@@ -68,8 +74,9 @@ import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { displayCode, displayProvider, logoUrls } from "@/lib/results/logos";
 import { tripSignature } from "@/lib/results/signature";
-import { TravelMode } from "@/types/search";
+import { TravelMode, type SearchResult } from "@/types/search";
 import { useAccent } from "@/lib/theme/accent";
+import { scaledStyles } from "@/lib/ui/compact";
 
 /**
  * Details-Slide als globales Overlay (Pattern wie SearchHeroOverlay).
@@ -186,7 +193,17 @@ export function DetailsOverlay() {
     lastResultRef.current = result;
     lastPassengersRef.current = passengers;
   }
-  const displayResult = lastResultRef.current;
+  /**
+   * Vorgebautes Ergebnis aus dem Berührungsfenster — siehe `detailsPreload`.
+   *
+   * Es zählt ausdrücklich NICHT als „offen": `open` unten hängt weiter allein
+   * an `result` aus dem Speicher. Vorgebaut heißt gebaut und geparkt, nicht
+   * sichtbar.
+   */
+  const [preloadResult, setPreloadResult] = useState<SearchResult | null>(null);
+  useEffect(() => subscribeDetailsPreload(setPreloadResult), []);
+
+  const displayResult = lastResultRef.current ?? preloadResult;
 
   // favored bezieht sich aufs ANGEZEIGTE Result — bleibt live (auch beim Slide-
   // Out), O(1) Set-Lookup statt ganzem savedTrips-Array (sonst full re-render
@@ -207,7 +224,7 @@ export function DetailsOverlay() {
   return (
     <DetailsContent
       result={displayResult}
-      passengers={lastPassengersRef.current}
+      passengers={lastResultRef.current ? lastPassengersRef.current : passengers}
       pending={open ? pending : false}
       clearSelectedResult={clearSelectedResult}
       locale={locale}
@@ -250,6 +267,10 @@ interface ContentProps {
  * unsichtbaren Baum voll re-rendern (= globale Ruckler). Alle Props sind
  * primitiv oder stabile Refs, memo greift also zuverlässig.
  */
+/** Stabile leere Liste — `?? []` erzeugt sonst pro Render ein neues Array und
+ *  entwertet damit jede Memoisierung, die es als Abhängigkeit hat. */
+const NO_OPTIONS: never[] = [];
+
 const DetailsContent = memo(function DetailsContent({
   result,
   passengers,
@@ -263,6 +284,7 @@ const DetailsContent = memo(function DetailsContent({
   open,
   hiddenForRoute,
 }: ContentProps) {
+  const palette = usePalette();
   const t = useT();
   const accent = useAccent();
   const screenWidth = useWindowDimensions().width;
@@ -270,49 +292,243 @@ const DetailsContent = memo(function DetailsContent({
   // Geschlossen-Park-Position: +48px über den rechten Rand hinaus, damit der
   // Elevation-Schatten des off-screen gemounteten Sheets (Keep-mounted) nicht
   // am Bildschirmrand durchscheint.
-  const translateX = useSharedValue(screenWidth + 48);
+  /**
+   * Die Position wird nur noch ABGELESEN — geschrieben wird sie im Tipp-Handler
+   * der Karte (`startDetailsPush`). Warum, steht dort.
+   *
+   * Der Wert läuft von 0 (draußen) bis 1 (angekommen); die Park-Position liegt
+   * 48 Punkt ÜBER dem rechten Rand hinaus, damit der Schatten des dauerhaft
+   * gemounteten Blattes im geschlossenen Zustand nicht am Bildschirmrand
+   * durchscheint.
+   */
+  const parkX = screenWidth + 48;
   const slideStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: translateX.value }],
-    // Unsichtbar sobald off-screen (translateX ≥ Breite) oder Route-Detour —
-    // kein Schatten-Durchscheinen im geparkten Zustand, kein Flash beim
-    // Reinsliden (off-screen ⇔ opacity 0).
-    opacity: hiddenForRoute || translateX.value >= screenWidth ? 0 : 1,
+    transform: [{ translateX: (1 - detailsPush.value) * parkX }],
+    // Unsichtbar, solange es außerhalb steht oder ein Umweg über eine andere
+    // Route läuft — kein Schatten-Durchscheinen im geparkten Zustand, kein
+    // Aufblitzen beim Hereinfahren.
+    opacity: hiddenForRoute || (1 - detailsPush.value) * parkX >= screenWidth ? 0 : 1,
   }));
 
   // Sichtbarkeit store-getrieben (KEEP-MOUNTED): `open` true → reinsliden,
   // false → raussliden. Der Tree bleibt gemountet, wir unmounten NICHT mehr —
   // das ist der eigentliche Leak-Fix (react-native-svg gibt SVG-Views beim
-  // Unmount nicht frei). Slide-In erst NACH dem ersten Paint (rAF), damit React
-  // den schweren Sub-Tree committen kann bevor die Animation läuft — sonst
-  // stuttert der Slide. Der Parallax (overlayCover) läuft synchron im selben rAF.
+  // Unmount nicht frei). Die Bewegung startet inzwischen im Tipp-Handler der
+  // Karte, nicht mehr hier über ein `requestAnimationFrame` — siehe
+  // `startDetailsPush`. Der Parallax läuft im selben Aufruf mit.
+  /**
+   * Texturen der Flächen, die unter diesem Blatt liegen.
+   *
+   * Angefordert werden sie beim AUFSETZEN des Fingers auf die Karte (ResultCard,
+   * `onSelectTouchStart`) — hier
+   * werden sie nur GEHALTEN, solange das Blatt oben liegt, und danach wieder
+   * freigegeben. `holdLayer` legt bewusst keine an: Eine Fläche, für die niemand
+   * vorbereitet hat, ist auch keine, die sich gerade bewegt.
+   *
+   * Beide Schlüssel, weil dieselbe Karte aus zwei Flächen heraus geöffnet wird —
+   * aus der Ergebnisliste und aus dem Saved-Tab. Der jeweils andere Aufruf tut
+   * nichts.
+   */
+  const releaseUnderlayLayers = useCallback(() => {
+    const gen = closingGenRef.current;
+    if (!gen) return;
+    closingGenRef.current = null;
+    releaseLayer("results", gen.results);
+    releaseLayer("saved", gen.saved);
+  }, []);
+
+  /**
+   * War das Blatt zuletzt überhaupt ZU SEHEN, als es noch offen war?
+   *
+   * Nachgeführt nur, solange `open` gilt — im Schließ-Render bleibt damit der
+   * Stand von davor stehen. Genau den braucht der Zweig unten, und zwar aus
+   * einem konkreten Fehlerbild:
+   *
+   * Tippt man im Toast auf „Ansehen", wechselt die App in den Saved-Reiter und
+   * räumt das Blatt zwei Sekunden später auf. `clearSelectedResult` löscht dabei
+   * in EINEM Zug `selectedResult` UND `selectedResultContext`. Ersteres löst die
+   * Rückfahrt aus — Letzteres nimmt aber genau die Bedingung weg, die das Blatt
+   * bis dahin unsichtbar gehalten hat (`hiddenForRoute` braucht den Kontext).
+   * Das Blatt wurde also im selben Bild wieder sichtbar und wischte danach über
+   * den Saved-Reiter. Zwei Sekunden nachdem der Nutzer dort angekommen war, und
+   * ohne jeden Bezug zu dem, was er gerade tat.
+   *
+   * War es beim Schließen ohnehin verdeckt, gibt es nichts zu zeigen: Dann wird
+   * ohne Bewegung zurückgesetzt.
+   */
+  const wasVisibleRef = useRef(false);
+  if (open) wasVisibleRef.current = !hiddenForRoute;
+
+  const wasOpenRef = useRef(false);
+  const closingGenRef = useRef<{ results: number; saved: number } | null>(null);
   useEffect(() => {
     if (open) {
-      const id = requestAnimationFrame(() => {
-        // Emphasized-Decelerate: bremst zum Ende stark ab → weiche Landung.
-        translateX.value = withTiming(0, { duration: PUSH_DURATION, easing: PUSH_IN_EASING });
-        // Parallax: kürzer + sanfter — kommt VOR der Overlay-Landung zur Ruhe.
-        overlayCover.value = withTiming(1, { duration: COVER_DURATION, easing: COVER_IN_EASING });
-      });
-      return () => cancelAnimationFrame(id);
+      wasOpenRef.current = true;
+      holdLayer("results");
+      holdLayer("saved");
+      return;
     }
-    // Schließen: raussliden (inkl. Schatten-Pad) + Parallax zurück — bleibt gemountet.
-    translateX.value = withTiming(screenWidth + 48, { duration: POP_DURATION, easing: POP_EASING });
-    overlayCover.value = withTiming(0, { duration: COVER_DURATION, easing: COVER_OUT_EASING });
+    if (!wasOpenRef.current) return;
+    wasOpenRef.current = false;
+    // Fürs Zurückfahren gibt es keinen Fingerdruck. `rearmLayer` statt
+    // `prepareLayer`: Es verlängert nur, was schon da ist, und legt auf der
+    // Fläche, die gar nicht darunter lag, nichts Neues an.
+    rearmLayer("results");
+    rearmLayer("saved");
+    // Stand festhalten, den die Freigabe unten meint. Tippt jemand am Ende der
+    // Rückfahrt schon die nächste Karte an, fordert das eine FRISCHE Textur an —
+    // und ohne diesen Vergleich räumte der Rückruf dieser Bewegung sie eine
+    // Zehntelsekunde später wieder ab. Der nächste Übergang liefe dann
+    // ungeschützt UND zahlte den Abbau im Berührungs-Frame.
+    closingGenRef.current = {
+      results: layerGeneration("results"),
+      saved: layerGeneration("saved"),
+    };
+  }, [open]);
+
+  const everOpenedRef = useRef(false);
+
+  useEffect(() => {
+    if (open) {
+      everOpenedRef.current = true;
+      // Nicht nach einem festen Bild starten, sondern sobald der JS-Thread frei
+      // ist (gedeckelt). Gemessen am Ergebnis-Bildschirm: Der Commit, der den
+      // Inhalt anlegt, belegt den Thread rund 80ms; ein Bild Vorlauf lag mitten
+      // drin, und die Feder lief dagegen an. Nach der Umstellung fiel dort das
+      // schlechteste Bild WÄHREND der Bewegung von 25ms auf 8ms — also auf den
+      // Takt, ohne ein einziges verpasstes Bild. Hier gilt derselbe Aufbau.
+      // Kein Warten mehr auf einen freien Thread.
+      //
+      // Die Begründung dafür („der Commit, der den Inhalt anlegt, belegt den
+      // Thread rund 80ms") galt für Overlays, die beim Öffnen aufgebaut wurden.
+      // Dieses hier bleibt dauerhaft gemountet — es gibt beim Öffnen gar keinen
+      // Aufbau-Commit, auf den zu warten wäre. Die Wartezeit war damit reine
+      // Latenz zwischen Finger und Bewegung, und sie hatte einen garantierten
+      // Boden von zwei Bildern (die Schleife kann frühestens im zweiten rAF
+      // feuern). Ein Bild Vorlauf reicht, damit die nativen Ansichten stehen.
+      /**
+       * Hier wurde die Bewegung GESTARTET — jetzt läuft sie längst.
+       *
+       * `startDetailsPush` schickt sie im Berührungs-Frame los; wenn dieser
+       * Effekt dran ist, sind Speicher-Schreibvorgang, Neu-Rendern und Commit
+       * schon vorbei. Es bleibt nur noch zu vermerken, dass dieses Blatt den
+       * geteilten Parallax-Wert gesetzt hat — daran hängt unten die Frage, wer
+       * ihn zurücknehmen darf.
+       *
+       * Der Notausgang darunter ist für den Fall, dass jemand das Blatt öffnet,
+       * ohne über eine Karte zu gehen (Bo, eine Verknüpfung, das Wiederaufnehmen
+       * nach einem Umweg). Dann hat niemand die Bewegung angestoßen, und ohne
+       * ihn bliebe das Blatt für immer neben dem Sichtfeld stehen.
+       */
+      ownsCoverRef.current = true;
+      /**
+       * Beim Öffnen IMMER zurücksetzen, nicht nur am Ende der Rückfahrt.
+       *
+       * Gelöscht wurde die Marke bisher ausschließlich im Abschlussrückruf des
+       * Schließens — und der steigt bei `finished === false` früh aus. Tippt
+       * jemand mitten in der Rückfahrt schon die nächste Karte an, bricht die
+       * neue Bewegung die alte ab, der Rückruf meldet „nicht fertig", und
+       * `atRest` blieb auf wahr stehen. Damit hing der schwere Teilbaum wieder
+       * im Berührungs-Frame im Baum und der Netz-Beobachter wurde genau dann
+       * scharf, was beides ausdrücklich vermieden werden soll.
+       */
+      setAtRest(false);
+      if (!isDetailsPushStarted()) {
+        startDetailsPush();
+      }
+      return undefined;
+    }
+    /**
+     * Schließen: hinausfahren + Parallax zurück — bleibt gemountet.
+     *
+     * Der Merker VOR der Zuweisung: Seit die Bewegung im Tipp-Handler der Karte
+     * startet, kann sie laufen, ohne dass dieser Zweig sie je als „meine"
+     * verbucht hat — nämlich dann, wenn das Blatt danach doch nicht aufgeht
+     * (ein Direktfahrt-Ablauf schiebt sich dazwischen). Ohne diese Zeile bliebe
+     * der geteilte Parallax-Wert dann auf 1 stehen, und die Ergebnisliste
+     * darunter klebte dauerhaft um ihre Ausweich-Strecke verschoben.
+     */
+    /**
+     * Nie offen gewesen — es gibt nichts zu schließen.
+     *
+     * Diese Wirkung läuft auch beim EINHÄNGEN, und seit das Blatt im
+     * Berührungsfenster vorgebaut wird (`detailsPreload`), ist das Einhängen
+     * nicht mehr identisch mit dem Öffnen. Ohne diese Sperre lief der
+     * Schließ-Zweig beim Aufsetzen des Fingers los und rief `releaseUnderlayLayers()`
+     * — also ausgerechnet das Abräumen der Textur, die `prepareLayer` im selben
+     * Handler ein paar Anweisungen vorher angefordert hat. Der Vorbau hätte
+     * gegen sich selbst gearbeitet.
+     *
+     * Geparkt ist der richtige Zustand ohnehin schon: `detailsPush` steht auf 0,
+     * `atRest` auf falsch, kein Ausweich-Wert gehört uns.
+     */
+    if (!everOpenedRef.current) return undefined;
+
+    const wasMoving = isDetailsPushStarted();
+    setDetailsPushStopped();
+    if (!wasVisibleRef.current) {
+      // Verdeckt geschlossen — siehe wasVisibleRef. Ohne Bewegung, sonst wischt
+      // es über einen Bildschirm, mit dem es nichts zu tun hat.
+      detailsPush.value = 0;
+      releaseUnderlayLayers();
+      setAtRest(false);
+      if (ownsCoverRef.current || wasMoving) {
+        ownsCoverRef.current = false;
+        overlayCover.value = 0;
+      }
+      return undefined;
+    }
+    detailsPush.value = withTiming(0, POP_SPRING, (finished?: boolean) => {
+      "worklet";
+      // Die Textur der Unterlage lebt jetzt genau so lange wie die Bewegung.
+      //
+      // Vorher hing ihr Abbau an der allgemeinen Obergrenze von 1,4s. Die
+      // Rückfahrt dauert aber nur die Dauer von POP_SPRING — die Textur stand danach noch fast
+      // eine Sekunde über einer Fläche, die längst wieder scrollbar ist, und
+      // wurde mitten im Scrollen abgebaut. Das ist ein Ruckler, der zeitlich
+      // nichts mehr mit dem Blatt zu tun hat und deshalb wie zufällige Trägheit
+      // wirkt.
+      if (!finished) return;
+      runOnJS(releaseUnderlayLayers)();
+      // Erst JETZT — siehe armAtRest. Der schwere Teil des Baumes verschwindet
+      // damit, wenn nichts mehr in Bewegung ist.
+      runOnJS(setAtRest)(false);
+    });
+    // Nur zurücknehmen, wenn DIESES Overlay den geteilten Wert auch gesetzt hat.
+    // `screenWidth` steht in den Abhängigkeiten, also läuft dieser Zweig auch bei
+    // jeder Größenänderung (Drehen, Foldable, geteilter Bildschirm) — und zöge
+    // den Parallax dann auf 0, während ein ANDERES Overlay ihn gerade benutzt.
+    if (ownsCoverRef.current || wasMoving) {
+      ownsCoverRef.current = false;
+      overlayCover.value = withTiming(0, COVER_OUT_SPRING);
+    }
     return undefined;
-  }, [open, translateX, screenWidth]);
+  }, [open, screenWidth]);
 
   // Route-Detour („auf Karte zeigen" → andere Route): NUR den Parallax
   // zurücknehmen/wiederherstellen, OHNE die Slide neu zu triggern (translateX
   // bleibt bei 0 → Zurückkommen ist instant, kein Re-Slide-Lag). Das visuelle
   // Verstecken macht die Render-Wurzel via opacity. Erst-Mount übersprungen.
+  const ownsCoverRef = useRef(false);
   const coverMounted = useRef(false);
   useEffect(() => {
     if (!coverMounted.current) { coverMounted.current = true; return; }
     if (!open) return; // Schließen erledigt der Slide-Effekt oben
-    overlayCover.value = withTiming(hiddenForRoute ? 0 : 1, {
-      duration: COVER_DURATION,
-      easing: hiddenForRoute ? COVER_OUT_EASING : COVER_IN_EASING,
-    });
+    /**
+     * `withTiming`, nicht `withSpring` — die Namen täuschen.
+     *
+     * `COVER_IN_SPRING`/`COVER_OUT_SPRING` sind längst Zeit-Konfigurationen
+     * (`{ duration, easing }`); nur die Bezeichner sind von früher geblieben.
+     * Eine Feder kennt kein `easing`: Der Wert wurde verworfen und stattdessen
+     * mit der Vorgabe-Dämpfung gefedert — die schwingt um rund 16% über. Auf
+     * dem Umweg über die Karte lief der Parallax der Unterlage also als
+     * einziger nachfedernd, während alle anderen Stellen mit demselben Objekt
+     * exakt landen.
+     */
+    overlayCover.value = withTiming(
+      hiddenForRoute ? 0 : 1,
+      hiddenForRoute ? COVER_OUT_SPRING : COVER_IN_SPRING,
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hiddenForRoute]);
 
@@ -325,24 +541,85 @@ const DetailsContent = memo(function DetailsContent({
   useEffect(() => {
     if (Platform.OS !== "android") return;
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
-      if (!open) return false; // nicht offen → System-Back durchlassen
+      // `hiddenForRoute` MIT prüfen: Beim Sprung auf die Karte bleibt dieses
+      // Overlay absichtlich offen, nur unsichtbar. Ohne die Prüfung schluckte es
+      // dort den Zurück-Druck — der Nutzer drückte zweimal, ohne dass etwas
+      // geschah, und kam anschließend ohne seinen Overlay-Stapel zurück.
+      if (!open || hiddenForRoute) return false;
       close();
       return true;
     });
     return () => sub.remove();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [open, hiddenForRoute]);
 
   // Zwei-Phasen-Render gegen Mount-Lag während des Slide-In.
-  const [contentReady, setContentReady] = useState(false);
-  useEffect(() => {
-    const id = setTimeout(() => setContentReady(true), 320);
-    return () => clearTimeout(id);
+  //
+  // Hier stand `setTimeout(320)`. Das war doppelt daneben:
+  //
+  //   • Die Slide dauert PUSH_SPRING lang. Nach 320ms ist sie noch
+  //     unterwegs — der Commit fiel also genau in die Bewegung, die er
+  //     entlasten sollte. Ausgerechnet app/search/results.tsx verwirft diesen
+  //     Ansatz namentlich („kein hartcodiertes setTimeout(320), das je nach
+  //     Mount-Speed zu früh oder zu spät feuern könnte").
+  //   • Der Zeitgeber hängt am MOUNT. Dieser Baum bleibt aber gemountet, also
+  //     lief er genau einmal im Leben der App; ab dem zweiten Öffnen gab es gar
+  //     kein Gate mehr.
+  //
+  // Jetzt hängt es am Ende der Bewegung — einmal freigegeben, bleibt es frei
+  // (der Baum steht ja weiter).
+  /**
+   * Steht das Blatt STILL?
+   *
+   * Hier hing beides an `contentReady`: Der Wert fiel bei halbem Weg und blieb
+   * danach für immer wahr, weil der Baum dauerhaft steht. Für einen Netzabruf
+   * und für einen schweren Teilbaum taugt das nicht — beim zweiten und jedem
+   * weiteren Öffnen war er längst wahr, beides lief also schon im
+   * Berührungs-Frame los: die Anfrage, das Einhängen der Anbieter-Karten und
+   * deren Dauerschleifen auf dem UI-Strang.
+   *
+   * Dieser Wert folgt stattdessen der Bewegung. Er ist nur im Stillstand wahr,
+   * beim ersten wie beim hundertsten Mal.
+   */
+  const [atRest, setAtRest] = useState(false);
+  /**
+   * NUR die steigende Flanke, und die zwei Bilder verzögert.
+   *
+   * Vorher meldete diese Stelle auch das Losfahren — `atRest` fiel damit im
+   * ERSTEN Bild der Rückfahrt auf falsch und riss den schweren Teil des Baumes
+   * mitten in der Bewegung wieder heraus. Das erklärt, warum das Zurückfahren
+   * schlechter lief als das Hereinfahren. Zurückgesetzt wird jetzt am ENDE der
+   * Rückfahrt, im Abschluss-Rückruf weiter unten — dann bewegt sich nichts mehr.
+   *
+   * Die zwei Bilder Abstand sind der zweite Teil: Der Rückruf kommt zwar mit dem
+   * letzten Wert, die Komposition dieses Bildes kann aber noch offen sein. Der
+   * Commit, der die Anbieter-Karten einhängt, fiele sonst genau hinein.
+   */
+  const armAtRest = useCallback(() => {
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        // In den zwei Bildern kann schon wieder geschlossen worden sein — dann
+        // hinge der schwere Teilbaum ausgerechnet in die Rückfahrt hinein.
+        if (isDetailsPushStarted()) setAtRest(true);
+      }),
+    );
   }, []);
+  useAnimatedReaction(
+    () => detailsPush.value >= 0.999,
+    (v, prev) => {
+      if (v && prev === false) runOnJS(armAtRest)();
+    },
+  );
+  // Der zweite Mapper hier ist ersatzlos entfallen. Er las den Fortschritt in
+  // JEDEM Bild, um bei halbem Weg einmal `contentReady` zu setzen — ein
+  // vollflächiger Auswerter pro Bild für ein einziges Ereignis. `atRest` oben
+  // beantwortet dieselbe Frage besser und braucht nur die eine Flanke.
 
   const dateLocale = DATE_LOCALES[locale] ?? enGB;
   const carrier = displayProvider(result);
-  const urls = logoUrls(result, carrier);
+  // Memoisiert, sonst ist es bei jedem Render ein NEUES Array — und damit eine
+  // Abhängigkeit, die jedes Memo darunter wertlos macht.
+  const urls = useMemo(() => logoUrls(result, carrier), [result, carrier]);
   const [logoIdx, setLogoIdx] = useState(0);
   const ModeIcon = MODE_ICON[result.mode] ?? Plane;
   // `favored` kommt jetzt als primitive Prop vom Outer-Component — der
@@ -415,13 +692,27 @@ const DetailsContent = memo(function DetailsContent({
         lang: locale,
         searchPrice: result.price,
       }),
-    // `open` im Gate: geparkt (keep-mounted, zu) soll KEIN Query-Observer
-    // aktiv sein und nichts refetchen.
-    enabled: open && isFlight && !!bookingToken,
+    /**
+     * Zwei Riegel, und der zweite ist neu.
+     *
+     * `open`: Geparkt (dauerhaft gemountet, aber zu) soll kein Beobachter aktiv
+     * sein und nichts nachladen.
+     *
+     * `atRest`: erst NACH der Bewegung. Ohne das wurde der Beobachter in
+     * dem Moment scharf, in dem das Blatt losfährt — und wenn der Server schnell
+     * antwortet (oder das Vorabholen aus der Karte gerade eintrifft), landet die
+     * Antwort mitten in der Fahrt: eine Antwort auf dem JS-Thread zerlegen,
+     * Zwischenspeicher schreiben, diesen Baum neu rendern, alles in denselben
+     * Bildern, in denen die Bewegung laufen soll. Dieselbe Begründung steht
+     * ausführlich am Suchlauf des Ergebnis-Bildschirms; dort war es derselbe
+     * Fehler. Das Vorabholen im Tipp-Handler der Karte bleibt — die Daten sind
+     * also meist schon da und werden hier nur noch abgeholt.
+     */
+    enabled: open && atRest && isFlight && !!bookingToken,
     staleTime: 5 * 60_000,
     retry: 1,
   });
-  const remoteOptions = optionsQuery.data?.options ?? [];
+  const remoteOptions = optionsQuery.data?.options ?? NO_OPTIONS;
 
   useEffect(() => {
     return () => {
@@ -440,7 +731,10 @@ const DetailsContent = memo(function DetailsContent({
 
   const flightOptionsLoading = isFlight && !!bookingToken && optionsQuery.isLoading;
 
-  const providerList: ProviderRow[] = (() => {
+  // Memoisiert: map + sort + Mutation liefen bei JEDEM Render — und dieser Baum
+  // bleibt seit keep-mounted dauerhaft stehen, rendert also bei jedem
+  // Query-Zustand, jedem Logo-Fehlschlag und jedem Theme-/Sprachwechsel neu.
+  const providerList: ProviderRow[] = useMemo(() => {
     if (isFlight && remoteOptions.length > 0) {
       const rows = remoteOptions.map((o) => toProviderRow(o, bookUrl));
       // Kein Infinity: zwei preislose Anbieter ergäben `Infinity - Infinity` = NaN,
@@ -466,7 +760,17 @@ const DetailsContent = memo(function DetailsContent({
         checked: result.mode !== "FLIGHT",
       },
     ];
-  })();
+  }, [
+    isFlight,
+    remoteOptions,
+    bookUrl,
+    flightOptionsLoading,
+    carrier,
+    result.price,
+    result.currency,
+    result.mode,
+    urls,
+  ]);
 
   const providerCount = providerList.length;
   const providerCountLabel =
@@ -513,7 +817,21 @@ const DetailsContent = memo(function DetailsContent({
         // Höher als StopDetailSheet (zIndex 100, elevation 16) damit der
         // Overlay GANZ VORNE liegt, wenn er via Departure-Tap aus dem
         // Surroundings-Sheet geöffnet wird.
-        { zIndex: 200, elevation: 24 },
+        /**
+         * `elevation` NUR während der Bewegung.
+         *
+         * Dauerhaft gesetzt verlangt es von Android auf einer
+         * bildschirmfüllenden Ansicht mit Rundung und Beschnitt in JEDEM Bild
+         * einen Schattenpass — auch im Ruhezustand, in dem gescrollt wird. Die
+         * Ergebnisliste hat genau das an ihrer Wurzel deshalb entfernt, mit
+         * ausformulierter Begründung („ein guter Teil der Zähigkeit"); dieses
+         * Blatt war das einzige, das es behalten hat. Der Ortspicker macht es
+         * schon richtig (`elevation: layered ? 32 : 0`).
+         *
+         * Gebraucht wird der Schatten nur, während die Kante sichtbar über die
+         * Unterlage läuft — im Stand deckt das Blatt ohnehin alles.
+         */
+        { zIndex: 200, elevation: atRest ? 0 : 24 },
         // Gerundete Ecken beim Reinsliden — reiner Transform-View, clipToOutline
         // ist günstig (siehe SCREEN_CORNER_RADIUS).
         //
@@ -524,16 +842,16 @@ const DetailsContent = memo(function DetailsContent({
         // Rausgleiten wieder eckig WIRKT. Mit Background wird die Outline rund und
         // der Schatten folgt der Rundung. (results hat kein elevation,
         // TicketDetailOverlay hat den Background schon.)
-        { backgroundColor: C.bg, borderRadius: SCREEN_CORNER_RADIUS, overflow: "hidden" },
+        { backgroundColor: palette.bg, borderRadius: SCREEN_CORNER_RADIUS, overflow: "hidden" },
         slideStyle,
       ]}
     >
-      <SafeAreaView style={styles.root} edges={["top"]}>
+      <SafeAreaView style={[styles.root, { backgroundColor: palette.bg }]} edges={["top"]}>
         {/* Header: runde 40×40-Icon-Buttons, Heart wird beim Save komplett
             lime mit schwarzem Icon (kräftigeres Visual als nur Heart-Fill). */}
         <View style={styles.header}>
           <View style={styles.headerLeft}>
-            <RippleTouch onPress={onClose} hitSlop={6} style={styles.roundBtn}>
+            <RippleTouch onPress={onClose} hitSlop={6} style={[styles.roundBtn, { backgroundColor: palette.s2 }]}>
               <ArrowLeft color={C.text} size={20} strokeWidth={2} />
             </RippleTouch>
             <Text style={styles.title} numberOfLines={1}>
@@ -541,13 +859,13 @@ const DetailsContent = memo(function DetailsContent({
             </Text>
           </View>
           <View style={styles.headerRight}>
-            <RippleTouch onPress={onShare} hitSlop={6} style={styles.roundBtn}>
+            <RippleTouch onPress={onShare} hitSlop={6} style={[styles.roundBtn, { backgroundColor: palette.s2 }]}>
               <Share2 color={C.text} size={18} strokeWidth={2} />
             </RippleTouch>
             <RippleTouch
               onPress={onToggleFav}
               hitSlop={6}
-              style={styles.roundBtn}
+              style={[styles.roundBtn, { backgroundColor: palette.s2 }]}
             >
               <Heart
                 color={favored ? C.red : C.text}
@@ -561,7 +879,7 @@ const DetailsContent = memo(function DetailsContent({
 
         <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
           {/* Route-Card */}
-          <View style={styles.routeCard}>
+          <View style={[styles.routeCard, { backgroundColor: palette.s2 }]}>
             <View style={{ gap: 10 }}>
               <CityRow head={origin.head} tail={origin.tail} />
               <View style={styles.dividerSoft} />
@@ -649,13 +967,29 @@ const DetailsContent = memo(function DetailsContent({
             ) : null}
           </View>
 
-          {contentReady ? (
+          {/*
+            An `atRest`, nicht mehr an einem Wert, der bei halbem Weg fällt.
+            
+            Der alte Riegel wurde bei 50% freigegeben und blieb danach für immer
+            offen. Das hatte zwei Folgen, und beide waren schlecht: Beim ersten Öffnen
+            entstand dieser ganze Teilbaum MITTEN in der Bewegung — die einzige
+            Stelle, an der während der Fahrt überhaupt neues Layout gerechnet
+            wird. Und ab dem zweiten Öffnen war er dauerhaft da, das bewegte
+            Blatt also bei jeder weiteren Fahrt entsprechend größer und teurer
+            pro Bild.
+            
+            `atRest` gilt nur im Stillstand: Während der Fahrt fährt nur der Kopf
+            samt Routenkarte mit, der Rest kommt danach. Beim Schließen bleibt er
+            bis zum Ende stehen (siehe oben) — herausgerissen wird nichts,
+            während man zusieht.
+          */}
+          {atRest ? (
             <>
               {!isDirect && !pending ? (
                 <>
                   <SectionHeader title={t("details.goodtoknow")} />
                   <View style={styles.sectionContent}>
-                    <View style={styles.infoRow}>
+                    <View style={[styles.infoRow, { backgroundColor: palette.s2 }]}>
                       <View style={styles.infoBadge}>
                         <AlertTriangle color={C.alert} size={16} strokeWidth={2.4} />
                       </View>
@@ -825,6 +1159,7 @@ function ProviderCard({
   t: (key: string) => string;
 }) {
   const accent = useAccent();
+  const palette = usePalette();
   // Wenn das Logo-Bild fehlerhaft lädt, fallen wir nach dem onError auf
   // den 2-Letter-Code-Fallback zurück. Verhindert dass die Provider-Card
   // mit einer leeren transparenten Logo-Box endet.
@@ -854,6 +1189,7 @@ function ProviderCard({
     <View
       style={[
         styles.providerCard,
+        { backgroundColor: palette.s2 },
         isRec && styles.providerCardRecommended,
         isRec && { borderColor: accent.solid },
       ]}
@@ -908,7 +1244,7 @@ function ProviderCard({
 
       {/* 24/7-Service Pille — nur wenn der Anbieter dafür bekannt ist. */}
       {showSupport ? (
-        <View style={styles.serviceRow}>
+        <View style={[styles.serviceRow, { backgroundColor: palette.s3 }]}>
           <View style={[styles.serviceCheck, { backgroundColor: accent.subtle }]}>
             <Check size={11} color={accent.solid} strokeWidth={3.2} />
           </View>
@@ -981,6 +1317,7 @@ function BaggageCell({ active, icon }: { active: boolean; icon: "carryOn" | "che
  * Card, sodass User sehen „mehr Anbieter werden gerade geladen".
  */
 function ProviderCardSkeleton() {
+  const palette = usePalette();
   const pulse = useSharedValue(0.5);
   useEffect(() => {
     pulse.value = withRepeat(withTiming(0.9, { duration: 900 }), -1, true);
@@ -992,17 +1329,17 @@ function ProviderCardSkeleton() {
   }, [pulse]);
   const pulseStyle = useAnimatedStyle(() => ({ opacity: pulse.value }));
   return (
-    <View style={styles.providerCard}>
+    <View style={[styles.providerCard, { backgroundColor: palette.s2 }]}>
       <View style={styles.providerHeader}>
         <View style={styles.providerLeft}>
-          <Animated.View style={[styles.skeletonLogo, pulseStyle]} />
+          <Animated.View style={[styles.skeletonLogo, { backgroundColor: palette.s3 }, pulseStyle]} />
           <View style={{ flex: 1, gap: 6 }}>
-            <Animated.View style={[styles.skeletonLineLg, pulseStyle]} />
-            <Animated.View style={[styles.skeletonLineSm, pulseStyle]} />
+            <Animated.View style={[styles.skeletonLineLg, { backgroundColor: palette.s3 }, pulseStyle]} />
+            <Animated.View style={[styles.skeletonLineSm, { backgroundColor: palette.s3 }, pulseStyle]} />
           </View>
         </View>
         <View style={{ alignItems: "flex-end", gap: 6 }}>
-          <Animated.View style={[styles.skeletonLabel, pulseStyle]} />
+          <Animated.View style={[styles.skeletonLabel, { backgroundColor: palette.s3 }, pulseStyle]} />
           <Animated.View style={[styles.skeletonPrice, pulseStyle]} />
         </View>
       </View>
@@ -1020,7 +1357,7 @@ function SectionHeader({ title, caption }: { title: string; caption?: string }) 
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   root: { flex: 1, backgroundColor: C.bg },
 
   /* Header */

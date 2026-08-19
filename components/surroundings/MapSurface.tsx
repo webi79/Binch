@@ -1,7 +1,6 @@
-import { ReactNode, forwardRef, memo, useImperativeHandle, useRef } from "react";
+import { ReactNode, forwardRef, memo, useCallback, useEffect, useImperativeHandle, useRef } from "react";
 import { StyleSheet, type NativeSyntheticEvent } from "react-native";
 import { Map, Camera, Images, type CameraRef } from "@maplibre/maplibre-react-native";
-import { USER_LOC } from "@/lib/surroundings/mockData";
 import { DARK_MAP_STYLE } from "./mapStyle";
 
 /**
@@ -75,6 +74,17 @@ interface Props {
    *  sind. Vor diesem Event zeigt die Surface ggf. nur leere Tiles —
    *  Parent kann ein Skelett darüber halten bis das echte Bild da ist. */
   onMapRendered?: () => void;
+  /**
+   * Wo die Kamera STARTET.
+   *
+   * Hier stand fest verdrahtet Berlin Hbf. Der Bildschirm darüber wartet
+   * eigens auf die Ortung, bevor er die Karte einhängt, mit der ausdrücklichen
+   * Begründung „`initialViewState` bekommt die Nutzerkoordinate" — bekam es
+   * aber nie. Die Karte startete also für JEDEN Nutzer in Berlin, lud dort
+   * einen Kachelsatz und wurde erst danach per Flug an die richtige Stelle
+   * geschoben. Genau der Ablauf, den der Kommentar verhindern wollte.
+   */
+  initialCenter?: { latitude: number; longitude: number };
 }
 
 /**
@@ -83,11 +93,37 @@ interface Props {
  * (siehe `mapStyle.ts`).
  */
 const MapSurfaceInner = forwardRef<MapSurfaceHandle, Props>(function MapSurface(
-  { children, onRegionChange, onMapRendered },
+  { children, onRegionChange, onMapRendered, initialCenter },
   ref,
 ) {
   const cameraRef = useRef<CameraRef>(null);
   const renderedFiredRef = useRef(false);
+  /** Frist des schwächeren Signals — siehe `onDidFinishRenderingMap` unten. */
+  const fallbackRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onMapRenderedRef = useRef(onMapRendered);
+  onMapRenderedRef.current = onMapRendered;
+  const markRendered = useCallback(() => {
+    if (renderedFiredRef.current) return;
+    renderedFiredRef.current = true;
+    if (fallbackRef.current) clearTimeout(fallbackRef.current);
+    onMapRenderedRef.current?.();
+  }, []);
+  /**
+   * Letzte Notbremse: Kommt gar kein Signal, geben wir nach vier Sekunden frei.
+   *
+   * `markRendered` hing vorher über `onMapRendered` an einer Pfeilfunktion, die
+   * der Aufrufer bei jedem Render neu anlegt — der Zeitgeber wurde also bei
+   * jedem Render abgeräumt und neu gestartet und griff ausgerechnet im
+   * Zappel-Fall nie, für den er gedacht ist. Über einen Ref hängt er an nichts
+   * mehr.
+   */
+  useEffect(() => {
+    const id = setTimeout(markRendered, 4000);
+    return () => {
+      clearTimeout(id);
+      if (fallbackRef.current) clearTimeout(fallbackRef.current);
+    };
+  }, [markRendered]);
 
   useImperativeHandle(
     ref,
@@ -97,6 +133,17 @@ const MapSurfaceInner = forwardRef<MapSurfaceHandle, Props>(function MapSurface(
           center: [longitude, latitude],
           zoom,
           duration: 600,
+          /**
+           * `ease` statt der Vorgabe `fly`.
+           *
+           * `flyTo` setzt in der Bibliothek von sich aus `easing: "fly"`, und
+           * das ist auf Android die van-Wijk-Flugbahn: erst herauszoomen, quer
+           * hinüber, wieder hineinzoomen. Unterwegs lädt die Karte JEDE
+           * Zwischenstufe der Kachel-Pyramide — bei einem Sprung über mehrere
+           * Zoomstufen ein Vielfaches dessen, was am Ziel gebraucht wird.
+           * `ease` interpoliert linear, ohne Zoom-Ausflug.
+           */
+          easing: "ease",
         });
       },
       fitBounds: (sw, ne, paddingPx = 60) => {
@@ -106,6 +153,7 @@ const MapSurfaceInner = forwardRef<MapSurfaceHandle, Props>(function MapSurface(
           {
             padding: { top: paddingPx, bottom: paddingPx, left: paddingPx, right: paddingPx },
             duration: 800,
+            easing: "ease",
           },
         );
       },
@@ -134,16 +182,42 @@ const MapSurfaceInner = forwardRef<MapSurfaceHandle, Props>(function MapSurface(
         // Feuert wenn alle sichtbaren Tiles geladen + die Karte einmal
         // vollständig gepaintet ist. Nur einmal aufrufen — danach feuert
         // das Event bei jedem Pan/Zoom erneut.
-        if (renderedFiredRef.current) return;
-        renderedFiredRef.current = true;
-        onMapRendered?.();
+        markRendered();
+      }}
+      /**
+       * Zweites, SCHWÄCHERES Signal — und es darf das Skelett nicht sofort
+       * wegnehmen.
+       *
+       * Nativ sind das zwei verschiedene Ereignisse (MLRNMapView.kt: `if (fully)
+       * … else …`). Das Nicht-Fully feuert beim ERSTEN gemalten Bild — da liegt
+       * nur die Hintergrund-Ebene des Stils auf dem Schirm, keine einzige
+       * Kachel. Es hier direkt durchzureichen hieß: Das Skelett verschwindet
+       * nach 280ms, und der Nutzer schaut den Kacheln beim Eintrudeln zu. Bei
+       * gemessenen 0,3 bis 4,7 Sekunden pro Kachelsatz sind das mehrere Sekunden
+       * dunkle Fläche. An der Netzzeit hat sich dabei nichts geändert — nur die
+       * Enthüllung. Genau das ist die „auf einmal lädt die Karte so langsam".
+       *
+       * Gebraucht wird es trotzdem: Ohne Netz oder bei nicht erreichbarem
+       * Kachel-Server kommt NUR dieses Ereignis, und das Skelett bliebe sonst
+       * für immer liegen. Also als Ausweg mit Frist — kommt in 2 Sekunden kein
+       * „Fully", gibt es frei.
+       */
+      onDidFinishRenderingMap={() => {
+        if (fallbackRef.current) return;
+        fallbackRef.current = setTimeout(markRendered, 2000);
       }}
     >
       <Camera
         ref={cameraRef}
         initialViewState={{
-          center: [USER_LOC.longitude, USER_LOC.latitude],
-          zoom: 13,
+          // Ohne bekannten Standort bleibt es bei einem weit herausgezoomten
+          // Blick statt bei einer fremden Stadt: Das ist ehrlicher als ein Ort,
+          // an dem der Nutzer nicht ist, und lädt keinen Kachelsatz, den
+          // niemand braucht.
+          center: initialCenter
+            ? [initialCenter.longitude, initialCenter.latitude]
+            : [0, 20],
+          zoom: initialCenter ? 13 : 1,
         }}
       />
       <Images

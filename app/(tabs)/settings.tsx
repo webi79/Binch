@@ -1,18 +1,45 @@
-import { ReactNode, useState } from "react";
+import { ReactNode, createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { subscribeLayer, prepareLayer } from "@/lib/nav/transitionLayer";
 import {
+  preloadSettingsSub,
+  subscribeSettingsPreload,
+  type SettingsSubId,
+} from "@/lib/nav/settingsPreload";
+import { OnFocusLost } from "@/lib/nav/FocusSentinel";
+import {
+  Platform,
+  BackHandler,
   View,
   Text,
   Pressable,
   ScrollView,
   StyleSheet,
+  useWindowDimensions,
   Switch,
   Linking,
   Image,
   ActivityIndicator,
+  type StyleProp,
+  type ViewStyle,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
-import { RevealScrollView, ScreenEntrance, ScrollReveal } from "@/lib/motion";
-import { GUTTER, SPACE } from "@/lib/theme/spacing";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+import Animated, {
+  runOnJS,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from "react-native-reanimated";
+import { usePressBounce } from "@/lib/motion";
+import { forgetSocialSession } from "@/lib/auth/socialSignIn";
+import {
+  PUSH_SPRING,
+  POP_SPRING,
+  SCREEN_CORNER_RADIUS,
+  UNDERLAY_TRAVEL_FRAC,
+  settingsPush,
+} from "@/lib/nav/overlayCover";
+import { GUTTER, SPACE, HEADING_TOP, HEADING_GAP, useNavbarSpace } from "@/lib/theme/spacing";
+import { ScreenHeading } from "@/components/ui/ScreenHeading";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
 import Svg, { Circle, Path, Rect } from "react-native-svg";
@@ -32,11 +59,13 @@ import {
 } from "lucide-react-native";
 import { useSearchStore, Locale } from "@/stores/searchStore";
 import { useAccent, ACCENT_LIST, type AccentId } from "@/lib/theme/accent";
+import { useAppBg, usePalette } from "@/lib/theme/appBg";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
 import { authLogout, authUpdateAvatar } from "@/lib/api/client";
 import { showAlert } from "@/lib/alert";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const C = {
   bg: "#1A1A1A",
@@ -64,31 +93,108 @@ function makeInitials(firstName: string, lastName: string): string {
 type SubScreen = "details" | "settings" | "support" | null;
 
 export default function SettingsScreen() {
-  const [sub, setSub] = useState<SubScreen>(null);
+  const t = useT();
+  const appBg = useAppBg();
 
-  const back = () => {
-    haptic("button");
-    setSub(null);
-  };
+  // Beim VERLASSEN des Tabs auf den Hub zurücksetzen: Sonst bleibt der zuletzt
+  // geöffnete Unterscreen (Details/Einstellungen/Support) stehen und man landet
+  // beim nächsten Tab-Wechsel wieder dort statt im Profil-Hub. Beim Verlassen
+  // (statt beim Betreten) zurücksetzen, damit man den Wechsel nicht sieht — der
+  // Screen blendet zu dem Zeitpunkt ohnehin gerade weg.
+  // Über <OnFocusLost/> statt useIsFocused() hier oben: Der Hook an dieser
+  // Stelle rendete den GESAMTEN Settings-Screen zweimal pro Tab-Wechsel neu
+  // (inkl. der nicht memoisierten Hub-Kacheln samt SVG-Illustrationen) — mitten
+  // im Wechsel-Frame. Die Sentinel-Komponente rendert stattdessen nur sich
+  // selbst; sie steht unten im JSX.
+
+  const setSettingsSub = useSearchStore((st) => st.setSettingsSub);
+
   const navTo = (id: Exclude<SubScreen, null>) => {
     haptic("button");
-    setSub(id);
+    // NUR den Speicher setzen. Die Bewegung startet die Überlagerung selbst, ein
+    // Bild später — siehe dort. Hier gestartet lief sie gegen den Aufbau des
+    // Unterschirms an, und der ist ein großer Baum mit eigenen Grafiken.
+    setSettingsSub(id);
   };
 
+  const { width: screenW } = useWindowDimensions();
+  const navbarSpace = useNavbarSpace();
+  /**
+   * Der Hub weicht um 30% nach links — derselbe Anteil wie überall sonst.
+   *
+   * Der Unterschirm selbst liegt NICHT mehr hier, sondern am Wurzel-Layout
+   * (siehe SettingsSubOverlay unten). Nur von dort deckt er die native
+   * Tab-Leiste mit ab; im Tab-Container endete er über ihr, und seine
+   * gerundeten Ecken standen mitten im Bild.
+   */
+  const hubStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: settingsPush.value * screenW * UNDERLAY_TRAVEL_FRAC }],
+  }));
+
+  // Keine gestaffelte Einblend-Welle mehr — siehe Landingscreen.
   return (
-    <ScreenEntrance>
-    <SafeAreaView style={styles.safe} edges={["top"]}>
-      <RevealScrollView
-        contentContainerStyle={{ paddingBottom: 90 }}
-        showsVerticalScrollIndicator={false}
-      >
-        {sub === null && <Hub onNav={navTo} />}
-        {sub === "details" && <DetailsScreen onBack={back} />}
-        {sub === "settings" && <SettingsSubScreen onBack={back} />}
-        {sub === "support" && <SupportSubScreen onBack={back} />}
-      </RevealScrollView>
+    <>
+    <OnFocusLost
+      run={() => {
+        // Ohne Bewegung zurücksetzen — der Tab blendet ohnehin gerade weg.
+        setSettingsSub(null);
+        settingsPush.value = 0;
+      }}
+    />
+    <SafeAreaView style={[styles.safe, { backgroundColor: appBg }]} edges={["top"]}>
+      {/* Die Überschrift liegt MIT im Hub, nicht darüber.
+          Sonst bliebe „Profil" stehen, während der Unterschirm darunter
+          hereinfährt — und der Hub würde nur zur Hälfte ausweichen. So wandert
+          der ganze Tab als ein Körper nach links, und der Unterschirm deckt ihn
+          vollständig ab, Überschrift eingeschlossen. */}
+      <View style={styles.stack}>
+        <HubLayer style={[styles.layer, hubStyle]}>
+          <View style={{ paddingHorizontal: GUTTER, paddingTop: HEADING_TOP }}>
+            <ScreenHeading>{t("bottomnav.settings")}</ScreenHeading>
+          </View>
+          <Animated.ScrollView
+            // Reanimated setzt auf seinen Scroll-Flächen ungefragt
+            // scrollEventThrottle=1, also EIN Ereignis pro Bild — bei 120Hz 120
+            // pro Sekunde zum JS-Thread, für eine Fläche ganz ohne onScroll.
+            scrollEventThrottle={16}
+            contentContainerStyle={{ paddingBottom: navbarSpace }}
+            showsVerticalScrollIndicator={false}
+          >
+            <Hub onNav={navTo} />
+          </Animated.ScrollView>
+        </HubLayer>
+
+      </View>
     </SafeAreaView>
-    </ScreenEntrance>
+    </>
+  );
+}
+
+/**
+ * Die wandernde Ebene des Hubs — als eigene Komponente, wegen der Textur.
+ *
+ * Der Profil-Hub war die EINZIGE Unterlage der App ohne GPU-Textur. Landing,
+ * Saved und Ergebnisliste hängen alle am Textur-Modul; hier wurde eine
+ * Scroll-Fläche mit Profilkarte und drei Kachel-Illustrationen (zusammen rund 40
+ * SVG-Knoten) 30% der Breite weit verschoben und dabei jedes Bild neu
+ * gezeichnet — der im Projekt mit 14,7ms vermessene Fall gegen ein Budget von
+ * 8,3ms.
+ *
+ * Eigene Komponente aus demselben Grund wie bei den drei anderen: Läge der
+ * Zustand im Bildschirm selbst, rendete dessen kompletter Baum im
+ * Berührungs-Frame neu — genau das, was die Textur verhindern soll.
+ */
+function HubLayer({ style, children }: { style: StyleProp<ViewStyle>; children: ReactNode }) {
+  const [layered, setLayered] = useState(false);
+  useEffect(() => subscribeLayer("settings", setLayered), []);
+  return (
+    <Animated.View
+      style={style}
+      collapsable={false}
+      renderToHardwareTextureAndroid={Platform.OS === "android" && layered}
+    >
+      {children}
+    </Animated.View>
   );
 }
 
@@ -97,6 +203,11 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
   const accent = useAccent();
   const t = useT();
   const isAuthed = useSearchStore((s) => s.authUser !== null);
+  /** Druck-Effekt wie an den Kacheln im Landingscreen. */
+  const signOutBounce = usePressBounce();
+  /** Und am Anmelden-Knopf, der an derselben Stelle steht, wenn niemand
+   *  angemeldet ist — er war vorhin schlicht übersehen. */
+  const signInBounce = usePressBounce();
   const token = useSearchStore((s) => s.authToken);
   const clearAuth = useSearchStore((s) => s.clearAuth);
   const openAuth = useSearchStore((s) => s.openAuthOverlay);
@@ -127,6 +238,9 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
               }
             }
             clearAuth();
+            // Auch die Verknüpfung zum Google-Konto lösen — sonst bekommt man
+            // beim nächsten Anmelden keine Kontoauswahl mehr. Siehe dort.
+            void forgetSocialSession();
           },
         },
       ],
@@ -135,53 +249,65 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
 
   return (
     <View>
-      {/* Der Hub ist das, was beim Tab-Wechsel erscheint — hier MUSS die Welle
-          laufen. Vorher lagen die Reveals nur im Detail-Unterscreen, den man
-          erst öffnen muss; der Tab selbst blendete gar nicht ein und fühlte sich
-          dadurch völlig anders an als Home. */}
-      <ScrollReveal index={0}>
+
         <ProfileCard />
-      </ScrollReveal>
 
       {/* Spacer matching the hidden "Bereiche" label slot in the design */}
       <View style={{ height: 30 }} />
 
       <View style={{ paddingHorizontal: GUTTER }}>
         {tiles.map((tile, idx) => (
-          <ScrollReveal key={tile.id} index={1 + idx} style={{ marginBottom: idx < tiles.length - 1 ? 8 : 0 }}>
+          <View key={tile.id} style={{ marginBottom: idx < tiles.length - 1 ? 8 : 0 }}>
             <SectionCard
               title={t(tile.titleKey)}
               desc={t(tile.descKey)}
               illu={tile.illu}
               onPress={() => onNav(tile.id)}
+              preloadId={tile.id}
             />
-          </ScrollReveal>
+          </View>
         ))}
       </View>
 
       <View style={styles.divider} />
-      <ScrollReveal index={4}>
+
+      {/* Der Druck-Effekt am Abmelden-Knopf hängt am Aufsetzen, nicht an
+          `onPressIn` — RippleTouch hält das um 50ms zurück, und ein Tipp ist
+          meist kürzer. */}
       {isAuthed ? (
-        <RippleTouch
-          onPress={onSignOut}
-          style={({ pressed }) => [styles.signOut, pressed && { opacity: 0.7 }]}
+        <Animated.View
+          style={signOutBounce.style}
+          onTouchStart={signOutBounce.onPressIn}
+          onTouchEnd={signOutBounce.onPressOut}
+          onTouchCancel={signOutBounce.onPressOut}
         >
-          <LogOut size={18} color={C.red} strokeWidth={2} />
-          <Text style={styles.signOutText}>{t("settings.signout")}</Text>
-        </RippleTouch>
+          <RippleTouch
+            onPress={onSignOut}
+            style={({ pressed }) => [styles.signOut, pressed && { opacity: 0.7 }]}
+          >
+            <LogOut size={18} color={C.red} strokeWidth={2} />
+            <Text style={styles.signOutText}>{t("settings.signout")}</Text>
+          </RippleTouch>
+        </Animated.View>
       ) : (
-        <RippleTouch
-          onPress={() => {
-            haptic("button");
-            openAuth();
-          }}
-          style={({ pressed }) => [styles.signIn, pressed && { opacity: 0.7 }]}
+        <Animated.View
+          style={signInBounce.style}
+          onTouchStart={signInBounce.onPressIn}
+          onTouchEnd={signInBounce.onPressOut}
+          onTouchCancel={signInBounce.onPressOut}
         >
-          <LogIn size={18} color={accent.solid} strokeWidth={2} />
-          <Text style={[styles.signInText, { color: accent.solid }]}>{t("auth.guest.cta")}</Text>
-        </RippleTouch>
+          <RippleTouch
+            onPress={() => {
+              haptic("button");
+              openAuth();
+            }}
+            style={({ pressed }) => [styles.signIn, pressed && { opacity: 0.7 }]}
+          >
+            <LogIn size={18} color={accent.solid} strokeWidth={2} />
+            <Text style={[styles.signInText, { color: accent.solid }]}>{t("auth.guest.cta")}</Text>
+          </RippleTouch>
+        </Animated.View>
       )}
-      </ScrollReveal>
 
       <Text style={styles.versionText}>{t("settings.app.version")}</Text>
     </View>
@@ -190,6 +316,7 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
 
 function ProfileCard() {
   const accent = useAccent();
+  const palette = usePalette();
   const t = useT();
   const user = useSearchStore((s) => s.authUser);
   const openAuth = useSearchStore((s) => s.openAuthOverlay);
@@ -207,16 +334,24 @@ function ProfileCard() {
   };
 
   return (
-    <View style={styles.profileCard}>
+    <View style={[styles.profileCard, { backgroundColor: palette.s1 }]}>
       <View style={styles.profileTopRow}>
         <View style={{ flex: 1, paddingRight: 12 }}>
           <Text style={styles.eyebrow}>{t("settings.account").toUpperCase()}</Text>
           {isAuthed ? (
             <>
-              <Text style={styles.profileName}>
-                {user.firstName}
-                {"\n"}
-                {user.lastName}
+              {/**
+                * EIN Text, kein fest eingebauter Umbruch.
+                *
+                * Hier stand ein `{"\n"}` zwischen Vor- und Nachname — ein
+                * hartes Zeilenumbruch-Zeichen. Damit standen sie IMMER
+                * untereinander, auch wenn beide bequem nebeneinander gepasst
+                * hätten. Als ein Text umbricht er nur dann, wenn der Platz
+                * wirklich nicht reicht; zwei Zeilen bleiben als Obergrenze
+                * erlaubt, damit ein sehr langer Name nicht abgeschnitten wird.
+                */}
+              <Text style={styles.profileName} numberOfLines={2}>
+                {user.firstName} {user.lastName}
               </Text>
               <Text style={styles.profileEmail}>{user.email}</Text>
             </>
@@ -232,7 +367,7 @@ function ProfileCard() {
               <Text style={styles.avatarText}>{initials}</Text>
             </View>
           ) : (
-            <View style={[styles.avatar, { backgroundColor: C.s2, borderWidth: 1, borderColor: C.border }]}>
+            <View style={[styles.avatar, { backgroundColor: palette.s2, borderWidth: 1, borderColor: palette.border }]}>
               <User size={26} color={C.g2} strokeWidth={2} />
             </View>
           )}
@@ -265,18 +400,31 @@ function SectionCard({
   desc,
   illu,
   onPress,
+  preloadId,
 }: {
   title: string;
   desc: string;
   illu: ReactNode;
   onPress: () => void;
+  /** Welcher Unterschirm hier hängt — für den Vorbau beim Berühren. */
+  preloadId?: SettingsSubId;
 }) {
+  const palette = usePalette();
   return (
     <RippleTouch
       onPress={onPress}
+      // Textur des Hubs beim AUFSETZEN anlegen — nicht beim Loslassen. Der
+      // Aufbau ist mit 66ms vermessen, die Bewegung startet unmittelbar nach dem
+      // Loslassen. Zwischen Aufsetzen und Loslassen liegen 80 bis 150ms.
+      onTouchStart={() => {
+        prepareLayer("settings");
+        // Und den Unterschirm gleich mit aufbauen — siehe preloadSettingsSub.
+        if (preloadId) preloadSettingsSub(preloadId);
+      }}
       style={({ pressed }) => [
         styles.sectionCard,
-        pressed && { backgroundColor: C.s3, transform: [{ scale: 0.982 }] },
+        { backgroundColor: palette.s1 },
+        pressed && { backgroundColor: palette.s3, transform: [{ scale: 0.982 }] },
       ]}
     >
       <View style={styles.sectionCardIllu} pointerEvents="none">
@@ -292,6 +440,7 @@ function SectionCard({
 
 /* ─────────────────────── DETAILS ─────────────────────── */
 function DetailsScreen({ onBack }: { onBack: () => void }) {
+  const palette = usePalette();
   const accent = useAccent();
   const t = useT();
   const user = useSearchStore((s) => s.authUser);
@@ -369,7 +518,6 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
     <View>
       <BackHeader title={t("settings.tile.details")} onBack={onBack} />
 
-      <ScrollReveal index={0}>
       <View style={styles.avatarLargeOuter}>
         <Pressable
           onPress={user ? onPickPhoto : () => { haptic("button"); openAuth(); }}
@@ -383,7 +531,7 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
               <Text style={styles.avatarLargeText}>{initials}</Text>
             </View>
           ) : (
-            <View style={[styles.avatarLarge, { backgroundColor: C.s2, borderWidth: 1, borderColor: C.border }]}>
+            <View style={[styles.avatarLarge, { backgroundColor: palette.s2, borderWidth: 1, borderColor: palette.border }]}>
               <User size={36} color={C.g2} strokeWidth={2} />
             </View>
           )}
@@ -417,9 +565,6 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
         )}
       </View>
 
-      </ScrollReveal>
-
-      <ScrollReveal index={1}>
       <SLabel text={t("settings.personal")} />
       <Group>
         <Row
@@ -437,9 +582,7 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
         />
       </Group>
 
-      </ScrollReveal>
-
-      <ScrollReveal index={2}>
+      <BelowFold>
       <SLabel text={t("settings.security")} />
       <Group>
         <Row
@@ -455,14 +598,15 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
           isLast
         />
       </Group>
-      </ScrollReveal>
+      </BelowFold>
+
     </View>
   );
 }
 
 /* ─────────────────────── SETTINGS SUB ─────────────────────── */
 const THEMES: { id: "dark" | "light" | "gray"; bg: string; surface: string }[] = [
-  { id: "dark", bg: "#1A1A1A", surface: "#1F1F20" },
+  { id: "dark", bg: "#000000", surface: "#1A1A1A" },
   { id: "light", bg: "#F2F2F5", surface: "#FFFFFF" },
   { id: "gray", bg: "#1C1C1E", surface: "#2C2C2E" },
 ];
@@ -477,6 +621,7 @@ const LANGS: { id: Locale; label: string; flag: string }[] = [
 const CURRENCIES = ["EUR", "USD", "GBP", "JPY", "CHF", "SEK"];
 
 function SettingsSubScreen({ onBack }: { onBack: () => void }) {
+  const palette = usePalette();
   const t = useT();
   const theme = useSearchStore((s) => s.theme);
   const setTheme = useSearchStore((s) => s.setTheme);
@@ -570,6 +715,7 @@ function SettingsSubScreen({ onBack }: { onBack: () => void }) {
 
       {/* LANGUAGE — Liste mit 44px Code-Badge links, Active-Highlight via
           accent.subtle. Code+Name fett wenn aktiv, Check rechts. */}
+      <BelowFold>
       <StripeLabel text={t("settings.language")} />
       <Group>
         {LANGS.map((l, i) => {
@@ -687,7 +833,7 @@ function SettingsSubScreen({ onBack }: { onBack: () => void }) {
       <StripeLabel text={t("settings.toast.section")} />
       <View style={{ paddingHorizontal: GUTTER }}>
         <Text style={styles.toastDesc}>{t("settings.toast.desc")}</Text>
-        <View style={styles.toastSegment}>
+        <View style={[styles.toastSegment, { backgroundColor: palette.s3 }]}>
           {(["top", "bottom"] as const).map((pos) => {
             const active = savedToastPosition === pos;
             return (
@@ -717,12 +863,14 @@ function SettingsSubScreen({ onBack }: { onBack: () => void }) {
       </View>
 
       <View style={{ height: 16 }} />
+      </BelowFold>
     </View>
   );
 }
 
 /* ─────────────────────── SUPPORT ─────────────────────── */
 function SupportSubScreen({ onBack }: { onBack: () => void }) {
+  const palette = usePalette();
   const t = useT();
   const [open, setOpen] = useState<number | null>(null);
 
@@ -757,8 +905,9 @@ function SupportSubScreen({ onBack }: { onBack: () => void }) {
         />
       </Group>
 
+      <BelowFold>
       <SLabel text={t("settings.support.faq")} />
-      <View style={styles.group}>
+      <View style={[styles.group, { backgroundColor: palette.s2 }]}>
         {faqs.map((f, i) => {
           const isOpen = open === i;
           const isLast = i === faqs.length - 1;
@@ -783,15 +932,25 @@ function SupportSubScreen({ onBack }: { onBack: () => void }) {
           );
         })}
       </View>
+      </BelowFold>
     </View>
   );
 }
 
 /* ─────────────────────── SHARED ─────────────────────── */
+/**
+ * Kopf eines Unterschirms.
+ *
+ * Der Titel steht an derselben Stelle und in derselben Schrift wie „Profil" im
+ * Hub — über `ScreenHeading`, also dieselbe Komponente, die auch die
+ * Überschriften der anderen Tabs setzt. Vorher stand hier eine eigene, deutlich
+ * kleinere Zeile (17/600), und darüber blieb zusätzlich „Profil" stehen: zwei
+ * Überschriften übereinander, von denen keine zum Rest der App passte.
+ */
 function BackHeader({ title, onBack }: { title: string; onBack: () => void }) {
   return (
     <View style={styles.backHeader}>
-      <Text style={styles.backHeaderTitle}>{title}</Text>
+      <ScreenHeading>{title}</ScreenHeading>
       <RippleTouch
         onPress={onBack}
         borderless
@@ -818,7 +977,8 @@ function StripeLabel({ text, firstSection }: { text: string; firstSection?: bool
 }
 
 function Group({ children }: { children: ReactNode }) {
-  return <View style={styles.group}>{children}</View>;
+  const palette = usePalette();
+  return <View style={[styles.group, { backgroundColor: palette.s2 }]}>{children}</View>;
 }
 
 interface RowProps {
@@ -876,10 +1036,11 @@ function ToggleRow({
   onChange: (v: boolean) => void;
   isLast?: boolean;
 }) {
+  const palette = usePalette();
   const accent = useAccent();
   return (
     <View style={[styles.row, !isLast && styles.rowDivider]}>
-      <View style={[styles.rowIcon, { backgroundColor: C.s2 }]}>{icon}</View>
+      <View style={[styles.rowIcon, { backgroundColor: palette.s2 }]}>{icon}</View>
       <View style={{ flex: 1 }}>
         <Text style={[styles.rowLabel, { fontWeight: "500" }]}>{label}</Text>
         {desc ? <Text style={styles.rowSub}>{desc}</Text> : null}
@@ -1003,7 +1164,7 @@ function IlluSupport() {
 }
 
 /* ─────────────────────── STYLES ─────────────────────── */
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   safe: { flex: 1, backgroundColor: C.bg },
 
   eyebrow: {
@@ -1017,7 +1178,9 @@ const styles = StyleSheet.create({
   /* — profile card — */
   profileCard: {
     marginHorizontal: GUTTER,
-    marginTop: 12,
+    // Erstes Element unter der Überschrift → geteilter Abstand. Stand auf 12 und
+    // war damit 4px enger als in Saved.
+    marginTop: HEADING_GAP,
     backgroundColor: C.s1,
     borderRadius: 22,
     overflow: "hidden",
@@ -1103,6 +1266,14 @@ const styles = StyleSheet.create({
 
   /* — divider, sign-out, version — */
   divider: { height: 1, backgroundColor: C.border, marginHorizontal: GUTTER, marginTop: 16 },
+  stack: { flex: 1 },
+  layer: { ...StyleSheet.absoluteFillObject },
+  subSheet: {
+    // Gerundete Ecken beim Hereinfahren, passend zum Geräte-Display — wie bei
+    // allen anderen Slides der App.
+    borderRadius: SCREEN_CORNER_RADIUS,
+    overflow: "hidden",
+  },
   signOut: {
     marginHorizontal: GUTTER,
     marginTop: 12,
@@ -1141,10 +1312,11 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: GUTTER,
-    paddingTop: 10,
-    paddingBottom: 6,
+    // Derselbe Takt wie die Überschrift im Hub, damit der Titel beim
+    // Hereinfahren genau dort landet, wo „Profil" stand.
+    paddingTop: HEADING_TOP,
+    paddingBottom: 0,
   },
-  backHeaderTitle: { fontSize: 17, fontWeight: "600", color: C.white },
   backHeaderBtn: {
     width: 36,
     height: 36,
@@ -1317,3 +1489,235 @@ const styles = StyleSheet.create({
   faqQ: { flex: 1, fontSize: 14, fontWeight: "500", color: C.white, paddingRight: 12 },
   faqA: { paddingHorizontal: 16, paddingBottom: 14, fontSize: 13, color: C.g2, lineHeight: 19 },
 });
+
+/* ─────────────────────── UNTERSCHIRM-ÜBERLAGERUNG ─────────────────────── */
+/**
+ * Die Unterschirme des Profil-Tabs — am WURZEL-Layout, nicht im Tab.
+ *
+ * Im Tab lag die Ebene innerhalb des nativen Tab-Containers und endete damit
+ * über der Leiste: Die Slide bedeckte nur einen Ausschnitt, und ihre gerundeten
+ * Ecken standen mitten im Bild statt an den Bildschirmecken. Von hier aus deckt
+ * sie den ganzen Bildschirm ab, und die Rundung sitzt dort, wo das Display
+ * ohnehin rund ist.
+ *
+ * Verbunden sind die beiden Bäume über `settingsPush` (Bewegung, UI-Thread) und
+ * `settingsSub` (welcher Inhalt, Speicher).
+ */
+/**
+ * Steht der Unterschirm still?
+ *
+ * Falsch, solange er hereinfährt. `BelowFold` hängt daran — die Begründung
+ * steht dort.
+ */
+const SubSettledContext = createContext(true);
+
+/**
+ * Alles, was beim Hereinfahren noch nicht zu sehen ist, entsteht erst danach.
+ *
+ * Der Bildschirm „Einstellungen" ist mehrere Bildschirme hoch: drei Themen-
+ * Karten mit eigener Vorschau-Oberfläche, die Farbreihe, vier Sprachen, sechs
+ * Währungen, dazu die Schalter. Das sind ein paar hundert Ansichten, und Fabric
+ * baut sie auf DEMSELBEN Strang auf, auf dem die Bewegung läuft. Sie lief also
+ * gegen den Aufbau an.
+ *
+ * Der Aufbau war schon um ein Bild nach hinten geschoben, aber das verschiebt
+ * die Kosten nur, es senkt sie nicht — sie landen dann eben in den ersten
+ * Bildern der Fahrt. Hier wird stattdessen gar nicht erst gebaut, was während
+ * der Fahrt niemand sehen kann: Sichtbar ist nur der oberste Bildschirm, der
+ * Rest steht darunter. Sobald die Bewegung durch ist, kommt er nach — dann
+ * bewegt sich nichts mehr, und der Aufbau stört keine Animation.
+ *
+ * Sichtbar wird davon nichts: Man kann während der Fahrt nicht scrollen, und
+ * oben ändert sich die Anordnung nicht.
+ */
+function BelowFold({ children }: { children: ReactNode }) {
+  return useContext(SubSettledContext) ? <>{children}</> : null;
+}
+
+export function SettingsSubOverlay() {
+  const appBg = useAppBg();
+  const sub = useSearchStore((s) => s.settingsSub);
+  const setSettingsSub = useSearchStore((s) => s.setSettingsSub);
+  const insets = useSafeAreaInsets();
+  const { width: screenW } = useWindowDimensions();
+
+  /**
+   * Was gerade ANGEZEIGT wird — nicht, was gewählt ist.
+   *
+   * Beim Zurückgehen fällt `settingsSub` sofort auf null, der Inhalt muss aber
+   * noch stehen, solange er hinausfährt. Abgeräumt wird er erst, wenn die
+   * Bewegung durch ist.
+   */
+  const [display, setDisplay] = useState<SubScreen>(null);
+  /**
+   * Schon beim Berühren der Kachel aufbauen, nicht erst beim Loslassen.
+   *
+   * Der Baum steht danach geparkt rechts außerhalb (`settingsPush` ist 0) — zu
+   * sehen ist nichts. Beim Loslassen bleibt nur noch das Schieben, und der
+   * Aufbau liegt im Berührungsfenster statt im Bild vor der Bewegung.
+   */
+  useEffect(() => subscribeSettingsPreload((id: SettingsSubId) => setDisplay(id)), []);
+  /** Läuft die Bewegung? Nur dann eine GPU-Ebene. */
+  const [moving, setMoving] = useState(false);
+  /**
+   * Ist der Unterschirm ANGEKOMMEN? Daran hängt `BelowFold`.
+   *
+   * Bewusst NICHT `moving` — das steht auch beim Hinausfahren auf wahr. Der
+   * untere Teil würde dann mitten in der Rückfahrt verschwinden, während man
+   * ihm zusieht. Diese Marke geht nur beim HEREINfahren auf falsch und bleibt
+   * danach wahr, bis der Unterschirm ganz abgeräumt ist.
+   */
+  const [settled, setSettled] = useState(false);
+
+  /**
+   * ERST aufbauen, DANN bewegen.
+   *
+   * Der Auslöser im Hub setzt nur noch den Speicher. Dieser Effekt baut daraufhin
+   * den Unterschirm auf — und startet die Feder erst im NÄCHSTEN Bild. Vorher
+   * lief beides im selben Moment los: Die Feder startete im Berührungs-Frame,
+   * während der Baum des Unterschirms (Details, Einstellungen, Support — jeweils
+   * mehrere Bildschirme hoch, mit eigenen Grafiken) im Commit unmittelbar danach
+   * entstand. Fabric baut den auf demselben Thread auf, auf dem die Bewegung
+   * läuft; sie lief also gegen ihn an. Genau daran lag der Ruckler.
+   */
+  /**
+   * `display` als Abhängigkeit hätte den Start VERZÖGERT — den er eigentlich
+   * beschleunigen sollte.
+   *
+   * Der Effekt setzt `display` selbst. Stand es mit in der Liste, lief er nach
+   * genau diesem Setzen ein zweites Mal an, und sein Aufräumen nahm dabei die
+   * eben angeforderte Startanforderung zurück. Die Bewegung fing also erst nach
+   * einem WEITEREN vollen Durchlauf an — zwei Bilder, in denen auf den Finger
+   * hin nichts passiert. Genau das liest sich als Verzögerung.
+   *
+   * Der Wert wird trotzdem gebraucht, aber nur GELESEN, und dafür genügt eine
+   * Ablage: sie erzwingt keinen erneuten Durchlauf.
+   */
+  const displayRef = useRef<SubScreen>(null);
+  displayRef.current = display;
+  useEffect(() => {
+    if (sub) {
+      setDisplay(sub);
+      setMoving(true);
+      setSettled(false);
+      const id = requestAnimationFrame(() => {
+        settingsPush.value = 0;
+        settingsPush.value = withTiming(1, PUSH_SPRING, (finished?: boolean) => {
+          "worklet";
+          if (finished) {
+            runOnJS(setMoving)(false);
+            runOnJS(setSettled)(true);
+          }
+        });
+      });
+      /**
+       * Notausgang, falls die Bewegung nie ans Ziel kommt.
+       *
+       * Der Rückruf oben meldet sich bei einer ABGEBROCHENEN Bewegung mit
+       * `finished === false` — dann bliebe `moving` stehen. Das war früher
+       * harmlos (nur eine GPU-Ebene zu viel); seit `BelowFold` daran hängt,
+       * bliebe der halbe Bildschirm leer, und zwar dauerhaft. Der Zeitgeber
+       * kostet nichts und macht diesen Ausgang unmöglich.
+       */
+      const safety = setTimeout(() => {
+        setMoving(false);
+        setSettled(true);
+      }, PUSH_SPRING.duration + 120);
+      return () => {
+        cancelAnimationFrame(id);
+        clearTimeout(safety);
+      };
+    }
+    if (!displayRef.current) return;
+    const id = setTimeout(() => {
+      setDisplay(null);
+      setMoving(false);
+    }, POP_SPRING.duration);
+    return () => clearTimeout(id);
+  }, [sub]);
+
+  const style = useAnimatedStyle(() => ({
+    transform: [{ translateX: (1 - settingsPush.value) * screenW }],
+  }));
+
+  const back = useCallback(() => {
+    haptic("button");
+    /**
+     * Erst die Bewegung, dann der Speicher — die Reihenfolge war umgekehrt.
+     *
+     * `setSettingsSub(null)` weckt jeden Abonnenten, und der daraus folgende
+     * Commit läuft bei einem Loslass-Ereignis SYNCHRON zu Ende. Er lag damit vor
+     * dem Start der Rückfahrt. `setMoving(true)` schaltet obendrein die
+     * GPU-Ebene — auch das im selben Durchgang.
+     *
+     * Jetzt läuft es wie auf dem Hinweg: Textur an, ein Bild zum Zeichnen, dann
+     * fahren — und der Speicher-Schreibvorgang erst danach, wo er niemanden
+     * mehr stört. Das Blatt bleibt in diesem Bild ohnehin stehen, sichtbar
+     * ändert sich also nichts.
+     */
+    setMoving(true);
+    requestAnimationFrame(() => {
+      settingsPush.value = withTiming(0, POP_SPRING);
+      setSettingsSub(null);
+    });
+  }, [setSettingsSub]);
+
+  /**
+   * Android-Zurück (Taste UND Wisch-Geste, beides feuert dieses Ereignis).
+   *
+   * Nötig, seit der Unterschirm am Wurzel-Layout hängt statt im Tab: Er ist kein
+   * Router-Bildschirm, hat also kein eingebautes Zurück. Ohne das schloss die
+   * Zurück-Geste die ganze App, obwohl sichtbar ein Bildschirm darüber lag.
+   */
+  useEffect(() => {
+    if (Platform.OS !== "android" || !sub) return;
+    const h = BackHandler.addEventListener("hardwareBackPress", () => {
+      back();
+      return true; // verbraucht — sonst schlösse Android die App.
+    });
+    return () => h.remove();
+  }, [sub, back]);
+
+  if (!display) return null;
+
+  return (
+    <Animated.View
+      /**
+       * Nur anfassbar, wenn wirklich geöffnet.
+       *
+       * Seit der Baum schon beim BERÜHREN der Kachel entsteht, steht er auch
+       * dann im Bild, wenn nur vorgebaut wurde — geparkt rechts außerhalb, also
+       * unsichtbar. Ohne diese Zeile könnte er am Rand trotzdem Berührungen
+       * abfangen; mit ihr ist ausgeschlossen, dass der Vorbau irgendetwas am
+       * Verhalten ändert.
+       */
+      pointerEvents={sub ? "auto" : "none"}
+      style={[
+        StyleSheet.absoluteFillObject,
+        styles.subSheet,
+        { backgroundColor: appBg, zIndex: 90 },
+        style,
+      ]}
+      // Für die DAUER der Bewegung eine GPU-Ebene: Der Unterschirm ist ein
+      // langer Baum mit eigenen Grafiken und würde sonst in jedem Bild der
+      // Bewegung neu gezeichnet. Dauerhaft darf sie nicht sein — dann entstünde
+      // sie bei jedem Scrollen darin neu.
+      renderToHardwareTextureAndroid={Platform.OS === "android" && moving}
+    >
+      <Animated.ScrollView
+        scrollEventThrottle={16}
+        // key an den Unterschirm gebunden: Sonst behielte die Fläche ihren
+        // Scroll-Stand vom vorherigen Unterschirm.
+        key={display}
+        contentContainerStyle={{ paddingTop: insets.top, paddingBottom: insets.bottom + 24 }}
+        showsVerticalScrollIndicator={false}
+      >
+        <SubSettledContext.Provider value={settled}>
+          {display === "details" && <DetailsScreen onBack={back} />}
+          {display === "settings" && <SettingsSubScreen onBack={back} />}
+          {display === "support" && <SupportSubScreen onBack={back} />}
+        </SubSettledContext.Provider>
+      </Animated.ScrollView>
+    </Animated.View>
+  );
+}

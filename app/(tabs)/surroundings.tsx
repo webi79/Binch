@@ -1,17 +1,20 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import { View, StyleSheet } from "react-native";
+import { prepareLayer } from "@/lib/nav/transitionLayer";
+import { View, StyleSheet, type LayoutChangeEvent } from "react-native";
 import Animated, { FadeOut } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useQuery } from "@tanstack/react-query";
 import { router } from "expo-router";
 import { useIsFocused } from "@react-navigation/native";
+import { Freeze } from "react-freeze";
+import { msSinceTabPress } from "@/lib/motion";
 import {
   MapSurface,
   type MapLayerType,
   type MapSurfaceHandle,
   type RegionInfo,
 } from "@/components/surroundings/MapSurface";
-import { POIMarker, UserPin } from "@/components/surroundings/MapMarkers";
+import { UserPin } from "@/components/surroundings/MapMarkers";
 import { MarkerLayer } from "@/components/surroundings/MarkerLayer";
 import { openStopSheet } from "@/components/surroundings/stopSheetAnimation";
 import { RouteLayer } from "@/components/surroundings/RouteLayer";
@@ -25,7 +28,6 @@ import { useT } from "@/lib/i18n/useT";
 import type { Location } from "@/types/search";
 import { useSearchStore } from "@/stores/searchStore";
 import {
-  POIS,
   markersForMode,
   listForMode,
   distanceMeters,
@@ -37,6 +39,7 @@ import { useUserLocation } from "@/lib/surroundings/useUserLocation";
 import { AIRPORT_PINS } from "@/lib/surroundings/airportCoords";
 import { CRUISE_PORT_PINS } from "@/lib/surroundings/cruisePortCoords";
 import { fetchSurroundings } from "@/lib/api/client";
+import { scaledStyles } from "@/lib/ui/compact";
 
 /** Viewport-Daten die wir an /api/surroundings schicken. */
 interface Viewport {
@@ -49,6 +52,9 @@ interface Viewport {
 
 const DEFAULT_VIEWPORT_DISTANCE = 2000;
 const DEFAULT_ZOOM = 13;
+
+/** Ruhe-Fenster, das ein Tab-Tipp braucht, bevor die Karte einfrieren darf. */
+const FREEZE_QUIET_MS = 500;
 
 /** Berechnet eine großzügige BBox aus Viewport-Center + Distanz. Faktor 2.5
  *  damit Marker am Rand schon gerendert sind wenn der User wischt — kein
@@ -91,10 +97,42 @@ export default function SurroundingsScreen() {
   const insets = useSafeAreaInsets();
   const mapRef = useRef<MapSurfaceHandle | null>(null);
   const openLocationPicker = useSearchStore((s) => s.openLocationPicker);
-  const { coord: userCoord, status: locationStatus, refresh: refreshLocation } = useUserLocation();
+  // Erst arbeiten, wenn der Tab wirklich einmal offen war.
+  //
+  // Seit die Tabs beim App-Start vorgerendert werden (lazy={false} in
+  // _layout.tsx) lief dieser Bildschirm sonst ab Sekunde eins mit: Ortung
+  // anfordern, GPS-Fix abwarten, danach /api/surroundings abfragen — für einen
+  // Tab, den der Nutzer vielleicht nie öffnet. Die Antwort kam dann irgendwann
+  // an und löste einen Commit aus, während man im Landingscreen scrollte oder
+  // gerade eine Slide lief. Weil der Zeitpunkt vom Netz abhängt, traf es mal
+  // eine Bewegung und mal nicht — genau das Muster von „ruckelt manchmal".
+  //
+  // Das Vorrendern selbst bleibt: Gerüst und Skelett stehen weiterhin fertig da,
+  // der erste Wechsel auf den Tab zeigt also weiterhin sofort etwas.
+  const [everFocused, setEverFocused] = useState(false);
+  const {
+    coord: userCoord,
+    status: locationStatus,
+    refresh: refreshLocation,
+  } = useUserLocation(everFocused);
 
   const pendingRoute = useSearchStore((s) => s.pendingRoute);
   const clearRoute = useSearchStore((s) => s.clearRoute);
+  /**
+   * Route erst nach der Navigation löschen — sonst liefe der Karten-Reset
+   * gleichzeitig mit der Bewegung und ruckelte sichtbar.
+   *
+   * Die Identitätsprüfung ist der Kern: Wer in diesen 400ms schon die nächste
+   * Route öffnet, bekam sie sonst gelöscht — der frisch geöffnete Karten-Screen
+   * poppte sich kommentarlos selbst wieder zu. Dieselbe Prüfung steht in
+   * `app/search/route-map.tsx` bereits.
+   */
+  const clearRouteSoon = useCallback(() => {
+    const closing = useSearchStore.getState().pendingRoute;
+    setTimeout(() => {
+      if (useSearchStore.getState().pendingRoute === closing) clearRoute();
+    }, 400);
+  }, [clearRoute]);
   const routeActive = pendingRoute !== null && pendingRoute.waypoints.length >= 2;
 
   const [viewport, setViewport] = useState<Viewport | null>(null);
@@ -112,15 +150,122 @@ export default function SurroundingsScreen() {
   // Jetzt: Skelett bleibt drauf bis die echten Tiles da sind → kein leerer
   // Zwischenzustand mehr sichtbar.
   const isFocused = useIsFocused();
+  useEffect(() => {
+    if (isFocused) setEverFocused(true);
+  }, [isFocused]);
+
+  // VERZÖGERTER Freeze (ersetzt freezeOnBlur, siehe (tabs)/_layout.tsx): Beim
+  // Blur soll die Karte NICHT sofort einfrieren — der dicke Freeze-Commit fiele
+  // sonst in den Tab-Crossfade und verschluckt einen Frame („Aufblitzen" beim
+  // Verlassen der Map). Er wird also nachgelagert.
+  //
+  // Zwei Dinge waren daran vorher falsch und haben Tab-Wechsel spürbar zäh
+  // gemacht:
+  //
+  //  1. Der feste 450ms-Timer war blind für weitere Tipps. Wer schneller
+  //     durchklickt, bekam den Freeze-Commit mitten in den ZWEITEN oder DRITTEN
+  //     Wechsel geschoben — der Ruckler war damit vom eigenen Tipp entkoppelt
+  //     und wirkte wie zufälliger Lag. Jetzt wird weiter aufgeschoben, solange
+  //     der letzte Tab-Tipp noch frisch ist (msSinceTabPress), der Commit landet
+  //     also garantiert in einer ruhigen Phase.
+  //  2. Aufgetaut wurde per State im Effekt: Der Screen rendete beim Zurück-
+  //     kommen erst NOCH eingefroren, und erst der Effekt danach taute den
+  //     kompletten Kartenbaum in einem zweiten Commit auf — beide im Wechsel-
+  //     Frame. `frozen` ist jetzt abgeleitet, das Auftauen passiert im ersten
+  //     Render, und es bleibt bei EINEM Commit.
+  const [freezeArmed, setFreezeArmed] = useState(false);
+  useEffect(() => {
+    if (isFocused) {
+      // Auftauen erledigt `frozen` unten schon. Gleicher Wert ⇒ React bailt raus.
+      setFreezeArmed((armed) => (armed ? false : armed));
+      return;
+    }
+    let id: ReturnType<typeof setTimeout>;
+    const schedule = (delay: number) => {
+      id = setTimeout(() => {
+        if (msSinceTabPress() < FREEZE_QUIET_MS) {
+          schedule(FREEZE_QUIET_MS);
+          return;
+        }
+        setFreezeArmed(true);
+      }, delay);
+    };
+    schedule(FREEZE_QUIET_MS);
+    return () => clearTimeout(id);
+  }, [isFocused]);
+  /**
+   * Auch einfrieren, wenn ein WÄHLER darüber liegt — nicht nur beim Tab-Wechsel.
+   *
+   * Der Ortswähler wird aus dieser Karte heraus geöffnet, also bei FOKUSSIERTEM
+   * Tab. Der Riegel griff dort nie: Während der 250ms Einfahrt und der 220ms
+   * Ausfahrt liefen der GL-Strang der Karte, die Marker-Ebene und die
+   * Ausschnitts-Abfrage einfach weiter — unter einem deckenden Blatt, das man
+   * ohnehin nicht durchschauen kann.
+   *
+   * Derselbe Wähler über dem Such-Bildschirm hat diesen Nachbarn nicht. Das ist
+   * einer der Gründe, warum es sich hier schlechter anfühlt als dort.
+   */
+  const pickerOverMap = useSearchStore((st) => st.locationPickerRequest !== null);
+  /**
+   * Auch einfrieren, sobald ÜBERHAUPT ein bildschirmfüllendes Blatt darüber
+   * liegt — nicht erst 500ms nach einem Tab-Wechsel.
+   *
+   * Der Riegel für den Tab-Wechsel wartet bewusst eine halbe Sekunde
+   * (`FREEZE_QUIET_MS`), damit ein schnelles Hin und Her nicht bei jedem
+   * Wechsel eine Karte neu aufbaut. Genau diese halbe Sekunde ist aber das
+   * Fenster, in dem jemand vom Landingscreen in die Suche und weiter in einen
+   * Wähler tippt — und solange läuft der GL-Strang der Karte samt Markern
+   * weiter, unter einem deckenden Blatt, das man ohnehin nicht durchsieht.
+   *
+   * Liegt die Suche darüber, gibt es nichts abzuwägen: Zu sehen ist die Karte
+   * dann sicher nicht.
+   */
+  const searchOverMap = useSearchStore((st) => st.searchOverlayMode != null);
+  const frozen = (!isFocused && freezeArmed) || pickerOverMap || searchOverMap;
+
   const [mapMounted, setMapMounted] = useState(false);
   const [mapTilesRendered, setMapTilesRendered] = useState(false);
+  /**
+   * Hat die Fläche schon eine echte Größe?
+   *
+   * Das ist neuerdings nicht mehr selbstverständlich, und genau daran hing das
+   * Problem mit den Kacheln. Solange die native Tab-Leiste da war, bekam jeder
+   * Tab-Bildschirm feste Pixelmaße von ihr zugewiesen (`measuredDimensions`).
+   * Mit eigener Leiste vergibt die Bibliothek stattdessen `width: "100%",
+   * height: "100%"` — und Prozentwerte sind erst dann eine Größe, wenn der
+   * Elternknoten eine hat. Im ersten Durchgang ist er 0.
+   *
+   * MapLibre nimmt seine Größe beim Anlegen der GL-Fläche EINMAL entgegen und
+   * berechnet daraus, welche Kacheln es überhaupt braucht. Wird es mit 0×0
+   * angelegt, fragt es nichts an — und holt das später auch nicht nach. Die
+   * Karte blieb deshalb leer, obwohl sowohl Netz als auch Zwischenspeicher in
+   * Ordnung waren. (Dass die Kacheln vorher OHNE Internet kamen, war der
+   * entscheidende Hinweis: Es war nie ein Ladeproblem.)
+   *
+   * Also erst messen, dann anlegen.
+   */
+  const [hasSize, setHasSize] = useState(false);
+  const onRootLayout = useCallback((e: LayoutChangeEvent) => {
+    const { width, height } = e.nativeEvent.layout;
+    if (width > 0 && height > 0) setHasSize(true);
+  }, []);
   useEffect(() => {
-    if (!isFocused || mapMounted) return;
+    /**
+     * Auch auf die Ortung warten — sonst startet die Karte auf Berlin.
+     *
+     * `initialViewState` bekommt die Nutzerkoordinate, und die steht bis zur
+     * ersten Ortung auf dem Platzhalter (Berlin Hbf). Wer nicht in Berlin ist,
+     * lud damit erst rund ein Megabyte Berliner Kacheln, bekam dann den Flug zur
+     * echten Position — und warf alles Geladene weg. Ein paar hundert
+     * Millisekunden später zu starten ist billiger als ein kompletter
+     * Kachelsatz, der niemanden interessiert.
+     */
+    if (!isFocused || mapMounted || !hasSize || locationStatus === "loading") return;
     // Ein Frame Defer damit der erste Tab-Commit das Skelett zeichnet
     // BEVOR wir die schwere MapLibre-Initialisation triggern.
     const id = requestAnimationFrame(() => setMapMounted(true));
     return () => cancelAnimationFrame(id);
-  }, [isFocused, mapMounted]);
+  }, [isFocused, mapMounted, hasSize, locationStatus]);
 
   // Tab-Tap soll sich sofort anfühlen. Marker-Swap (100+ native Views) ist
   // teuer und blockt sonst den Tap. useDeferredValue rendert die Marker
@@ -129,20 +274,31 @@ export default function SurroundingsScreen() {
 
   // Effektiver Viewport für Backend-Calls — vor dem ersten Map-Idle-Event
   // nutzen wir den User-Standort als Default.
-  const effectiveViewport: Viewport = viewport ?? {
-    latitude: userCoord.latitude,
-    longitude: userCoord.longitude,
-    distance: DEFAULT_VIEWPORT_DISTANCE,
-    zoom: DEFAULT_ZOOM,
-  };
+  /**
+   * Ohne bekannten Standort UND ohne Kartenausschnitt gibt es nichts
+   * abzufragen. Vorher stand hier der Platzhalter, die erste Umkreis-Abfrage
+   * lief also für Berlin — für jeden Nutzer, überall.
+   */
+  const effectiveViewport: Viewport | null =
+    viewport ??
+    (userCoord
+      ? {
+          latitude: userCoord.latitude,
+          longitude: userCoord.longitude,
+          distance: DEFAULT_VIEWPORT_DISTANCE,
+          zoom: DEFAULT_ZOOM,
+        }
+      : null);
 
   // Query-Key in grobe Buckets runden — Center auf ~500 m, Distanz auf 1 km.
   // Damit triggern kleine Pans (User wischt durch die Karte) keinen Refetch
   // mehr; erst nach signifikanter Bewegung kommt frische Daten.
-  const keyLat = Math.round(effectiveViewport.latitude * 200) / 200; // ~500m
-  const keyLng = Math.round(effectiveViewport.longitude * 200) / 200;
-  const keyDistance = Math.round(effectiveViewport.distance / 1000) * 1000;
-  const keyZoom = Math.round(effectiveViewport.zoom);
+  const keyLat = effectiveViewport ? Math.round(effectiveViewport.latitude * 200) / 200 : 0; // ~500m
+  const keyLng = effectiveViewport ? Math.round(effectiveViewport.longitude * 200) / 200 : 0;
+  const keyDistance = effectiveViewport
+    ? Math.round(effectiveViewport.distance / 1000) * 1000
+    : DEFAULT_VIEWPORT_DISTANCE;
+  const keyZoom = effectiveViewport ? Math.round(effectiveViewport.zoom) : DEFAULT_ZOOM;
 
   // Zoom-abhängiges Marker-Limit: bei rausgezoomter Karte wollen wir viele
   // Train-Stationen für Clustering; unter zoom 9 zeigt der Server eh nichts.
@@ -160,12 +316,25 @@ export default function SurroundingsScreen() {
         mode: deferredMode,
       }),
     staleTime: 60_000,
+    // Eigene Aufbewahrungszeit statt der globalen 30 Minuten.
+    //
+    // Der Schlüssel dieser Abfrage enthält den Kartenausschnitt — jedes Schieben
+    // und Zoomen erzeugt also einen NEUEN Eintrag, und jeder hält bis zu 400
+    // Haltestellen fest. Mit 30 Minuten sammeln sich beim Erkunden der Karte
+    // schnell hunderte davon an, die alle im Speicher bleiben. Das ist ein
+    // Mechanismus, über den die App mit der Laufzeit tatsächlich langsamer wird.
+    // Fünf Minuten decken das ab, was zählt: kurz wegzoomen und zurück.
+    gcTime: 5 * 60 * 1000,
     // Erst fragen, wenn wir wissen WO. Vorher stand `coord` noch auf dem
     // Default USER_LOC (Berlin Hbf) — der erste Call ging also immer für Berlin
     // raus, egal wo der User ist, und war schlicht Müll. Sobald die Karte
     // einmal idle war (`viewport`) oder die Ortung durch ist (granted/denied/
     // error → dann gilt bewusst der Default), fragen wir.
-    enabled: deferredMode === "transit" && (viewport !== null || locationStatus !== "loading"),
+    enabled:
+      everFocused &&
+      deferredMode === "transit" &&
+      effectiveViewport != null &&
+      (viewport !== null || locationStatus !== "loading"),
     retry: 1,
     placeholderData: (prev) => prev,
   });
@@ -227,17 +396,103 @@ export default function SurroundingsScreen() {
     return listForMode(mode, userCoord);
   }, [data, mode, userCoord]);
 
+  /**
+   * Eine Station auswählen — von der Karte ODER aus der Liste im Blatt.
+   *
+   * Beide Wege enden im selben Zustand; das war vorher nicht so, denn die Zeilen
+   * im Blatt hatten überhaupt keine Wirkung. Sie und die Nadeln auf der Karte
+   * teilen sich dieselbe Kennung, also genügt hier ein Nachschlagen.
+   *
+   * Der Unterschied ist nur die Kamera: Wer eine Nadel antippt, sieht sie schon
+   * — da wäre ein Flug dorthin eine Bewegung ohne Anlass. Wer eine Zeile in der
+   * Liste antippt, sieht die Station gerade NICHT, und genau darum geht es.
+   *
+   * Die Zoomstufen sind die Gegenstücke zu denen weiter unten, wo auf den
+   * eigenen Standort geflogen wird: Bei Haltestellen will man die Straße
+   * ringsum sehen, bei Flughäfen und Häfen den Ort in seiner Region.
+   */
+  const focusStopRef = useRef<(id: string, fly: boolean) => void>(() => {});
+  const focusStop = useCallback(
+    (id: string, fly: boolean) => {
+      const m = markers.find((mm) => mm.id === id);
+      if (!m) return;
+      if (fly) {
+        const zoom = mode === "transit" ? 15 : 11;
+        mapRef.current?.flyTo(m.coord.latitude, m.coord.longitude, zoom);
+      }
+      openStopSheet();
+      // Ohne eigenen Standort gibt es keine Entfernung — dann lieber keine
+      // Angabe als eine, die von einem fremden Ort aus gerechnet ist.
+      const here = latestCoordRef.current;
+      const dist = here ? distanceMeters(here, m.coord) : null;
+      selectStop({
+        code: m.id,
+        label: m.label ?? "",
+        distanceMeters: dist == null ? undefined : Math.round(dist),
+        kinds: m.kinds && m.kinds.length > 0 ? m.kinds : [m.type],
+      });
+    },
+    [markers, mode, openStopSheet, selectStop],
+  );
+  focusStopRef.current = focusStop;
+
+  /**
+   * Feste Kennungen für alles, was nach unten gereicht wird.
+   *
+   * Die drei Rückrufe standen als Pfeilfunktionen im JSX. Damit war jede
+   * Eigenschaft bei jedem Render neu, und die `memo`-Hüllen an `MapSurface` und
+   * `MarkerLayer` konnten nie greifen — die Karte samt ihrer ~20 Ebenen wurde
+   * bei JEDEM Render dieses Bildschirms abgeglichen. Und der rendert oft: bei
+   * jedem Stillstand der Karte, jedem Tipp auf einen der Knöpfe, jedem Wechsel
+   * des Ortungs-Zustands.
+   *
+   * `focusStop` hängt an `markers`, wechselt also mit jeder Antwort. Für die
+   * Karte liest es die Marker deshalb aus einer Ablage — sonst wäre auch diese
+   * Kennung wieder bei jeder Antwort neu, und wir hätten nichts gewonnen.
+   */
+  const selectStopFromList = useCallback((id: string) => focusStopRef.current(id, true), []);
+  const selectStopFromMap = useCallback((id: string) => focusStopRef.current(id, false), []);
+  const onMapRendered = useCallback(() => setMapTilesRendered(true), []);
+
   // Beim ersten GPS-Fix auf den Standort fliegen — Zoom je nach Modus.
   // Wird übersprungen wenn eine Route aktiv ist (dann fitten wir auf die Route).
   // Wichtig: NICHT fliegen solange `locationStatus === "loading"`. Sonst
   // landet der User zuerst auf der Default-Coord (Berlin Hbf) und springt
   // erst nach Auflösung des echten GPS-Fixes an seine wahre Position.
+  //
+  // NUR EINMAL. Vorher flog die Karte bei JEDER Änderung der Koordinate — und die
+  // kommt zweistufig: erst der Fix aus dem OS-Cache, bis zu acht Sekunden später
+  // der frische. Wer in der Zwischenzeit einen Ort gesucht oder die Karte bewegt
+  // hatte, wurde ohne Zutun zurück auf seine eigene Position gerissen. Dasselbe
+  // bei jedem Antippen des Standort-Knopfes.
+  const didInitialFlyRef = useRef(false);
+  // Immer der neueste Fix — für Rückrufe, die ein await überdauern.
+  const latestCoordRef = useRef(userCoord);
+  latestCoordRef.current = userCoord;
   useEffect(() => {
     if (routeActive) return;
     if (locationStatus === "loading") return;
+    /**
+     * ERST prüfen, ob die Karte überhaupt existiert — dann die Sperre setzen.
+     *
+     * Die Sperre stand VOR dem Zugriff auf die Karte, und die Karte gibt es zu
+     * diesem Zeitpunkt garantiert noch nicht: Sie wird selbst erst gemountet,
+     * wenn die Ortung fertig ist, und zwar über eine Bild-Anforderung — also
+     * mindestens ein Bild NACH diesem Effekt. Der Flug lief damit immer ins
+     * Leere, die Sperre war trotzdem verbraucht, und spätere Koordinaten wurden
+     * abgewiesen. Die Karte blieb auf ihrer Startposition stehen.
+     *
+     * Der Effekt zwei Stellen weiter unten macht es richtig und prüft
+     * `mapMounted` mit; hier war es nicht nachgezogen.
+     */
+    if (!mapMounted || !mapRef.current) return;
+    // Kein Standort, kein Flug — sonst flöge die Karte an den Platzhalter.
+    if (!userCoord) return;
+    if (didInitialFlyRef.current) return;
+    didInitialFlyRef.current = true;
     const zoom = mode === "transit" ? 13 : mode === "airport" ? 5 : 4;
-    mapRef.current?.flyTo(userCoord.latitude, userCoord.longitude, zoom);
-  }, [userCoord.latitude, userCoord.longitude, routeActive, locationStatus]);
+    mapRef.current.flyTo(userCoord.latitude, userCoord.longitude, zoom);
+  }, [userCoord, routeActive, locationStatus, mode, mapMounted]);
 
   // Wenn eine Route gesetzt wird → Bounds berechnen und Karte darauf fitten.
   useEffect(() => {
@@ -261,16 +516,64 @@ export default function SurroundingsScreen() {
   const handleModeChange = useCallback(
     (m: SheetMode) => {
       setMode(m);
+      if (!userCoord) return;
       const zoom = m === "transit" ? 13 : m === "airport" ? 5 : 4;
       mapRef.current?.flyTo(userCoord.latitude, userCoord.longitude, zoom);
     },
-    [userCoord.latitude, userCoord.longitude],
+    [userCoord],
   );
 
+  /**
+   * Läuft gerade eine Ortung?
+   *
+   * Sie darf bis zu acht Sekunden brauchen, und der Knopf sah in dieser Zeit aus
+   * wie immer — also tippte man nochmal, und jeder Tipp startete eine weitere
+   * GPS-Abfrage. Jetzt läuft höchstens eine, und der Knopf zeigt das gedimmt an.
+   *
+   * Dass am Ende zum Standort geflogen wird, auch wenn die Karte inzwischen
+   * woanders steht, bleibt ausdrücklich so: Genau darum hat man den Knopf
+   * gedrückt. Ein Ausstieg bei zwischenzeitlicher Karten-Bewegung stand hier
+   * kurz — er hätte den Knopf tot wirken lassen, wenn die Karte beim Tippen noch
+   * ausrollt, denn auch dieses Ausrollen meldet eine Bewegung.
+   */
+  const locatingRef = useRef(false);
+  const [locating, setLocating] = useState(false);
   const onLocate = useCallback(async () => {
-    await refreshLocation();
-    mapRef.current?.flyTo(userCoord.latitude, userCoord.longitude, 14);
-  }, [userCoord.latitude, userCoord.longitude, refreshLocation]);
+    if (locatingRef.current) return;
+    locatingRef.current = true;
+    setLocating(true);
+    try {
+      /**
+       * ZUERST fliegen, dann nachmessen — vorher war es umgekehrt.
+       *
+       * `refreshLocation()` wartet auf `getCurrentPositionAsync`, und das ist
+       * mit acht Sekunden gedeckelt. Der Flug hing also hinter dieser Messung:
+       * Man drückte den Knopf und es passierte bis zu acht Sekunden lang
+       * nichts. Und weil ein zweiter Druck in dieser Zeit über `locatingRef`
+       * verworfen wird, wirkte der Knopf dann ganz tot.
+       *
+       * Der zuletzt bekannte Punkt ist für „bring mich zurück" gut genug — er
+       * stammt aus dem OS-Zwischenspeicher oder der letzten Messung. Die genaue
+       * Messung zieht danach nach, aber nur, wenn sie nennenswert woanders
+       * liegt; ein zweiter Flug über wenige Meter sähe wie ein Wackler aus.
+       */
+      const known = latestCoordRef.current;
+      if (known) mapRef.current?.flyTo(known.latitude, known.longitude, 14);
+      await refreshLocation();
+      // Nach dem await steht in `userCoord` noch der ALTE Wert aus der Closure
+      // des Renders, in dem dieser Rückruf entstand. Frisch aus dem Hook lesen.
+      const fresh = latestCoordRef.current;
+      if (!fresh) return;
+      const moved =
+        !known ||
+        Math.abs(known.latitude - fresh.latitude) > 0.0008 ||
+        Math.abs(known.longitude - fresh.longitude) > 0.0008;
+      if (moved) mapRef.current?.flyTo(fresh.latitude, fresh.longitude, 14);
+    } finally {
+      locatingRef.current = false;
+      setLocating(false);
+    }
+  }, [refreshLocation]);
 
   const onToggleLayers = useCallback(() => {
     setMapType((t) => (t === "standard" ? "satellite" : "standard"));
@@ -304,7 +607,8 @@ export default function SurroundingsScreen() {
   }, []);
 
   return (
-    <View style={styles.root}>
+    <Freeze freeze={frozen}>
+    <View style={styles.root} onLayout={onRootLayout}>
       {/* MapSurface mountet darunter, MapSkeleton liegt DARÜBER und fadet
           erst raus wenn MapLibre seine Tiles tatsächlich gerendert hat.
           So sieht der User nie blanke Tiles. */}
@@ -314,7 +618,9 @@ export default function SurroundingsScreen() {
           mapType={mapType}
           showsTraffic={trafficOn}
           onRegionChange={onRegionChange}
-          onMapRendered={() => setMapTilesRendered(true)}
+          onMapRendered={onMapRendered}
+          // Die Karte startet dort, wo der Nutzer ist — siehe `initialCenter`.
+          initialCenter={userCoord ?? undefined}
         >
           {/* Route-Modus: nur RouteLayer + UserPin, sonst MarkerLayer + POIs */}
           {routeActive ? (
@@ -325,27 +631,14 @@ export default function SurroundingsScreen() {
             />
           ) : (
             <>
-              {deferredMode === "transit" &&
-                POIS.map((p, i) => <POIMarker key={`p${i}`} id={`p${i}`} p={p} />)}
               <MarkerLayer
                 key={deferredMode}
                 markers={markers}
-                onMarkerPress={(id) => {
-                  const m = markers.find((mm) => mm.id === id);
-                  if (!m) return;
-                  openStopSheet();
-                  const dist = distanceMeters(userCoord, m.coord);
-                  selectStop({
-                    code: m.id,
-                    label: m.label ?? "",
-                    distanceMeters: Math.round(dist),
-                    kinds: m.kinds && m.kinds.length > 0 ? m.kinds : [m.type],
-                  });
-                }}
+                onMarkerPress={selectStopFromMap}
               />
             </>
           )}
-          <UserPin coord={userCoord} />
+          {userCoord ? <UserPin coord={userCoord} /> : null}
         </MapSurface>
       )}
       {/* Skelett liegt OBEN bis die Tiles wirklich gerendert sind, dann
@@ -375,7 +668,7 @@ export default function SurroundingsScreen() {
             const stash = useSearchStore.getState().stashedSurroundings;
             if (stash) {
               useSearchStore.getState().restoreSurroundings();
-              setTimeout(() => clearRoute(), 400);
+              clearRouteSoon();
               return;
             }
 
@@ -396,7 +689,7 @@ export default function SurroundingsScreen() {
             }
             // clearRoute DEFERRED — der Map-Reset würde sonst gleichzeitig mit
             // der Nav-Animation laufen und sichtbar ruckeln.
-            setTimeout(() => clearRoute(), 400);
+            clearRouteSoon();
           }}
           topInset={insets.top}
         />
@@ -414,6 +707,10 @@ export default function SurroundingsScreen() {
             // sichtbar und hob sich beim Keyboard-Öffnen nativ über die
             // Tastatur (Material NavigationBarView IME-Insets). Über den
             // Root-Host ist sie während der Suche komplett abgedeckt.
+            // Textur des Pickers beim AUFSETZEN anlegen — derselbe Weg wie im
+            // Such-Blatt. Ohne das öffnet der Picker von hier aus ohne Ebene und
+            // wird während der ganzen Fahrt Bild für Bild neu gezeichnet.
+            onTouchStart={() => prepareLayer("pickerLocation")}
             onPress={() =>
               openLocationPicker({
                 field: "from",
@@ -422,6 +719,14 @@ export default function SurroundingsScreen() {
                 title: t("surroundings.search.title"),
                 leadingLabel: "",
                 placeholderKey: "surroundings.search.placeholder",
+                /**
+                 * „Aktueller Standort" — dieselbe Aufgabe wie der Knopf auf der
+                 * Karte, also auch derselbe Rückruf. Er holt vorher einen
+                 * frischen Fix; das Blatt hat sich zu dem Zeitpunkt schon
+                 * geschlossen (der Picker schließt, bevor er ruft), man sieht
+                 * also die Karte, während es passiert.
+                 */
+                onCurrentLocation: onLocate,
                 onSelect: (loc: Location) => {
                   // Mode an den Treffer-Typ anpassen, damit das passende
                   // Marker-Icon an der Zielposition sichtbar ist (sonst
@@ -457,16 +762,23 @@ export default function SurroundingsScreen() {
         onToggleLayers={onToggleLayers}
         onToggleTraffic={onToggleTraffic}
         onLocate={onLocate}
+        locating={locating}
       />
 
       {!routeActive && (
-        <SurroundingsSheet mode={mode} setMode={handleModeChange} items={listItems} />
+        <SurroundingsSheet
+          mode={mode}
+          setMode={handleModeChange}
+          items={listItems}
+          onSelectStop={selectStopFromList}
+        />
       )}
     </View>
+    </Freeze>
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   root: {
     flex: 1,
     backgroundColor: "#14181A",

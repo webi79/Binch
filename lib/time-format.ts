@@ -9,6 +9,40 @@
 
 import { formatInTimeZone } from "date-fns-tz";
 
+/**
+ * Gedächtnis für bereits formatierte Zeitpunkte.
+ *
+ * `formatInTimeZone` ist der teuerste Aufruf in einer Ergebniskarte: Es schlägt
+ * die Zone nach, rechnet den Versatz aus und läuft dann durch das Muster. Jede
+ * Karte macht das vier- bis sechsmal (Abfahrt, Ankunft, beide Daten, dazu die
+ * Ist-Zeiten bei Verspätung).
+ *
+ * Beim Auffüllen der Liste kommen die Karten in Stapeln — und genau dort lagen
+ * in der Bild-Messung die langen JS-Bilder nach der Bewegung. Das Entscheidende:
+ * Die Ergebnisse sind zwischen den Karten größtenteils IDENTISCH. Alle Treffer
+ * einer Suche starten am selben Tag in derselben Zone, „Do, 14 Aug" wurde also
+ * für jede der 74 Karten neu ausgerechnet statt einmal.
+ *
+ * Ein Zeitpunkt in einer Zone hat außerdem immer dieselbe Darstellung — der
+ * Zwischenspeicher kann deshalb nicht veralten. Er gilt nur für den Programm-
+ * lauf und ist gedeckelt, damit er bei vielen Suchen hintereinander nicht
+ * unbegrenzt wächst.
+ */
+const memo = new Map<string, string>();
+const MEMO_MAX = 600;
+
+function cached(key: string, compute: () => string): string {
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const value = compute();
+  // Beim Überlaufen komplett leeren statt einzeln zu verdrängen: Eine echte
+  // Verdrängungsreihenfolge kostet pro Zugriff mehr, als sie hier einspart —
+  // die Treffer kommen ohnehin stapelweise aus derselben Suche.
+  if (memo.size >= MEMO_MAX) memo.clear();
+  memo.set(key, value);
+  return value;
+}
+
 /** Verschiebt eine ISO-UTC-Zeit um `minutes` und gibt wieder ISO-UTC zurück.
  *  Für die Ist-Zeit-Anzeige bei Verspätung (Soll-Zeit + delayMinutes). */
 export function shiftIsoByMinutes(isoUtc: string, minutes: number): string {
@@ -20,11 +54,16 @@ export function formatTimeInZone(
   tz: string | undefined,
   _locale = "en-GB",
 ): string {
-  if (tz) return formatInTimeZone(new Date(isoUtc), tz, "HH:mm");
-  return new Date(isoUtc).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
+  // Die Sprache steht im Schlüssel, obwohl sie im Rumpf (noch) niemand
+  // benutzt — wer sie später verdrahtet, bekommt sonst stillschweigend die
+  // Ausgabe der zuletzt gefragten Sprache zurück.
+  return cached(`t|${isoUtc}|${tz ?? ""}|${_locale}`, () => {
+    if (tz) return formatInTimeZone(new Date(isoUtc), tz, "HH:mm");
+    return new Date(isoUtc).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
   });
 }
 
@@ -33,11 +72,13 @@ export function formatDateInZone(
   tz: string | undefined,
   _locale = "en-GB",
 ): string {
-  if (tz) return formatInTimeZone(new Date(isoUtc), tz, "EEE, dd MMM");
-  return new Date(isoUtc).toLocaleDateString([], {
-    weekday: "short",
-    day: "2-digit",
-    month: "short",
+  return cached(`d|${isoUtc}|${tz ?? ""}|${_locale}`, () => {
+    if (tz) return formatInTimeZone(new Date(isoUtc), tz, "EEE, dd MMM");
+    return new Date(isoUtc).toLocaleDateString([], {
+      weekday: "short",
+      day: "2-digit",
+      month: "short",
+    });
   });
 }
 
@@ -56,10 +97,12 @@ export function dayOffset(
 }
 
 function dayKey(iso: string, tz: string | undefined): number {
-  const d = new Date(iso);
-  if (tz) {
-    const ymd = formatInTimeZone(d, tz, "yyyy-MM-dd");
-    return Date.parse(`${ymd}T00:00:00Z`);
-  }
-  return Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+  // Ebenfalls gemerkt: `dayOffset` läuft zweimal pro Karte und landet für die
+  // Abfahrt bei allen Treffern derselben Suche auf demselben Wert.
+  const ymdCached = cached(`y|${iso}|${tz ?? ""}`, () => {
+    const d = new Date(iso);
+    if (tz) return formatInTimeZone(d, tz, "yyyy-MM-dd");
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  });
+  return Date.parse(`${ymdCached}T00:00:00Z`);
 }

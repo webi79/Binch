@@ -31,6 +31,8 @@ import Animated, {
 } from "react-native-reanimated";
 import Svg, { Circle, Defs, LinearGradient, Path, RadialGradient, Stop } from "react-native-svg";
 import { haptic } from "@/lib/haptics";
+import { useAccent, type AccentPalette } from "@/lib/theme/accent";
+import { scaledStyles } from "@/lib/ui/compact";
 
 // Stern-Pfad (viewBox 0 0 24 24)
 const STAR_PATH =
@@ -38,7 +40,20 @@ const STAR_PATH =
 // Vierzackiger Funkel-Stern (CSS-clip-path 50/0 60/40 100/50 …)
 const SPARKLE_PATH = "M12 0 L14.4 9.6 L24 12 L14.4 14.4 L12 24 L9.6 14.4 L0 12 L9.6 9.6 Z";
 
-const GOLD = ["#FFE9A8", "#FFD24D", "#FFC01F", "#F5A623"];
+/**
+ * Die Funken-Farben — abgeleitet aus dem gewählten Akzent, nicht mehr golden.
+ *
+ * Die Vorlage war in Gold gezeichnet, und Gold gehört zu keiner der beiden
+ * Paletten der App. Der Stern gehörte damit als einziges Element nirgends dazu:
+ * Wer auf Mint umstellt, bekam überall Mint — und hier weiter Gold.
+ *
+ * Die Palette hat genau die drei Stufen, die die Vorlage braucht (hell, Haupt,
+ * dunkel), dazu die abgedunkelte Variante als vierte. Die Verteilung bleibt
+ * damit dieselbe wie vorher: vier Töne desselben Farbtons, von hell nach satt.
+ */
+function sparkColors(accent: AccentPalette): string[] {
+  return [accent.gradient[0], accent.gradient[1], accent.solid, accent.dark];
+}
 const SPARK_COUNT = 15;
 
 // Easing-Kurven — exakt wie im CSS
@@ -59,7 +74,7 @@ interface Spark {
   duration: number;
 }
 
-function makeSparks(): Spark[] {
+function makeSparks(colors: string[]): Spark[] {
   return Array.from({ length: SPARK_COUNT }, () => {
     const angle = Math.random() * Math.PI * 2;
     const dist = rand(36, 88);
@@ -68,7 +83,7 @@ function makeSparks(): Spark[] {
       ty: Math.sin(angle) * dist,
       scale: rand(0.3, 0.85),
       rot: `${Math.round(rand(-180, 180))}deg`,
-      color: GOLD[Math.floor(Math.random() * GOLD.length)]!,
+      color: colors[Math.floor(Math.random() * colors.length)]!,
       size: rand(6, 13),
       star: Math.random() < 0.5,
       delay: Math.random() * 200,
@@ -162,6 +177,7 @@ function SparkView({
 const BURST_LIFETIME_MS = 2100;
 
 export function SaveStarButton({ size = 46, starSize = 30, saved: savedProp, onChange }: Props) {
+  const accent = useAccent();
   const [savedState, setSavedState] = useState(false);
   const saved = savedProp ?? savedState;
 
@@ -189,7 +205,11 @@ export function SaveStarButton({ size = 46, starSize = 30, saved: savedProp, onC
     pressOrigin.current = true;
     haptic(willSave ? "important" : "button");
 
-    setBurst((b) => ({ id: (b?.id ?? 0) + 1, sparks: makeSparks(), mode: willSave ? "save" : "unsave" }));
+    setBurst((b) => ({
+      id: (b?.id ?? 0) + 1,
+      sparks: makeSparks(sparkColors(accent)),
+      mode: willSave ? "save" : "unsave",
+    }));
     if (burstTimer.current) clearTimeout(burstTimer.current);
     burstTimer.current = setTimeout(() => setBurst(null), BURST_LIFETIME_MS);
 
@@ -206,7 +226,7 @@ export function SaveStarButton({ size = 46, starSize = 30, saved: savedProp, onC
 
     if (savedProp === undefined) setSavedState(willSave);
     onChange?.(willSave);
-  }, [saved, onChange, savedProp, pop]);
+  }, [saved, onChange, savedProp, pop, accent]);
 
   // Externe saved-Änderung (Erst-Mount / Station-Wechsel ohne Press) → sofort
   // in den Zielzustand snappen, ohne Bounce.
@@ -288,9 +308,9 @@ export function SaveStarButton({ size = 46, starSize = 30, saved: savedProp, onC
           >
             <Defs>
               <RadialGradient id="bncglow" cx="50%" cy="50%" r="50%">
-                <Stop offset="0%" stopColor="#FFC11F" stopOpacity={0.15} />
-                <Stop offset="55%" stopColor="#FFC11F" stopOpacity={0.05} />
-                <Stop offset="100%" stopColor="#FFC11F" stopOpacity={0} />
+                <Stop offset="0%" stopColor={accent.solid} stopOpacity={0.15} />
+                <Stop offset="55%" stopColor={accent.solid} stopOpacity={0.05} />
+                <Stop offset="100%" stopColor={accent.solid} stopOpacity={0} />
               </RadialGradient>
             </Defs>
             <Circle cx={50} cy={50} r={50} fill="url(#bncglow)" />
@@ -298,13 +318,22 @@ export function SaveStarButton({ size = 46, starSize = 30, saved: savedProp, onC
 
           <Svg width={goldSize} height={goldSize} viewBox="0 0 24 24">
             <Defs>
+              {/* Dieselben drei Stufen wie in der Vorlage — nur eben im
+                  Akzentton statt in Gold. Die Kontur ist die hellste davon, so
+                  wie das Original eine hellere Kontur über dem Verlauf hatte. */}
               <LinearGradient id="bncGold" x1="0" y1="0" x2="1" y2="1">
-                <Stop offset="0%" stopColor="#FFF0BE" />
-                <Stop offset="50%" stopColor="#FFC01F" />
-                <Stop offset="100%" stopColor="#F39A12" />
+                <Stop offset="0%" stopColor={accent.gradient[0]} />
+                <Stop offset="50%" stopColor={accent.gradient[1]} />
+                <Stop offset="100%" stopColor={accent.gradient[2]} />
               </LinearGradient>
             </Defs>
-            <Path d={STAR_PATH} fill="url(#bncGold)" stroke="#FFDE86" strokeWidth={1.2} strokeLinejoin="round" />
+            <Path
+              d={STAR_PATH}
+              fill="url(#bncGold)"
+              stroke={accent.gradient[0]}
+              strokeWidth={1.2}
+              strokeLinejoin="round"
+            />
           </Svg>
         </View>
       </Animated.View>
@@ -322,7 +351,7 @@ export function SaveStarButton({ size = 46, starSize = 30, saved: savedProp, onC
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   btn: { alignItems: "center", justifyContent: "center" },
   overlay: { ...StyleSheet.absoluteFillObject, alignItems: "center", justifyContent: "center" },
 });

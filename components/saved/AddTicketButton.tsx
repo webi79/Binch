@@ -1,14 +1,23 @@
 import { View, Text, Pressable, StyleSheet } from "react-native";
 import Svg, { Line, Polyline } from "react-native-svg";
 import { useAccent } from "@/lib/theme/accent";
+import { usePalette, getAppBg } from "@/lib/theme/appBg";
 import { useT } from "@/lib/i18n/useT";
 import { GUTTER, SPACE } from "@/lib/theme/spacing";
+import { ms, scaledStyles } from "@/lib/ui/compact";
 
-// App-Farben (Akzent kommt live aus useAccent()):
-const SURFACE = "#242425"; // Ticket-Fläche — = C.surface (wie TicketCard)
+// App-Farben (Akzent kommt live aus useAccent(), Flächen aus usePalette()):
 const META = "#7E7E86";
 const BARCODE = "#3A3A3D";
 
+/**
+ * Auch diese beiden über `ms`.
+ *
+ * Sie stehen zwar im Stilblatt, aber nicht als eigenes Maß — sie werden dort
+ * verrechnet (`left: STUB_W - NOTCH / 2`, `borderRadius: NOTCH / 2`). Was der
+ * Wrapper sieht, ist das Ergebnis; skalierte er es ein zweites Mal, liefen
+ * Perforation und Aussparung gegeneinander. Deshalb hier einmal, dort roh.
+ */
 const STUB_W = 76; // Breite des linken Stubs (Plus-Icon)
 const NOTCH = 18; // Durchmesser der ausgestanzten Kreise
 
@@ -24,11 +33,15 @@ interface Props {
  * oben/unten ausgestanzte Notch-Kreise, Barcode-Motiv + Chevron rechts.
  * Akzentfarben (Plus, Barcode-Akzentstriche, Chevron) folgen dem User-Akzent.
  */
-export function AddTicketButton({ onPress, bgColor = "#1A1A1A" }: Props) {
+export function AddTicketButton({ onPress, bgColor }: Props) {
   const accent = useAccent();
+  const palette = usePalette();
   const t = useT();
+  // Die Notch-Kreise stanzen den Button aus, müssen also exakt die Farbe
+  // DAHINTER haben — der Aufrufer reicht sie durch, sonst der Screen-Grund.
+  const behind = bgColor ?? getAppBg();
   return (
-    <Pressable onPress={onPress} style={styles.ticket} android_ripple={{ color: accent.subtle }}>
+    <Pressable onPress={onPress} style={[styles.ticket, { backgroundColor: palette.s2 }]} android_ripple={{ color: accent.subtle }}>
       {/* Stub mit Plus-Icon */}
       <View style={styles.stub}>
         <View style={[styles.plusBox, { backgroundColor: accent.subtle }]}>
@@ -43,8 +56,8 @@ export function AddTicketButton({ onPress, bgColor = "#1A1A1A" }: Props) {
       <View style={styles.perforation} pointerEvents="none" />
 
       {/* Ausgestanzte Notches oben/unten — Farbe = Hintergrund */}
-      <View style={[styles.notch, styles.notchTop, { backgroundColor: bgColor }]} pointerEvents="none" />
-      <View style={[styles.notch, styles.notchBottom, { backgroundColor: bgColor }]} pointerEvents="none" />
+      <View style={[styles.notch, styles.notchTop, { backgroundColor: behind }]} pointerEvents="none" />
+      <View style={[styles.notch, styles.notchBottom, { backgroundColor: behind }]} pointerEvents="none" />
 
       {/* Body */}
       <View style={styles.body}>
@@ -60,7 +73,11 @@ export function AddTicketButton({ onPress, bgColor = "#1A1A1A" }: Props) {
               key={i}
               style={{
                 width: w,
-                height: 34,
+                // Maße AM ORT werden von `scaledStyles` nicht erfasst — das
+                // gilt nur für Stilblätter. Ohne `ms` bliebe der Barcode in
+                // voller Höhe stehen, während der Rahmen um ihn herum
+                // schrumpft: Genau daher der Eindruck „viel zu dick".
+                height: ms(34),
                 borderRadius: 1,
                 marginLeft: i === 0 ? 0 : 2,
                 backgroundColor: i % 4 === 0 ? accent.solid : BARCODE,
@@ -70,7 +87,7 @@ export function AddTicketButton({ onPress, bgColor = "#1A1A1A" }: Props) {
         </View>
 
         {/* Chevron */}
-        <Svg width={22} height={22} viewBox="0 0 24 24" style={{ marginLeft: 12 }}>
+        <Svg width={ms(22)} height={ms(22)} viewBox="0 0 24 24" style={{ marginLeft: ms(12) }}>
           <Polyline
             points="9 18 15 12 9 6"
             fill="none"
@@ -85,11 +102,10 @@ export function AddTicketButton({ onPress, bgColor = "#1A1A1A" }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   ticket: {
     flexDirection: "row",
     alignItems: "stretch",
-    backgroundColor: SURFACE,
     borderRadius: 18,
     minHeight: 72,
     overflow: "visible",

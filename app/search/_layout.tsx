@@ -1,4 +1,5 @@
 import { Stack } from "expo-router";
+import { useAppBg } from "@/lib/theme/appBg";
 
 // Initial-Route explizit auf `index` festsetzen. Ohne diese Zeile nimmt
 // react-navigation das erste deklarierte `<Stack.Screen>` als Initial-Route —
@@ -10,13 +11,14 @@ export const unstable_settings = {
 };
 
 export default function SearchLayout() {
+  const appBg = useAppBg();
   return (
     <Stack
       initialRouteName="index"
       screenOptions={{
         headerShown: false,
         animation: "none",
-        contentStyle: { backgroundColor: "#1A1A1A" },
+        contentStyle: { backgroundColor: appBg },
       }}
     >
       <Stack.Screen

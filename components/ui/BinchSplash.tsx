@@ -13,6 +13,7 @@
 
 import { useEffect } from "react";
 import { StyleSheet, View } from "react-native";
+import { useAppBg } from "@/lib/theme/appBg";
 import Animated, {
   Easing,
   interpolate,
@@ -23,9 +24,9 @@ import Animated, {
   type SharedValue,
 } from "react-native-reanimated";
 import { useAccent } from "@/lib/theme/accent";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const WHITE = "#FFFFFF";
-const BG = "#161616";
 
 interface Props {
   onFinish?: () => void;
@@ -38,6 +39,7 @@ export function BinchSplash({
   loop = false,
   duration = 3000,
 }: Props) {
+  const appBg = useAppBg();
   const p = useSharedValue(0);
   // Akzent-Farbe aus dem User-Setting (lime/mint/…). Splash matched damit
   // die App-Wahl — bei Lime grün, bei Mint türkis.
@@ -77,7 +79,7 @@ export function BinchSplash({
   }, []);
 
   return (
-    <View style={styles.root}>
+    <View style={[styles.root, { backgroundColor: appBg }]}>
       <View style={styles.logoRow} pointerEvents="none">
         {letters.map((l, i) => (
           <Letter key={i} p={p} index={i} char={l.ch} color={l.color} />
@@ -126,10 +128,9 @@ function Letter({
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   root: {
     flex: 1,
-    backgroundColor: BG,
     alignItems: "center",
     justifyContent: "center",
   },

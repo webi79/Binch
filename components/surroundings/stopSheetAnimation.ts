@@ -15,6 +15,7 @@
  * über `selectStop()`. Beide Pfade convergieren beim User-sichtbaren Sheet.
  */
 import { type SharedValue, withTiming } from "react-native-reanimated";
+import { SHEET_IN, SHEET_OUT } from "@/lib/nav/overlayCover";
 
 interface SheetController {
   translateY: SharedValue<number>;
@@ -31,12 +32,26 @@ export function registerStopSheetAnimation(c: SheetController): () => void {
   };
 }
 
+/**
+ * Startet die Bewegung im Berührungs-Frame — und ist damit die EINZIGE Stelle,
+ * die sie startet.
+ *
+ * Das Blatt fuhr bis eben zweimal: hier mit 350ms und Reanimateds Vorgabe-Kurve,
+ * und einen Commit später noch einmal aus dem Blatt selbst mit `SHEET_IN`. Die
+ * zweite Kurve setzte von der inzwischen erreichten Position neu an — ein
+ * Geschwindigkeitssprung mitten in der Fahrt, und die Gesamtdauer lag über
+ * beiden Werten. Der Kommentar im Blatt behauptete dabei, hier laufe die
+ * Bewegung bereits und dort werde nur ein Zeitgeber gesetzt.
+ *
+ * Jetzt gilt dieselbe Vorgabe wie für jedes andere Blatt von unten.
+ */
 export function openStopSheet(): void {
   if (!controller) return;
-  controller.translateY.value = withTiming(controller.getMid(), { duration: 350 });
+  controller.translateY.value = withTiming(controller.getMid(), SHEET_IN);
 }
 
+/** Ohne Aufrufer — bleibt als Gegenstück stehen, benutzt aber dieselbe Vorgabe. */
 export function closeStopSheet(): void {
   if (!controller) return;
-  controller.translateY.value = withTiming(controller.getSheetHeight(), { duration: 350 });
+  controller.translateY.value = withTiming(controller.getSheetHeight(), SHEET_OUT);
 }

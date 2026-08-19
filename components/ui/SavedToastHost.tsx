@@ -11,7 +11,8 @@
  * im Leerlauf.
  */
 
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useRef } from "react";
+import { resultsPush, overlayCover } from "@/lib/nav/overlayCover";
 import { StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import Animated, {
   cancelAnimation,
@@ -30,6 +31,8 @@ import { useSearchStore } from "@/stores/searchStore";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
 import { useAccent } from "@/lib/theme/accent";
+import { usePalette } from "@/lib/theme/appBg";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const AnimatedPath = Animated.createAnimatedComponent(Path);
 
@@ -45,18 +48,23 @@ const TEXT_PRIMARY = "#FFFFFF";
 const TEXT_TERTIARY = "#8A8A90";
 const ICON_INK = "#123007";
 
-const toastEntering = new Keyframe({
-  0: { opacity: 0, transform: [{ translateY: -200 }] },
-  100: {
-    opacity: 1,
-    transform: [{ translateY: 0 }],
-    easing: Easing.bezier(0.18, 0.9, 0.22, 1.04),
-  },
-}).duration(SLIDE_DURATION);
-
-// KEIN exiting Keyframe — Reanimated hielt sonst die native View 140ms
-// nach dem Unmount fest und das verzögert Tab-Switch + Overlay-Cleanup.
-// Toast verschwindet jetzt instant beim Unmount.
+/**
+ * Beide Richtungen über EIGENE Werte, keine Ein-/Aussprung-Animation.
+ *
+ * Hier stand ein `Keyframe` fürs Hereinfahren und ausdrücklich KEINER fürs
+ * Hinausfahren — mit der Begründung, Reanimated halte die native Ansicht nach
+ * dem Abbau noch 140ms fest und verzögere damit den Reiter-Wechsel. Die
+ * Begründung stimmt, die Folge war aber, dass die Meldung einfach verschwand,
+ * statt wieder hochzufahren.
+ *
+ * Mit eigenen Werten entfällt das Problem an der Wurzel: Wir bestimmen selbst,
+ * wann abgebaut wird. Die Meldung fährt hinaus, und ERST DANACH verschwindet
+ * sie — Reanimated hält nichts fest, weil gar keine Ein-/Aussprung-Animation
+ * mehr im Spiel ist. Für den Weg über „Ansehen" bleibt es beim sofortigen
+ * Abbau: Dort wird ohnehin navigiert, und dieser Wechsel soll auf nichts warten.
+ */
+const TOAST_TRAVEL = -200;
+const TOAST_EASE = Easing.bezier(0.18, 0.9, 0.22, 1.04);
 
 export function SavedToastHost() {
   const toast = useSearchStore((s) => s.savedToast);
@@ -70,10 +78,39 @@ function Toast() {
   const insets = useSafeAreaInsets();
   const t = useT();
   const accent = useAccent();
+  const palette = usePalette();
   // Store-Daten zu Mount-Zeit einlesen, danach nicht mehr subscriben —
   // die Toast-Lebenszeit ist von außen kontrolliert (HOLD_MS oder Klick).
   const toastData = useSearchStore.getState().savedToast;
   const clearSelectedResult = useSearchStore.getState().clearSelectedResult;
+
+
+  /** Position und Deckkraft der Meldung — siehe Begründung oben. */
+  const ty = useSharedValue(TOAST_TRAVEL);
+  const op = useSharedValue(0);
+  const toastStyle = useAnimatedStyle(() => ({
+    opacity: op.value,
+    transform: [{ translateY: ty.value }],
+  }));
+  /**
+   * Hinausfahren und ERST DANACH abbauen. Der Riegel fängt den Fall ab, dass
+   * die Haltezeit abläuft, während schon von Hand geschlossen wurde.
+   */
+  const closingRef = useRef(false);
+  const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const slideOut = useCallback(() => {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    ty.value = withTiming(TOAST_TRAVEL, { duration: SLIDE_DURATION, easing: TOAST_EASE });
+    op.value = withTiming(0, { duration: SLIDE_DURATION });
+    hideTimer.current = setTimeout(hide, SLIDE_DURATION);
+  }, [hide, ty, op]);
+  useEffect(
+    () => () => {
+      if (hideTimer.current) clearTimeout(hideTimer.current);
+    },
+    [],
+  );
 
   const ring = useSharedValue(0);
   const check = useSharedValue(0);
@@ -88,8 +125,15 @@ function Toast() {
       SLIDE_DURATION,
       withTiming(1, { duration: CHECK_DURATION, easing: Easing.out(Easing.cubic) }),
     );
-    const dismiss = setTimeout(hide, HOLD_MS);
+    // Hereinfahren im nächsten Bild — der Baum steht dann, die Bewegung läuft
+    // nicht gegen seinen Aufbau an.
+    const raf = requestAnimationFrame(() => {
+      ty.value = withTiming(0, { duration: SLIDE_DURATION, easing: TOAST_EASE });
+      op.value = withTiming(1, { duration: SLIDE_DURATION });
+    });
+    const dismiss = setTimeout(slideOut, HOLD_MS);
     return () => {
+      cancelAnimationFrame(raf);
       clearTimeout(dismiss);
       cancelAnimation(ring);
       cancelAnimation(check);
@@ -110,7 +154,50 @@ function Toast() {
     // expo-router das in zwei separaten State-Updates, was dazu führte dass
     // der User einen Frame lang den Home-Tab sah (= Reanimated unfreeze
     // + Re-Mount-Churn) BEVOR der Saved-Tab fokussiert wurde.
+    // Welches Ergebnis war offen, als getippt wurde? Im Handler lesen, nicht im
+    // Render — dort würde es bei jedem Render überschrieben und der Wächter unten
+    // verglichen gegen die NEUE Auswahl, also genau gegen die, die er schützen soll.
+    const openId = useSearchStore.getState().selectedResult?.id;
+    /**
+     * Den Ergebnis-Bildschirm SOFORT wegstellen, bevor der Reiter wechselt.
+     *
+     * Die Marke oben überspringt nur seine Rückfahrt — stehen bleibt er
+     * trotzdem, in voller Größe und an seiner Endposition, bis die Route beim
+     * Wechsel abgeräumt wird. Der Reiter-Wechsel lief also über einen
+     * bildschirmfüllenden Baum hinweg, der erst irgendwann darin verschwand.
+     * Das ist das „ich bugge mich durch mehrere Reiter": Man sieht die
+     * Ergebnisse, dann den darunterliegenden Reiter, dann das Ziel.
+     *
+     * Beides ohne Bewegung: Der Fortschritt springt auf 0 (der Baum liegt damit
+     * rechts außerhalb, wo er im Ruhezustand ohnehin liegt), und der geteilte
+     * Parallax-Wert geht mit, damit die Unterlage nicht verschoben stehenbleibt.
+     * Sichtbar ist davon nichts — es passiert im selben Bild wie der Wechsel.
+     */
+    /**
+     * ERST wechseln, DANN wegstellen — die Reihenfolge war falsch herum.
+     *
+     * Ich hatte den Ergebnis-Bildschirm vor dem Wechsel geparkt, damit der
+     * Reiter-Wechsel nicht über ihn hinwegläuft. Damit lag aber für die Dauer
+     * des Wechsels der Home-Reiter frei, und genau der blitzte auf. Der
+     * Kommentar unten warnt seit jeher vor exakt diesem Bild.
+     *
+     * Richtig ist die andere Reihenfolge: Der Ergebnis-Bildschirm deckt den
+     * Wechsel ab und verschwindet erst, wenn der Saved-Reiter darunter steht.
+     * Zwei Bilder Abstand, weil der Wechsel selbst einen Commit braucht — dann
+     * gibt es weder ein Aufblitzen noch ein Durchwandern.
+     *
+     * Ohne Bewegung: Der Fortschritt springt auf 0, also dorthin, wo der Baum im
+     * Ruhezustand ohnehin liegt (rechts außerhalb). Der geteilte Parallax-Wert
+     * geht mit, sonst bliebe die Unterlage verschoben stehen.
+     */
     router.dismissTo("/(tabs)/saved");
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        resultsPush.value = 0;
+        overlayCover.value = 0;
+        useSearchStore.getState().setResultsParams(null);
+      }),
+    );
     // KEINE direkte clearSelectedResult-Aufrufung mehr! Der DetailsContent-
     // Subtree ist riesig (useQuery + viele Reanimated-Hooks + ScrollView).
     // Ein synchrones Unmount während der Tab-Switch + Modal-Pop läuft,
@@ -118,7 +205,16 @@ function Toast() {
     // anfühlen ließ. Stattdessen 2s deferred — bis dahin hat der User sich
     // visuell schon längst auf der Saved-Tab eingelebt, und das Unmount
     // passiert unsichtbar im Hintergrund.
-    setTimeout(() => clearSelectedResult(), 2000);
+    setTimeout(() => {
+          // NUR löschen, wenn immer noch DAS Ergebnis offen ist, um das es hier
+          // ging. Der Toast ist längst weg, wenn dieser Zeitgeber feuert — wer in
+          // den zwei Sekunden zurück in die Liste geht und eine andere Karte
+          // öffnet, bekam sein frisch geöffnetes Detail sonst kommentarlos wieder
+          // zugemacht (die Aktion nullt auch die Bein-Zeitleiste mit).
+          const st = useSearchStore.getState();
+          if (st.selectedResult?.id !== openId) return;
+          clearSelectedResult();
+        }, 2000);
   }, [ring, check, hide, router, clearSelectedResult]);
 
   const ringStyle = useAnimatedStyle(() => {
@@ -147,10 +243,9 @@ function Toast() {
       style={[StyleSheet.absoluteFillObject, styles.host]}
     >
       <Animated.View
-        entering={toastEntering}
-        style={[styles.layer, { top: (insets.top || 0) + 10 }]}
+        style={[styles.layer, { top: (insets.top || 0) + 10 }, toastStyle]}
       >
-        <View style={styles.toast}>
+        <View style={[styles.toast, { backgroundColor: palette.s3 }]}>
             <View style={styles.iconWrap}>
               <Animated.View
                 style={[
@@ -199,7 +294,7 @@ function Toast() {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   host: {
     zIndex: 1000,
     elevation: 32,

@@ -6,6 +6,7 @@
  */
 import { memo, useMemo } from "react";
 import { View, Text, StyleSheet } from "react-native";
+import { usePalette } from "@/lib/theme/appBg";
 import { format, parseISO } from "date-fns";
 import { de, enGB, es, fr } from "date-fns/locale";
 import { showAlert } from "@/lib/alert";
@@ -16,6 +17,8 @@ import { useSearchStore } from "@/stores/searchStore";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import { prepareLayer } from "@/lib/nav/transitionLayer";
+import { startTicketPush } from "@/lib/nav/overlayCover";
 import { deleteTicketFiles } from "@/lib/saved/ticketImages";
 import {
   TicketHead,
@@ -24,6 +27,7 @@ import {
   useDepartureCountdown,
   bookingRefFor,
 } from "./TicketParts";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const C = {
   bg: "#1A1A1A",
@@ -47,11 +51,16 @@ const C = {
 const DATE_LOCALES = { en: enGB, de, fr, es } as const;
 
 function TicketCardInner({ ticket }: { ticket: Ticket }) {
+  const palette = usePalette();
+  // Die Notch-Kreise stanzen die Karte aus; sichtbar wird der Screen-Grund,
+  // leicht abgedunkelt durch den Kartenschatten. Bei echtem Schwarz gibt es
+  // nichts mehr abzudunkeln — dann direkt der Grund.
+  const notchBehind = palette.bg === "#000000" ? palette.bg : C.notchShadow;
   const t = useT();
   const accent = useAccent();
   const locale = useSearchStore((s) => s.locale);
-  const openTicketDetail = useSearchStore((s) => s.openTicketDetail);
-  const removeTicket = useSearchStore((s) => s.removeTicket);
+  const openTicketDetail = useSearchStore.getState().openTicketDetail;
+  const removeTicket = useSearchStore.getState().removeTicket;
 
   const dateLocale = DATE_LOCALES[locale] ?? enGB;
 
@@ -88,9 +97,30 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
     }
   }, [ticket.departTime, t]);
 
+  /**
+   * Die Textur des Reiters entsteht beim AUFSETZEN des Fingers.
+   *
+   * Sie stand im Loslassen — entgegen der Regel des Moduls, das den Aufbau mit
+   * 66ms beziffert und deshalb ausdrücklich den Fingerdruck vorschreibt. So
+   * fielen 66ms genau in die Bilder, in denen die Bewegung anlaufen soll, und
+   * das ausgerechnet bei dem Übergang, der als der glatte gilt. Zwischen
+   * Aufsetzen und Loslassen liegen 80 bis 150ms, die ohnehin verstreichen.
+   *
+   * `onTouchStart` am Rahmen, NICHT `onPressIn`: Diese Karte liegt in einer
+   * Liste, und ein Druck-Beginn dort wird oft ein Scrollen. Das reine
+   * Berührungs-Ereignis beansprucht die Geste nicht und stört das Scrollen
+   * nicht — dieselbe Lösung wie am „Auswählen"-Knopf der Ergebnis-Karte.
+   */
+  const onTouchStart = () => {
+    prepareLayer("saved");
+  };
+
   const onPress = () => {
+    // Bewegung ZUERST — sie war die einzige Seitwärts-Slide, die erst nach dem
+    // Commit anlief. Siehe startTicketPush.
+    startTicketPush();
     haptic("button");
-    openTicketDetail(ticket);
+    requestAnimationFrame(() => openTicketDetail(ticket));
   };
 
   const onLongPress = () => {
@@ -129,31 +159,21 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
           erhalten (TouchableNativeFeedback wrapper auf Android, plus
           overflow:hidden Clip am inner View). Visueller Ripple ist aus
           (transparent) damit's bei LongPress nicht als Welle stehen bleibt. */}
-      {/* Zwei ineinandergeschachtelte Wrapper, beide nötig:
+      {/* cardShadow trägt den Schatten und sitzt NICHT auf der Karte selbst:
+          Die braucht overflow:"hidden" für die Perforationskreise, und das
+          schnitte einen Außenschatten weg. Gleicher Radius, damit der Schatten
+          den runden Ecken folgt.
 
-          shadowClip (außen) = die Hardware-Textur gegen den Scroll-Lag. Der
-          Blur-Schatten (3 Layer über die volle Kartenbreite) wurde beim Scrollen
-          JEDEN Frame neu gerastert — genau der Lag, der mit dem Schatten kam. Als
-          Textur wird die fertige Karte samt Schatten beim Scrollen nur noch
-          verschoben. ABER: Die Textur wird exakt auf die View-Größe zugeschnitten,
-          und ein Außenschatten ragt darüber hinaus — texturiert man die enge Karte,
-          wird der Schatten ABGESCHNITTEN (genau das war eben kaputt). Deshalb hat
-          shadowClip ringsum so viel Innenabstand, wie der Schatten ausgreift
-          (oben 8, unten 28, seitlich 20), damit er vollständig in der Textur liegt.
-          Ein exakt gegenläufiger negativer Rand rechnet diesen Abstand wieder
-          heraus — das Layout bleibt unverändert. Seitlich passt der Abstand in den
-          20-px-Rand, den die Karte ohnehin hat.
-
-          cardShadow (innen) = trägt den boxShadow. Sitzt NICHT auf der Karte
-          selbst, weil die overflow:"hidden" für die Perforationskreise braucht und
-          das den Außenschatten wegclippen würde. Gleicher Radius, damit der Schatten
-          den runden Ecken folgt. */}
-      <View style={styles.shadowClip} renderToHardwareTextureAndroid>
-      <View style={styles.cardShadow}>
+          Der Rahmen darum (`shadowClip`) ist weg. Er machte nur die
+          Hardware-Textur groß genug für den Schatten — die Textur gibt es nicht
+          mehr (sie invalidierte sich bei jeder Inhaltsänderung selbst), also
+          blieben Innenabstand und negativer Rand übrig, die sich exakt
+          aufhoben. */}
+      <View style={styles.cardShadow} onTouchStart={onTouchStart}>
       <RippleTouch
         onPress={onPress}
         onLongPress={onLongPress}
-        style={styles.card}
+        style={[styles.card, { backgroundColor: palette.s2 }]}
         rippleColor="transparent"
       >
         <TicketHead ticket={ticket} />
@@ -162,7 +182,7 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
             Notch-Kreise von card.overflow:hidden sauber an den Card-Rändern
             geclippt werden (halbe Kreise die wie ausgestanzt aussehen). Mit
             einem Padding-Wrapper wäre der Clip-Anker falsch positioniert. */}
-        <Perforation notchColor={C.notchShadow} />
+        <Perforation notchColor={notchBehind} />
 
         <View style={styles.countdown}>
           <View style={styles.countdownTop}>
@@ -185,14 +205,13 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
         </View>
       </RippleTouch>
       </View>
-      </View>
 
       <Text style={styles.hint}>{t("saved.ticket.openHint")}</Text>
     </View>
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   wrap: { marginHorizontal: GUTTER, marginBottom: 8 },
   headerRow: {
     paddingHorizontal: 8,
@@ -217,21 +236,17 @@ const styles = StyleSheet.create({
   //   0 10px 24px -8px rgba(0,0,0,.42)  — Abwurf, jetzt kurz
   //   0  5px 14px -6px rgba(0,0,0,.26)  — mittlere Lage
   //   0  2px  6px      rgba(0,0,0,.18)  — enge Kantenabhebung
-  // Innenabstand = Schatten-Ausdehnung (oben 8, unten 28, seitlich 20), damit die
-  // Hardware-Textur den ganzen Schatten umfasst; negativer Rand gleich groß, damit
-  // das Layout unverändert bleibt (seitlich in den 20-px-Kartenrand hinein).
-  shadowClip: {
-    paddingTop: 8,
-    paddingBottom: 28,
-    paddingHorizontal: 20,
-    marginTop: -8,
-    marginBottom: -28,
-    marginHorizontal: -20,
-  },
   cardShadow: {
     borderRadius: 24,
-    boxShadow:
-      "0px 10px 24px -8px rgba(0, 0, 0, 0.42), 0px 5px 14px -6px rgba(0, 0, 0, 0.26), 0px 2px 6px rgba(0, 0, 0, 0.18)",
+    // EINE Schicht statt drei. Jede Schicht ist ein eigener weicher Verlauf über
+    // die volle Kartenbreite, den die GPU beim Zeichnen mit dem Untergrund
+    // mischt — beim Scrollen und bei jeder Karten-Animation erneut. Drei davon
+    // übereinander kosteten das Dreifache für einen Unterschied, den man im
+    // direkten Vergleich nicht sieht: Die mittlere Schicht liegt fast deckungs-
+    // gleich unter der ersten, die dritte (2px, ohne Ausbreitung) verschwindet
+    // hinter der Kartenkante. Die eine hier ist die Summe: etwas kräftiger
+    // (0.55 statt 0.42) und dafür enger gezogen.
+    boxShadow: "0px 8px 20px -6px rgba(0, 0, 0, 0.55)",
   },
 
   card: {

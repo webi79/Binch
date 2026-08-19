@@ -17,6 +17,7 @@ import {
   SCENE_W,
   SCENE_H,
 } from "./SearchSceneChrome";
+import { scaledStyles } from "@/lib/ui/compact";
 
 interface Props {
   destLabel: string;
@@ -77,7 +78,7 @@ export function WeatherScene({ destLabel }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   flyer: { position: "absolute", top: 0, left: 0 },
   cloud: { position: "absolute" },
   code: { position: "absolute", fontSize: 11, fontWeight: "700" },

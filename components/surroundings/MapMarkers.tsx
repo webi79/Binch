@@ -8,12 +8,10 @@ import {
   Plane,
   Ship,
   type LucideIcon,
-  Trees,
-  ShoppingBag,
-  UtensilsCrossed,
 } from "lucide-react-native";
-import { MapMarker, MarkerKind, POI, USER_LOC, type Coord } from "@/lib/surroundings/mockData";
+import { MapMarker, MarkerKind, type Coord } from "@/lib/surroundings/mockData";
 import { useAccent } from "@/lib/theme/accent";
+import { scaledStyles } from "@/lib/ui/compact";
 
 // LIME-Konstanten entfernt — Marker holen den User-Akzent via useAccent zur
 // Laufzeit. markerColors() nimmt den Akzent als Parameter.
@@ -83,24 +81,15 @@ export const Marker = memo(function Marker({ m }: { m: MapMarker }) {
   );
 });
 
-const POI_COLORS: Record<POI["kind"], { bg: string; fg: string; Icon: LucideIcon }> = {
-  park: { bg: "#2A4A30", fg: "#7ACC8A", Icon: Trees },
-  shop: { bg: "#3A2A4A", fg: "#B388E6", Icon: ShoppingBag },
-  food: { bg: "#4A3A2A", fg: "#E6A04A", Icon: UtensilsCrossed },
-};
-
-export function POIMarker({ p, id }: { p: POI; id: string }) {
-  const { bg, fg, Icon } = POI_COLORS[p.kind];
-  return (
-    <MapLibreMarker id={id} lngLat={lngLat(p.coord)} anchor="center">
-      <View style={[styles.poi, { backgroundColor: bg }]}>
-        <Icon color={fg} size={11} strokeWidth={2.4} />
-      </View>
-    </MapLibreMarker>
-  );
-}
-
-export function UserPin({ coord = USER_LOC }: { coord?: Coord }) {
+/**
+ * Die Stecknadel „du bist hier".
+ *
+ * Der Vorgabewert war der Berliner Platzhalter — ohne Standort stand die Nadel
+ * also in Berlin und behauptete, das sei der Nutzer. Jetzt ist die Koordinate
+ * Pflicht, und der Aufrufer zeichnet die Nadel gar nicht erst, solange keine
+ * bekannt ist.
+ */
+export function UserPin({ coord }: { coord: Coord }) {
   const accent = useAccent();
   return (
     <MapLibreMarker id="user-pin" lngLat={lngLat(coord)} anchor="center">
@@ -112,7 +101,7 @@ export function UserPin({ coord = USER_LOC }: { coord?: Coord }) {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   markerWrap: {
     alignItems: "center",
     justifyContent: "center",
@@ -163,15 +152,6 @@ const styles = StyleSheet.create({
     borderLeftColor: "transparent",
     borderRightColor: "transparent",
     marginTop: -2,
-  },
-  poi: {
-    width: 22,
-    height: 22,
-    borderRadius: 11,
-    alignItems: "center",
-    justifyContent: "center",
-    borderWidth: 1.5,
-    borderColor: "rgba(0,0,0,0.5)",
   },
   userPin: {
     width: 52,

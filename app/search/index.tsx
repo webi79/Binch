@@ -3,6 +3,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useIsFocused } from "@react-navigation/native";
 import { SearchHero } from "@/components/search/SearchHero";
 import { useSearchStore } from "@/stores/searchStore";
+import { useAppBg } from "@/lib/theme/appBg";
 
 /**
  * Nur rendern wenn dieser Screen tatsächlich der aktive Stack-Eintrag ist
@@ -20,6 +21,7 @@ import { useSearchStore } from "@/stores/searchStore";
  * onPress-Fallback) ist focused dauerhaft true → nach 80 ms ist der Hero da.
  */
 export default function SearchScreen() {
+  const appBg = useAppBg();
   const focused = useIsFocused();
   const mode = useSearchStore((s) => s.activeMode);
   const [ready, setReady] = useState(false);
@@ -36,7 +38,7 @@ export default function SearchScreen() {
   if (!focused || !ready) return null;
 
   return (
-    <SafeAreaView className="flex-1 bg-[#1A1A1A]" edges={["top"]}>
+    <SafeAreaView style={{ flex: 1, backgroundColor: appBg }} edges={["top"]}>
       <SearchHero mode={mode} />
     </SafeAreaView>
   );

@@ -10,6 +10,7 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { View, Text, StyleSheet } from "react-native";
 import Svg, { Path, Circle, Line, Ellipse, G } from "react-native-svg";
+import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
   useSharedValue,
   useAnimatedStyle,
@@ -20,6 +21,7 @@ import Animated, {
   Easing,
   type SharedValue,
 } from "react-native-reanimated";
+import { scaledStyles } from "@/lib/ui/compact";
 
 export const SCENE_W = 300;
 export const SCENE_H = 240;
@@ -51,8 +53,28 @@ export function useArcMotion(duration = 5000): SharedValue<number> {
   const p = useSharedValue(0);
   useEffect(() => {
     if (paused) return;
+    /**
+     * LINEAR — und das ist bei einer nicht umkehrenden Schleife der Kern.
+     *
+     * Hier stand `Easing.inOut(Easing.ease)`. Diese Kurve bremst zum Ende auf
+     * null ab und läuft am Anfang aus der Ruhe an — richtig für eine einmalige
+     * Bewegung, falsch für eine, die von vorne beginnt. Der dritte Wert unten
+     * ist `false`: Die Schleife kehrt NICHT um, sie springt am Ende zurück an
+     * den Anfang. Damit ergab sich pro Zyklus:
+     *
+     *   erste 0,5s   3% des Weges      (Anlauf aus dem Stand)
+     *   letzte 0,5s  die letzten 3%    (Abbremsen auf null)
+     *   dazwischen   der ganze Rest
+     *
+     * Eine Sekunde von fünf, in der sich fast nichts bewegt — und direkt danach
+     * ein Sprung an den Anfang. Genau das fühlt sich zäh an.
+     *
+     * Ein Element, das eine Strecke entlangfliegt und dann neu beginnt, muss
+     * gleichmäßig laufen. Beschleunigen und Abbremsen gehört an Wendepunkte, und
+     * die hat diese Schleife nicht.
+     */
     p.value = withRepeat(
-      withTiming(1, { duration, easing: Easing.inOut(Easing.ease) }),
+      withTiming(1, { duration, easing: Easing.linear }),
       -1,
       false,
     );
@@ -195,8 +217,9 @@ export function DealChip({
   label: string;
   accent: string;
 }) {
+  const palette = usePalette();
   return (
-    <View style={styles.chip}>
+    <View style={[styles.chip, { backgroundColor: palette.s2 }]}>
       {code ? (
         <View style={[styles.chipCode, { backgroundColor: badgeColor || C.surface4 }]}>
           <Text style={styles.chipCodeTxt}>{code}</Text>
@@ -220,8 +243,9 @@ export function WeatherChip({
   cond: string;
   accent: string;
 }) {
+  const palette = usePalette();
   return (
-    <View style={styles.weather}>
+    <View style={[styles.weather, { backgroundColor: palette.s2 }]}>
       <Sun size={22} accent={accent} />
       <Text style={styles.weatherTemp}>{temp}</Text>
       <Text style={styles.weatherMeta}>
@@ -238,10 +262,11 @@ export function SpeechBubble({
   children: ReactNode;
   maxWidth?: number;
 }) {
+  const palette = usePalette();
   return (
-    <View style={[styles.bubble, { maxWidth }]}>
+    <View style={[styles.bubble, { backgroundColor: palette.s2 }, { maxWidth }]}>
       {children}
-      <View style={styles.bubbleTail} />
+      <View style={[styles.bubbleTail, { backgroundColor: palette.s2 }]} />
     </View>
   );
 }
@@ -274,7 +299,7 @@ export function SpruecheLine({ items }: { items: string[] }) {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   chip: {
     flexDirection: "row",
     alignItems: "center",

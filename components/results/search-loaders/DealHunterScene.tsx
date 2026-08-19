@@ -16,6 +16,7 @@ import Animated, {
 import { Bo } from "@/components/assistant/Bo";
 import { useAccent } from "@/lib/theme/accent";
 import { CatchNet, DealChip, SCENE_W, useLoaderPaused } from "./SearchSceneChrome";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const SCENE_H = 252;
 
@@ -103,7 +104,7 @@ export function DealHunterScene() {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   catcher: {
     position: "absolute",
     bottom: 4,

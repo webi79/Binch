@@ -19,7 +19,7 @@
  *   - Animated-G-Props bewegen einzelne Gesichtsteile (Augen, Mund, Arm, Tropfen)
  *   - Animationen werden bei state-Wechsel komplett cancelled + neu gestartet
  */
-import React, { useEffect, useRef } from "react";
+import React, { memo, useEffect, useRef } from "react";
 import { View, StyleSheet } from "react-native";
 import Svg, {
   Defs,
@@ -45,6 +45,7 @@ import Animated, {
   Easing,
 } from "react-native-reanimated";
 import { useAccent } from "@/lib/theme/accent";
+import { scaledStyles } from "@/lib/ui/compact";
 
 export type BoMood = "idle" | "waving" | "talking" | "thinking" | "happy" | "error" | "sad";
 
@@ -68,7 +69,18 @@ interface Props {
   paused?: boolean;
 }
 
-export function Bo({ state = "idle", size = 128, paused = false }: Props) {
+/**
+ * `memo` ist hier nicht Kür.
+ *
+ * Bo hängt im Assistenten-Bildschirm, und der rendert bei JEDEM Textstück der
+ * Antwort neu — also viele Male pro Sekunde, solange Bo schreibt. Ohne Riegel
+ * lief dabei jedes Mal sein ganzer Baum durch: rund 45 SVG-Knoten, zwei
+ * Verläufe, dazu fünf `useAnimatedStyle`, die ihre Worklet-Umgebung jedes Mal
+ * neu an den UI-Strang schicken.
+ *
+ * Alle Eigenschaften sind einfache Werte, der Vergleich greift also zuverlässig.
+ */
+function BoInner({ state = "idle", size = 128, paused = false }: Props) {
   const accent = useAccent();
 
   // Wenn Bo mit `paused=true` UND `state="sad"` mountet (typisch in der
@@ -107,6 +119,26 @@ export function Bo({ state = "idle", size = 128, paused = false }: Props) {
   // ein Reset würde sie auf 0/-7 zurücksetzen → sichtbarer Snap-Frame bevor
   // die State-spezifische Setup-Logik wieder auf -3/-15 snappt.
   const isFirstRunRef = useRef(true);
+  /**
+   * Welcher Zustand wurde zuletzt EINGERICHTET?
+   *
+   * Der Effekt darunter hängt an `state` UND `paused`. Bisher machte er in
+   * beiden Fällen dasselbe: alles abbrechen, alles über 200ms auf die neutrale
+   * Pose zurückfahren, dann den Zustand neu aufsetzen — der selbst noch einmal
+   * 200ms Anlauf hat, bevor seine Schleife beginnt.
+   *
+   * Für einen ZUSTANDSWECHSEL ist das richtig. Für ein Fortsetzen nach einer
+   * Pause ist es der Grund, warum Bo sich zäh anfühlt: `paused` ist
+   * `!isFocused || isScrolling || sliding` — es kippt also bei JEDEM Scrollen im
+   * Verlauf. Nach jedem Scrollen lief damit ab: einfrieren, 200ms zur neutralen
+   * Pose gleiten, 200ms zur Startpose zurückgleiten, und die Schleife fängt von
+   * vorne an. Das sind rund 400ms Bewegung, die niemand angefordert hat, und
+   * eine Schleife, die nie durchläuft.
+   *
+   * Das sieht aus wie Ruckeln, ist aber keins — es ist eine Animation, die
+   * dauernd neu anfängt. Deshalb wird jetzt unterschieden.
+   */
+  const lastSetupRef = useRef<BoMood | null>(null);
   useEffect(() => {
     const all = [
       tx, ty, rot, sx, sy,
@@ -115,7 +147,10 @@ export function Bo({ state = "idle", size = 128, paused = false }: Props) {
     ];
     all.forEach(cancelAnimation);
 
-    if (!isFirstRunRef.current) {
+    const stateChanged = lastSetupRef.current !== state;
+    lastSetupRef.current = state;
+
+    if (!isFirstRunRef.current && stateChanged) {
       // Cross-State-Reset — smoother Übergang zur neutralen Pose (200ms
       // withTiming statt instant assignment). Wenn der neue State danach
       // einen Wert selber animiert (z.B. neue ty/rot via withSequence),
@@ -174,6 +209,31 @@ export function Bo({ state = "idle", size = 128, paused = false }: Props) {
     // ursprüngliche Repeat/Sequence. Damit überlappt der State-Wechsel sanft
     // statt zu snappen.
     const T_IN = { duration: 200, easing: EASE };
+
+    /**
+     * Mit OFFENEN Augen in jeden Zustand gehen.
+     *
+     * Ohne diese Zeile blieb Bo regelmäßig mit „hell weißen" Augen stehen — was
+     * in Wahrheit heißt: mit GESCHLOSSENEN. Die Augen sind dunkle Flächen, die
+     * beim Blinzeln auf 4% Deckkraft ausblenden; bleibt der Wert dort hängen,
+     * scheint sein heller Körper durch die Augenhöhlen.
+     *
+     * Der Ablauf davor: Die Aufräumroutine dieses Effekts bricht `eyeBlink` ab,
+     * und sie läuft bei JEDEM Wechsel von `state` ODER `paused`. `paused` hängt
+     * am Scrollen, kippt also ständig. Wurde dabei gerade zugeblinzelt, fror der
+     * Wert nahe null ein. Danach zwei Wege, beide falsch:
+     *
+     *  • Zustände mit Blinzeln (idle, waving, talking, thinking) starten ihren
+     *    Takt mit `withDelay(10_000, …)` — der Wert bleibt also ZEHN SEKUNDEN
+     *    auf „geschlossen" stehen, bevor überhaupt etwas passiert.
+     *  • `error` und `sad` zeigen offene Augen, rufen `blink()` aber gar nicht.
+     *    Dort blieb es bis zum nächsten Zustandswechsel.
+     *
+     * Ein `withTiming` wäre hier falsch: Es würde beim nächsten Abbruch wieder
+     * irgendwo dazwischen stehen bleiben. Der Sprung ist unsichtbar, weil er
+     * nur einen Zustand herstellt, der ohnehin der Normalfall ist.
+     */
+    eyeBlink.value = 1;
 
     if (state === "idle") {
       glowOp.value = withTiming(0.18);
@@ -413,7 +473,7 @@ export function Bo({ state = "idle", size = 128, paused = false }: Props) {
 
   const W = size;
   const H = size * 1.2; // SVG-Body-Höhe; ViewBox erweitert für Glow-Halo.
-  const frameH = H + size * 0.42; // Platz für Schatten unten
+  const frameH = boFrameHeight(size); // Platz für Schatten unten
 
   return (
     <View style={[styles.frame, { width: W, height: frameH }]}>
@@ -653,6 +713,41 @@ export function Bo({ state = "idle", size = 128, paused = false }: Props) {
   );
 }
 
+/** Siehe Begründung an `BoInner`. */
+/**
+ * Die tatsächliche Höhe, die `Bo` einnimmt — und warum das exportiert wird.
+ *
+ * `size` ist die BREITE. Der Rahmen ist ein Vielfaches davon: die SVG-Fläche
+ * (`size * 1.2`) plus Platz für den Boden-Schatten (`size * 0.42`), also
+ * `size * 1.62`. Bei `size={120}` sind das 194,4 und nicht 120.
+ *
+ * Genau diese Verwechslung steckte im Chat-Bildschirm: Dort wurde mit 120 als
+ * Höhe gerechnet, um den Freiraum unter Bo zu bemessen. Die oberste Nachricht
+ * lag deshalb rund zwölf Punkte unter seinem Kinn und komplett unter seinem
+ * Boden-Schatten — bei voller Deckkraft, also gut sichtbar.
+ *
+ * Wer den Platz unter Bo braucht, fragt hier, statt aus `size` zu raten.
+ */
+export function boFrameHeight(size: number): number {
+  return size * 1.62;
+}
+
+/**
+ * Bis wohin der gezeichnete KÖRPER reicht (ohne Schatten und Halo).
+ *
+ * Der Rahmen ist absichtlich höher als die Figur — darin liegen Schatten und
+ * Leuchten. Für „wie viel Platz muss darunter frei bleiben, damit nichts unter
+ * dem Kinn klebt" ist der Körper das richtige Maß; der Schatten darf über einer
+ * Nachricht liegen, das Kinn nicht.
+ */
+export function boBodyHeight(size: number): number {
+  // Der Körper endet im Rahmen bei rund `size * 1.25` — nachgerechnet am
+  // Body-Pfad (viewBox 320, Kinn-Scheitel bei User-y ≈ 209) und nicht geschätzt.
+  return size * 1.25;
+}
+
+export const Bo = memo(BoInner);
+
 const SPARKS = [
   { x: 0.14, y: 0.22, c: "✦" },
   { x: 0.86, y: 0.36, c: "✦" },
@@ -661,7 +756,7 @@ const SPARKS = [
   { x: 0.82, y: 0.7, c: "✧" },
 ];
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   frame: { alignItems: "center", justifyContent: "center" },
   shadow: {
     position: "absolute",

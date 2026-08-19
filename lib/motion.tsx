@@ -1,4 +1,12 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 import {
   AccessibilityInfo,
   StyleSheet,
@@ -7,14 +15,15 @@ import {
 } from "react-native";
 import { useIsFocused } from "@react-navigation/native";
 import Animated, {
+  cancelAnimation,
   Easing,
   FadeInDown,
   ReduceMotion,
   makeMutable,
-  useAnimatedReaction,
   useAnimatedStyle,
   useSharedValue,
   withDelay,
+  withSpring,
   withTiming,
   type SharedValue,
 } from "react-native-reanimated";
@@ -53,17 +62,35 @@ export const MOTION = {
    */
   rise: 16,
   /**
-   * Weg für große Flächen.
+   * Weg für große Flächen — AKTUELL UNGENUTZT.
    *
-   * Größere Elemente brauchen MEHR Weg, nicht weniger: Derselbe Weg wirkt an
-   * einer bildschirmhohen Karte proportional kleiner als an einem Chip und
-   * verschwindet dort in der Wahrnehmung.
+   * Die Idee dahinter: Größere Elemente brauchen MEHR Weg, weil derselbe Weg an
+   * einer bildschirmhohen Karte proportional kleiner wirkt als an einem Chip.
+   *
+   * Große Flächen bewegen sich inzwischen aber gar nicht mehr (siehe `large` in
+   * Reveal): Sie sind gerundet + geclippt, und Androids clipToOutline rendert
+   * unter einem Ancestor-Transform fehlerhaft — flackernde Ecken und ruckeliges
+   * Gleiten. Der Wert bleibt dokumentiert, falls die Bewegung je zurückkehrt
+   * (dann aber nur ohne gerundeten Clip auf der bewegten View).
    */
   riseLarge: 22,
   /** Erste Fassung lief mit 360 ms und wirkte gehetzt. „Smooth" heißt hier vor
-   *  allem: Zeit lassen. 550 ms ist noch weit unter der Schwelle, ab der
+   *  allem: Zeit lassen. 500 ms ist noch weit unter der Schwelle, ab der
    *  Bewegung als Warten empfunden wird (Kontextwechsel dürfen 600-800 ms). */
   duration: 500,
+  /**
+   * NUR das erste Element der Welle — deutlich kürzer.
+   *
+   * Über „fühlt sich der Tab-Wechsel instant an" entscheidet allein das, was man
+   * zuerst ansieht. Lief das erste Element mit denselben 500 ms wie der Rest, war
+   * es eine halbe Sekunde lang halbdurchsichtig — und halbdurchsichtiger Inhalt
+   * liest sich als „noch nicht da", obwohl der Tab längst steht.
+   *
+   * Es dem Rest der Welle vorwegzunehmen kostet nichts: Die Kaskade dahinter
+   * behält ihr Timing komplett, sie beginnt nur hinter einem Element, das schon
+   * da ist. Alles darunter darf sich in Ruhe setzen.
+   */
+  lead: 200,
   /**
    * Für große Flächen (bildschirmhohe Bild-Karten).
    *
@@ -118,26 +145,45 @@ export function staggerDelay(index: number): number {
 }
 
 /**
- * Systemeinstellung „Bewegung reduzieren".
+ * Systemeinstellung „Bewegung reduzieren" — EIN Abo für die ganze App statt
+ * eines pro Element.
  *
- * Wer sie gesetzt hat, tut das meist wegen Schwindel oder Migräne — für den ist
- * eine Kaskade keine Verspieltheit, sondern ein Problem. Dann erscheint alles
- * sofort, ohne Bewegung.
+ * Wer sie gesetzt hat, tut das meist wegen Schwindel oder Migräne; dann
+ * erscheint alles sofort, ohne Bewegung.
+ *
+ * Vorher legte jede Reveal-Instanz ihr eigenes an: eine asynchrone Abfrage und
+ * einen AccessibilityInfo-Listener pro Element. Bei rund zehn Elementen je
+ * Screen und vier dauerhaft gemounteten Tabs waren das etwa 40 Listener, 40
+ * Abfragen beim Start und 40 Zustandsänderungen, sobald das Ergebnis eintrifft
+ * — für einen Wert, der sich praktisch nie ändert und für alle gleich ist.
  */
+let reduceMotionValue = false;
+let reduceMotionWatched = false;
+const reduceMotionSubs = new Set<() => void>();
+
+function publishReduceMotion(v: boolean): void {
+  if (v === reduceMotionValue) return;
+  reduceMotionValue = v;
+  for (const notify of reduceMotionSubs) notify();
+}
+
+function watchReduceMotion(): void {
+  if (reduceMotionWatched) return;
+  reduceMotionWatched = true;
+  void AccessibilityInfo.isReduceMotionEnabled().then(publishReduceMotion);
+  AccessibilityInfo.addEventListener("reduceMotionChanged", publishReduceMotion);
+}
+
+function subscribeReduceMotion(notify: () => void): () => void {
+  reduceMotionSubs.add(notify);
+  return () => {
+    reduceMotionSubs.delete(notify);
+  };
+}
+
 export function useReduceMotion(): boolean {
-  const [reduce, setReduce] = useState(false);
-  useEffect(() => {
-    let alive = true;
-    void AccessibilityInfo.isReduceMotionEnabled().then((v) => {
-      if (alive) setReduce(v);
-    });
-    const sub = AccessibilityInfo.addEventListener("reduceMotionChanged", setReduce);
-    return () => {
-      alive = false;
-      sub.remove();
-    };
-  }, []);
-  return reduce;
+  watchReduceMotion();
+  return useSyncExternalStore(subscribeReduceMotion, () => reduceMotionValue);
 }
 
 /**
@@ -153,7 +199,88 @@ export function useReduceMotion(): boolean {
  * über einen Shared Value neu. (Klassisches RN-Animated bleibt hier auf der New
  * Architecture am Startwert hängen — deshalb reanimated.)
  */
+/**
+ * Wann zwei Tab-Wechsel als „schnelles Durchklicken" gelten.
+ *
+ * Modulweit (nicht pro Screen), weil die Frage lautet: Wie lange ist der LETZTE
+ * Wechsel her — egal von welchem Tab zu welchem.
+ */
+const RAPID_NAV_MS = 600;
+let lastTabPressAt = 0;
+let rapidNav = false;
+
+/**
+ * Wird vom Tab-Navigator bei JEDEM Tab-Tipp gerufen (siehe app/(tabs)/_layout.tsx).
+ *
+ * Warum nicht mehr aus dem Fokus-Effekt heraus: Der Zeitstempel wurde vorher nur
+ * von `ScreenEntrance` gesetzt — und der Surroundings-Tab hat gar keine
+ * `ScreenEntrance`. Die Kette Home → Surroundings → Saved sah deshalb aus wie
+ * EIN Wechsel über die doppelte Zeit und galt fälschlich als „langsam": Die
+ * volle Welle lief los, genau im schnellen Durchklicken, das sie vermeiden
+ * sollte. Der Navigator sieht dagegen jeden Tipp.
+ */
+export function noteTabPress(): void {
+  const now = Date.now();
+  rapidNav = lastTabPressAt !== 0 && now - lastTabPressAt < RAPID_NAV_MS;
+  lastTabPressAt = now;
+}
+
+/**
+ * Einmalige Sperre für die NÄCHSTE Einblend-Welle.
+ *
+ * Gedacht für Screens, die man aus einem Zwischenzustand heraus verlässt — etwa
+ * den Ergebnis-Screen, solange die Suche noch läuft. Dort ist das Zurückgehen ein
+ * Abbruch, und der Landingscreen soll einfach wieder dastehen, statt sich noch
+ * einmal aufzubauen. Kommt man dagegen normal von den fertigen Ergebnissen
+ * zurück, läuft die Welle wie gewohnt.
+ *
+ * Die Sperre verfällt von selbst: Greift sie nicht innerhalb von SKIP_VALID_MS
+ * (weil doch kein Fokus-Wechsel folgte), gilt sie nicht mehr — sonst würde sie
+ * irgendwann eine völlig unbeteiligte Welle verschlucken.
+ */
+const SKIP_VALID_MS = 1200;
+let skipEntranceUntil = 0;
+
+export function skipNextScreenEntrance(): void {
+  skipEntranceUntil = Date.now() + SKIP_VALID_MS;
+}
+
+/** Prüft die Sperre und verbraucht sie dabei. */
+function consumeSkipEntrance(): boolean {
+  const active = Date.now() < skipEntranceUntil;
+  skipEntranceUntil = 0;
+  return active;
+}
+
+/** true = der Nutzer klickt gerade schnell durch die Tabs. */
+export function isRapidNav(): boolean {
+  // Zusätzlich die Frische prüfen: Sonst würde ein alter `true`-Stand noch für
+  // Screens gelten, die gar nicht über die Tab-Leiste kommen (Bo, Suche).
+  return rapidNav && Date.now() - lastTabPressAt < RAPID_NAV_MS;
+}
+
+/**
+ * Wie lange der letzte Tab-Tipp her ist. Damit können schwere, aufschiebbare
+ * Commits (z.B. das Einfrieren der Karte) sich aus dem Wechsel-Frame
+ * heraushalten, statt blind auf einen festen Timer zu setzen.
+ */
+export function msSinceTabPress(): number {
+  return lastTabPressAt === 0 ? Number.POSITIVE_INFINITY : Date.now() - lastTabPressAt;
+}
+
 interface Entrance {
+  /**
+   * true = Inhalt SOFORT vollständig zeigen, ohne Welle.
+   *
+   * Beim schnellen Durchklicken durch die Tabs überlagern sich der native
+   * Crossfade und die noch laufende Einblend-Welle: Der neue Tab ist noch
+   * halbdurchsichtig, während der Crossfade läuft → man sieht den ALTEN Tab
+   * durchscheinen. Deshalb: Kommt ein Fokus-Wechsel < RAPID_NAV_MS nach dem
+   * vorigen, ist der Inhalt sofort da (nichts fadet) — der Crossfade zeigt dann
+   * fertige Inhalte statt halbleerer Screens. Beim normalen (langsamen) Wechsel
+   * läuft die Welle unverändert.
+   */
+  instant: boolean;
   /** Zählt bei jedem Fokus hoch → die Welle läuft neu. */
   generation: number;
   /** Wann der Fokus kam. Daran erkennt ein Element, ob es zur Welle gehört oder
@@ -171,6 +298,15 @@ interface Entrance {
    * abgebrochen.
    */
   finishWave: SharedValue<number>;
+  /**
+   * false = die Welle ist noch NICHT scharf; Reveals bleiben stumm im
+   * Versteckt-Zustand (progress 0), OHNE zu animieren. Nur im manuellen Modus
+   * relevant: Der Such-Screen mountet verdeckt VOR der Expansion — ohne diese
+   * Sperre liefe die Welle unsichtbar unter dem Splash und wäre vorbei, bevor
+   * man den Screen sieht (danach triggert man erneut → alles animiert doppelt).
+   * Fokus-getriebene Screens sind immer armed=true.
+   */
+  armed: boolean;
 }
 
 const EntranceContext = createContext<Entrance>({
@@ -178,25 +314,127 @@ const EntranceContext = createContext<Entrance>({
   focusedAt: 0,
   // Modulweiter Default, falls ein Reveal ohne ScreenEntrance läuft.
   finishWave: makeMutable(0),
+  armed: true,
+  instant: false,
 });
 
-export function ScreenEntrance({ children }: { children: ReactNode }) {
+export function ScreenEntrance({
+  children,
+  trigger,
+  resetTrigger,
+  wave = true,
+}: {
+  children: ReactNode;
+  /**
+   * `false` = KEINE Welle. Der Inhalt ist beim Fokus sofort vollständig da.
+   *
+   * So laufen jetzt Landingscreen, Saved und Profil. Den Übergang trägt allein
+   * der native „Fade Through" der Tab-Leiste — und der ist genau das, was
+   * Material für Bottom-Navigation vorsieht: Der abgehende Inhalt blendet in
+   * 100ms aus, der eingehende blendet über 200ms ein und wächst dabei von 92%
+   * auf 100%. Bei 92% (nicht 0%) beginnt die Skalierung ausdrücklich deshalb,
+   * damit der Übergang keine übermäßige Aufmerksamkeit auf sich zieht. Auf iOS
+   * wechselt ein UITabBarController sogar ganz ohne Animation.
+   *
+   * Der Inhalt kommt damit als EIN Körper mit Ein- und Ausblenden statt in einer
+   * Kaskade. Nichts ploppt, und es fühlt sich sofort an, weil alles gleichzeitig
+   * eintrifft.
+   *
+   * Der Wellen-Code bleibt vollständig erhalten: Zum Zurückschalten genügt es,
+   * das Attribut in den drei Screens zu entfernen (Default ist `true`).
+   */
+  wave?: boolean;
+  /**
+   * Manueller Wellen-Auslöser für Inhalte, die KEIN Navigations-Screen sind
+   * (z.B. der Such-Screen im Launch-Overlay): Bei jeder Änderung dieses Werts
+   * läuft die Welle neu. Ist er gesetzt, wird der Fokus ignoriert — sonst
+   * würde die Welle schon beim (unsichtbaren) Mount hinter dem Splash laufen
+   * und wäre vorbei, bevor der Nutzer den Screen überhaupt sieht.
+   */
+  trigger?: number;
+  /**
+   * ENTWAFFNEN: Bei jeder Änderung springen alle Reveals sofort zurück in den
+   * Versteckt-Zustand — ohne Animation.
+   *
+   * Nötig für Screens, die DAUERHAFT gemountet bleiben (Such-Overlay): Ohne das
+   * stünde beim nächsten Öffnen noch der fertig eingeblendete Stand von letztem
+   * Mal. Der Reveal würde ihn dann erst sichtbar zurücksetzen und neu einblenden
+   * — genau das flackert. Also einmal beim Launch-START entwaffnen, solange der
+   * Screen noch unsichtbar ist; `trigger` schärft danach wieder und animiert.
+   */
+  resetTrigger?: number;
+}) {
   const focused = useIsFocused();
   const finishWave = useSharedValue(0);
+  const manual = trigger !== undefined;
+  const firstManual = useRef(true);
   const [entrance, setEntrance] = useState<Entrance>(() => ({
     generation: 0,
     focusedAt: Date.now(),
     finishWave,
+    // Manuell: erst stumm (nicht scharf). Fokus-getrieben: sofort scharf.
+    armed: !manual,
+    // Ohne Welle schon beim ERSTEN Render vollständig da — sonst blitzte der
+    // Inhalt beim App-Start einmal versteckt auf, bevor der Effekt greift.
+    instant: !wave,
   }));
   useEffect(() => {
-    if (focused) {
-      setEntrance((e) => ({
-        generation: e.generation + 1,
-        focusedAt: Date.now(),
-        finishWave,
-      }));
+    if (manual || !focused) return;
+    // Schnelles Durchklicken erkennen (siehe `instant` im Interface): Der
+    // Zeitstempel kommt jetzt vom Navigator (`noteTabPress`), nicht mehr von
+    // hier — sonst zählen Tabs ohne ScreenEntrance nicht mit und die Erkennung
+    // greift ausgerechnet in den Ketten nicht, um die es geht.
+    setEntrance((e) => ({
+      generation: e.generation + 1,
+      focusedAt: Date.now(),
+      finishWave,
+      armed: true,
+      // Sperre hat Vorrang: Wer aus einem laufenden Ladevorgang zurückkommt,
+      // soll den Screen einfach vorfinden (siehe skipNextScreenEntrance).
+      // wave={false} → gar keine Welle (siehe dort). `instant` ist genau der
+      // Zustand „alles sofort vollständig da", den es dafür schon gibt.
+      instant: !wave || consumeSkipEntrance() || isRapidNav(),
+    }));
+  }, [focused, finishWave, manual, wave]);
+  useEffect(() => {
+    if (!manual) return;
+    // Den Mount-Lauf überspringen: der Effect feuert auch beim ersten Render,
+    // aber DA soll die Welle noch nicht laufen (Screen ist verdeckt). Erst der
+    // echte Trigger-Wechsel (nach dem Reveal) schaltet scharf.
+    if (firstManual.current) {
+      firstManual.current = false;
+      return;
     }
-  }, [focused, finishWave]);
+    setEntrance((e) => ({
+      generation: e.generation + 1,
+      focusedAt: Date.now(),
+      finishWave,
+      armed: true,
+      // `wave` gilt AUCH im manuellen Modus.
+      //
+      // Hier stand fest `false` mit der Begründung „beim manuellen Trigger ist
+      // die Welle bewusst gewollt". Damit war `wave={false}` am Such-Screen
+      // wirkungslos: Das Attribut wird nur im Anfangszustand und im Fokus-Zweig
+      // gelesen, nie hier — und der Such-Screen ist der EINZIGE Ort mit
+      // manuellem Trigger. Der Kommentar dort („Der Inhalt ist sofort
+      // vollständig da und fährt als EIN Körper mit dem Blatt herein")
+      // beschrieb also einen Zustand, der nie eintrat: Die Welle lief mitten in
+      // der Bewegung, mit fünf zusätzlich bewegten Ansichten.
+      instant: !wave,
+    }));
+  }, [trigger, finishWave, manual, wave]);
+  // Entwaffnen (siehe resetTrigger oben): Reveals sofort auf versteckt, ohne
+  // Animation. Der erste Lauf wird übersprungen — beim Mount ist ohnehin nichts
+  // eingeblendet.
+  const firstReset = useRef(true);
+  useEffect(() => {
+    if (resetTrigger === undefined) return;
+    if (firstReset.current) {
+      firstReset.current = false;
+      return;
+    }
+    setEntrance((e) => (e.armed ? { ...e, armed: false } : e));
+  }, [resetTrigger]);
   return <EntranceContext.Provider value={entrance}>{children}</EntranceContext.Provider>;
 }
 
@@ -259,24 +497,30 @@ export function Reveal({
   large = false,
   style,
 }: RevealProps) {
-  const { generation, focusedAt, finishWave } = useContext(EntranceContext);
+  const { generation, focusedAt, finishWave, armed, instant } = useContext(EntranceContext);
   const reduceMotion = useReduceMotion();
   const progress = useSharedValue(0);
 
-  // Scroll-Griff → Welle sofort fertig. Die Zuweisung bricht ein noch
-  // anstehendes withDelay/withTiming auf progress ab.
-  useAnimatedReaction(
-    () => finishWave.value,
-    (v, prev) => {
-      if (prev === null || v === prev) return;
-      if (progress.value !== 1) progress.value = 1;
-    },
-    [finishWave],
-  );
+  // Hier stand eine Reaktion auf `finishWave` („Scroll-Griff → Welle sofort
+  // fertig"). Hochgezählt wurde dieser Wert einzig von `RevealScrollView` — und
+  // die Komponente wird nirgends mehr verwendet, seit die Wellen aus den Tabs
+  // raus sind. Die Reaktion horchte also auf einen Wert, der sich nie ändert:
+  // ein Mapper pro Reveal auf dem UI-Thread, dauerhaft, für nichts. Im
+  // Such-Screen sind das fünf Stück, die während des Öffnens mitlaufen.
 
   useEffect(() => {
-    if (reduceMotion) {
+    // reduceMotion: Systemeinstellung. instant: schnelles Tab-Durchklicken →
+    // Inhalt sofort vollständig da, keine Welle (sonst sieht man während des
+    // Crossfades den alten Tab durch den halbdurchsichtigen neuen).
+    if (reduceMotion || instant) {
       progress.value = 1;
+      return;
+    }
+    // Noch nicht scharf (manueller Modus, Screen verdeckt) → stumm im
+    // Versteckt-Zustand bleiben, NICHT animieren. Erst der Trigger schaltet
+    // scharf und lässt die Welle einmal sauber laufen.
+    if (!armed) {
+      progress.value = 0;
       return;
     }
     // Nachgewachsen statt mitgekommen → keine Welle davor, also auch kein
@@ -284,29 +528,35 @@ export function Reveal({
     const late = Date.now() - focusedAt > LATE_MOUNT_MS;
     const step = late ? index - waveBase : index;
 
+    // Das erste Element der Welle läuft kürzer (siehe MOTION.lead) — es trägt
+    // den Eindruck „sofort da". Alles dahinter behält die gewohnte Kurve.
+    const duration =
+      step <= 0 ? MOTION.lead : large ? MOTION.durationLarge : MOTION.duration;
+
     progress.value = 0;
     progress.value = withDelay(
       staggerDelay(step),
-      withTiming(1, {
-        duration: large ? MOTION.durationLarge : MOTION.duration,
-        easing: MOTION.easing,
-      }),
+      withTiming(1, { duration, easing: MOTION.easing }),
     );
-  }, [generation, focusedAt, index, waveBase, large, reduceMotion, progress]);
+  }, [generation, focusedAt, index, waveBase, large, reduceMotion, armed, instant, progress]);
 
-  const animatedStyle = useAnimatedStyle(() => ({
+  const animatedStyle = useAnimatedStyle(() => {
     // Mit Vorhang bleibt die View selbst opak — der Vorhang erledigt das Faden.
-    opacity: scrim ? 1 : progress.value,
-    // Große Flächen bewegen sich WEITER, nicht weniger — derselbe Weg wirkt an
-    // einer bildschirmhohen Karte proportional kleiner als an einem Chip.
-    //
-    // (Der Weg war hier zwischenzeitlich auf 0, weil ich das Verschieben für den
-    // Ruckler hielt. War es nicht: Teuer war das Alpha-Compositing. Eine OPAKE
-    // View zu verschieben macht die ScrollView ohnehin bei jedem Scroll-Frame.)
-    transform: [
-      { translateY: (1 - progress.value) * (large ? MOTION.riseLarge : MOTION.rise) },
-    ],
-  }));
+    const opacity = scrim ? 1 : progress.value;
+    // GROSSE Flächen (die bildschirmhohen Bild-Karten) bewegen sich GAR NICHT:
+    // Sie sind gerundet + `overflow: hidden` (Android clipToOutline), und ein
+    // gerundeter Clip rendert unter einem Ancestor-Transform fehlerhaft — das
+    // waren die flackernden Ecken UND das ruckelige Hochgleiten. Ohne transform
+    // gibt es keinen Ancestor-Transform: Der Clip stimmt, und die Karte blendet
+    // über den Vorhang sauber ein (das Einblenden allein trägt die Welle).
+    // Kleine Elemente (Chips, Zeilen) haben keinen solchen Clip → sie gleiten
+    // weiter, das ist der spürbare Teil der Welle.
+    if (large) return { opacity };
+    return {
+      opacity,
+      transform: [{ translateY: (1 - progress.value) * MOTION.rise }],
+    };
+  });
 
   const scrimStyle = useAnimatedStyle(() => ({ opacity: 1 - progress.value }));
 
@@ -349,7 +599,7 @@ export function Reveal({
  */
 export function revealEntering(index: number) {
   return FadeInDown.delay(staggerDelay(index))
-    .duration(MOTION.duration)
+    .duration(index <= 0 ? MOTION.lead : MOTION.duration)
     .easing(MOTION.easing)
     .withInitialValues({ opacity: 0, transform: [{ translateY: MOTION.rise }] })
     .reduceMotion(ReduceMotion.System);
@@ -425,4 +675,60 @@ export function ScrollReveal({
       {children}
     </Reveal>
   );
+}
+
+
+
+/**
+ * Der Druck-Effekt der Kategorie-Kacheln, zum Weiterverwenden.
+ *
+ * Die Werte stammen aus `app/(tabs)/index.tsx` und sind dort begründet:
+ * Interaktive Elemente brauchen sofortige Rückmeldung, also hohe Steifigkeit
+ * beim Hineindrücken — das Zurückfedern darf weicher sein und schwingt dadurch
+ * spürbar nach. Sie stehen hier, damit ein zweiter Knopf sich nicht „ungefähr
+ * so" anfühlt, sondern gleich.
+ */
+export const PRESS_SCALE = 0.93;
+export const PRESS_IN = { damping: 18, stiffness: 320, mass: 0.7 } as const;
+export const PRESS_OUT = { damping: 15, stiffness: 200, mass: 0.8 } as const;
+
+/**
+ * Liefert Stil und Handler für den Druck-Effekt.
+ *
+ * Wer sie benutzt, muss `onPressIn`/`onPressOut` durchreichen — bei einem
+ * eigenen Handler beides aufrufen.
+ *
+ * `scale` ist übersteuerbar, weil dieselbe Zahl auf verschieden großen Flächen
+ * verschieden stark WIRKT: 7% Weg sind auf einer bildschirmbreiten Kachel gut
+ * sichtbar, auf einem 26px-Symbol kaum. Kleine Elemente brauchen mehr.
+ */
+export function usePressBounce(scale: number = PRESS_SCALE) {
+  const press = useSharedValue(1);
+  const style = useAnimatedStyle(() => ({ transform: [{ scale: press.value }] }));
+  const onPressIn = () => {
+    press.value = withSpring(scale, PRESS_IN);
+  };
+  const onPressOut = () => {
+    press.value = withSpring(1, PRESS_OUT);
+  };
+  /**
+   * Sofort auf Endstand, ohne Nachfedern.
+   *
+   * Für Knöpfe, die einen bildschirmfüllenden Übergang auslösen. `PRESS_OUT`
+   * ist mit einem Dämpfungsgrad von rund 0,59 unterdämpft und schwingt etwa
+   * 430ms nach — fast die gesamte Dauer einer Slide. Liegt der Knopf dabei auf
+   * einer Fläche, die als GPU-Textur eingefroren wurde (und das ist bei einem
+   * Übergang der Normalfall), macht diese Feder die Textur in JEDEM Bild
+   * ungültig: Eine Ebene mit sich änderndem Inhalt muss neu gerastert werden,
+   * spart also nicht nur nichts, sondern kostet zusätzlich.
+   *
+   * Das Hineindrücken bleibt sichtbar — es läuft, solange der Finger liegt. Nur
+   * das Nachschwingen entfällt, und das sieht ohnehin niemand mehr, sobald der
+   * Bildschirm wegfährt.
+   */
+  const settle = () => {
+    cancelAnimation(press);
+    press.value = 1;
+  };
+  return { style, onPressIn, onPressOut, settle };
 }

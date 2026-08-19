@@ -1,5 +1,6 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { View, Text } from "react-native";
+import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
   Easing,
   cancelAnimation,
@@ -7,6 +8,7 @@ import Animated, {
   useSharedValue,
   withDelay,
   withRepeat,
+  withSequence,
   withTiming,
 } from "react-native-reanimated";
 import Svg, { Path } from "react-native-svg";
@@ -77,16 +79,47 @@ function FloatingHeart({
   // daraus eine glatte, sprungfreie Schwingung (sin(2π·0) == sin(2π·1) == 0).
   const phase = useSharedValue(0);
 
+  // Beim ERSTEN Erscheinen mit gestaffeltem Anlauf, danach nahtlos weiter.
+  const startedRef = useRef(false);
+
   useEffect(() => {
     if (!focused || reduceMotion) {
+      // Nur anhalten, NICHT zurücksetzen. Vorher sprang die Phase auf 0 — beim
+      // Verlassen des Tabs rutschten also alle Herzen auf ihre Grundstellung,
+      // und beim Zurückkommen standen sie dort bis zu 1,3s regungslos (der
+      // Anlauf-Versatz lief jedes Mal neu), bevor sie ansprangen. Genau das ließ
+      // die Szene bei jedem Besuch wie frisch hingesetzt wirken.
       cancelAnimation(phase);
-      phase.value = 0;
       return;
     }
-    phase.value = withDelay(
-      delay,
-      withRepeat(withTiming(1, { duration, easing: Easing.linear }), -1, false),
+    const loop = withRepeat(
+      withTiming(1, { duration, easing: Easing.linear }),
+      -1,
+      false,
     );
+    if (!startedRef.current) {
+      startedRef.current = true;
+      phase.value = 0;
+      phase.value = withDelay(delay, loop);
+    } else {
+      // Dort weiter, wo angehalten wurde: der Rest des laufenden Durchgangs zu
+      // unveränderter Geschwindigkeit, dann wieder die Endlosschleife.
+      //
+      // Der Rücksprung auf 0 in der Mitte ist NICHT kosmetisch, er ist der
+      // eigentliche Punkt: `withRepeat` wiederholt ab dem Wert, mit dem es
+      // startet. Ohne ihn übernähme die Schleife die 1 vom Schritt davor und
+      // liefe von 1 nach 1 — die Herzen standen dann nach einem Tab-Wechsel
+      // einfach still. Sichtbar ist der Sprung nicht: sin(2π·1) und sin(2π·0)
+      // sind beide 0, also exakt dieselbe Stellung.
+      phase.value = withSequence(
+        withTiming(1, {
+          duration: duration * (1 - phase.value),
+          easing: Easing.linear,
+        }),
+        withTiming(0, { duration: 0 }),
+        loop,
+      );
+    }
     return () => cancelAnimation(phase);
   }, [focused, reduceMotion, phase, delay, duration]);
 
@@ -128,14 +161,16 @@ function FloatingHeart({
 }
 
 export function EmptyState({ tab, active = true }: Props) {
+  const palette = usePalette();
   const t = useT();
-  // Native-Bottom-Tabs halten alle Tab-Screens mounted. Bo hat 33+
-  // Reanimated-Hooks (auch mit paused=true bleiben die als UI-Thread-
-  // Subscriptions aktiv) → wenn der Saved-Tab nicht fokussiert ist, sollte
-  // Bo NICHT gerendert werden, sonst konkurriert er mit anderen Animations
-  // (z.B. Landing-Scroll). Wir prüfen `useIsFocused` und unmounten Bo
-  // sobald der User die Saved-Tab verlässt. Die Herzen laufen aus demselben
-  // Grund nur bei Fokus (siehe FloatingHeart).
+  // Native-Bottom-Tabs halten alle Tab-Screens gemountet, deshalb hängen die
+  // Herz-SCHLEIFEN am Fokus — im Hintergrund würden sie mit dem Scrollen anderer
+  // Tabs konkurrieren.
+  //
+  // Bo hängt bewusst NICHT mehr daran: Er läuft hier fest mit `paused`, und in
+  // dem Zustand startet er keine einzige Animation (nur einmalig statische
+  // Posen-Werte). Gemountet kostet er also pro Bild nichts, während das
+  // Ab- und Wiederaufbauen seinen ganzen SVG-Baum in den Wechsel-Frame legte.
   const isFocused = useIsFocused();
   // Animieren nur, wenn der Saved-Tab offen UND dieses Panel das sichtbare ist.
   const animate = isFocused && active;
@@ -183,7 +218,13 @@ export function EmptyState({ tab, active = true }: Props) {
             amp={5}
             sway={5}
           />
-          {isFocused ? <Bo state="sad" size={138} paused /> : null}
+          {/* Dauerhaft gemountet statt bei jedem Fokus neu.
+              Das Ab- und Wiederaufbauen war reine Verschwendung: Bo trägt 27
+              Endlos-Animationen und einen SVG-Baum, die bei JEDEM Wechsel in den
+              Tab komplett neu entstanden — sichtbar als „wird neu hingeklebt".
+              Der Grund fürs Abbauen (Hintergrund-Last) greift ohnehin nicht,
+              denn `paused` steht fest an: Die Schleifen laufen nie. */}
+          <Bo state="sad" size={138} paused />
         </View>
         <Text className="text-base font-semibold text-white mb-2 text-center">
           {t(titleKey)}
@@ -198,7 +239,7 @@ export function EmptyState({ tab, active = true }: Props) {
   // Tickets-Tab: minimaler Ticket-Icon-Empty bleibt.
   return (
     <View className="items-center pt-16 px-8">
-      <View className="w-[72px] h-[72px] rounded-2xl bg-[#242425] items-center justify-center mb-4">
+      <View className="w-[72px] h-[72px] rounded-2xl items-center justify-center mb-4" style={{ backgroundColor: palette.s2 }}>
         <TicketIcon size={30} color="#56565C" strokeWidth={1.8} />
       </View>
       <Text className="text-base font-semibold text-white mb-2 text-center">

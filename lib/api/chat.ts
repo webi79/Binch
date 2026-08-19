@@ -164,6 +164,24 @@ export async function streamChat(req: ChatStreamRequest): Promise<void> {
       reject(new Error("Chat API network error — server unreachable?"));
     };
 
+    /**
+     * Eine Frist — ohne die feuert der Rückruf darunter NIE.
+     *
+     * `ontimeout` stand hier von Anfang an, `xhr.timeout` aber nicht. Ohne
+     * gesetzten Wert hat ein XHR gar keine Frist: Hängt die Verbindung, wird
+     * dieses Versprechen weder erfüllt noch abgelehnt. Es bleibt für immer
+     * offen.
+     *
+     * Auf der Aufrufseite hängt daran der `finally`-Block, der die Sende-Sperre
+     * löst. Blieb das Versprechen offen, blieb die Sperre stehen — und ab da
+     * verwarf der Chat jedes weitere Absenden stillschweigend. Genau das Bild:
+     * „ich schreibe hallo, es kommt nichts mehr, er ist stuck."
+     *
+     * 60 Sekunden sind großzügig: Der Server antwortet im Protokoll zwischen
+     * anderthalb und sechzehn Sekunden, auch mit Flugsuche. Wer darüber liegt,
+     * hängt.
+     */
+    xhr.timeout = 60_000;
     xhr.ontimeout = () => {
       reject(new Error("Chat API timeout"));
     };

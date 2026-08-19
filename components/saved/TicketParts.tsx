@@ -3,8 +3,9 @@
  * TicketDetailOverlay (Detail-Slide) gemeinsam verwendet. Damit ist der
  * obere Teil der Bordkarte garantiert identisch in beiden Screens.
  */
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { View, Text, StyleSheet } from "react-native";
+import { useNavigation } from "@react-navigation/native";
 import {
   Plane,
   TrainFront,
@@ -15,10 +16,12 @@ import {
 import { Ticket } from "@/types/saved";
 import { TravelMode } from "@/types/search";
 import { useT } from "@/lib/i18n/useT";
+import { usePalette } from "@/lib/theme/appBg";
 import { useSearchStore } from "@/stores/searchStore";
 import { useAccent } from "@/lib/theme/accent";
 import { formatTimeInZone } from "@/lib/time-format";
 import { intlLocale } from "@/lib/i18n/intl";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const C = {
   bg: "#1A1A1A",
@@ -102,6 +105,7 @@ export function bookingRefFor(ticket: Ticket): string {
  * Stats). Identisch zwischen Card und Detail.
  */
 export function TicketHead({ ticket }: { ticket: Ticket }) {
+  const palette = usePalette();
   const t = useT();
   const accent = useAccent();
   const locale = useSearchStore((s) => s.locale);
@@ -146,7 +150,7 @@ export function TicketHead({ ticket }: { ticket: Ticket }) {
       <View style={styles.timeline}>
         <View style={[styles.dot, { backgroundColor: accent.solid }]} />
         <View style={styles.dash} />
-        <View style={styles.glyph}>
+        <View style={[styles.glyph, { backgroundColor: palette.s3 }]}>
           <Icon size={17} color={accent.solid} strokeWidth={1.8} />
         </View>
         <View style={styles.dash} />
@@ -176,7 +180,7 @@ export function TicketHead({ ticket }: { ticket: Ticket }) {
         </View>
       </View>
 
-      <View style={styles.divider} />
+      <View style={[styles.divider, { backgroundColor: palette.border }]} />
 
       <Text style={styles.eyebrow}>{t("saved.ticket.bookingRef").toUpperCase()}</Text>
       <Text style={styles.booking}>{bookingRefFor(ticket)}</Text>
@@ -184,7 +188,7 @@ export function TicketHead({ ticket }: { ticket: Ticket }) {
       <View style={styles.statsRow}>
         {stats.map((s, i) => (
           <Fragment key={s.label}>
-            {i > 0 && <View style={styles.statDivider} />}
+            {i > 0 && <View style={[styles.statDivider, { backgroundColor: palette.border }]} />}
             <View style={styles.stat}>
               <Text style={styles.eyebrow}>{s.label.toUpperCase()}</Text>
               <Text style={styles.statValue} numberOfLines={1}>
@@ -211,10 +215,11 @@ export function Perforation({ notchColor = C.bg }: { notchColor?: string }) {
 
 /** Countdown-Fortschrittsbalken (0..1). */
 export function ProgressBar({ value, fill }: { value: number; fill?: string }) {
+  const palette = usePalette();
   const accent = useAccent();
   const pct = Math.max(0, Math.min(1, value)) * 100;
   return (
-    <View style={styles.track}>
+    <View style={[styles.track, { backgroundColor: palette.s3 }]}>
       <View
         style={[
           styles.fill,
@@ -238,14 +243,80 @@ export function useDepartureCountdown(departTime?: string) {
     return Number.isFinite(t) ? t : null;
   }, [departTime]);
 
+  // Nur ticken, solange der Saved-Tab wirklich vorne ist — aber OHNE dafür neu
+  // zu rendern.
+  //
+  // Hier stand `useIsFocused()`. Der Hook liefert den Fokus als Render-Wert,
+  // also rendert jede Ticket-Karte bei jedem Betreten UND Verlassen des Tabs
+  // neu. Das ist hier besonders teuer: Die Karte liegt auf einer Hardware-Textur
+  // (siehe TicketCard), und ein Re-Render erzwingt deren Neurasterung samt des
+  // dreifach gestapelten Schattens — mal N Karten, genau im Wechsel-Bild. Genau
+  // das lässt den Tab-Wechsel gelegentlich zäh wirken.
+  //
+  // Der Fokus liegt jetzt in einer Referenz und wird über Navigations-Ereignisse
+  // gepflegt. Die verursachen keinen Render. Der Zähler läuft weiter, tut im
+  // Hintergrund aber nichts.
+  const navigation = useNavigation();
+  const focusedRef = useRef(true);
+  /**
+   * Der Fokus muss auch als ZUSTAND vorliegen, nicht nur als Ablage.
+   *
+   * Die Ablage allein verhinderte bloß die Arbeit IM Rückruf — der Zeitgeber
+   * lief weiter und weckte den JS-Strang pro Ticket alle 30 bis 60 Sekunden,
+   * auch bei unsichtbarem Reiter. Bei mehreren Tickets sind das versetzte,
+   * unkoordinierte Aufwachpunkte, die auch mitten in eine Bewegung fallen
+   * können. Als Zustand in den Abhängigkeiten unten wird der Zeitgeber wirklich
+   * abgebaut.
+   */
+  const [focused, setFocused] = useState(true);
+  useEffect(() => {
+    const offFocus = navigation.addListener("focus", () => {
+      focusedRef.current = true;
+      setFocused(true);
+      // Nur nachziehen, wenn sich der angezeigte Wert überhaupt geändert haben
+      // kann. Bei einem kurzen Abstecher in einen anderen Tab bleibt der Stand
+      // gleich, React bricht dann ab und es rendert gar nichts neu.
+      setNow((prev) => (Date.now() - prev > 30_000 ? Date.now() : prev));
+    });
+    const offBlur = navigation.addListener("blur", () => {
+      focusedRef.current = false;
+      setFocused(false);
+    });
+    return () => {
+      offFocus();
+      offBlur();
+    };
+  }, [navigation]);
+
   useEffect(() => {
     if (!departMs) return;
     // Wenn die Abfahrt schon in der Vergangenheit ist, brauchen wir kein
-    // Sekunden-Ticken (würde nur unnötig Re-Renders triggern).
-    if (departMs - now < 0) return;
-    const id = setInterval(() => setNow(Date.now()), 30_000);
+    // Ticken (würde nur unnötig Re-Renders triggern).
+    const remaining = departMs - Date.now();
+    if (remaining < 0) return;
+    // Takt aus der RESTZEIT statt fester 30 Sekunden.
+    //
+    // Vorher tickte jedes Ticket alle 30s — auch eines, das in drei Wochen
+    // abfährt und dabei stundenlang dieselbe Zahl anzeigt. Jeder Tick rendert
+    // die Karte neu, und weil sie auf einer GPU-Textur liegt, wird die dabei
+    // komplett neu gerastert. Die Intervalle mehrerer Tickets laufen dabei
+    // versetzt, treffen also auch mitten ins Scrollen.
+    const period =
+      remaining > 24 * 3_600_000
+        ? 0 // über einen Tag entfernt: die Anzeige ändert sich nicht spürbar
+        : remaining > 2 * 3_600_000
+          ? 60_000
+          : 30_000;
+    if (period === 0) return;
+    if (!focused) return;
+    const id = setInterval(() => {
+      if (!focusedRef.current) return;
+      // Siehe unten: `focused` steht in den Abhängigkeiten, der Zeitgeber läuft
+      // ohne Fokus also gar nicht erst. Die Abfrage bleibt als zweite Sicherung.
+      setNow(Date.now());
+    }, period);
     return () => clearInterval(id);
-  }, [departMs, now]);
+  }, [departMs, focused]);
 
   if (!departMs) return { label: "—", isPast: false, isDeparted: false, progress: 0 };
 
@@ -268,7 +339,7 @@ export function useDepartureCountdown(departTime?: string) {
   return { label, isPast: false, isDeparted: false, progress };
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   headPad: { padding: 18 },
   eyebrow: {
     fontSize: 11,

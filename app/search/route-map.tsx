@@ -13,6 +13,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { View, StyleSheet } from "react-native";
+import { useAppBg } from "@/lib/theme/appBg";
 import Animated, { FadeOut } from "react-native-reanimated";
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -21,10 +22,12 @@ import { MapSurface, type MapSurfaceHandle } from "@/components/surroundings/Map
 import { MapSkeleton } from "@/components/surroundings/MapSkeleton";
 import { RouteLayer } from "@/components/surroundings/RouteLayer";
 import { RouteBanner } from "@/components/surroundings/RouteBanner";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const C = { bg: "#1A1A1A" };
 
 export default function RouteMapScreen() {
+  const appBg = useAppBg();
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const pendingRoute = useSearchStore((s) => s.pendingRoute);
@@ -59,13 +62,21 @@ export default function RouteMapScreen() {
   }, [pendingRoute]);
 
   useEffect(() => {
-    if (!bbox) return;
-    // Kleiner Delay damit die Map zuerst mountet, dann fitBounds.
-    const id = setTimeout(() => {
-      mapRef.current?.fitBounds(bbox.sw, bbox.ne, 80);
-    }, 150);
-    return () => clearTimeout(id);
-  }, [bbox]);
+    // Auf das ECHTE Signal warten, nicht auf eine Schätzung.
+    //
+    // Hier stand ein fester Timer von 150ms mit der Begründung „damit die Map
+    // zuerst mountet". Ob MapLibre in 150ms so weit ist, hängt aber vom Gerät,
+    // vom Cache und vom Netz ab — mal ja, mal nein. War sie es nicht, lief
+    // fitBounds ins Leere: Die Karte blieb auf ihrem Startausschnitt stehen
+    // statt die Route zu zeigen. Genau das ist das gelegentliche „buggt rum"
+    // beim Wechsel zur Karte, und es ließ sich nie zuverlässig nachstellen.
+    //
+    // onMapRendered feuert, wenn die Karte wirklich gezeichnet hat — dasselbe
+    // Signal, das auch das Skelett wegblendet. Der Ausschnitt springt damit noch
+    // hinter dem ausblendenden Skelett an seinen Platz.
+    if (!bbox || !mapTilesRendered) return;
+    mapRef.current?.fitBounds(bbox.sw, bbox.ne, 80);
+  }, [bbox, mapTilesRendered]);
 
   // Wenn pendingRoute fehlt (z.B. Hot-Reload Edge-Case oder direkter Aufruf),
   // sofort zurück.
@@ -91,10 +102,10 @@ export default function RouteMapScreen() {
     }, 400);
   };
 
-  if (!pendingRoute) return <View style={styles.root} />;
+  if (!pendingRoute) return <View style={[styles.root, { backgroundColor: appBg }]} />;
 
   return (
-    <View style={styles.root}>
+    <View style={[styles.root, { backgroundColor: appBg }]}>
       <MapSurface ref={mapRef} onMapRendered={() => setMapTilesRendered(true)}>
         <RouteLayer
           waypoints={pendingRoute.waypoints}
@@ -121,6 +132,6 @@ export default function RouteMapScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   root: { flex: 1, backgroundColor: C.bg },
 });

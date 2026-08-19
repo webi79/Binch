@@ -1,34 +1,89 @@
-import { Easing, makeMutable } from "react-native-reanimated";
+import { Easing, makeMutable, withTiming } from "react-native-reanimated";
+import { markTransitionBusy } from "./transitionBusy";
 import { getDeviceCornerRadius } from "@/modules/screen-corners";
 
 /**
- * Timing der horizontalen Push-Transitions — Werte NACHGEMESSEN an YouTubes
- * Push (screenrecord → Frame-Analyse, 60 Samples/s, Juli 2026):
+ * Push-Übergänge — Werte aus echten Referenz-Implementierungen, nicht geschätzt.
  *
- *   PUSH (hin):  Overlay ~400ms emphasized-decelerate — perzeptuell gelandet
- *                bei ~300ms, danach langer butterweicher Kriech-Schwanz
- *                (Android-System nutzt dieselbe Idee: 450ms
- *                fast_out_extra_slow_in). Unterlay-Parallax ist bereits nach
- *                ~100-150ms KOMPLETT fertig (Verhältnis ~1:3!) und der Weg
- *                ist klein (~13% Screenbreite).
- *   POP (zurück): schneller (~250ms), Ease-in-out mit WEICHER Landung (kein
- *                pures Beschleunigen) — Unterlay ist nach ~130ms zuhause,
- *                während das Overlay noch rausfährt.
+ * DREI QUELLEN, die sich decken:
+ *
+ * 1. React Navigation, packages/stack/src/TransitionConfigs/TransitionSpecs.tsx
+ *    `FadeInFromRightAndroidSpec` und `FadeOutToLeftAndroidSpec` — also genau
+ *    dieser Übergang, rein wie raus:
+ *        animation: "timing", duration: 450,
+ *        easing: Easing.bezier(0.20833, 0.82, 0.25, 1)
+ *
+ * 2. react-native-screens, res/v33/anim-v33/rns_default_enter_in.xml — was
+ *    Android 13+ selbst fährt:
+ *        duration: 450, interpolator: fast_out_extra_slow_in
+ *    (dieselbe Dauer, und `fast_out_extra_slow_in` ist die Systemfassung
+ *    derselben Kurvenform: kurzer Anlauf, langes weiches Auslaufen)
+ *
+ * 3. React Navigation, CardStyleInterpolators.tsx, `forHorizontalIOS` — der Weg
+ *    der Unterlage:
+ *        translateUnfocused: outputRange [0, screen.width * -0.3]
+ *    also 30 % der Bildschirmbreite. Genau der Wert, der auch in
+ *    rns_ios_from_right_background_open.xml steht (`toXDelta="-30%"`).
+ *
+ * WARUM DAS HIN UND HER: Es lief erst über eine eigene Feder mit 550ms
+ * Nennwert — real das 1,5-fache, also rund 825ms, und das war zäh. Dann über die
+ * 200ms aus der ÄLTEREN Fassung derselben Bibliothek (`rns_ios_*`, gedacht als
+ * Notnagel für alte Android-Versionen) — und das war zu hastig. Die aktuelle
+ * Vorgabe liegt bei 450ms, und zwar sowohl bei React Navigation als auch bei
+ * Android selbst.
+ *
+ * Die Kurve tut genau das, was hier zweimal als Beschwerde ankam: Sie beginnt
+ * bei Geschwindigkeit null (kein Stoß beim Losfahren) und läuft über mehr als
+ * die halbe Dauer weich aus (kein Aufschlagen am Ende). Und weil sie exakt bei 1
+ * endet, braucht es keinen Beschnitt wie bei einer Feder.
  */
-export const PUSH_DURATION = 400;
-export const PUSH_IN_EASING = Easing.bezier(0.05, 0.7, 0.1, 1);
-
-export const POP_DURATION = 260;
-export const POP_EASING = Easing.bezier(0.35, 0, 0.25, 1);
+/**
+ * Kurve: gleichmäßig statt betont.
+ *
+ * Vorher stand hier `bezier(0.20833, 0.82, 0.25, 1)` — die „Emphasized"-Form aus
+ * React Navigations Android-Vorgaben. Rechnet man sie aus, erreicht sie **82 %
+ * der Strecke in den ersten 21 % der Zeit** und kriecht den Rest. Auf der
+ * reinslidenden Ebene fällt das kaum auf (sie hat viel Weg), auf der Unterlage
+ * ist dieser Stoß aber die GANZE Bewegung — sie legt nur 30 % der Breite zurück.
+ * Genau das kam als „sprunghaft, hektisch" an.
+ *
+ * Die Datei hatte diesen Zusammenhang schon einmal dokumentiert und die Form
+ * deshalb verworfen; ich habe sie mit den Referenzwerten versehentlich
+ * zurückgeholt. Die Messreihe von damals:
+ *
+ *   Emphasized-Decelerate   34,9 % Spitze pro Bild   10,5× das Mittel
+ *   Emphasized (Standard)   23,6 %                    7,1×
+ *   gleichmäßige Kurve       ~9 %                     rund 2×
+ *
+ * `bezier(0.4, 0, 0.2, 1)` ist Materials Standard-Kurve: sanftes Anlaufen,
+ * langes weiches Auslaufen, Spitze in der Mitte statt am Anfang. Dazu 500ms —
+ * Material sieht für bildschirmfüllende Übergänge bis dahin vor, und länger war
+ * ausdrücklich gewünscht.
+ */
+const EMPHASIZED = Easing.bezier(0.4, 0, 0.2, 1);
 
 /**
- * Unterlay-Parallax: kurz + früh fertig (gemessen ~1/3 der Overlay-Dauer).
- * Decelerate-Kurve: zügiger Start, weiches Ausrollen — bei dem kurzen Weg
- * (13% Breite) wirkt das ruhig, nicht snappy.
+ * 430ms hinein, 380 hinaus — vorher 500/450.
+ *
+ * Die Kurve bleibt unangetastet: Sie läuft sanft an und lange aus, und genau das
+ * soll erhalten bleiben. Verkürzt wird nur die Strecke in der Zeit.
+ *
+ * Warum nicht deutlich weniger: Die Referenzen liegen bei 450ms (React
+ * Navigations `FadeInFromRightAndroidSpec`, react-native-screens
+ * `rns_default_enter_in.xml`), und darunter zu gehen kostet den Auslauf, der
+ * diesen Übergang trägt — bei 300ms bleibt von „langsam werden zum Ende hin"
+ * nichts übrig, was man noch sähe. 430/380 ist rund ein Sechstel schneller: im
+ * direkten Vergleich merklich, ohne die Form der Bewegung zu verlieren.
+ *
+ * Der Parallax der Unterlage hängt an denselben Werten (siehe COVER_IN_SPRING
+ * darunter) — beide Ebenen bleiben damit zwangsläufig synchron.
  */
-export const COVER_DURATION = 150;
-export const COVER_IN_EASING = Easing.bezier(0.25, 0, 0.2, 1);
-export const COVER_OUT_EASING = Easing.bezier(0.25, 0, 0.2, 1);
+export const PUSH_SPRING = { duration: 430, easing: EMPHASIZED } as const;
+export const POP_SPRING = { duration: 380, easing: EMPHASIZED } as const;
+
+/** Unterlage läuft mit derselben Kurve — beide Ebenen als ein Körper. */
+export const COVER_IN_SPRING = PUSH_SPRING;
+export const COVER_OUT_SPRING = POP_SPRING;
 
 /**
  * Geteilter Parallax-Fortschritt der horizontalen Push-Overlays.
@@ -40,9 +95,81 @@ export const COVER_OUT_EASING = Easing.bezier(0.25, 0, 0.2, 1);
  */
 export const overlayCover = makeMutable(0);
 
-/** Parallax-Weg des Unterlays als Bruchteil der Screen-Breite (negativ =
- *  links). YouTube gemessen: ~13%. */
-export const UNDERLAY_TRAVEL_FRAC = -0.13;
+/**
+ * Wie weit ein WÄHLER über dem Such-Bildschirm liegt: 0 zu, 1 offen.
+ *
+ * Der Grund für diesen Wert ist die zentrale Frage, an der wir lange
+ * vorbeigearbeitet haben: Warum wirkt die Fahrt des Such-Blattes eleganter als
+ * die der Wähler, obwohl Kurve, Dauer, Strecke, Antrieb und Textur inzwischen
+ * nachweislich identisch sind?
+ *
+ * Weil es NICHT dasselbe ist. Das Such-Blatt fährt nicht bloß herein — es wächst
+ * aus der angetippten Kachel, sein Inhalt hält über eine Gegenbewegung optisch
+ * still, und die Unterlage zieht mit 30% Parallax nach. Vier abgestimmte
+ * Bewegungen. Die Wähler dagegen schieben eine bildschirmfüllende Fläche über
+ * eine völlig stillstehende — mehr passiert nicht. Eine Kante, die sich mit 90
+ * Punkten pro Bild über ein stehendes Bild schiebt, hat nichts, woran das Auge
+ * die Bewegung festmachen könnte; sie liest sich als Sprungfolge, auch wenn
+ * kein einziges Bild ausfällt.
+ *
+ * Dieser Wert gibt der Unterlage dieselbe Rolle wie beim Such-Blatt: Sie weicht
+ * ein Stück zurück, während der Wähler kommt. Er läuft auf dem UI-Strang und
+ * kostet einen einzigen Transform auf einer Fläche, die währenddessen ohnehin
+ * als Textur gehalten wird.
+ */
+export const pickerCover = makeMutable(0);
+
+/**
+ * EIN Fortschritt für die Ergebnis-Slide: 0 = ganz rechts außerhalb,
+ * 1 = deckt den Bildschirm.
+ *
+ * Vorher waren das drei getrennte Animationen (Slide, Parallax, Beschnitt), die
+ * zufällig dieselbe Dauer hatten. Drei Federn gleichzeitig kosten nicht nur
+ * unnötig Zeit auf dem UI-Thread — sie können auch minimal auseinanderlaufen,
+ * und schon das liest sich als Ruckeln. Jetzt läuft EINE Animation, alle drei
+ * leiten ihren Wert daraus ab und sind damit bildgenau gekoppelt.
+ *
+ * Bewusst getrennt von `overlayCover`: Den liest der Ergebnis-Screen selbst, um
+ * beiseite zu rücken, wenn ein Detail-Overlay über IHN kommt. Mit demselben Wert
+ * schöbe er sich beim Reinkommen selbst zur Seite.
+ */
+export const resultsPush = makeMutable(0);
+
+/**
+ * Früher wurde der Fortschritt bei 98% geklemmt, weil eine Feder ihr Ziel nur
+ * asymptotisch erreicht und dabei am linken Rand einen Streifen offenließ.
+ *
+ * Mit einer Zeitkurve gibt es das Problem nicht: Sie endet exakt bei 1. Die
+ * Funktion bleibt als Durchreiche stehen, damit die Aufrufer unverändert
+ * bleiben — und weil sie die Stelle markiert, an der man es wieder bräuchte,
+ * falls hier je wieder eine Feder steht.
+ */
+export function pushProgress(p: number): number {
+  "worklet";
+  return p;
+}
+
+
+/**
+ * Gemeinsamer Progress des Home→Search „Launch"-Übergangs (Xiaomi-Feeling).
+ * 0 = Homescreen normal, 1 = Such-Screen voll offen. EIN Wert, aus dem ALLES
+ * abgeleitet wird — das wachsende Splash-Fenster + der Content im
+ * SearchHeroOverlay UND die Tiefe des Homescreens (scale/dim) im Root-Layout.
+ * makeMutable, weil über zwei Komponenten geschrieben/gelesen.
+ */
+export const searchLaunch = makeMutable(0);
+
+/**
+ * Parallax-Weg der Unterlage als Bruchteil der Bildschirmbreite (negativ = links).
+ *
+ * 30 %. Der Wert steht so auch in React Navigation (`forHorizontalIOS`:
+ * `screen.width * -0.3`) und in react-native-screens
+ * (`rns_ios_from_right_background_open.xml`: `toXDelta="-30%"`).
+ *
+ * Der Text hier nannte lange 15 % und stammte aus einer Zwischenstufe — die Zahl
+ * darunter war da längst wieder auf den Referenzwert gesetzt.
+ */
+export const UNDERLAY_TRAVEL_FRAC = -0.30;
 
 /**
  * Eckenradius der horizontal reinslidenden Screens (results + Detail-Overlays).
@@ -69,3 +196,449 @@ const FALLBACK_RADIUS = 40;
 const measuredRadius = getDeviceCornerRadius();
 export const SCREEN_CORNER_RADIUS =
   measuredRadius != null ? measuredRadius : FALLBACK_RADIUS;
+
+
+
+/**
+ * Startet die Ergebnis-Slide SOFORT beim Tippen — nicht erst, wenn der
+ * Zielbildschirm steht.
+ *
+ * Vorher hing die Bewegung am Mounten: tippen → navigieren (18-41ms) → Bildschirm
+ * aufbauen (~20ms) → auf einen freien Thread warten → losfahren. Selbst im besten
+ * Fall lagen 60-80ms zwischen Finger und erster Bewegung, und genau das ist die
+ * Verzögerung, die man spürt.
+ *
+ * Der Punkt: Die Unterlage braucht den Zielbildschirm überhaupt nicht. Ihr
+ * Parallax hängt allein an diesem Wert, und der lebt auf dem UI-Thread. Er kann
+ * loslaufen, während React noch arbeitet. Der Ergebnis-Bildschirm leitet seine
+ * Position aus demselben Wert ab — er steigt beim Mounten also einfach an der
+ * Stelle ein, an der die Bewegung gerade ist, statt sie anzuführen.
+ *
+ * Sichtbar bleibt davon nichts: In den ~50ms bis zum Mounten liegt der
+ * Fortschritt bei rund 10%, die Unterlage ist also 2% der Breite gewandert. Der
+ * dabei freiwerdende Streifen am rechten Rand ist wenige Pixel breit und zeigt
+ * die App-Hintergrundfarbe — dieselbe, die auch der Ergebnis-Bildschirm trägt.
+ */
+/**
+ * Zählt, wie oft eine Ergebnis-Slide gestartet wurde.
+ *
+ * `resultsPush` ist modulweit. Wer ihn beim Abbau zurücksetzt, muss wissen, ob er
+ * noch der Eigentümer ist — sonst parkt eine abgebaute Instanz eine andere, die
+ * gerade hereinfährt, unsichtbar außerhalb des Bildes.
+ */
+let pushGen = 0;
+let lastPushAt = 0;
+
+export function pushGeneration(): number {
+  return pushGen;
+}
+
+/**
+ * Millisekunden seit dem letzten Start einer Ergebnis-Slide.
+ *
+ * Der Ergebnis-Bildschirm braucht beim Mounten die Antwort auf „hat jemand schon
+ * für mich gestartet?". Über den Wert selbst zu prüfen ginge zwar, sein Getter
+ * macht auf dem JS-Thread aber einen SYNCHRONEN Sprung in die UI-Runtime — beide
+ * Threads werden dabei kurz gegeneinander gesperrt, ausgerechnet während die
+ * Feder läuft. Der Zähler allein reicht nicht, weil er „schon gestartet" nicht
+ * von „Direktlink" unterscheiden kann. Eine Uhr schon.
+ */
+export function msSinceResultsPush(): number {
+  return Date.now() - lastPushAt;
+}
+
+/**
+ * Fährt der Such-Screen bei der nächsten Bewegung mit?
+ *
+ * Gesetzt beim Tippen auf „Suchen", eingelöst von `startResultsPush`. Ein
+ * einfacher Modul-Wert reicht: Gelesen wird er nur hier, nie im Render.
+ */
+let heroClipArmed = false;
+
+/** Beim Suchen AUS dem Such-Screen aufrufen. */
+export function armHeroClip(): void {
+  heroClipArmed = true;
+}
+
+/**
+ * Alle Bewegungswerte EINMAL durch ihre echten Kurven schicken.
+ *
+ * Reanimated baut pro Kurve beim ersten Lauf einiges auf — die Bézier-Tabelle,
+ * den Zeitgeber-Pfad, die Anbindung an den geteilten Wert. Das passierte bisher
+ * nur für `resultsPush` und den Parallax; die vier anderen Übergänge liefen bei
+ * ihrer ERSTEN echten Verwendung kalt an. Genau das kam wiederholt als „beim
+ * ersten Mal ruckelt es" zurück, und zwar bei jedem der betroffenen Blätter
+ * einzeln.
+ *
+ * Die Wege sind winzig (0,002) und die Werte stehen dabei außerhalb des Bildes
+ * oder auf ihrer Ruhestellung — sichtbar ist nichts. Wichtig ist nur, dass
+ * dieselben Konfigurationen benutzt werden wie später: Ein Aufwärmen mit einer
+ * ANDEREN Kurve wärmt den falschen Pfad, und genau dieser Fehler steckte in den
+ * beiden Pickern.
+ *
+ * Jeder Rückruf prüft `finished`. Startet in diesem Fenster ein echter Übergang,
+ * bricht er das Aufwärmen ab — ohne die Prüfung zöge der Rückruf den Wert
+ * mitten in der echten Bewegung wieder auf 0.
+ */
+export function warmPushCurves(): void {
+  type Curve = Parameters<typeof withTiming>[1];
+  const warm = (v: typeof resultsPush, cfg: Curve) => {
+    v.value = 0;
+    v.value = withTiming(0.002, cfg, (finished?: boolean) => {
+      "worklet";
+      if (!finished) return;
+      v.value = 0;
+    });
+  };
+  warm(detailsPush, PUSH_SPRING);
+  warm(ticketPush, PUSH_SPRING);
+  warm(settingsPush, PUSH_SPRING);
+  warm(assistantPush, ASSISTANT_IN);
+}
+
+export function startResultsPush(): void {
+  markTransitionBusy(PUSH_SPRING.duration);
+  pushGen += 1;
+  lastPushAt = Date.now();
+  resultsPush.value = 0;
+  resultsPush.value = withTiming(1, PUSH_SPRING);
+  // Beide Bewegungen im SELBEN Aufruf starten.
+  //
+  // Der Beschnitt des Such-Screens wurde vorher direkt im Tipp-Handler gestartet,
+  // die Bewegung der Ergebnisliste erst zwei Bilder später: Dazwischen liegen ein
+  // `requestAnimationFrame`, das Schreiben in den Speicher, ein React-Render und
+  // noch ein `requestAnimationFrame`. Beide liefen mit derselben Kurve über
+  // dieselbe Dauer — nur eben um zwei Bilder versetzt.
+  //
+  // Sichtbar ist dieser Versatz die ganze Bewegung lang: Der Such-Screen weicht
+  // durchgehend ein Stück weiter zur Seite, als die Kante der hereinfahrenden
+  // Liste steht. An der Kante klafft damit ein wandernder Spalt, und am Ende hört
+  // der eine zwei Bilder vor dem anderen auf. Genau das war „aus dem Suchscreen
+  // heraus buggt die Slide durch" — aus dem Landingscreen gibt es diesen zweiten
+  // Wert gar nicht, und von dort war die Bewegung sauber.
+  //
+  // Vom selben Wert ablesen ginge auch, kostet aber bei JEDER Suche zwei
+  // bildschirmfüllende Mapper, die für den nicht offenen Such-Screen garantiert
+  // null rechnen. Deshalb weiterhin ein eigener Wert — nur eben gleichzeitig
+  // gestartet.
+  if (heroClipArmed) {
+    heroClipArmed = false;
+    heroClipPush.value = 0;
+    heroClipPush.value = withTiming(1, PUSH_SPRING);
+  }
+}
+
+/**
+ * Fortschritt NUR für den Beschnitt des Such-Screens.
+ *
+ * Vorher las er `resultsPush` mit. Der Screen hängt aber dauerhaft am Root — bei
+ * jeder Suche aus dem Landingscreen liefen seine zwei Mapper damit trotzdem
+ * jedes Bild, rechneten garantiert null und schrieben pro Bild einen Transform
+ * auf zwei bildschirmfüllende Ansichten. Über einen eigenen Wert, den nur die
+ * Übergabe aus dem Such-Screen anfasst, laufen sie dort gar nicht erst an.
+ */
+export const heroClipPush = makeMutable(0);
+
+/**
+ * Fortschritt des Profil-Unterschirms: 0 = Hub, 1 = Unterschirm liegt oben.
+ *
+ * Modulweit, weil die beiden Ebenen inzwischen in VERSCHIEDENEN Bäumen hängen:
+ * Der Hub liegt im Tab, der Unterschirm am Wurzel-Layout — nur von dort kann er
+ * die native Tab-Leiste überdecken. Ein geteilter Wert verbindet sie, ohne dass
+ * ein Zustand durch beide Bäume gereicht werden muss.
+ */
+export const settingsPush = makeMutable(0);
+
+/**
+ * DIE Zeitvorgabe für alle Blätter, die von unten hereinfahren.
+ *
+ * Bisher stand sie an sieben Stellen einzeln im Code — jedes Blatt hatte die
+ * Zahlen vom vorigen abgeschrieben (der Anmelde-Screen gab sie vor, das
+ * Such-Blatt übernahm sie, Bo und das Ticket-Blatt wieder von dort). Das hielt
+ * nur, solange niemand eine davon anfasst. Genau das steht jetzt an: Sie sollen
+ * schneller werden, und zwar alle gemeinsam, sonst fährt der eine Knopf anders
+ * als der daneben.
+ *
+ * 280ms statt 350 hinein, 240 statt 300 hinaus. Ein Blatt von unten legt einen
+ * kurzen Weg zurück; die 350 stammen aus Reanimateds Vorgabe für `SlideInDown`
+ * und sind für einen bildschirmfüllenden Wechsel gedacht, nicht für etwas, das
+ * man mehrmals hintereinander auf- und zumacht. Hinaus darf kürzer sein als
+ * hinein — wer schließt, hat die Entscheidung schon getroffen.
+ *
+ * DIE KURVE ist nicht mehr `Easing.inOut(Easing.quad)`.
+ *
+ * Die alte war Reanimateds Standard für `SlideInDown`, und sie wirkt linear —
+ * zu Recht. Nachgerechnet liegt sie bei halber Zeit auf EXAKT halber Strecke,
+ * also genau auf der Geraden; nennenswert langsamer wird sie erst auf den
+ * letzten 22% der Zeit. Die Kurve der Seitwärts-Slides lässt sich für dieselben
+ * letzten 10% Weg dagegen 37% der Zeit:
+ *
+ *   Anteil der Zeit, nach dem 90% des Weges zurückgelegt sind
+ *     inOut(quad)          78%   → Auslauf über die restlichen 22%
+ *     bezier(.4, 0, .2, 1) 63%   → Auslauf über die restlichen 37%
+ *
+ * Welche Kurve es genau ist, steht bei SHEET_EASE darunter.
+ */
+/**
+ * Eigene Kurve für die Blätter — NICHT die der Seitwärts-Slides.
+ *
+ * Dass beide dieselbe bekommen sollten, war der Fehlschluss. `EMPHASIZED`
+ * (`bezier(.4, 0, .2, 1)`) legt die HALBE Strecke in den ersten 35% der Zeit
+ * zurück; die Spitzengeschwindigkeit liegt beim 2,7-fachen des Mittels. Auf der
+ * Bildschirmbreite geht das gut auf, ein Blatt von unten legt aber die ganze
+ * Bildschirmhöhe zurück — dieselbe Form ergibt dort deutlich mehr Weg pro Bild
+ * am Anfang, und genau das kam als „hastig, wirkt ruckelig" zurück.
+ *
+ * Diese hier hat die Spitze der ursprünglichen Kurve, aber den Auslauf der
+ * neuen:
+ *
+ *                          Spitze/Mittel   50% bei   90% bei
+ *   inOut(quad)  („linear")     2,00x        50%       78%
+ *   bezier(.4,0,.2,1) („hastig") 2,73x       35%       63%
+ *   bezier(.4,0,.4,1)  HIER      2,04x       43%       71%
+ *
+ * Also: kein schnellerer Anlauf als vorher (2,04 gegen 2,00), aber die letzten
+ * 10% des Weges dauern jetzt 29% der Zeit statt 22%. Genau das war gewünscht —
+ * langsamer werden zum Ende hin, ohne vorne zu schnellen.
+ */
+const SHEET_EASE = Easing.bezier(0.4, 0, 0.4, 1);
+
+/**
+ * 300/260. Zwischenzeitlich standen hier 320/280, um den vorgezogenen Weg der
+ * `EMPHASIZED`-Kurve auszugleichen. Mit der milderen Kurve braucht es diesen
+ * Ausgleich nicht mehr: Gerechnet auf den Punkt, an dem 90% zurückgelegt sind,
+ * liegt sie bei 71% von 300ms = 213ms — praktisch gleichauf mit den 218ms der
+ * ursprünglichen Fassung, deren Tempo als richtig bezeichnet wurde.
+ */
+/**
+ * 300/260 — bewusst NICHT verlangsamt.
+ *
+ * Die Rechnung unten stimmt, die Schlussfolgerung war trotzdem falsch: Langsamer
+ * ist nicht dasselbe wie flüssiger. Sie bleibt hier stehen, weil sie die
+ * Verhältnisse festhält — nicht als Aufforderung, an der Zahl zu drehen.
+ *
+ * Die Kurve war nie das Problem: Sie ist projektweit dieselbe, und die Wähler
+ * benutzen wertgleiche Konstanten. Das Missverhältnis liegt zwischen STRECKE
+ * und ZEIT. Ein Blatt von unten legt die volle Fensterhöhe zurück, ein
+ * Seitwärts-Slide nur die Breite:
+ *
+ *     Seitwärts   411dp / 430ms  →  43 Punkte pro Bild bei 60Hz
+ *     Blatt       801dp / 300ms  →  90 Punkte pro Bild
+ *
+ * Die Blätter bewegen sich also mehr als doppelt so schnell pro Bild wie die
+ * Slides, die im selben Projekt als weich gelten. Bei so großen Schritten
+ * zwischen zwei Bildern sieht das Auge die Einzelbilder — und zwar unabhängig
+ * davon, ob eines ausfällt. Genau das ist der Rest, der nach allen Aufräum-
+ * arbeiten übrig blieb: kein Ruckler im technischen Sinn, sondern zu viel Weg
+ * pro Bild.
+ *
+ * Die Konstante gilt für alle Blätter von unten — sie bleiben untereinander
+ * identisch, und `PICKER_IN`/`PICKER_OUT` sind buchstäblich dieselbe, damit sie
+ * nicht wieder auseinanderlaufen.
+ */
+export const SHEET_IN = { duration: 300, easing: SHEET_EASE } as const;
+export const SHEET_OUT = { duration: 260, easing: SHEET_EASE } as const;
+
+/**
+ * Ort- und Datumswähler fahren etwas zügiger als die großen Blätter.
+ *
+ * Eigene Zahlen und nicht die gemeinsamen verstellt: An `SHEET_IN` hängen auch
+ * das Such-Blatt aus dem Landingscreen und Bos Bildschirm, und deren Tempo ist
+ * ausdrücklich als richtig bezeichnet worden. Die beiden Picker sind aber etwas
+ * anderes — sie legen sich über einen Bildschirm, auf dem man gerade
+ * weiterarbeitet, und dürfen deshalb direkter kommen.
+ *
+ * 250/220 statt 300/260, also rund ein Sechstel schneller. Bewusst nicht
+ * darunter: Die KURVE bleibt dieselbe, und mit ihr braucht es genug Zeit, damit
+ * das Auslaufen am Ende noch als Auslaufen lesbar ist. Unter etwa 200ms kippt
+ * eine Bewegung ins Aufblitzen — sie wirkt dann nicht schneller, sondern
+ * abwesend.
+ */
+/**
+ * GLEICHE Dauer wie das Such-Blatt — 300/260 statt 250/220.
+ *
+ * Die Kurve war schon dieselbe, die Strecke auch: Beide fahren die volle
+ * Fensterhöhe. Nur die Zeit war kürzer, und das heißt bei gleicher Strecke
+ * höhere Geschwindigkeit — bei rund 800 Punkten Weg gut 100 Punkte pro Bild
+ * statt 85. Weniger Bilder für dieselbe Strecke bedeutet größere Sprünge
+ * zwischen ihnen, und das liest sich als „ruckelig", auch wenn kein einziges
+ * Bild ausfällt.
+ *
+ * Das Blatt, das als weich empfunden wird, fährt 300/260. Es gibt keinen Grund,
+ * warum ausgerechnet diese beiden schneller sein sollten — zumal sie direkt
+ * darauf aufsetzen und der Unterschied im Wechsel auffällt.
+ */
+export const PICKER_IN = SHEET_IN;
+export const PICKER_OUT = SHEET_OUT;
+
+/**
+ * Bo fährt VON UNTEN herein, nicht von rechts — wie das Such-Blatt und der
+ * Anmelde-Screen.
+ *
+ * Deshalb auch andere Zahlen als die Push-Übergänge oben: Ein Blatt von unten
+ * legt einen kürzeren Weg zurück und darf nicht so lange brauchen wie ein
+ * Bildschirmwechsel zur Seite. `BinchAuthScreen` gibt die Vorgabe
+ * (`SlideInDown.duration(350)` / `SlideOutDown.duration(300)`), das Such-Blatt
+ * hat sie übernommen, und `Easing.inOut(Easing.quad)` ist die Standardkurve, mit
+ * der Reanimated diese beiden Bewegungen fährt.
+ *
+ * 0 = unterhalb des Bildrands, 1 = oben angekommen.
+ */
+export const ASSISTANT_IN = SHEET_IN;
+export const ASSISTANT_OUT = SHEET_OUT;
+
+export const assistantPush = makeMutable(0);
+
+/**
+ * Fortschritt des Detail-Blattes („Auswählen" an einer Ticket-Karte).
+ * 0 = rechts außerhalb, 1 = deckt den Bildschirm.
+ *
+ * WARUM DAS AUS DER KOMPONENTE RAUS MUSSTE — es ist derselbe Befund wie bei
+ * `startResultsPush`, nur eine Ebene tiefer:
+ *
+ * Die Bewegung hing an einem Wert INNERHALB des Blattes und startete in einem
+ * Effekt. Zwischen Finger und erster Bewegung lag damit die ganze Kette
+ * Speicher schreiben → alle Abonnenten wecken → das Detail-Blatt mit einem NEUEN
+ * Ticket durchrendern → Fabric committen → Effekt → ein Bild Vorlauf. Der Commit
+ * ist dabei nicht klein: Es ist der komplette Blatt-Inhalt mit anderen Daten.
+ *
+ * Genau das kam als „braucht voll lange, bis die Animation getriggert wird" an.
+ * Von hier aus startet sie im Berührungs-Frame, und der Commit läuft daneben,
+ * statt davor.
+ */
+export const detailsPush = makeMutable(0);
+
+/**
+ * Fortschritt des Ticket-Blattes im Saved-Reiter. 0 = draußen, 1 = angekommen.
+ *
+ * Es war die EINZIGE Seitwärts-Slide, die ihre Bewegung nicht im Tipp startete,
+ * sondern in einem Effekt mit einem Bild Vorlauf — also erst, nachdem der
+ * Speicher-Schreibvorgang alle Abonnenten geweckt und Fabric committet hatte.
+ * Der Kommentar dort begründet den Vorlauf damit, dass der Baum dauerhaft steht
+ * und es „gar keinen Aufbau-Commit" gebe, auf den zu warten wäre — das stimmt,
+ * macht die Wartezeit aber gerade deshalb zu reiner Latenz.
+ */
+export const ticketPush = makeMutable(0);
+
+let ticketMoving = false;
+export function isTicketPushStarted(): boolean {
+  return ticketMoving;
+}
+
+export function startTicketPush(): void {
+  markTransitionBusy(PUSH_SPRING.duration);
+  ticketMoving = true;
+  ticketPush.value = withTiming(1, PUSH_SPRING);
+  overlayCover.value = withTiming(1, COVER_IN_SPRING);
+}
+
+export function endTicketPush(): void {
+  markTransitionBusy(POP_SPRING.duration);
+  ticketMoving = false;
+}
+
+/**
+ * Beide Bewegungen in EINEM Aufruf — die des Blattes und der Parallax der
+ * Unterlage.
+ *
+ * Sie liefen vorher in zwei getrennten Zuweisungen an derselben Stelle, was
+ * hier gut ging; sobald aber eine davon im Tipp-Handler und die andere im
+ * Effekt startet, laufen sie um zwei Bilder versetzt. Wie sich das liest, steht
+ * ausführlich bei `startResultsPush`: ein wandernder Spalt an der Kante.
+ */
+/**
+ * Läuft die Bewegung? Als schlichter JS-Wert, NICHT über den geteilten Wert.
+ *
+ * Das Blatt muss unterscheiden können, ob jemand die Bewegung schon angestoßen
+ * hat — sonst startet sein Notausgang eine zweite. Nachgelesen wurde das bis
+ * eben mit `detailsPush.value` aus React heraus, und das ist teuer an der
+ * falschen Stelle: Ein Zugriff aus JS auf einen geteilten Wert ist ein
+ * SYNCHRONER Sprung in die UI-Laufzeit, bei dem beide Stränge kurz gegeneinander
+ * gesperrt werden — ausgerechnet während die Kurve läuft. Die Datei warnt weiter
+ * oben selbst davor.
+ *
+ * Ein einfaches Modul-Flag beantwortet dieselbe Frage, ohne irgendetwas zu
+ * sperren.
+ */
+let detailsMoving = false;
+export function isDetailsPushStarted(): boolean {
+  return detailsMoving;
+}
+
+export function startDetailsPush(): void {
+  markTransitionBusy(PUSH_SPRING.duration);
+  detailsMoving = true;
+  // Kein Rückwurf auf 0 davor. `withTiming` startet ohnehin beim aktuellen Wert
+  // — und genau das ist hier das bessere Verhalten: Wer mitten in der Rückfahrt
+  // erneut auf eine Karte tippt, soll von dort aus weiterfahren statt erst nach
+  // rechts aus dem Bild zu springen. Der Wurf war zusätzlich ein eigener
+  // Auftrag an den UI-Strang, also ein Zustellvorgang mehr im heikelsten Moment.
+  detailsPush.value = withTiming(1, PUSH_SPRING);
+  overlayCover.value = withTiming(1, COVER_IN_SPRING);
+}
+
+/** Vom Blatt gesetzt, wenn es seine Rückfahrt selbst fährt (Schließen-Knopf,
+ *  Zurück-Geste) — dort läuft `endDetailsPush` nicht. */
+export function setDetailsPushStopped(): void {
+  detailsMoving = false;
+}
+
+export function endDetailsPush(): void {
+  markTransitionBusy(POP_SPRING.duration);
+  detailsMoving = false;
+  detailsPush.value = withTiming(0, POP_SPRING);
+  overlayCover.value = withTiming(0, COVER_OUT_SPRING);
+}
+
+/**
+ * Startet Bos Bewegung SCHON BEIM TIPPEN, nicht erst wenn der Bildschirm steht.
+ *
+ * Derselbe Kniff wie bei `startResultsPush`, aus demselben Grund: Zwischen
+ * Fingerkontakt und dem ersten gemounteten Bild liegen Navigation, Aufbau des
+ * Bildschirms und ein freier UI-Thread — 60 bis 80ms, in denen nichts passiert.
+ * Wird die Bewegung stattdessen im Tipp-Handler losgeschickt, läuft sie bereits,
+ * wenn der Bildschirm auftaucht: Er erscheint mitten in der Fahrt statt am
+ * Anfang. Man sieht keinen Sprung — nur, dass es sofort losgeht.
+ */
+let assistantMoving = false;
+/** Läuft Bos Bewegung? Als JS-Wert — Begründung siehe `isDetailsPushStarted`. */
+export function isAssistantPushStarted(): boolean {
+  return assistantMoving;
+}
+
+/**
+ * Auch für die Blätter von unten anzumelden — sie haben keinen gemeinsamen
+ * Startpunkt wie die Seitwärts-Slides, deshalb hier als eigene Funktion für
+ * alle, die eines öffnen oder schließen.
+ */
+export function markSheetMoving(durationMs: number = SHEET_IN.duration): void {
+  markTransitionBusy(durationMs);
+}
+
+export function startAssistantPush(): void {
+  markTransitionBusy(ASSISTANT_IN.duration);
+  assistantMoving = true;
+  assistantPush.value = 0;
+  assistantPush.value = withTiming(1, ASSISTANT_IN);
+}
+
+/**
+ * Beim Abbau zurücksetzen — Lage UND Merker.
+ *
+ * Der Bildschirm hat bisher nur `assistantPush` genullt und den Merker stehen
+ * lassen. Wird Bo je auf einem anderen Weg als über `closeScreen` verlassen und
+ * danach ohne die übliche Geste geöffnet (Verknüpfung, Wiederherstellung), gilt
+ * die Fahrt als „läuft schon" — sie startet also nicht, und der Bildschirm
+ * bleibt um eine volle Bildschirmhöhe verschoben liegen. Also unsichtbar.
+ */
+export function resetAssistantPush(): void {
+  assistantMoving = false;
+  assistantPush.value = 0;
+}
+
+/** Gegenbewegung beim Schließen. Der Aufrufer navigiert erst danach zurück. */
+export function endAssistantPush(): void {
+  markTransitionBusy(ASSISTANT_OUT.duration);
+  assistantMoving = false;
+  assistantPush.value = withTiming(0, ASSISTANT_OUT);
+}

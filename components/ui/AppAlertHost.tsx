@@ -3,6 +3,8 @@ import Animated, { FadeIn, FadeOut, ZoomIn, ZoomOut } from "react-native-reanima
 import { useAlertStore, type AlertButton } from "@/lib/alert";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { haptic } from "@/lib/haptics";
+import { usePalette } from "@/lib/theme/appBg";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const C = {
   sheet: "#1F1F20",
@@ -17,6 +19,7 @@ const C = {
 
 /** Mounted once at the app root. Renders styled alerts triggered via `showAlert(...)`. */
 export function AppAlertHost() {
+  const palette = usePalette();
   const visible = useAlertStore((s) => s.visible);
   const title = useAlertStore((s) => s.title);
   const body = useAlertStore((s) => s.body);
@@ -45,7 +48,7 @@ export function AppAlertHost() {
         <Animated.View
           entering={ZoomIn.duration(200)}
           exiting={ZoomOut.duration(150)}
-          style={styles.dialog}
+          style={[styles.dialog, { backgroundColor: palette.s1 }]}
         >
           {title ? <Text style={styles.title}>{title}</Text> : null}
           {body ? <Text style={styles.body}>{body}</Text> : null}
@@ -73,6 +76,7 @@ export function AppAlertHost() {
                   onPress={() => handlePress(btn)}
                   style={({ pressed }) => [
                     styles.btn,
+                    !isPrimary && !isDestructive && { backgroundColor: palette.s3 },
                     wStyle,
                     isDestructive && styles.btnDestructive,
                     !isPrimary && !isDestructive && styles.btnCancel,
@@ -100,7 +104,7 @@ export function AppAlertHost() {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   backdrop: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: "rgba(0,0,0,0.6)",

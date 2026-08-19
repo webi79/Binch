@@ -4,13 +4,42 @@ import { Location, SearchParams, SearchResponse, TravelMode } from "@/types/sear
 export const API_BASE_URL: string =
   (Constants.expoConfig?.extra as { apiBaseUrl?: string })?.apiBaseUrl ?? "http://localhost:3000";
 
+/**
+ * Adressen im eigenen Netz — dort ist http die einzige realistische Option,
+ * weil man für eine LAN-IP kein gültiges Zertifikat bekommt.
+ *
+ * Bewusst eng: nur die drei privaten IPv4-Bereiche (RFC 1918), Loopback und die
+ * Emulator-Adressen. Ein öffentlicher Hostname passt hier NIE — eine versehentlich
+ * auf http stehende Produktions-Domain scheitert also weiterhin laut.
+ */
+function isPrivateHost(url: string): boolean {
+  let host: string;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return false;
+  }
+  if (host === "localhost" || host === "127.0.0.1" || host === "::1") return true;
+  // Android-Emulator: 10.0.2.2 = Host-Rechner, 10.0.3.2 = Genymotion.
+  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
+  if (!v4) return false;
+  const a = Number(v4[1]);
+  const b = Number(v4[2]);
+  return a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31);
+}
+
 // Defense-in-Depth gegen unverschlüsselten Transport: Ein PRODUKTIONS-Build darf
 // niemals über http:// sprechen — dort reisen Login-Passwort, Bearer-Token,
-// Suchen, Chat und Ticket-PDFs für jeden im Netz mitlesbar. __DEV__ ist im
-// Release-Build false; eine http-URL dort ist ein Fehlkonfigurations-Unfall, der
-// LAUT scheitern soll (Startup-Crash mit klarer Meldung) statt still Klartext zu
-// senden. Im Dev (LAN-Server, kein Zertifikat möglich) bleibt http erlaubt.
-if (!__DEV__ && API_BASE_URL.startsWith("http://")) {
+// Suchen, Chat und Ticket-PDFs für jeden im Netz mitlesbar. Eine http-URL auf
+// eine öffentliche Domain ist ein Fehlkonfigurations-Unfall, der LAUT scheitern
+// soll (Startup-Crash mit klarer Meldung) statt still Klartext zu senden.
+//
+// Ausgenommen bleibt der Server im eigenen Netz: Dafür war die Regel nie gedacht
+// (siehe isPrivateHost). Vorher hing die Ausnahme allein an `__DEV__` — damit
+// konnte ein Release-Build auf dem Gerät gar nicht mehr mit dem lokalen Backend
+// reden, obwohl genau das der Testfall ist. Das Schutzziel bleibt: Klartext ins
+// offene Internet ist weiterhin ein harter Fehler.
+if (!__DEV__ && API_BASE_URL.startsWith("http://") && !isPrivateHost(API_BASE_URL)) {
   throw new Error(
     `[binch] Unsicherer API-Base im Release-Build: ${API_BASE_URL}. ` +
       `Produktion MUSS https:// nutzen (Caddy-Proxy). ` +
@@ -30,6 +59,57 @@ function buildUrl(path: string, params?: Record<string, string | number | undefi
 
 // Default 20s timeout für Search-Calls, 8s für Locations/kleine Calls.
 // Verhindert dass der Client minutenlang hängt wenn der Server unerreichbar ist.
+/**
+ * `fetch` mit Zeitgrenze — für ALLE Aufrufe, nicht nur die lesenden.
+ *
+ * `getJson` hatte eine, die schreibenden Pfade (Login, Avatar, Ticket-Upload)
+ * nicht. Bei totem oder langsamem Backend hingen die unbegrenzt. Im schlimmsten
+ * Fall beim Ticket-Upload: Der Dialog setzt dabei `busy`, und das deaktiviert
+ * gleichzeitig Wisch-Geste und Hintergrund-Tipp — das Blatt klebte dann auf dem
+ * Ladekreis, und der einzige Ausweg war die Hardware-Zurück-Taste.
+ */
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    /**
+     * Der Zeitgeber LÄUFT WEITER — und zwar absichtlich.
+     *
+     * Hier stand ein `finally { clearTimeout(timer) }` mit dem Kommentar, es
+     * greife „erst nach dem `await` der Aufrufer". Das stimmt nicht: Ein
+     * `finally` läuft beim Verlassen DIESER Funktion, also bevor irgendein
+     * Aufrufer `res.json()` überhaupt anfasst. Die Uhr war damit genau in dem
+     * Abschnitt aus, den sie schützen sollte — ein Server, der Kopfzeilen sendet
+     * und den Rumpf stehen lässt, hing weiterhin unbegrenzt. Genau der Fall, den
+     * der Kommentar über dieser Funktion als Grund nennt („das Blatt klebte auf
+     * dem Ladekreis").
+     *
+     * Ohne Löschen deckt das Signal auch das Lesen des Rumpfes ab. Der Zeitgeber
+     * feuert nach einer erfolgreichen Antwort trotzdem noch einmal ins Leere —
+     * `abort()` auf eine bereits gelesene Antwort tut nichts. Das ist der Preis:
+     * ein anhängiger Zeitgeber je Anfrage, höchstens für die Dauer der
+     * Zeitgrenze.
+     *
+     * Ein abgebrochenes Lesen meldet sich beim Aufrufer als roher `AbortError`,
+     * nicht mit dem freundlichen Text unten — der ist nur für den Abbruch beim
+     * Verbindungsaufbau erreichbar. Unschön, aber allemal besser als ein Aufruf,
+     * der nie zurückkommt.
+     */
+    return res;
+  } catch (err) {
+    clearTimeout(timer);
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(`Request timeout after ${timeoutMs}ms — Server nicht erreichbar (${url})`);
+    }
+    throw err;
+  }
+}
+
 async function getJson<T>(
   path: string,
   params?: Record<string, string | number | undefined>,
@@ -58,6 +138,10 @@ async function getJson<T>(
 /** Optionale Such-Flags. `nocache=1` umgeht den 2h-Server-Cache (für Refresh). */
 export interface SearchOptions {
   nocache?: boolean;
+  /** Nur Flüge: auf nahegelegene Flughäfen ausweichen. Wird ausschließlich
+   *  gesetzt, wenn der Nutzer das im Leerzustand ausdrücklich anfordert —
+   *  ungefragt untergeschobene Alternativen wären irreführend. */
+  nearby?: boolean;
   /** Pagination-Token aus einer vorherigen SearchResponse — für „Später"-
    *  Pagination bei TRAIN. Wenn gesetzt, umgeht der Server automatisch den
    *  Cache und ruft den Provider mit HAFAS-laterThan auf. */
@@ -81,14 +165,19 @@ function searchParamsForApi(p: SearchParams, opt?: SearchOptions) {
     passengers: p.passengers,
     currency: p.currency,
     ...(opt?.nocache ? { nocache: "1" } : {}),
+    ...(opt?.nearby ? { nearby: "1" } : {}),
     ...(opt?.paginationToken ? { paginationToken: opt.paginationToken } : {}),
   };
 }
 
 export function searchFlights(p: SearchParams, opt?: SearchOptions): Promise<SearchResponse> {
-  // 25s: die Flugsuche pollt die flaky API mehrfach (keep-best) + persistiert
-  // viele Treffer → kann länger dauern als der 20s-Default. Loader läuft solange.
-  return getJson("/api/search/flights", searchParamsForApi(p, opt), 25_000);
+  // 60s: Die Flugsuche zieht mehrere Stichproben (die Datenquelle liefert
+  // sporadisch leere Antworten) und weicht bei Flughäfen ohne Linienverkehr
+  // zusätzlich auf den nächstgelegenen aus — nachgemessen z.B. Bern→Tel Aviv
+  // 44s bis zu 72 Treffern ab Basel. Mit den bisherigen 25s brach der Client
+  // genau dann ab und zeigte „keine Verbindungen", obwohl der Server längst
+  // Ergebnisse hatte. Solange läuft der Such-Loader.
+  return getJson("/api/search/flights", searchParamsForApi(p, opt), 60_000);
 }
 
 export function searchTrains(p: SearchParams, opt?: SearchOptions): Promise<SearchResponse> {
@@ -381,11 +470,16 @@ export function fetchFlightBookingOptions(input: {
   if (input.searchPrice !== undefined && input.searchPrice > 0) {
     params.set("searchPrice", String(input.searchPrice));
   }
-  // 18s: die google-flights2-API ist flaky (liefert denselben Token mal leer,
-  // mal „Invalid"), daher retryt der Server mehrfach (RETRY_ATTEMPTS) + löst
-  // Deeplinks auf. Das braucht im Worst Case >12s — lieber etwas länger laden
-  // (Skeletons) als auf den Single-Provider-Fallback zu kippen.
-  return getJson<FlightBookingOptionsResponse>(`/api/flights/booking-options?${params.toString()}`, undefined, 18_000);
+  // 60s: Der Anbieter-Endpoint von google-flights2 braucht nachgemessen 10-30s
+  // pro Antwort (nicht <1s, wie lange angenommen). Mit den bisherigen 18s brach
+  // der Client regelmäßig ab, BEVOR der Server fertig war — und selbst wenn er
+  // wartete, lief serverseitig jeder Versuch in ein zu knappes Zeitlimit.
+  // Solange geladen wird, zeigt das Detail-Overlay Skelette; das ist besser als
+  // eine leere Anbieterliste. Nachgemessen am fertigen Endpoint: 41,6s kalt
+  // (30s Anbieter-Abfrage + parallele Deeplink-Auflösung), 7ms warm — die
+  // Antwort wird serverseitig 30min gecacht. Der Client startet den Abruf
+  // bereits beim Antippen der Karte, ein Teil der Wartezeit ist also verdeckt.
+  return getJson<FlightBookingOptionsResponse>(`/api/flights/booking-options?${params.toString()}`, undefined, 60_000);
 }
 
 export interface ParsedTicketResponse {
@@ -436,7 +530,7 @@ export interface AuthResponse {
 
 async function postJson<T>(path: string, body: unknown, token?: string): Promise<T> {
   const url = buildUrl(path);
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: "POST",
     headers: {
       Accept: "application/json",
@@ -444,7 +538,7 @@ async function postJson<T>(path: string, body: unknown, token?: string): Promise
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: JSON.stringify(body),
-  });
+  }, 20000);
   if (!res.ok) {
     let detail = "";
     try {
@@ -476,15 +570,31 @@ export function authLogin(input: { email: string; password: string }): Promise<A
   return postJson("/api/auth/login", input);
 }
 
+/**
+ * Anmeldung über Apple oder Google.
+ *
+ * Geschickt wird nur das ID-Token des Anbieters. Geprüft wird es
+ * ausschließlich serverseitig gegen dessen öffentlichen Schlüsselsatz — der
+ * Client kann dazu nichts beitragen und soll es auch nicht.
+ */
+export function authOAuth(input: {
+  provider: "google" | "apple";
+  idToken: string;
+  firstName?: string;
+  lastName?: string;
+}): Promise<AuthResponse> {
+  return postJson("/api/auth/oauth", input);
+}
+
 export function authLogout(token: string): Promise<void> {
   return postJson<void>("/api/auth/logout", {}, token);
 }
 
 export async function authMe(token: string): Promise<AuthUser> {
   const url = buildUrl("/api/auth/me");
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
-  });
+  }, 20000);
   if (!res.ok) throw new Error(`API ${res.status} ${res.statusText}`);
   const j = (await res.json()) as { user: AuthUser };
   return j.user;
@@ -495,7 +605,7 @@ export async function authUpdateAvatar(
   dataUrl: string | null,
 ): Promise<AuthUser> {
   const url = buildUrl("/api/auth/avatar");
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: "PUT",
     headers: {
       Accept: "application/json",
@@ -503,7 +613,7 @@ export async function authUpdateAvatar(
       Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify({ dataUrl }),
-  });
+  }, 20000);
   if (!res.ok) {
     let msg = `API ${res.status} ${res.statusText}`;
     try {
@@ -544,14 +654,14 @@ export async function parseTicketPdf(
     type: mimeType,
   } as unknown as Blob);
 
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: "POST",
     body: form,
     headers: {
       Accept: "application/json",
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
-  });
+  }, 60000);
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
     throw new TicketParseError(

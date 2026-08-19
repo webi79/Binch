@@ -9,6 +9,7 @@
  * Pure View + StyleSheet, das rendert in einem Frame.
  */
 import { View, StyleSheet } from "react-native";
+import { scaledStyles } from "@/lib/ui/compact";
 
 // MapLibre's Standard-Dark-Style hat einen Mid-Grey-Hintergrund (#3A3F44 ca.).
 // Wir benutzen einen leicht abgedunkelten Wert damit das Skelett unauffälliger
@@ -30,7 +31,7 @@ export function MapSkeleton() {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   root: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: MAP_BG,

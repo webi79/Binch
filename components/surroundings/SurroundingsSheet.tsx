@@ -1,4 +1,6 @@
-import { memo, useEffect, useMemo } from "react";
+import { createContext, memo, useContext, useEffect, useMemo } from "react";
+import { SHEET_IN } from "@/lib/nav/overlayCover";
+import { haptic } from "@/lib/haptics";
 import {
   View,
   Text,
@@ -8,13 +10,16 @@ import {
   Pressable,
   type ListRenderItemInfo,
 } from "react-native";
+import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
   useAnimatedStyle,
   useSharedValue,
   withSpring,
+  withTiming,
 } from "react-native-reanimated";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { TAB_BAR_H } from "@/components/ui/BinchTabBar";
 import {
   Train,
   Bus,
@@ -29,6 +34,7 @@ import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useT } from "@/lib/i18n/useT";
 import { MarkerKind, SheetMode, StopListItem } from "@/lib/surroundings/mockData";
 import { useAccent } from "@/lib/theme/accent";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const LIME = "#7FEA4D";
 const LIME_SUB = "rgba(127,234,77,0.18)";
@@ -80,9 +86,15 @@ interface Props {
   mode: SheetMode;
   setMode: (m: SheetMode) => void;
   items: StopListItem[];
+  /**
+   * Antippen einer Zeile. Der Bildschirm darüber entscheidet, was das heißt —
+   * hier wird nur die Kennung durchgereicht, die Zeile und Kartennadel teilen.
+   */
+  onSelectStop: (id: string) => void;
 }
 
-export function SurroundingsSheet({ mode, setMode, items }: Props) {
+export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props) {
+  const palette = usePalette();
   const t = useT();
   const accent = useAccent();
   const insets = useSafeAreaInsets();
@@ -95,9 +107,32 @@ export function SurroundingsSheet({ mode, setMode, items }: Props) {
   const snap = useMemo(() => {
     const fullTop = Math.max(60, insets.top + 12);
     const sheetHeight = screenHeight - fullTop;
-    const tabBarSpace = 80 + insets.bottom; // Platz für FloatingTabBar
-    // Peek = nur Handle + Tab-Row; die 1-px-Border darunter wird abgeschnitten
-    const peekVisible = 51;
+    // Platz für die Tab-Leiste. Der Wert stand fest auf 80 und stammte noch von
+    // der früheren, freischwebenden Leiste; er kommt jetzt aus der Leiste selbst
+    // — sonst laufen die zwei Zahlen bei der nächsten Höhenänderung auseinander.
+    const tabBarSpace = TAB_BAR_H + insets.bottom;
+    /**
+     * Was im Ruhezustand ÜBER der Tab-Leiste stehen bleibt.
+     *
+     * Hier stand 51 mit dem Vermerk, die 1-Punkt-Trennlinie werde abgeschnitten.
+     * Abgeschnitten wurden in Wahrheit 15 Punkte — und darin lag die
+     * Unterstreichung des aktiven Reiters, also genau das Element, das anzeigt,
+     * wo man gerade ist. Nachgerechnet aus den Stilen darunter:
+     *
+     *   Griffzone      10 (oben) +  5 (Griff) + 4 (unten)   = 19
+     *   Reiter-Zeile    4 (oben) + 42 (Reiter) + 1 (Linie)  = 47
+     *   Reiter selbst  12 + 18 (Symbol/Schrift) + 12        = 42
+     *                                                        ----
+     *                                                          66
+     *
+     * Die Unterstreichung sitzt am unteren Rand des Reiters, also bei 65 — und
+     * lag damit vollständig hinter der Leiste. Mit der vollen Höhe sitzt sie
+     * genau auf deren Oberkante, so wie gewünscht.
+     */
+    const HANDLE_ZONE = 10 + 5 + 4;
+    const TAB_H = 12 + 18 + 12;
+    const TAB_ROW = 4 + TAB_H + 1;
+    const peekVisible = HANDLE_ZONE + TAB_ROW;
     const midVisible = Math.min(sheetHeight - 80, Math.max(420, screenHeight * 0.5));
     return {
       sheetHeight,
@@ -109,20 +144,41 @@ export function SurroundingsSheet({ mode, setMode, items }: Props) {
     };
   }, [screenHeight, insets.top, insets.bottom]);
 
-  const translateY = useSharedValue(snap.peek);
+  /**
+   * Startwert UNTERHALB des Bildrands, nicht auf der Ruhestellung.
+   *
+   * Hier stand `snap.peek` — also genau das Ziel, das der Mount-Effekt gleich
+   * darunter anfährt. Start gleich Ziel heißt: Es bewegt sich nichts. Das Blatt
+   * stand von Anfang an da, die Zeitvorgabe darunter wirkte auf nichts. Vom
+   * unteren Rand aus fährt es jetzt wirklich herein, mit derselben Kurve wie
+   * jedes andere Blatt von unten.
+   */
+  const translateY = useSharedValue(snap.sheetHeight);
   const sheetAnim = useAnimatedStyle(() => ({
     transform: [{ translateY: translateY.value }],
   }));
 
   useEffect(() => {
-    // Beim ersten Mount sanft in den Peek-State sliden.
-    translateY.value = withSpring(snap.peek, { damping: 22, stiffness: 200 });
+    // Beim ersten Mount in die Ruhestellung fahren — mit derselben Vorgabe wie
+    // jedes andere Blatt, das von unten hereinkommt (siehe SHEET_IN). Hier stand
+    // eine eigene Feder; sie schwingt über und endet nur asymptotisch, während
+    // alle anderen exakt landen.
+    translateY.value = withTiming(snap.peek, SHEET_IN);
   }, []);
 
   // Pan-Gesture an der Handle-Zone: aktualisiert translateY während Drag,
   // snapt beim Loslassen auf den nächstgelegenen Punkt.
   const startY = useSharedValue(0);
-  const pan = Gesture.Pan()
+  /**
+   * In `useMemo` — sonst entsteht sie bei jedem Render neu.
+   *
+   * Dieser Baum rendert unter anderem dann, wenn die Karte nach einer Bewegung
+   * zur Ruhe kommt und neue Daten schreibt. Jedes neue `Gesture.Pan()`-Objekt
+   * muss der Erkenner gegen seinen nativen Gegenpart abgleichen und neu
+   * einrichten. Die Rastpunkte sind die einzige Abhängigkeit.
+   */
+  const pan = useMemo(() =>
+    Gesture.Pan()
     .onStart(() => {
       startY.value = translateY.value;
     })
@@ -146,7 +202,8 @@ export function SurroundingsSheet({ mode, setMode, items }: Props) {
       if (e.velocityY < -800) closest = snap.full;
       else if (e.velocityY > 800) closest = snap.peek;
       translateY.value = withSpring(closest, { damping: 22, stiffness: 220, mass: 0.8 });
-    });
+    }),
+  [snap, startY, translateY]);
 
   const title = t(TITLE_KEY[mode]);
 
@@ -154,6 +211,7 @@ export function SurroundingsSheet({ mode, setMode, items }: Props) {
     <Animated.View
       style={[
         styles.sheet,
+        { backgroundColor: palette.s1 },
         { top: Math.max(60, insets.top + 12), height: snap.sheetHeight },
         sheetAnim,
       ]}
@@ -200,6 +258,7 @@ export function SurroundingsSheet({ mode, setMode, items }: Props) {
         </RippleTouch>
       </View>
 
+      <SelectStopContext.Provider value={onSelectStop}>
       <FlatList
         style={styles.scroll}
         data={items}
@@ -218,9 +277,20 @@ export function SurroundingsSheet({ mode, setMode, items }: Props) {
           </Text>
         }
       />
+      </SelectStopContext.Provider>
     </Animated.View>
   );
 }
+
+/**
+ * Der Rückruf fürs Antippen einer Zeile — über den Kontext, nicht als Eigenschaft.
+ *
+ * `renderStopRow` steht bewusst auf Modulebene: Eine bei jedem Render neu
+ * gebaute Zeichenfunktion nimmt der Liste jede Möglichkeit, Zeilen
+ * wiederzuverwenden, und macht das `memo` an `StopRow` wertlos. Über den Inhalt
+ * ändert sich weder das eine noch das andere.
+ */
+const SelectStopContext = createContext<(id: string) => void>(() => {});
 
 const keyExtractor = (item: StopListItem) => item.id;
 const renderStopRow = ({ item }: ListRenderItemInfo<StopListItem>) => (
@@ -230,8 +300,16 @@ const renderStopRow = ({ item }: ListRenderItemInfo<StopListItem>) => (
 const StopRow = memo(function StopRow({ item }: { item: StopListItem }) {
   const t = useT();
   const accent = useAccent();
+  const palette = usePalette();
+  const onSelectStop = useContext(SelectStopContext);
   return (
-    <RippleTouch style={[styles.row, item.selected && styles.rowSelected]}>
+    <RippleTouch
+      onPress={() => {
+        haptic("button");
+        onSelectStop(item.id);
+      }}
+      style={[styles.row, item.selected && [styles.rowSelected, { backgroundColor: palette.s2 }]]}
+    >
       <View style={{ flex: 1 }}>
         <View style={styles.rowTitleLine}>
           <Text style={styles.rowTitle}>{item.name}</Text>
@@ -268,7 +346,7 @@ const StopRow = memo(function StopRow({ item }: { item: StopListItem }) {
             </View>
           ))}
           {item.badge && (
-            <View style={styles.metaBadge}>
+            <View style={[styles.metaBadge, { backgroundColor: palette.s3 }]}>
               <Text style={styles.metaBadgeText}>{item.badge}</Text>
             </View>
           )}
@@ -282,7 +360,7 @@ const StopRow = memo(function StopRow({ item }: { item: StopListItem }) {
   );
 });
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   sheet: {
     position: "absolute",
     left: 0,
@@ -290,8 +368,10 @@ const styles = StyleSheet.create({
     backgroundColor: C.bg,
     borderTopLeftRadius: 28,
     borderTopRightRadius: 28,
-    borderTopWidth: 1,
-    borderTopColor: C.border,
+    // KEINE borderTopWidth mehr: Eine PARTIELLE Border (nur oben) zusammen mit
+    // borderRadius rendert Android an den gerundeten Ecken fehlerhaft — dort
+    // fehlte der Hintergrund und die Karte darunter schien an den oberen Ecken
+    // links/rechts durch. Die optische Trennung übernimmt der Schatten unten.
     shadowColor: "#000",
     shadowOffset: { width: 0, height: -12 },
     shadowOpacity: 0.5,

@@ -1,13 +1,25 @@
 import { useEffect, useState } from "react";
 import * as Location from "expo-location";
-import { USER_LOC, type Coord } from "./mockData";
+import { type Coord } from "./mockData";
+import { useSearchStore } from "@/stores/searchStore";
 
 export type LocationStatus = "loading" | "granted" | "denied" | "error";
 
 export interface UseUserLocation {
-  /** Aktuelle Position. Fällt auf den Default (Berlin Hbf) zurück, wenn GPS abgelehnt/fehlerhaft. */
-  coord: Coord;
+  /**
+   * Aktuelle Position, oder `null` solange keine bekannt ist.
+   *
+   * Hier stand ein fest verdrahteter Platzhalter (Berlin Hbf). Der wurde
+   * überall wie eine echte Position behandelt: Die Karte startete dort, die
+   * Umkreis-Abfrage lief dafür, und die Stecknadel „du bist hier" stand
+   * mitten in Berlin — für jeden Nutzer, der nicht in Berlin ist. `null` ist
+   * die ehrliche Antwort, und die Aufrufer können darauf reagieren.
+   */
+  coord: Coord | null;
   status: LocationStatus;
+  /** true, sobald die Position aus einer echten Messung stammt (nicht aus dem
+   *  gemerkten Wert der letzten Sitzung). */
+  hasFix: boolean;
   /** Position aktiv neu auflösen — für den Locate-FAB. */
   refresh: () => Promise<void>;
 }
@@ -29,10 +41,18 @@ const FRESH_FIX_TIMEOUT_MS = 8_000;
 const LAST_KNOWN_MAX_AGE_MS = 5 * 60_000;
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  // Zeitgeber aufräumen, sobald das Rennen entschieden ist. Ohne das lief er
+  // auch dann weiter, wenn die Ortung längst geantwortet hat — bei jedem Tippen
+  // auf den Standort-Knopf erneut.
+  let timer: ReturnType<typeof setTimeout> | null = null;
   return Promise.race([
     p,
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
-  ]);
+    new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), ms);
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 /**
@@ -45,9 +65,32 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
  *   2. `getCurrentPositionAsync` — die genaue Messung, aber gedeckelt. Läuft sie
  *      in den Timeout, behalten wir den Fix aus (1), statt ewig zu hängen.
  */
-export function useUserLocation(): UseUserLocation {
-  const [coord, setCoord] = useState<Coord>(USER_LOC);
+/**
+ * @param enabled false = noch gar nichts tun. Gedacht für Bildschirme, die
+ * vorgerendert im Hintergrund liegen: Seit die Tabs beim App-Start entstehen
+ * (lazy={false}), lief die Ortung sonst sofort los — inklusive Berechtigungs-
+ * Dialog und GPS-Fix für einen Tab, den der Nutzer vielleicht nie öffnet.
+ */
+export function useUserLocation(enabled = true): UseUserLocation {
+  /**
+   * Start beim zuletzt bekannten EIGENEN Ort, nicht bei einem fremden.
+   *
+   * Der gemerkte Wert überlebt den App-Start (siehe `lastKnownCoord` im
+   * Speicher). Beim allerersten Start gibt es ihn nicht — dann bleibt es bei
+   * `null`, und die Karte startet weit herausgezoomt statt in einer Stadt, in
+   * der der Nutzer nicht ist.
+   */
+  const remembered = useSearchStore((s) => s.lastKnownCoord);
+  const [coord, setCoord] = useState<Coord | null>(remembered);
+  const [hasFix, setHasFix] = useState(false);
   const [status, setStatus] = useState<LocationStatus>("loading");
+
+  const remember = (c: Coord) => {
+    setCoord(c);
+    setHasFix(true);
+    setStatus("granted");
+    useSearchStore.getState().setLastKnownCoord(c);
+  };
 
   const fetchLocation = async (): Promise<void> => {
     try {
@@ -62,8 +105,7 @@ export function useUserLocation(): UseUserLocation {
       try {
         const last = await Location.getLastKnownPositionAsync({ maxAge: LAST_KNOWN_MAX_AGE_MS });
         if (last) {
-          setCoord({ latitude: last.coords.latitude, longitude: last.coords.longitude });
-          setStatus("granted");
+          remember({ latitude: last.coords.latitude, longitude: last.coords.longitude });
           haveFix = true;
         }
       } catch {
@@ -76,8 +118,7 @@ export function useUserLocation(): UseUserLocation {
         FRESH_FIX_TIMEOUT_MS,
       );
       if (fresh) {
-        setCoord({ latitude: fresh.coords.latitude, longitude: fresh.coords.longitude });
-        setStatus("granted");
+        remember({ latitude: fresh.coords.latitude, longitude: fresh.coords.longitude });
       } else if (!haveFix) {
         // Weder Cache noch frischer Fix → der Screen darf nicht in "loading"
         // festhängen, sonst wartet die Query ewig auf einen Standort.
@@ -89,8 +130,10 @@ export function useUserLocation(): UseUserLocation {
   };
 
   useEffect(() => {
+    if (!enabled) return;
     void fetchLocation();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled]);
 
-  return { coord, status, refresh: fetchLocation };
+  return { coord, status, hasFix, refresh: fetchLocation };
 }

@@ -12,6 +12,7 @@
  */
 import { useCallback, useMemo, useRef, useState } from "react";
 import { LayoutChangeEvent, Pressable, StyleSheet, Text, View, type ColorValue, type TextStyle, type ViewStyle, Platform } from "react-native";
+import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
   Easing,
   useAnimatedStyle,
@@ -20,6 +21,7 @@ import Animated, {
 } from "react-native-reanimated";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
+import { scaledStyles } from "@/lib/ui/compact";
 
 export interface SegmentedToggleItem {
   id: string;
@@ -57,7 +59,7 @@ export function SegmentedToggle({
   items,
   selectedId,
   onChange,
-  containerColor = "#242425",
+  containerColor,
   activeTextStyle,
   inactiveTextStyle,
   innerPadding = 4,
@@ -66,6 +68,7 @@ export function SegmentedToggle({
   withShadow = true,
   style,
 }: Props) {
+  const palette = usePalette();
   const accent = useAccent();
   const [containerWidth, setContainerWidth] = useState(0);
 
@@ -85,6 +88,8 @@ export function SegmentedToggle({
   const lastSelectedRef = useRef(selectedIndex);
 
   // Bei jeder Selection-Änderung: animiere Pill smooth zur neuen Position.
+  /** Zuletzt an `tx` geschriebene Zielposition — siehe unten. */
+  const lastTargetRef = useRef<number | null>(null);
   // Wenn segmentWidth noch nicht bekannt (vor onLayout), nichts tun — der
   // erste Layout-Pass setzt tx direkt auf den richtigen Initial-Wert.
   if (segmentWidth > 0) {
@@ -92,10 +97,20 @@ export function SegmentedToggle({
     if (selectedIndex !== lastSelectedRef.current) {
       tx.value = withTiming(targetX, { duration: SLIDE_MS, easing: EASE });
       lastSelectedRef.current = selectedIndex;
-    } else if (tx.value !== targetX) {
+      lastTargetRef.current = targetX;
+    } else if (lastTargetRef.current !== targetX) {
       // Erstes Layout ODER segmentWidth änderte sich (Orientation-Wechsel
       // etc.) — instant setzen ohne Slide.
+      //
+      // Verglichen wird gegen eine eigene Ablage, NICHT gegen `tx.value`.
+      // Letzteres stand hier und ist aus React heraus ein synchroner Sprung in
+      // die UI-Laufzeit, bei dem beide Stränge kurz gegeneinander gesperrt
+      // werden — und zwar bei JEDEM Render dieser Komponente, nicht nur beim
+      // Wechsel. Sie sitzt im Kopf des Saved-Reiters und im Such-Blatt, rendert
+      // also unter anderem mitten im Reiter-Wechsel. Die Ablage beantwortet
+      // dieselbe Frage, ohne irgendetwas zu sperren.
       tx.value = targetX;
+      lastTargetRef.current = targetX;
     }
   }
 
@@ -109,7 +124,7 @@ export function SegmentedToggle({
 
   const containerStyle: ViewStyle = {
     flexDirection: "row",
-    backgroundColor: containerColor,
+    backgroundColor: containerColor ?? palette.s2,
     borderRadius,
     padding: innerPadding,
     height: segmentHeight + innerPadding * 2,
@@ -170,7 +185,7 @@ export function SegmentedToggle({
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   segment: { flex: 1, alignItems: "center", justifyContent: "center" },
   text: { fontSize: 13, fontWeight: "600" },
   activeText: { color: "#000000", fontWeight: "700" },

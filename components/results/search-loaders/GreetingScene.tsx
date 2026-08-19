@@ -17,6 +17,7 @@ import { Bo } from "@/components/assistant/Bo";
 import { useAccent } from "@/lib/theme/accent";
 import { useT } from "@/lib/i18n/useT";
 import { SpeechBubble, PaperPlane, SCENE_W, useLoaderPaused } from "./SearchSceneChrome";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const SCENE_H = 250;
 
@@ -49,8 +50,12 @@ function MiniPlane({
   const t = useSharedValue(0);
   useEffect(() => {
     if (paused) return;
+    // Linear, aus demselben Grund wie beim Bogen (siehe useArcMotion): Die
+    // Schleife kehrt nicht um (`false`), sie springt zurück. Eine Kurve, die zum
+    // Ende abbremst und am Anfang anläuft, erzeugt dabei je eine halbe Sekunde
+    // Stillstand pro Zyklus.
     t.value = withRepeat(
-      withTiming(1, { duration: 3400, easing: Easing.inOut(Easing.ease) }),
+      withTiming(1, { duration: 3400, easing: Easing.linear }),
       -1,
       false,
     );
@@ -118,7 +123,7 @@ export function GreetingScene({ name, destLabel }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   stack: {
     position: "absolute",
     // Bottom-verankert: Bo (letztes Kind) sitzt fest über der Routen-Linie, die

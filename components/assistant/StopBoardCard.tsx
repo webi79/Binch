@@ -22,7 +22,9 @@ import Svg, { Circle } from "react-native-svg";
 import { Plane, Train, Bus, Ship, type LucideIcon } from "lucide-react-native";
 import { useAccent } from "@/lib/theme/accent";
 import { useT } from "@/lib/i18n/useT";
+import { usePalette } from "@/lib/theme/appBg";
 import { fetchStopDepartures, fetchStopArrivals, type StopBoardItem } from "@/lib/api/client";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const C = {
   card: "#1F1F20",
@@ -65,6 +67,7 @@ function iconForProduct(product: string | null): LucideIcon {
 function StopBoardCardInner({ stop, initialBoard }: Props) {
   const accent = useAccent();
   const t = useT();
+  const palette = usePalette();
   const [board, setBoard] = useState<BoardKind>(initialBoard);
 
   // useQuery mit per-Board-Key — Tab-Switch lädt aus Cache wenn schon
@@ -84,7 +87,7 @@ function StopBoardCardInner({ stop, initialBoard }: Props) {
     kind === "departures" ? t("stop.tab.departures") : t("stop.tab.arrivals");
 
   return (
-    <View style={styles.card}>
+    <View style={[styles.card, { backgroundColor: palette.s1, borderColor: palette.border }]}>
       {/* Header: Station-Name */}
       <Text style={styles.stopLabel} numberOfLines={1}>
         {stop.label}
@@ -100,6 +103,7 @@ function StopBoardCardInner({ stop, initialBoard }: Props) {
               onPress={() => setBoard(kind)}
               style={[
                 styles.tab,
+                { backgroundColor: palette.s2, borderColor: palette.border },
                 on && { backgroundColor: accent.subtle, borderColor: accent.border },
               ]}
             >
@@ -145,6 +149,7 @@ function Hero({
   accentSolid: string;
   fetchedAt: string | undefined;
 }) {
+  const palette = usePalette();
   const delay = item.delayMinutes ?? 0;
   const ModeIcon = iconForProduct(item.product);
   const isFocused = useIsFocused();
@@ -180,7 +185,7 @@ function Hero({
       : `${realTime}${item.platform ? ` · ${item.platform}` : ""}`;
 
   return (
-    <View style={styles.hero}>
+    <View style={[styles.hero, { backgroundColor: palette.s2 }]}>
       <View style={styles.heroRing}>
         <Svg width={70} height={70} viewBox="0 0 70 70">
           <Circle cx={35} cy={35} r={RING_R} fill="none" stroke={C.border} strokeWidth={5} />
@@ -267,7 +272,7 @@ export const StopBoardCard = memo(
   (prev, next) => prev.stop.code === next.stop.code && prev.initialBoard === next.initialBoard,
 );
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   card: {
     backgroundColor: C.card,
     borderRadius: 20,

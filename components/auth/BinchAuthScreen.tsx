@@ -21,10 +21,13 @@
  * → register-Pfad, bei „wrong password" → login-Pfad mit Passwort-Eingabe.
  * Bei beliebigem anderen Fehler oder neuem User Default = register-Pfad.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  BackHandler,
+  Dimensions,
   Keyboard,
+  Platform,
   Pressable,
   StatusBar,
   StyleSheet,
@@ -32,17 +35,16 @@ import {
   TextInput,
   View,
 } from "react-native";
+import { usePalette } from "@/lib/theme/appBg";
 import { LinearGradient } from "expo-linear-gradient";
 import Animated, {
   Easing,
   FadeIn,
   FadeOut,
-  SlideInDown,
   SlideInLeft,
   SlideInRight,
-  SlideOutDown,
   interpolate,
-  useAnimatedKeyboard,
+  runOnJS,
   useAnimatedStyle,
   useSharedValue,
   withDelay,
@@ -68,6 +70,20 @@ import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
 import { useT } from "@/lib/i18n/useT";
 import { useSearchStore } from "@/stores/searchStore";
+import {
+  isAppleAvailable,
+  isGoogleAvailable,
+  signInWithApple,
+  signInWithGoogle,
+  SignInCancelled,
+} from "@/lib/auth/socialSignIn";
+import { usePressBounce } from "@/lib/motion";
+import { SCREEN_CORNER_RADIUS, SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
+import { scaledStyles } from "@/lib/ui/compact";
+
+/** Siehe `styles.body`: Fenstermaß beim Laden, also ohne Tastatur. */
+const WINDOW_H = Dimensions.get("window").height;
+
 
 const C = {
   bg: "#1A1A1A",
@@ -97,13 +113,82 @@ function rateStrength(v: string): number {
   return Math.min(s, 4);
 }
 
+/**
+ * Eins zu eins der Weg des Such-Blattes — und der Unterschied ist NICHT die
+ * Kurve, sondern der Mechanismus.
+ *
+ * Vorher: `if (!open) return null` plus `entering`/`exiting`. Das hatte zwei
+ * Folgen, die beide teuer sind:
+ *
+ *  1. Der gesamte Baum entstand in genau dem Bild, in dem die Bewegung
+ *     losfährt — Verlaufsband, Felder, Anbieter-Knöpfe. Das Such-Blatt hält
+ *     seinen Inhalt dauerhaft gemountet und schreibt ausdrücklich hin, warum:
+ *     „sonst fiele pro Öffnung ein Aufbau an, und zwar genau im Bild, in dem
+ *     die Bewegung startet."
+ *  2. `SlideInDown` animiert `originY` — und Reanimated hat auf Android eine
+ *     feste Liste von Eigenschaften, die den synchronen Weg direkt an die
+ *     native View nehmen dürfen. `transform` steht darin, `originY` nicht.
+ *     Alles außerhalb dieser Liste läuft pro Bild über einen Klon des
+ *     Schattenbaums, einen Yoga-Durchlauf und eine Einbau-Transaktion. Bei
+ *     300ms sind das rund 20 bis 36 solcher Durchgänge für einen Baum dieser
+ *     Größe — auf demselben Strang, auf dem die Bewegung läuft.
+ *
+ * Jetzt derselbe Aufbau wie beim Such-Blatt: dauerhaft gemountet, eigener
+ * Wert, `transform`, Start im nächsten Bild nach dem Commit.
+ */
 export function BinchAuthScreen() {
-  const open = useSearchStore((s) => s.authOverlayOpen);
-  if (!open) return null;
   return <Sheet />;
 }
 
 function Sheet() {
+  const palette = usePalette();
+  const open = useSearchStore((s) => s.authOverlayOpen);
+  /**
+   * Die Bewegung — Zeile für Zeile die des Such-Blattes.
+   *
+   * `sheetY` ist der Abstand nach unten: 0 oben angekommen, WINDOW_H unterhalb
+   * des Bildrands. Beim Öffnen erst parken, dann im NÄCHSTEN Bild losfahren —
+   * der Commit, der die Sichtbarkeit umschaltet, ist dann durch und die
+   * Bewegung hat den Strang für sich.
+   */
+  const sheetY = useSharedValue(WINDOW_H);
+  const [moving, setMoving] = useState(false);
+  const [mounted, setMounted] = useState(open);
+  const rafRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    if (open) {
+      setMounted(true);
+      setMoving(true);
+      sheetY.value = WINDOW_H;
+      rafRef.current = requestAnimationFrame(() => {
+        markSheetMoving(SHEET_IN.duration);
+        sheetY.value = withTiming(0, SHEET_IN, (finished) => {
+          "worklet";
+          if (!finished) return;
+          runOnJS(setMoving)(false);
+        });
+      });
+      return () => {
+        if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+      };
+    }
+    if (!mounted) return undefined;
+    setMoving(true);
+    markSheetMoving(SHEET_OUT.duration);
+    sheetY.value = withTiming(WINDOW_H, SHEET_OUT, (finished) => {
+      "worklet";
+      if (!finished) return;
+      runOnJS(setMoving)(false);
+      // Erst wenn das Blatt unten steht, den Inhalt wieder freigeben.
+      runOnJS(setMounted)(false);
+    });
+    return undefined;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+  const sheetStyleAnim = useAnimatedStyle(() => ({
+    transform: [{ translateY: sheetY.value }],
+  }));
   const t = useT();
   const accent = useAccent();
   const close = useSearchStore((s) => s.closeAuthOverlay);
@@ -125,27 +210,210 @@ function Sheet() {
   }>({});
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  /** Spiegel von `loading` als Ref — die gemeinsame Sperre in `runSocial` muss
+   *  den Wert im SELBEN Bild sehen, nicht den aus dem letzten Render. */
+  const loadingRef = useRef(false);
+  loadingRef.current = loading;
+  /** Druck-Effekt wie an den Kacheln im Landingscreen. */
+  const primaryBounce = usePressBounce();
+
+  /**
+   * Läuft dieser Bildschirm noch?
+   *
+   * Anmeldung und Registrierung dauern ein paar hundert Millisekunden. Wer in
+   * dieser Zeit abbricht, war danach trotzdem angemeldet: Die Antwort kam an,
+   * schrieb Token und Nutzer in den Speicher und legte den Erfolgs-Schritt an —
+   * auf einem Bildschirm, den es nicht mehr gab. Alles, was nach einem `await`
+   * schreibt, fragt darum erst hier nach, ob es überhaupt noch jemanden gibt,
+   * den es angeht.
+   *
+   * Der Ref stimmt, weil der äußere Rahmen `null` liefert, sobald die
+   * Überlagerung zu ist — dieser Baum wird dabei wirklich abgebaut.
+   *
+   * Zwischendurch war das Schließen während des Ladens zusätzlich gesperrt. Das
+   * ist wieder raus: Der Netz-Zeitgeber steht bei 20 Sekunden, und so lange darf
+   * niemand in einem Bildschirm festsitzen, den er verlassen will. Bricht jemand
+   * eine Registrierung ab, die serverseitig durchläuft, bleibt das folgenlos —
+   * der nächste Versuch bekommt 409 und wird unten auf die Anmeldung geleitet.
+   */
+  const aliveRef = useRef(true);
+  useEffect(() => () => {
+    aliveRef.current = false;
+  }, []);
+
+  /**
+   * Anmeldung über Apple oder Google.
+   *
+   * `social` ist gleichzeitig Sperre und Anzeige: Solange ein Anbieter läuft,
+   * sind beide Knöpfe gesperrt. Ohne das öffnete ein zweiter Tipp einen zweiten
+   * Anbieter-Dialog, und die später eintreffende Antwort überschriebe die
+   * frühere.
+   */
+  const [social, setSocial] = useState<"apple" | "google" | null>(null);
+  /** Eigener Fehlertext — `errorMsg` gehört zum Passwort-Feld und wird auf
+   *  diesem Schritt gar nicht gerendert. */
+  const [socialError, setSocialError] = useState<string | null>(null);
+  /**
+   * Sperre als Ref, nicht als Zustand.
+   *
+   * Zwei Finger auf Apple und Google sehen im selben Render beide
+   * `social === null` und starten beide. Ein Ref greift schon im selben Bild.
+   */
+  const busyRef = useRef(false);
+  /** `null` = noch nicht geprüft. Mit `false` als Start blitzte auf iOS erst
+   *  ein alleiniger, volle Breite füllender Google-Knopf auf und sprang dann
+   *  auf die Hälfte, sobald Apple dazukam. */
+  const [appleReady, setAppleReady] = useState<boolean | null>(null);
+  const googleReady = isGoogleAvailable();
+  useEffect(() => {
+    let alive = true;
+    void isAppleAvailable().then((v) => {
+      if (alive) setAppleReady(v);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const runSocial = async (provider: "apple" | "google") => {
+    // Beide Wege teilen sich die Sperre: Der Passwort-Weg darf nicht parallel
+    // laufen, sonst wechselt er den Schritt, während der Anbieter-Dialog offen
+    // ist.
+    if (busyRef.current || loadingRef.current) return;
+    busyRef.current = true;
+    setSocial(provider);
+    setSocialError(null);
+    haptic("button");
+    try {
+      const res = provider === "apple" ? await signInWithApple() : await signInWithGoogle();
+      // Dieselbe Lebend-Prüfung wie beim Passwort-Weg: Der Anbieter-Dialog
+      // dauert Sekunden, und wer in der Zeit abbricht, war sonst danach
+      // trotzdem angemeldet.
+      if (!aliveRef.current) return;
+      setAuth(res.token, res.user);
+      setSuccess({ mode: "login", firstName: (res.user.firstName ?? "").trim() });
+      haptic("important");
+    } catch (err) {
+      if (!aliveRef.current) return;
+      // Abbruch ist kein Fehler — dann still zurück zum Formular.
+      if (err instanceof SignInCancelled) return;
+      const msg = (err instanceof Error ? err.message : "").toLowerCase();
+      // Die drei Fälle, die der Server unterscheidet — jeder braucht eine
+      // andere Ansage, sonst steht der Nutzer ohne Weg da.
+      setSocialError(
+        // Ratenbegrenzung zuerst prüfen: Sie greift VOR allem anderen, und der
+        // Auffangtext („noch einmal versuchen") ist dafür der schlechteste
+        // mögliche Rat — genau das Wiederholen verlängert die Sperre.
+        msg.includes("too many")
+          ? t("binchauth.social.toomany")
+          : msg.includes("already registered")
+          ? // Es gibt bereits ein Konto MIT Passwort für diese Adresse. Wir
+            // hängen den Anbieter bewusst nicht daran (das wäre eine
+            // Konto-Übernahme, siehe Server) — also den Passwort-Weg anbieten.
+            t("binchauth.social.usepassword")
+          : msg.includes("no email")
+            ? t("binchauth.social.noemail")
+            : msg.includes("not configured")
+              ? t("binchauth.social.unavailable")
+              : t("binchauth.social.failed"),
+      );
+    } finally {
+      busyRef.current = false;
+      if (aliveRef.current) setSocial(null);
+    }
+  };
+  const appleBounce = usePressBounce();
+  const googleBounce = usePressBounce();
   const [success, setSuccess] = useState<{ mode: Path; firstName: string } | null>(
     null,
   );
+
+  /**
+   * Beim Schließen alles zurücksetzen — der Bildschirm wird nicht mehr abgebaut.
+   *
+   * Vorher hing dieses Blatt an `if (!open) return null`, jede Öffnung fing
+   * also bei null an. Seit es für die Bewegung dauerhaft gemountet bleibt,
+   * überlebt der Zustand: Nach einer erfolgreichen Anmeldung stünde beim
+   * nächsten Öffnen die Erfolgsmeldung da, ohne Weg zurück zum Formular. Und
+   * ein halb ausgefülltes Formular samt Klartext-Passwort bliebe im Speicher.
+   *
+   * Erst NACH der Ausfahrt, damit man das Zurücksetzen nicht sieht.
+   */
+  useEffect(() => {
+    if (open) {
+      aliveRef.current = true;
+      return;
+    }
+    aliveRef.current = false;
+    const id = setTimeout(() => {
+      setStep("email");
+      setPath("register");
+      setEmail("");
+      setName("");
+      setPassword("");
+      setSuccess(null);
+      setLoading(false);
+      setErrorMsg(null);
+      setErrors({});
+      setSocial(null);
+    }, SHEET_OUT.duration + 40);
+    return () => clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
 
   const order: Step[] = path === "login" ? ["email", "password"] : ["email", "name", "password"];
   const total = step === "email" ? 2 : order.length;
   const idx = order.indexOf(step);
 
-  // Sheet hebt sich beim Keyboard-Open frame-genau via useAnimatedKeyboard
-  // an — paddingBottom = Keyboard-Höhe.
-  const keyboard = useAnimatedKeyboard();
-  const sheetStyle = useAnimatedStyle(() => ({
-    paddingBottom: keyboard.height.value + 28,
-  }));
+  /**
+   * DAS war die Ursache — und sie stand die ganze Zeit hier.
+   *
+   * `paddingBottom = Tastaturhöhe` hob den Inhalt des Blattes Bild für Bild mit
+   * der Tastatur an. Genau das schiebt den Google-Knopf nach oben; alle meine
+   * Umbauten davor (feste Höhe, Ausblenden, Beschnitt) haben an dieser Zeile
+   * vorbeigearbeitet.
+   *
+   * Sie war zusätzlich teuer: `paddingBottom` steht NICHT in Reanimateds Liste
+   * der Eigenschaften, die auf Android synchron an die native View gehen
+   * dürfen. Jedes Bild der Tastatur-Bewegung lief damit über einen Klon des
+   * Schattenbaums samt Yoga-Durchlauf — dieselbe Krankheit, die die Fahrt des
+   * Blattes hatte, nur eben bei jedem Tippen.
+   *
+   * Fester Abstand. Verdeckt wird dadurch nichts: Feld und „Weiter" sitzen im
+   * oberen Zweidrittel, die Tastatur beginnt darunter.
+   */
+  const sheetStyle = { paddingBottom: 28 } as const;
 
   // Social-Section sofort ausblenden sobald irgendein Input fokussiert wird —
   // sonst sieht der User die Apple/Google-Buttons kurz nach oben fliegen
   // bevor der paddingBottom-Layout-Pass die Position korrigiert.
   // Wir tracken's via TextInput onFocus/onBlur (sicher auf beiden
   // Plattformen, fired noch vor keyboard.height-Updates).
-  const [inputFocused, setInputFocused] = useState(false);
+  /**
+   * KEIN `inputFocused` mehr.
+   *
+   * Daran hing das Ausblenden der Anbieter-Knöpfe, solange sie der Tastatur
+   * ausweichen mussten. Sie weichen ihr nicht mehr aus — der Körper behält
+   * seine Höhe (siehe `styles.body`), die Tastatur legt sich einfach darüber.
+   * Geblieben war ein Zustand samt zwei Zuhörern, den niemand mehr liest.
+   */
+
+  /**
+   * Zusätzlich am tatsächlichen Zustand der Tastatur — wegen der Ausfüllhilfe.
+   *
+   * Das Ausblenden hing allein am Fokus. Wer das gespeicherte Passwort aus der
+   * Vorschlagszeile der Tastatur übernimmt, löst auf Android aber einen
+   * Fokuswechsel aus: Das Feld verliert kurz den Fokus, `onBlur` feuert, und
+   * die Anbieter-Sektion klappt wieder auf — während die Tastatur noch steht.
+   * Das Fenster ist zu dem Zeitpunkt um deren Höhe geschrumpft, die Sektion
+   * sitzt also mitten im Inhalt und deckt „Weiter" zu.
+   *
+   * „Fokussiert" und „die Tastatur steht im Weg" sind zwei verschiedene Dinge —
+   * darüber steht das schon einmal. Hier zählt das zweite.
+   */
+  // KEIN Tastatur-Merker mehr: Der Fuß weicht ihr nicht aus, seit der Körper
+  // seine Höhe behält (siehe `styles.body`). Er wurde nur noch geschrieben.
+
 
   // Progress bar
   const [trackW, setTrackW] = useState(0);
@@ -159,6 +427,7 @@ function Sheet() {
   }, [idx, total, trackW, barW]);
   const barStyle = useAnimatedStyle(() => ({ width: barW.value }));
 
+
   function goTo(next: Step, direction: "fwd" | "back") {
     setDir(direction);
     setStep(next);
@@ -169,6 +438,36 @@ function Sheet() {
     const prev = order[idx - 1];
     if (prev) goTo(prev, "back");
   }
+
+  // Android-Zurück (Hardware-Taste UND Zurück-WISCHGESTE — die feuert dasselbe
+  // Event). Ohne das ließ sich der Auth-Screen per Geste nicht verlassen: Er ist
+  // ein Root-Overlay, kein Router-Screen, hat also kein eingebautes Zurück.
+  // Verhalten wie der Chevron oben links: erst einen Schritt zurück, und auf dem
+  // ersten Schritt das Overlay schließen.
+  useEffect(() => {
+    if (Platform.OS !== "android") return;
+    // NUR wenn das Blatt auch offen ist. Es bleibt jetzt dauerhaft gemountet
+    // (siehe `BinchAuthScreen`) — ohne diese Prüfung schluckte es die
+    // Zurück-Geste der ganzen App, auch wenn es unsichtbar unten steht.
+    if (!open) return;
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      // Liegt die Erfolgsmeldung darüber, gibt es nichts zurückzugehen — sonst
+      // blättert man unsichtbar hinter ihr durch die Schritte, und erst der
+      // dritte Druck schließt.
+      if (success) {
+        close();
+        return true;
+      }
+      if (idx > 0) {
+        back();
+      } else {
+        close();
+      }
+      return true; // Event verbraucht — sonst schlösse Android die ganze App.
+    });
+    return () => sub.remove();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idx, close, open, success]);
 
   function editEmail() {
     goTo("email", "back");
@@ -186,16 +485,18 @@ function Sheet() {
     setLoading(true);
     try {
       const { exists } = await authCheckEmail(e);
+      if (!aliveRef.current) return;
       const next: Path = exists ? "login" : "register";
       setPath(next);
       goTo(next === "login" ? "password" : "name", "fwd");
     } catch (err) {
+      if (!aliveRef.current) return;
       // Network/Server-Error: defaulten auf register-Pfad, User kann jedenfalls
       // weiter (bei Register mit existing email würde der Server eh 409 melden).
       setPath("register");
       goTo("name", "fwd");
     } finally {
-      setLoading(false);
+      if (aliveRef.current) setLoading(false);
     }
   }
 
@@ -233,11 +534,13 @@ function Sheet() {
           lastName,
         });
       }
+      if (!aliveRef.current) return;
       setAuth(res.token, res.user);
       const firstName = (res.user.firstName ?? name.trim().split(" ")[0] ?? "").trim();
       setSuccess({ mode: path, firstName });
       haptic("important");
     } catch (err) {
+      if (!aliveRef.current) return;
       const msg = err instanceof Error ? err.message : "";
       const lower = msg.toLowerCase();
       // Wenn Register fehlschlägt weil die Email schon existiert (409 /
@@ -261,11 +564,14 @@ function Sheet() {
         setErrors({ pass: true });
       }
     } finally {
-      setLoading(false);
+      if (aliveRef.current) setLoading(false);
     }
   }
 
   function primaryAction() {
+    // Kein Passwort-Schritt, während ein Anbieter-Dialog offen ist — sonst
+    // wechselt der Bildschirm unter dem laufenden Dialog den Schritt.
+    if (busyRef.current) return;
     haptic("button");
     if (step === "email") return submitEmail();
     if (step === "name") return submitName();
@@ -305,14 +611,78 @@ function Sheet() {
   ];
 
   const slideIn = dir === "back" ? SlideInLeft : SlideInRight;
+  /**
+   * Der Schritt fährt erst ab dem ZWEITEN Mal von der Seite herein.
+   *
+   * Beim Aufsetzen liefen zwei Layout-Animationen gleichzeitig: das Blatt von
+   * unten und der Inhalt darin von rechts. Beide sind Reanimated-Ein-
+   * sprünge, beide messen im selben Bild, und der Inhalt ist der teurere —
+   * Verlaufsband, Felder, Anbieter-Knöpfe. Genau daher das Haken beim
+   * Hochfahren.
+   *
+   * Für den eigentlichen Zweck ist der seitliche Einzug beim Aufsetzen ohnehin
+   * überflüssig: Er soll den WECHSEL zwischen E-Mail-, Passwort- und
+   * Namensschritt zeigen. Beim ersten Schritt gibt es nichts zu wechseln.
+   */
+  const [entered, setEntered] = useState(false);
+  useEffect(() => {
+    const id = setTimeout(() => setEntered(true), SHEET_IN.duration + 40);
+    return () => clearTimeout(id);
+  }, []);
 
   return (
     <Animated.View
-      entering={SlideInDown.duration(350)}
-      exiting={SlideOutDown.duration(300)}
-      style={styles.root}
+      /* Die Kurve MUSS mit: Eine Ein-/Aussprung-Animation nimmt sonst
+         Reanimateds Standard (`inOut(quad)`), und der wirkt linear — siehe die
+         Rechnung an SHEET_IN. Nur die Dauer zu übernehmen reicht also nicht. */
+      style={[styles.root, { backgroundColor: palette.bg }, sheetStyleAnim]}
+      // Für die DAUER der Bewegung eine GPU-Ebene — genau wie beim Such-Blatt.
+      // Dauerhaft wäre sie bei jeder Eingabe im Formular neu zu rastern.
+      renderToHardwareTextureAndroid={Platform.OS === "android" && moving}
     >
       <StatusBar barStyle="light-content" backgroundColor="transparent" translucent />
+
+      {/**
+        * Der INHALT hängt an `mounted`, nicht die Hülle.
+        *
+        * Für die Bewegung muss der Wert samt Effekt dauerhaft bestehen — sonst
+        * gäbe es beim Öffnen wieder einen Aufbau im Startbild. Der schwere Teil
+        * darf aber nicht dauerhaft im Wurzelbaum liegen: Verlaufsband, Felder,
+        * Anbieter-Knöpfe und die Erfolgsmeldung würden sonst bei JEDER
+        * Vermessung des Baums mitgemessen — und die läuft unter `adjustResize`
+        * bei jeder Tastatur, also mitten in fremde Fahrten hinein.
+        *
+        * `mounted` steht von der Öffnung bis zum Ende der Ausfahrt auf wahr:
+        * gebaut wird also ein Bild VOR der Bewegung, abgebaut erst danach.
+        */}
+      {mounted && (
+        <>
+
+      {/**
+        * Feste Höhe aus dem Fenstermaß beim LADEN — nicht gemessen.
+        *
+        * Gemessen war falsch, und der Screenshot zeigt genau warum: Die erste
+        * Messung fällt nicht zwingend in einen Moment ohne Tastatur. Wird
+        * dieser Bildschirm geöffnet, während sie schon steht — oder misst er
+        * erst nach ihrem Erscheinen —, brennt sich die verkleinerte Höhe ein.
+        * Der Fuß rückt dann dauerhaft nach oben und legt sich über „Weiter".
+        *
+        * Das Fenstermaß beim Laden der App kennt keine Tastatur. Die Wurzel
+        * darüber beschneidet (`overflow: hidden`), es ragt also nichts hinaus —
+        * das war der Fehler der Fassung davor, die diese Höhe der WURZEL gab.
+        */}
+      {/**
+        * `pointerEvents` sitzt HIER, nicht auf dem animierten Knoten.
+        *
+        * Es wechselt in genau dem Durchgang, in dem die Fahrt beginnt, und ein
+        * Eigenschafts-Wechsel ist auf Fabric ein Commit auf eben dem Knoten,
+        * den Reanimated Bild für Bild beschreibt. Dieselbe Korrektur wie bei
+        * beiden Wählern.
+        */}
+      <View
+        style={[styles.body, { height: WINDOW_H }]}
+        pointerEvents={open ? "auto" : "none"}
+      >
 
       {/* Brand-Band */}
       <View style={styles.band}>
@@ -351,18 +721,18 @@ function Sheet() {
       </View>
 
       {/* Sheet — paddingBottom dynamisch = Keyboard-Höhe + 28 */}
-      <Animated.View style={[styles.sheet, sheetStyle]}>
+      <Animated.View style={[styles.sheet, { backgroundColor: palette.s1 }, sheetStyle]}>
         {/* nav: back + progress */}
         <View style={styles.navRow}>
           {idx > 0 ? (
-            <Pressable onPress={back} style={styles.backBtn} hitSlop={10}>
+            <Pressable onPress={back} style={[styles.backBtn, { backgroundColor: palette.s2, borderColor: palette.border }]} hitSlop={10}>
               <ChevronLeft size={19} color={C.white} strokeWidth={2.4} />
             </Pressable>
           ) : (
             <View style={styles.backSpacer} />
           )}
           <View
-            style={styles.track}
+            style={[styles.track, { backgroundColor: palette.s3 }]}
             onLayout={(e) => setTrackW(e.nativeEvent.layout.width)}
           >
             <Animated.View
@@ -379,7 +749,11 @@ function Sheet() {
             Fields nach oben wenn das Keyboard aufgeht; Social-Section
             unten wird vom Keyboard überdeckt. */}
         <View style={styles.stepWrap}>
-          <Animated.View key={step} entering={slideIn.duration(420)} style={styles.panel}>
+          <Animated.View
+            key={step}
+            entering={entered ? slideIn.duration(420) : undefined}
+            style={styles.panel}
+          >
             {step === "email" && (
               <>
                 <Text style={styles.h1} numberOfLines={1} adjustsFontSizeToFit>
@@ -412,8 +786,6 @@ function Sheet() {
                     // anschließend bewusst über den großen Continue-Button.
                     returnKeyType="done"
                     onSubmitEditing={() => Keyboard.dismiss()}
-                    onFocus={() => setInputFocused(true)}
-                    onBlur={() => setInputFocused(false)}
                   />
                 </Field>
               </>
@@ -444,8 +816,6 @@ function Sheet() {
                     autoComplete="name"
                     returnKeyType="done"
                     onSubmitEditing={() => Keyboard.dismiss()}
-                    onFocus={() => setInputFocused(true)}
-                    onBlur={() => setInputFocused(false)}
                   />
                 </Field>
               </>
@@ -510,8 +880,6 @@ function Sheet() {
                     textContentType="none"
                     returnKeyType="done"
                     onSubmitEditing={() => Keyboard.dismiss()}
-                    onFocus={() => setInputFocused(true)}
-                    onBlur={() => setInputFocused(false)}
                   />
                 </Field>
 
@@ -551,13 +919,20 @@ function Sheet() {
           {/* Primary-CTA direkt unter den Input-Feldern — sitzt INNERHALB
               stepWrap, klebt am Input. Beim Keyboard-Open kommen Input +
               Button gemeinsam nach oben (Sheet-paddingBottom = kbHeight). */}
+          {/* Am Aufsetzen ausgelöst, nicht an `onPressIn`: RippleTouch hält das
+              um 50ms zurück, ein Tipp ist meist kürzer — man sähe nichts. */}
+          <Animated.View
+            style={[styles.primaryInline, primaryBounce.style]}
+            onTouchStart={canSubmit && !loading ? primaryBounce.onPressIn : undefined}
+            onTouchEnd={primaryBounce.onPressOut}
+            onTouchCancel={primaryBounce.onPressOut}
+          >
           <RippleTouch
             onPress={primaryAction}
             disabled={!canSubmit || loading}
             style={[
               styles.primary,
-              styles.primaryInline,
-              !(canSubmit && !loading) && styles.primaryDisabled,
+              !(canSubmit && !loading) && [styles.primaryDisabled, { backgroundColor: palette.s3 }],
             ]}
           >
             {canSubmit && !loading ? <GradientFill /> : null}
@@ -585,29 +960,91 @@ function Sheet() {
               </>
             )}
           </RippleTouch>
+          </Animated.View>
         </View>
 
         {/* Social-Section + Terms — sitzt am Sheet-Bottom. Wird komplett
             ausgeblendet sobald irgendein Input fokussiert ist, sonst gibt's
             einen sichtbaren Flash währ das Sheet-padding sich justiert. */}
         <View style={styles.footer}>
-          {step === "email" && !inputFocused && (
+          {step === "email" && (appleReady === true || googleReady) && (
             <Animated.View entering={FadeIn} exiting={FadeOut}>
               <View style={styles.dividerRow}>
                 <View style={styles.line} />
                 <Text style={styles.dividerTxt}>{t("binchauth.continuewith")}</Text>
                 <View style={styles.line} />
               </View>
+              {/* Auch hier der Druck-Effekt. Die Breitenverteilung (`flex: 1`)
+                  muss dabei an den ÄUSSEREN Knoten: In einer Zeile teilt der den
+                  Platz auf — am Knopf gelassen streckte er in seinem eigenen,
+                  senkrechten Rahmen und beide würden schmal. */}
+              {/* Nur zeigen, was auch geht: Apple gibt es ausschließlich auf
+                  iOS, Google nur mit hinterlegter Client-ID. Ein Knopf, der
+                  nichts tut, ist schlechter als keiner. */}
               <View style={styles.socials}>
-                <Pressable style={styles.soc}>
-                  <AppleMark size={19} color={C.white} />
-                  <Text style={styles.socTxt}>Apple</Text>
-                </Pressable>
-                <Pressable style={styles.soc}>
-                  <GoogleMark size={19} color={C.white} />
-                  <Text style={styles.socTxt}>Google</Text>
-                </Pressable>
+                {appleReady === true ? (
+                  <Animated.View
+                    style={[styles.socWrap, appleBounce.style]}
+                    onTouchStart={appleBounce.onPressIn}
+                    onTouchEnd={appleBounce.onPressOut}
+                    onTouchCancel={appleBounce.onPressOut}
+                  >
+                    <Pressable
+                      style={[styles.soc, { backgroundColor: palette.s2 }]}
+                      disabled={social != null}
+                      onPress={() => runSocial("apple")}
+                    >
+                      {social === "apple" ? (
+                        <ActivityIndicator color={C.white} />
+                      ) : (
+                        <>
+                          <AppleMark size={19} color={C.white} />
+                          <Text style={styles.socTxt}>Apple</Text>
+                        </>
+                      )}
+                    </Pressable>
+                  </Animated.View>
+                ) : null}
+                {googleReady ? (
+                  <Animated.View
+                    style={[styles.socWrap, googleBounce.style]}
+                    onTouchStart={googleBounce.onPressIn}
+                    onTouchEnd={googleBounce.onPressOut}
+                    onTouchCancel={googleBounce.onPressOut}
+                  >
+                    <Pressable
+                      style={[styles.soc, { backgroundColor: palette.s2 }]}
+                      disabled={social != null}
+                      onPress={() => runSocial("google")}
+                    >
+                      {social === "google" ? (
+                        <ActivityIndicator color={C.white} />
+                      ) : (
+                        <>
+                          <GoogleMark size={19} color={C.white} />
+                          <Text style={styles.socTxt}>Google</Text>
+                        </>
+                      )}
+                    </Pressable>
+                  </Animated.View>
+                ) : null}
               </View>
+              {/* Eigene Fehlerzeile. `errorMsg` wird sonst NUR am Passwort-Feld
+                  gerendert — und das gibt es auf diesem Schritt gar nicht. Eine
+                  fehlgeschlagene Anbieter-Anmeldung endete damit vollkommen
+                  stumm: Spinner aus, Knopf wieder da, keine Erklärung. */}
+              {socialError ? (
+                <Text style={styles.socialErr}>{socialError}</Text>
+              ) : null}
+            </Animated.View>
+          )}
+          {/* AGB und Datenschutz stehen AUSSERHALB der Anbieter-Bedingung.
+              Sie lagen darin und verschwanden damit auf jedem Gerät, auf dem
+              weder Apple noch Google eingerichtet ist — also derzeit auf jedem
+              Android-Build. Ein Rechtshinweis darf nicht an der Verfügbarkeit
+              eines Anmeldeknopfes hängen. */}
+          {step === "email" && (
+            <Animated.View entering={FadeIn} exiting={FadeOut}>
               <Text style={styles.terms}>
                 {t("binchauth.terms.prefix")}{" "}
                 <Text style={styles.link}>{t("binchauth.terms.tos")}</Text>
@@ -619,6 +1056,7 @@ function Sheet() {
           )}
         </View>
       </Animated.View>
+      </View>
 
       {success && (
         <SuccessOverlay
@@ -626,6 +1064,8 @@ function Sheet() {
           firstName={success.firstName}
           onContinue={close}
         />
+      )}
+        </>
       )}
     </Animated.View>
   );
@@ -738,10 +1178,11 @@ function Field({
   bad?: boolean;
   errorText?: string;
 }) {
+  const palette = usePalette();
   return (
     <View style={styles.field}>
       <Text style={styles.fieldLabel}>{label}</Text>
-      <View style={[styles.inputRow, bad && styles.inputRowBad]}>
+      <View style={[styles.inputRow, { backgroundColor: palette.s2, borderColor: palette.border }, bad && styles.inputRowBad]}>
         {icon}
         {children}
         {trailing}
@@ -762,13 +1203,14 @@ function EmailChip({
   editLabel: string;
   accent: string;
 }) {
+  const palette = usePalette();
   return (
-    <View style={styles.chip}>
+    <View style={[styles.chip, { backgroundColor: palette.s2 }]}>
       <Mail size={15} color={C.textTertiary} />
       <Text style={styles.chipMail} numberOfLines={1}>
         {email}
       </Text>
-      <Pressable onPress={onEdit} style={styles.chipEdit} hitSlop={6}>
+      <Pressable onPress={onEdit} style={[styles.chipEdit, { backgroundColor: palette.s3 }]} hitSlop={6}>
         <Text style={[styles.chipEditTxt, { color: accent }]}>{editLabel}</Text>
       </Pressable>
     </View>
@@ -798,8 +1240,36 @@ function GoogleMark({ size = 19, color = C.white }: { size?: number; color?: str
 
 /* ──── Styles ────────────────────────────────────────────────────── */
 
-const styles = StyleSheet.create({
-  root: { ...StyleSheet.absoluteFillObject, backgroundColor: C.bg, zIndex: 1000 },
+const styles = scaledStyles({
+  root: {
+    /**
+     * Die Wurzel begrenzt WIE IMMER — fest wird die Höhe eine Ebene tiefer.
+     *
+     * Die App läuft mit `adjustResize`: Geht die Tastatur auf, schrumpft das
+     * Fenster — und mit `bottom: 0` schrumpft dieses Blatt mit. Alles am
+     * unteren Rand rückt dann nach oben, also genau die Anbieter-Knöpfe und der
+     * „oder weiter mit"-Balken. Das Ausblenden davon war nur ein Pflaster: Es
+     * hängt am Fokus-Ereignis, das Fenster schrumpft aber schon vorher — und
+     * dieses eine Bild dazwischen ist das Aufblinzeln.
+     *
+     * Ich hatte deshalb die Wurzel selbst auf eine feste Höhe gesetzt — und
+     * damit einen zweiten Fehler gebaut: Sie ragte unten über ihren Platz
+     * hinaus, und im Bereich der Navigationsleiste schien Inhalt durch.
+     *
+     * Richtig ist die Ebene darunter: Die Wurzel bleibt exakt so groß wie ihr
+     * Platz (also auch die runden Ecken und der Beschnitt stimmen), und der
+     * INHALT darin behält seine einmal gemessene Höhe. Schrumpft das Fenster,
+     * wird er unten abgeschnitten statt zusammengeschoben — die Tastatur legt
+     * sich einfach darüber. Siehe `body`.
+     */
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: C.bg,
+    zIndex: 1000,
+    // Gerundete Ecken beim Hochfahren, passend zum Geräte-Display — wie bei
+    // allen anderen bildschirmfüllenden Slides der App.
+    borderRadius: SCREEN_CORNER_RADIUS,
+    overflow: "hidden",
+  },
 
   band: { height: 220, overflow: "hidden" },
   sun: {
@@ -943,6 +1413,20 @@ const styles = StyleSheet.create({
   seg: { flex: 1, height: 5, borderRadius: 99 },
   strengthLbl: { color: C.textTertiary, fontSize: 12, marginTop: 8 },
 
+  /**
+   * Behält die einmal gemessene Höhe — siehe `root`. Ohne feste Höhe schöbe das
+   * schrumpfende Fenster alles darin nach oben.
+   */
+  /**
+   * KEIN `flex: 1` — das machte die feste Höhe wirkungslos.
+   *
+   * `flex: 1` bedeutet in Yoga `flexBasis: 0` plus `flexGrow/Shrink: 1`, und
+   * die Basis schlägt auf der Hauptachse eine gesetzte Höhe. Der Körper hat
+   * sich damit weiter mit dem Fenster verkleinert, obwohl daneben `height`
+   * stand — deshalb schob die Tastatur den Google-Knopf immer noch über
+   * „Weiter", trotz der Umbauten davor.
+   */
+  body: { height: WINDOW_H },
   footer: { flex: 1, justifyContent: "flex-end", paddingTop: 16 },
   primaryInline: { marginTop: 22 },
   primary: {
@@ -961,8 +1445,9 @@ const styles = StyleSheet.create({
   line: { flex: 1, height: 1, backgroundColor: C.border },
   dividerTxt: { color: C.textTertiary, fontSize: 13 },
   socials: { flexDirection: "row", gap: 12 },
+  /** Breitenverteilung am äußeren Knoten — siehe Kommentar im JSX. */
+  socWrap: { flex: 1 },
   soc: {
-    flex: 1,
     height: 50,
     borderRadius: 16,
     backgroundColor: C.surface2,
@@ -974,6 +1459,7 @@ const styles = StyleSheet.create({
     gap: 9,
   },
   socTxt: { color: C.white, fontSize: 15, fontWeight: "600" },
+  socialErr: { color: C.error, fontSize: 13, textAlign: "center", marginTop: 12, lineHeight: 18 },
   terms: { color: C.textTertiary, fontSize: 12, lineHeight: 18, textAlign: "center", marginTop: 16 },
   link: { color: C.textSecondary, textDecorationLine: "underline" },
 

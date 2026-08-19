@@ -2,6 +2,7 @@ import { View, StyleSheet } from "react-native";
 import { Layers, Activity, Crosshair } from "lucide-react-native";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useAccent } from "@/lib/theme/accent";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const WHITE = "#FFFFFF";
 
@@ -12,6 +13,8 @@ interface Props {
   onToggleLayers: () => void;
   onToggleTraffic: () => void;
   onLocate: () => void;
+  /** Ortung läuft — Knopf gedimmt, damit niemand ins Leere tippt. */
+  locating?: boolean;
 }
 
 export function MapFabs({
@@ -21,6 +24,7 @@ export function MapFabs({
   onToggleLayers,
   onToggleTraffic,
   onLocate,
+  locating,
 }: Props) {
   const accent = useAccent();
   return (
@@ -31,7 +35,7 @@ export function MapFabs({
       <Fab active={trafficOn} onPress={onToggleTraffic} activeColor={accent.solid}>
         <Activity size={20} color={trafficOn ? accent.solid : WHITE} strokeWidth={2} />
       </Fab>
-      <Fab onPress={onLocate}>
+      <Fab onPress={onLocate} dimmed={locating}>
         <Crosshair size={20} color={accent.solid} strokeWidth={2} />
       </Fab>
     </View>
@@ -43,15 +47,21 @@ function Fab({
   onPress,
   active,
   activeColor,
+  dimmed,
 }: {
   children: React.ReactNode;
   onPress: () => void;
   active?: boolean;
   activeColor?: string;
+  dimmed?: boolean;
 }) {
   return (
     <RippleTouch
-      style={[styles.fab, active && activeColor ? { borderColor: activeColor } : null]}
+      style={[
+        styles.fab,
+        active && activeColor ? { borderColor: activeColor } : null,
+        dimmed ? { opacity: 0.5 } : null,
+      ]}
       borderless
       onPress={onPress}
     >
@@ -60,7 +70,7 @@ function Fab({
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   col: {
     position: "absolute",
     right: 16,

@@ -23,7 +23,12 @@ export const DARK_MAP_STYLE: StyleSpecification = {
       url: "https://tiles.openfreemap.org/planet",
     },
   },
-  sprite: "https://tiles.openfreemap.org/sprites/ofm_f384/ofm",
+  // KEIN `sprite`.
+  //
+  // Er war deklariert, aber keine einzige der Ebenen unten benutzt ein
+  // `icon-image` — nur Flächen, Linien und vier reine Text-Ebenen. Die Marker
+  // kommen aus der Laufzeit-Registry in MapSurface, nicht von hier. Der Sprite
+  // kostete damit 147 KB und zwei Roundtrips VOR der ersten Kachel, für nichts.
   glyphs: "https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf",
   layers: [
     { id: "background", type: "background", paint: { "background-color": "#14181A" } },
@@ -189,7 +194,7 @@ export const DARK_MAP_STYLE: StyleSpecification = {
       "source-layer": "water_name",
       layout: {
         "text-field": ["get", "name"],
-        "text-font": ["Noto Sans Italic"],
+        "text-font": ["Noto Sans Regular"],
         "text-size": 11,
       },
       paint: {

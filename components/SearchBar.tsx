@@ -1,11 +1,14 @@
 import { useEffect, useRef } from "react";
-import { Text, TextInput, Pressable, StyleSheet, View, type StyleProp, type ViewStyle } from "react-native";
+import { Text, TextInput, StyleSheet, View, type StyleProp, type ViewStyle } from "react-native";
 import { useRouter } from "expo-router";
-import { Search as SearchIcon, Mic } from "lucide-react-native";
+import { Search as SearchIcon } from "lucide-react-native";
+import Svg, { Path, Circle } from "react-native-svg";
 import { useT } from "@/lib/i18n/useT";
+import { usePalette } from "@/lib/theme/appBg";
 import { useSearchStore } from "@/stores/searchStore";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
+import { scaledStyles } from "@/lib/ui/compact";
 
 const COLORS = {
   surface: "#242425",
@@ -32,6 +35,14 @@ interface CommonProps {
 interface PressProps extends CommonProps {
   /** Tap handler. If not given, navigates to `/search`. */
   onPress?: () => void;
+  /**
+   * Rohes Berührungs-Ereignis, durchgereicht an den Knopf.
+   *
+   * Für Vorbereitungen, die schon beim Aufsetzen laufen müssen — etwa das
+   * Anlegen einer GPU-Ebene, deren Aufbau nicht in den Start einer Bewegung
+   * fallen darf.
+   */
+  onTouchStart?: () => void;
   value?: undefined;
   onChangeText?: undefined;
   autoFocus?: undefined;
@@ -53,7 +64,48 @@ interface InputProps extends CommonProps {
 
 type Props = PressProps | InputProps;
 
+/**
+ * Bo, klein und statisch.
+ *
+ * Die Silhouette ist NICHT nachgezeichnet, sondern exakt dieselben Pfaddaten wie
+ * die große Figur in `components/assistant/Bo.tsx` — Kuppe mit Radius 72, vier
+ * Zipfel am Saum. Ein selbst gezeichneter Geist sah daneben immer etwas anders
+ * aus; so ist es dieselbe Figur, nur kleiner.
+ *
+ * Statt die Zahlen auf ein 24er-Raster umzurechnen (und dabei Rundungsfehler
+ * einzubauen), steht Bos eigener Bildausschnitt im `viewBox`. Die Augen sind
+ * runde Kreise statt der hohen Ellipsen der großen Figur: Auf 18px lesen sich
+ * Ellipsen als Schlitze, Kreise als freundlicher Blick.
+ *
+ * Bewusst NICHT die echte `Bo`-Komponente: Die ist eine vollständige, animierte
+ * Figur mit mehreren Endlos-Worklets — für einen Knopf, der dauerhaft im
+ * Landingscreen steht, wäre das grotesk teuer.
+ *
+ * Auf MODULEBENE, nicht in der Komponente: Dort entstünde bei jedem Render ein
+ * neuer Komponententyp, und React baut den Teilbaum darunter dann jedes Mal neu
+ * auf statt ihn abzugleichen.
+ */
+function BoMark() {
+  return (
+    <Svg width={19} height={19} viewBox="20 42 160 188">
+      {/* Körper — 1:1 aus Bo.tsx: Kuppe (A 72 72) und vier Zipfel (Q). */}
+      <Path
+        d="M28 120 A72 72 0 0 1 172 120 L172 197 Q154 221 136 197 Q118 221 100 197 Q82 221 64 197 Q46 221 28 197 Z"
+        fill={COLORS.black}
+      />
+      {/* Augen: an Bos Position (cx 76/124), rund statt hoch-oval. */}
+      <Circle cx="76" cy="120" r="15" fill="#FFFFFF" />
+      <Circle cx="124" cy="120" r="15" fill="#FFFFFF" />
+      {/* Die kleinen Glanzpunkte machen den Blick weich — dieselbe Idee wie bei
+          der großen Figur, nur größer im Verhältnis, damit sie hier trägt. */}
+      <Circle cx="82" cy="113" r="5" fill={COLORS.black} opacity={0.55} />
+      <Circle cx="130" cy="113" r="5" fill={COLORS.black} opacity={0.55} />
+    </Svg>
+  );
+}
+
 export function SearchBar(props: Props) {
+  const palette = usePalette();
   const t = useT();
   const router = useRouter();
   const openVoiceOverlay = useSearchStore((s) => s.openVoiceOverlay);
@@ -110,13 +162,18 @@ export function SearchBar(props: Props) {
       accessibilityLabel={t("mode.voice")}
     >
       <GradientFill />
-      <Mic size={17} color={COLORS.black} strokeWidth={1.8} />
+      {/* Bo als Symbol — kein Standard-Geist aus dem Symbolsatz.
+          Der hatte die Strichstärke und die nüchterne Form aller anderen Symbole
+          und las sich damit als „irgendein Piktogramm". Dieser hier ist eine
+          gefüllte Silhouette mit Zipfelsaum und großen Augen, also erkennbar
+          dieselbe Figur, die im Chat antwortet. */}
+      <BoMark />
     </RippleTouch>
   ) : null;
 
   if (isInput) {
     return (
-      <View style={[styles.bar, style]}>
+      <View style={[styles.bar, { backgroundColor: palette.s2 }, style]}>
         <SearchIcon size={18} color={COLORS.gray2} />
         {leadingLabel && <Text style={styles.leadingLabel}>{leadingLabel}</Text>}
         <TextInput
@@ -138,8 +195,9 @@ export function SearchBar(props: Props) {
 
   return (
     <RippleTouch
-      style={[styles.bar, style]}
+      style={[styles.bar, { backgroundColor: palette.s2 }, style]}
       onPress={props.onPress ?? (() => router.navigate("/search"))}
+      onTouchStart={"onTouchStart" in props ? props.onTouchStart : undefined}
     >
       <SearchIcon size={18} color={COLORS.gray2} />
       {leadingLabel && <Text style={styles.leadingLabel}>{leadingLabel}</Text>}
@@ -151,9 +209,8 @@ export function SearchBar(props: Props) {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   bar: {
-    backgroundColor: COLORS.surface,
     borderRadius: 9999,
     paddingLeft: 18,
     paddingRight: 8,

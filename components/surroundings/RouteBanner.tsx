@@ -2,6 +2,7 @@ import { View, Text, StyleSheet } from "react-native";
 import { ArrowLeft } from "lucide-react-native";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useT } from "@/lib/i18n/useT";
+import { scaledStyles } from "@/lib/ui/compact";
 
 interface Props {
   title: string;
@@ -41,7 +42,7 @@ export function RouteBanner({ title, waypointCount, onBack, topInset }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   wrap: {
     position: "absolute",
     left: 16,

@@ -1,6 +1,8 @@
-import { memo, useMemo, useState } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
 import { View, Text, Share, Image, StyleSheet } from "react-native";
-import { useRouter, usePathname, useLocalSearchParams } from "expo-router";
+import { usePalette } from "@/lib/theme/appBg";
+import { useRouter } from "expo-router";
+import { useRouteMirror } from "@/lib/nav/routeMirror";
 import { Heart, Share2, Plane, Train, Bus, Ship, ChevronRight, Route as RouteIcon } from "lucide-react-native";
 import Animated, {
   useAnimatedStyle,
@@ -22,11 +24,26 @@ import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { displayCode, displayProvider, logoUrls } from "@/lib/results/logos";
 import { tripSignature } from "@/lib/results/signature";
+import { usePressBounce } from "@/lib/motion";
+import { prepareLayer, type LayerKey } from "@/lib/nav/transitionLayer";
+import { preloadDetails } from "@/lib/nav/detailsPreload";
+import { startDetailsPush } from "@/lib/nav/overlayCover";
 import { buildRoutePlan } from "@/lib/routing/buildRoute";
+import { scaledStyles } from "@/lib/ui/compact";
 
 interface Props {
   result: SearchResult;
   passengers?: number;
+  /**
+   * Welche Fläche liegt unter dieser Karte?
+   *
+   * Wird beim bestätigten Tipp als GPU-Textur angelegt, damit sie während der
+   * Bewegung des Detail-Blatts nicht jedes Bild neu gezeichnet wird. Dieselbe
+   * Karte steht in der Ergebnisliste, im Saved-Tab und in Bos Antworten — welche
+   * Fläche dahinter liegt, weiß nur die aufrufende Seite. Ohne Angabe passiert
+   * nichts (Bos Liste hat keine eigene Ebene).
+   */
+  underlay?: LayerKey;
 }
 
 const C = {
@@ -62,12 +79,20 @@ function currencyCode(code: string): string {
   return code.toUpperCase();
 }
 
-function ResultCardInner({ result, passengers = 1 }: Props) {
+function ResultCardInner({ result, passengers = 1, underlay }: Props) {
+  const palette = usePalette();
   const accent = useAccent();
   const t = useT();
   const router = useRouter();
-  const pathname = usePathname();
-  const currentParams = useLocalSearchParams();
+  // Route NICHT per Hook abonnieren: `usePathname()`/`useLocalSearchParams()`
+  // hängen an expo-routers routeInfo-Store, der sich bei JEDEM Tab-Wechsel
+  // ändert — das rendete jede gemountete Karte neu, an der memo-Schranke unten
+  // vorbei (der Hook saß hier drin). Im Saved-Tab sind alle Trips gleichzeitig
+  // gemountet → N schwere Renders im Wechsel-Frame. Gebraucht wird die Route
+  // ohnehin nur in onSelect, also lesen wir sie erst dort aus der Ref.
+  const routeRef = useRouteMirror();
+  /** Druck-Effekt wie an den Kacheln im Landingscreen. */
+  const selectBounce = usePressBounce();
   // Sig pro Render einmal berechnen statt im Selector und im handleSave-
   // Callback erneut.
   const resultSig = useMemo(() => tripSignature(result), [result]);
@@ -119,6 +144,30 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
   // Doppel-Tap-Guard ist nicht mehr nötig: das Details-Overlay reagiert
   // idempotent auf wiederholtes selectResult (gleiche Daten ⇒ kein
   // Re-Mount, kein doppelter Slide).
+  /**
+   * Die Textur der Unterlage entsteht beim AUFSETZEN des Fingers.
+   *
+   * Sie stand bis eben in `onSelect`, also beim LOSLASSEN — entgegen der
+   * ausdrücklichen Regel des Moduls, und mit genau der Folge, gegen die die
+   * Regel geschrieben ist: Das Einschalten der Ebene erzwingt ein Neuzeichnen
+   * des gesamten Baumes darunter, in `saved.tsx` mit 66ms vermessen. Das fiel
+   * damit in dieselben Bilder, in denen die Bewegung anlaufen soll — sie startet
+   * pünktlich und hängt trotzdem, weil der Strang belegt ist.
+   *
+   * Zwischen Aufsetzen und Loslassen liegen 80 bis 150ms, die ohnehin
+   * verstreichen. Dort kostet der Aufbau niemanden etwas.
+   *
+   * Welche Fläche darunter liegt, weiß nur die aufrufende Seite: Dieselbe Karte
+   * steht in der Ergebnisliste, im Saved-Tab und in Bos Antworten. Ohne Angabe
+   * wird nichts vorbereitet.
+   */
+  const onSelectTouchStart = useCallback(() => {
+    if (underlay) prepareLayer(underlay);
+    // Detail-Blatt im Berührungsfenster bauen statt im Loslass-Bild.
+    preloadDetails(result);
+    selectBounce.onPressIn();
+  }, [underlay, selectBounce]);
+
   function onSelect() {
     // Overlay-Pattern: nur den Store füllen — DetailsOverlay im _layout
     // hört auf `selectedResult` und slidet rein. Kein router.push mehr,
@@ -130,23 +179,88 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
     // sauber via previousHref zurück zur Ergebnis-Liste navigieren kann, muss
     // hier (im Results-Screen, wo die echten Params verfügbar sind) der Kontext
     // mit eingefangen werden.
-    const paramsObj: Record<string, string> = {};
-    for (const [k, v] of Object.entries(currentParams)) {
-      if (typeof v === "string") paramsObj[k] = v;
-      else if (Array.isArray(v) && typeof v[0] === "string") paramsObj[k] = v[0];
-    }
-    selectResult(result, passengers, {
-      pathname,
-      params: Object.keys(paramsObj).length > 0 ? paramsObj : undefined,
+    // Textur der Unterlage anlegen, solange der Finger gerade abhebt.
+    //
+    // Das fehlte für das Detail-Blatt komplett — als einziger der vier Übergänge.
+    // Der Baum darunter (Ergebnisliste bzw. Saved-Tab) wurde dabei jedes Bild der
+    // Bewegung neu gezeichnet. Im Saved-Tab ist genau das der Unterschied
+    // zwischen den zwei Reitern: Eine Ticket-Karte legt die Textur an
+    // (TicketCard), eine Reise-Karte tat es nicht — dasselbe Blatt, einmal glatt
+    // und einmal ruckelig, je nachdem worauf man tippt.
+    //
+    /**
+     * ERSTE Zeile, und das ist keine Kosmetik.
+     *
+     * Alles darunter kostet Zeit auf demselben Strang: der Speicher-
+     * Schreibvorgang weckt jeden Abonnenten, das Detail-Blatt rendert mit einem
+     * anderen Ticket komplett durch, Fabric committet das. Stand die Bewegung
+     * dahinter, war genau das die Wartezeit zwischen Finger und erster
+     * Regung. Von hier aus läuft sie los, und der Rest läuft daneben.
+     */
+    startDetailsPush();
+    /**
+     * Und die Druck-Feder auf der Stelle beenden.
+     *
+     * Sie läuft sonst rund 430ms nach — also fast die ganze Slide — und zwar
+     * INNERHALB der Ergebnisliste, die für den Übergang gerade als GPU-Textur
+     * eingefroren wurde. Eine Ebene mit sich änderndem Inhalt muss jedes Bild
+     * neu gerastert werden: Die beim Aufsetzen vorbereitete Textur war damit
+     * nicht nur wertlos, sondern teurer als gar keine.
+     *
+     * Genau das ist der Unterschied zur Ticket-Karte im Saved-Tab, die als
+     * „glatt" gilt — dort bewegt sich in der Unterlage nichts.
+     */
+    selectBounce.settle();
+    const route = routeRef.current;
+
+    /**
+     * DER SPEICHER ERST EIN BILD SPÄTER — und das ist der eigentliche Punkt.
+     *
+     * Hier stand die Annahme, `startDetailsPush()` als erste Zeile lasse die
+     * Bewegung „daneben" laufen, während React committet. Auf diesem Stapel
+     * stimmt das nicht, und der Grund ist die Zustellreihenfolge:
+     *
+     *  • Eine Zuweisung an einen geteilten Wert geht über `runOnUI`. Das reiht
+     *    nur ein und leert die Schlange in einem MICROTASK — beim Verlassen
+     *    dieser Zeile ist auf dem UI-Strang also noch nichts angekommen.
+     *  • Ein Loslassen trägt in React die höchste Dringlichkeit. Der Commit,
+     *    den `selectResult` auslöst, läuft deshalb SYNCHRON noch in diesem
+     *    Aufruf zu Ende.
+     *  • Microtasks kommen erst danach dran.
+     *
+     * Die Reihenfolge im Handler war damit wirkungslos: Erst lief der komplette
+     * Commit, dann erst wurde die Bewegung überhaupt zugestellt. Der Commit
+     * stand also nicht neben ihr, sondern davor — genau die Verzögerung, die zu
+     * beheben er gedacht war.
+     *
+     * Ein Bild Abstand dreht das um: Die Bewegung ist zugestellt und läuft,
+     * bevor der Commit anfängt. Für den Speicher ist das Bild ohne Bedeutung —
+     * das Blatt zieht seinen Inhalt ohnehin erst nach, wenn es unterwegs ist.
+     */
+    requestAnimationFrame(() => {
+      selectResult(result, passengers, {
+        pathname: route.pathname,
+        params: route.params,
+      });
     });
-    haptic("important");
+    // "button", nicht "important" — dieselbe Stufe wie beim Auslösen der Suche
+    // von einer Kachel im Landingscreen. "important" ist der kräftige Stoß und
+    // fühlte sich neben demselben Druck-Effekt nach einer anderen Geste an.
+    haptic("button");
 
     // Prefetch: schon beim Card-Tap die Buchungs-Optionen für diesen Flug
-    // anfordern. Bis das Overlay durch die 260ms Slide-In durch ist, ist
+    // anfordern. Bis das Overlay durch die Slide-In durch ist, ist
     // die RapidAPI-Antwort meistens schon da → Provider-Liste erscheint
     // ohne sichtbaren Spinner. Reine Network-Last, kein UI-Konflikt mit
     // der Slide-Animation (die läuft auf der UI-Thread via Reanimated).
+    //
+    // NICHT im Berührungs-Frame: `prefetchQuery` legt synchron einen Beobachter
+    // an, schreibt in den Zwischenspeicher und stößt die Anfrage an — alles auf
+    // dem JS-Thread, in genau dem Bild, in dem die Bewegung anlaufen soll. Ein
+    // Bild später ist für eine Anfrage, auf die ohnehin die ganze Bewegung lang
+    // niemand wartet, völlig unerheblich.
     if (result.mode === "FLIGHT" && result.bookingToken) {
+      requestAnimationFrame(() => {
       queryClient.prefetchQuery({
         queryKey: ["flightBookingOptions", result.bookingToken, result.currency, passengers, locale],
         queryFn: () =>
@@ -161,6 +275,7 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
             searchPrice: result.price,
           }),
         staleTime: 5 * 60_000,
+      });
       });
     }
   }
@@ -211,8 +326,17 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
   const urls = logoUrls(result, carrierName);
   const [logoIdx, setLogoIdx] = useState(0);
   const currentLogoUrl = urls[logoIdx];
-  const departStr = formatTimeInZone(result.departTime, result.originTz);
-  const arriveStr = formatTimeInZone(result.arriveTime, result.destinationTz);
+  // Zeitformatierung memoisiert: Jeder Aufruf baut ein Date und schlägt die
+  // Zeitzone nach. Das lief bei JEDEM Render — also bei jeder hereinscrollenden
+  // Karte und erneut bei jedem Favoriten-, Theme- oder Sprachwechsel, obwohl es
+  // nur von `result` abhängt.
+  const { departStr, arriveStr } = useMemo(
+    () => ({
+      departStr: formatTimeInZone(result.departTime, result.originTz),
+      arriveStr: formatTimeInZone(result.arriveTime, result.destinationTz),
+    }),
+    [result.departTime, result.originTz, result.arriveTime, result.destinationTz],
+  );
   const dateStr = formatDateInZone(result.departTime, result.originTz);
   const arriveDateStr = formatDateInZone(result.arriveTime, result.destinationTz);
   // Verspätung: neue Ist-Zeit = Soll + delayMinutes (zonen-korrekt formatiert).
@@ -232,16 +356,21 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
   const flightCode = result.flightNumber ?? "";
 
   return (
-    // Schatten wie bei der Ticket-Karte (Saved): shadowClip (außen) wird als
-    // Hardware-Textur gecacht, damit der Blur beim Scrollen nicht jeden Frame neu
-    // gerastert wird, und hat ringsum so viel Innenabstand, wie der Schatten
-    // ausgreift — sonst schneidet die Textur ihn ab. Der negative Rand rechnet den
-    // Abstand wieder heraus (seitlich in den 20-px-Listenrand), das Layout bleibt
-    // gleich. cardShadow (innen) trägt den boxShadow. Testweise eingebaut — fällt
-    // in einem Stück wieder raus, wenn's nicht gefällt.
-    <View style={styles.shadowClip} renderToHardwareTextureAndroid>
+    // Die Hardware-Textur ist RAUS.
+    //
+    // cardShadow trägt den Schatten, nicht die Karte selbst: Die braucht
+    // overflow:"hidden" für ihre runden Ecken, und das schnitte einen
+    // Außenschatten weg.
+    //
+    // Darum lag hier noch ein zweiter Rahmen (`shadowClip`) mit Innenabstand in
+    // Schattengröße plus gegenläufigem negativen Rand. Sein einziger Zweck war,
+    // die Hardware-Textur groß genug zu machen, damit sie den Schatten nicht
+    // abschneidet. Die Textur ist weg (sie invalidierte sich bei jeder
+    // Inhaltsänderung selbst), also ist der Rahmen ein Paar Zahlen, die sich
+    // gegenseitig aufheben — und eine Ansicht pro Karte, die Fabric bei jedem
+    // Listen-Nachschub mit anlegen muss.
     <View style={styles.cardShadow}>
-    <Animated.View style={[styles.card, cardAnim]}>
+    <Animated.View style={[styles.card, { backgroundColor: palette.s2 }, cardAnim]}>
       <View style={styles.headerRow}>
         <View style={styles.providerWrap}>
           {/* Logo-Box: bei vorhandenem Carrier-Logo transparent, damit das
@@ -261,6 +390,11 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
                 source={{ uri: currentLogoUrl }}
                 style={styles.providerLogoImg}
                 resizeMode="contain"
+                // Anbieter-Logos kommen in Originalgröße (oft 512px+) und werden
+                // hier auf ~28px gezeigt. Ohne das dekodiert Android das volle
+                // Bild in den Speicher und skaliert bei JEDEM Zeichnen herunter;
+                // mit "resize" passiert das einmal beim Laden.
+                resizeMethod="resize"
                 onError={() => setLogoIdx((i) => i + 1)}
               />
             ) : (
@@ -357,14 +491,28 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
             <Text style={styles.priceUnknownText}>{t("results.price.provider")}</Text>
           )}
         </View>
-        <RippleTouch onPress={onSelect} style={styles.cta}>
-          <GradientFill />
-          <Text style={styles.ctaText}>{t("results.select")}</Text>
-          <ChevronRight color={C.black} size={14} strokeWidth={2.5} />
-        </RippleTouch>
+        {/* Druck-Effekt am Aufsetzen, NICHT an `onPressIn`: RippleTouch hält
+            das um 50ms zurück (Scroll-Schutz), und ein Tipp ist meist kürzer —
+            man sähe nichts. Dieselbe Lösung wie am Such-Knopf. */}
+        <Animated.View
+          style={selectBounce.style}
+          onTouchStart={onSelectTouchStart}
+          onTouchEnd={selectBounce.onPressOut}
+          onTouchCancel={selectBounce.onPressOut}
+        >
+          {/* Kein sichtbarer Ripple: Sein Auslauf dauert einige hundert
+              Millisekunden und läuft damit ebenfalls in der eingefrorenen
+              Fläche weiter — dieselbe Begründung wie bei `settle()` oben. Die
+              Ticket-Karte im Saved-Tab macht es genauso, und die Rückmeldung
+              beim Drücken übernimmt der Druck-Effekt. */}
+          <RippleTouch onPress={onSelect} style={styles.cta} rippleColor="transparent">
+            <GradientFill />
+            <Text style={styles.ctaText}>{t("results.select")}</Text>
+            <ChevronRight color={C.black} size={14} strokeWidth={2.5} />
+          </RippleTouch>
+        </Animated.View>
       </View>
     </Animated.View>
-    </View>
     </View>
   );
 }
@@ -377,25 +525,23 @@ function ResultCardInner({ result, passengers = 1 }: Props) {
 export const ResultCard = memo(
   ResultCardInner,
   (prev, next) =>
-    prev.result.id === next.result.id && prev.passengers === next.passengers,
+    prev.result.id === next.result.id &&
+    prev.passengers === next.passengers &&
+    prev.underlay === next.underlay,
 );
 
-const styles = StyleSheet.create({
-  // Innenabstand = Schatten-Ausdehnung (oben 8, unten 28, seitlich 20), damit die
-  // Hardware-Textur den ganzen Schatten umfasst; negativer Rand gleich groß, damit
-  // das Layout unverändert bleibt (seitlich in den 20-px-Listenrand hinein).
-  shadowClip: {
-    paddingTop: 8,
-    paddingBottom: 28,
-    paddingHorizontal: 20,
-    marginTop: -8,
-    marginBottom: -28,
-    marginHorizontal: -20,
-  },
+const styles = scaledStyles({
   cardShadow: {
     borderRadius: 20,
-    boxShadow:
-      "0px 10px 24px -8px rgba(0, 0, 0, 0.42), 0px 5px 14px -6px rgba(0, 0, 0, 0.26), 0px 2px 6px rgba(0, 0, 0, 0.18)",
+    // EINE Schicht statt drei. Jede Schicht ist ein eigener weicher Verlauf über
+    // die volle Kartenbreite, den die GPU beim Zeichnen mit dem Untergrund
+    // mischt — beim Scrollen und bei jeder Karten-Animation erneut. Drei davon
+    // übereinander kosteten das Dreifache für einen Unterschied, den man im
+    // direkten Vergleich nicht sieht: Die mittlere Schicht liegt fast deckungs-
+    // gleich unter der ersten, die dritte (2px, ohne Ausbreitung) verschwindet
+    // hinter der Kartenkante. Die eine hier ist die Summe: etwas kräftiger
+    // (0.55 statt 0.42) und dafür enger gezogen.
+    boxShadow: "0px 8px 20px -6px rgba(0, 0, 0, 0.55)",
   },
   card: {
     backgroundColor: C.card,

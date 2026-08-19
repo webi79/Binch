@@ -15,6 +15,7 @@ import {
   SCENE_W,
   SCENE_H,
 } from "./SearchSceneChrome";
+import { scaledStyles } from "@/lib/ui/compact";
 
 interface Props {
   originCode?: string;
@@ -77,7 +78,7 @@ export function GlobetrotterScene({ originCode = "—", destCode = "—" }: Prop
   );
 }
 
-const styles = StyleSheet.create({
+const styles = scaledStyles({
   flyer: { position: "absolute", top: 0, left: 0, width: 140, height: 150 },
   bo: { position: "absolute", left: 27, top: 6 },
   plane: { position: "absolute", left: 20, top: 96 },
