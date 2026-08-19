@@ -226,6 +226,10 @@ export default function SurroundingsScreen() {
   useEffect(() => {
     if (frozen) {
       setMapTilesRendered(false);
+      // Und das Bauteil wieder scharf stellen — sonst meldet es nach dem
+      // Auftauen nie wieder „fertig" und das Skelett bliebe bis zur Notbremse
+      // über einer längst gemalten Karte liegen.
+      mapRef.current?.rearm();
       return;
     }
     if (!mapMounted) return;

@@ -31,6 +31,7 @@ import { config } from "../config.js";
 import { searchLocations } from "./locationService.js";
 import { runSearch } from "./searchService.js";
 import { stationNameCompatible } from "../util/stationName.js";
+import { exonymQueryVariants } from "../util/cityExonyms.js";
 import { motisGeocode } from "./motisClient.js";
 import { loadStopBoard } from "../routes/stops.js";
 import type { TravelMode } from "../db/schema.js";
@@ -947,7 +948,24 @@ async function loadEndpointCoords(
  */
 const POI_MAX_STOP_DISTANCE_M = 1200;
 
-async function resolvePoiToStop(q: string, mode: TravelMode): Promise<ResolvedLoc | null> {
+async function resolvePoiToStop(
+  q: string,
+  mode: TravelMode,
+  /**
+   * Land des ANDEREN Endpunkts, falls es sich auflösen ließ.
+   *
+   * `motisGeocode` fällt ohne Länderangabe auf den ersten Rohtreffer zurück,
+   * und dessen Kommentar nennt den vermessenen Fall: „Paris" → ein Halt in
+   * Brasilien. Auf diesem Pfad greift die Namensprüfung dort nicht, denn der
+   * brasilianische Halt heißt wirklich „Paris".
+   *
+   * Geprüft wird deshalb am Ergebnis, mit unseren eigenen Daten: Der gefundene
+   * Halt muss im erwarteten Land liegen. Das braucht keine ISO-Umschlüsselung —
+   * beide Seiten tragen denselben Ländernamen aus derselben Tabelle. Eine Reise
+   * von Rom nach Rio ist mit dem Zug ohnehin keine.
+   */
+  expectedCountry?: string | null,
+): Promise<ResolvedLoc | null> {
   let place: Awaited<ReturnType<typeof motisGeocode>> = null;
   try {
     place = await motisGeocode(q);
@@ -992,6 +1010,7 @@ async function resolvePoiToStop(q: string, mode: TravelMode): Promise<ResolvedLo
 
   const row = rows[0];
   if (!row || row.latitude == null || row.longitude == null) return null;
+  if (expectedCountry && row.country && row.country !== expectedCountry) return null;
   return {
     code: row.code,
     label: row.label,
@@ -1003,6 +1022,14 @@ async function resolvePoiToStop(q: string, mode: TravelMode): Promise<ResolvedLo
 async function resolveJourneyEndpoint(
   q: string,
   mode: TravelMode,
+  /**
+   * Ort-Rückfall zulassen? Im ERSTEN Durchgang nicht.
+   *
+   * Der Rückfall geokodiert freien Text, und ohne Länderangabe ist genau das
+   * die Stelle, an der „Paris" schon einmal in Brasilien gelandet ist. Er läuft
+   * deshalb erst im zweiten Anlauf, wenn das Land der Gegenseite bekannt ist.
+   */
+  poi?: { allow: boolean; expectedCountry?: string | null },
 ): Promise<EndpointResolution> {
   const results = await searchLocations(q, mode);
   const all: ResolvedLoc[] = results.slice(0, 8).map((r) => ({
@@ -1030,8 +1057,24 @@ async function resolveJourneyEndpoint(
    * Geprüft wird gegen Bezeichnung UND Stadt — „Colosseo" darf auf
    * „Roma Colosseo" passen, „Rom" auf eine Station in der Stadt Rom.
    */
-  const named = all.filter(
-    (r) => stationNameCompatible(q, r.label) || stationNameCompatible(q, r.city),
+  /**
+   * Geprüft wird gegen die Anfrage UND ihre Exonyme.
+   *
+   * Ohne die Varianten erschlägt die Prüfung genau das, was die
+   * Exonym-Auflösung eine Ebene tiefer gerade geleistet hat: `searchLocations`
+   * findet zu „München" den Eintrag mit der Bezeichnung „Munich" — und
+   * „munchen" ist in „munich" nicht enthalten, in keine Richtung. Der Treffer
+   * wäre also weggefallen, und die Flugsuche nach deutschem Städtenamen
+   * (München, Köln, Prag, Mailand, Lissabon, Genf …) wäre still gestorben.
+   *
+   * Es sind dieselben Varianten, die auch die Suche benutzt — die Prüfung
+   * akzeptiert damit genau das, was die Suche liefern durfte, und nicht mehr.
+   */
+  const queryForms = [q, ...exonymQueryVariants(q)];
+  const named = all.filter((r) =>
+    queryForms.some(
+      (form) => stationNameCompatible(form, r.label) || stationNameCompatible(form, r.city),
+    ),
   );
   /**
    * Bleibt nichts übrig, ist es ein NICHT-GEFUNDEN — kein Notnagel.
@@ -1044,8 +1087,9 @@ async function resolveJourneyEndpoint(
   const top = trimmed[0];
   if (!top) {
     // Kein Halt dieses Namens — vielleicht ist es gar keiner, sondern ein ORT.
-    const poi = await resolvePoiToStop(q, mode);
-    if (poi) return { status: "ok", loc: poi };
+    if (!poi?.allow) return { status: "not_found" };
+    const nearby = await resolvePoiToStop(q, mode, poi.expectedCountry);
+    if (nearby) return { status: "ok", loc: nearby };
     return { status: "not_found" };
   }
   if (trimmed.length === 1) return { status: "ok", loc: top };
@@ -1534,10 +1578,41 @@ async function execTool(
       const mode = input.mode as TravelMode;
       // Beide Endpoints parallel server-seitig auflösen (ersetzt den
       // früheren find_location-Roundtrip, siehe resolveJourneyEndpoint).
-      const [originRes, destRes] = await Promise.all([
+      let [originRes, destRes] = await Promise.all([
         resolveJourneyEndpoint(input.origin, mode),
         resolveJourneyEndpoint(input.destination, mode),
       ]);
+      /**
+       * Zweiter Anlauf für die Seite, die nichts gefunden hat — mit dem Land
+       * der anderen.
+       *
+       * Der Ort-Rückfall geokodiert einen freien Text, und ohne Länderangabe
+       * ist das die Stelle, an der „Paris" schon einmal in Brasilien gelandet
+       * ist. Hat die Gegenseite aufgelöst, kennen wir das Land und können den
+       * Rückfall darauf festnageln. Fast immer liegen beide Enden im selben
+       * Land; tun sie es nicht, findet der zweite Anlauf eben nichts und es
+       * bleibt beim ehrlichen „nicht gefunden".
+       */
+      if (originRes.status === "not_found" || destRes.status === "not_found") {
+        // Land der Gegenseite, falls sie aufgelöst hat. Sind beide Enden ein
+        // Ort, gibt es keine — dann trägt allein der eigene Bestand die
+        // Prüfung: Was der Geocoder danebengreift, hat dort keinen Halt in
+        // 1200 Metern und fällt durch.
+        const originCountry = originRes.status === "ok" ? originRes.loc.country : null;
+        const destCountry = destRes.status === "ok" ? destRes.loc.country : null;
+        if (originRes.status === "not_found") {
+          originRes = await resolveJourneyEndpoint(input.origin, mode, {
+            allow: true,
+            expectedCountry: destCountry,
+          });
+        }
+        if (destRes.status === "not_found") {
+          destRes = await resolveJourneyEndpoint(input.destination, mode, {
+            allow: true,
+            expectedCountry: originCountry,
+          });
+        }
+      }
       if (originRes.status !== "ok" || destRes.status !== "ok") {
         // Kein Fehler, sondern ein Dialog-Schritt: Bo bekommt Kandidaten
         // bzw. not_found und fragt den User nach — exakt die UX, die vorher

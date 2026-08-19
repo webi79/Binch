@@ -52,6 +52,14 @@ interface RegionChangeEvent {
 export type MapLayerType = "standard" | "satellite" | "hybrid";
 
 export interface MapSurfaceHandle {
+  /**
+   * „Fertig gerendert" wieder scharf stellen — nach einem Einfrieren.
+   *
+   * Der Aufrufer weiß als Einziger, wann eingefroren wird; das Bauteil kann es
+   * nicht erfahren, weil `react-freeze` seine Durchgänge verwirft. Siehe
+   * `rearm` weiter unten.
+   */
+  rearm: () => void;
   /** Map auf eine Koordinate (lat/lng) zentrieren mit gewünschtem Zoom. */
   flyTo: (latitude: number, longitude: number, zoom?: number) => void;
   /** Map auf ein Bounding-Box zoomen (für Route-Übersicht). */
@@ -102,6 +110,27 @@ const MapSurfaceInner = forwardRef<MapSurfaceHandle, Props>(function MapSurface(
   const fallbackRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const onMapRenderedRef = useRef(onMapRendered);
   onMapRenderedRef.current = onMapRendered;
+  /**
+   * Den Riegel wieder scharf stellen — über die Steuerung, nicht über ein Prop.
+   *
+   * Der Aufrufer holt das Skelett zurück, wenn eingefroren wird (die GL-Fläche
+   * stirbt dabei). Beim Auftauen meldet MapLibre erneut „fertig" — aber der
+   * Riegel unten ist pro AUFBAU einmalig, und `react-freeze` baut nichts ab.
+   * Ohne diese Zeile bliebe das Skelett bis zur Notbremse liegen, also volle
+   * vier Sekunden über einer längst gemalten Karte.
+   *
+   * Als Prop ginge es nicht: Solange eingefroren ist, verwirft `react-freeze`
+   * jeden Durchgang des Unterbaums, ein neues Prop käme also nie an. Die
+   * Steuerung erreicht die Instanz trotzdem.
+   */
+  const rearm = useCallback(() => {
+    renderedFiredRef.current = false;
+    if (fallbackRef.current) {
+      clearTimeout(fallbackRef.current);
+      fallbackRef.current = null;
+    }
+  }, []);
+
   const markRendered = useCallback(() => {
     if (renderedFiredRef.current) return;
     renderedFiredRef.current = true;
@@ -147,6 +176,7 @@ const MapSurfaceInner = forwardRef<MapSurfaceHandle, Props>(function MapSurface(
   useImperativeHandle(
     ref,
     () => ({
+      rearm,
       flyTo: (latitude, longitude, zoom = 13) => {
         cameraRef.current?.flyTo({
           center: [longitude, latitude],

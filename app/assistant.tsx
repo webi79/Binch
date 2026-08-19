@@ -3039,8 +3039,17 @@ function appendBoardMessage(
   data?: StopBoardResponse,
 ): Msg[] {
   const rest = messages.filter((m) => m.kind !== "typing");
-  if (rest.some((m) => m.kind === "board" && m.botId === botId)) return rest;
-  return [...rest, { id: `${botId}:board`, kind: "board", stop, board, data, botId }];
+  /**
+   * Die Doppel-Prüfung gilt DIESEM Halt, nicht dem ganzen Zug.
+   *
+   * Sie stand nur auf `botId` — fragte jemand in einer Nachricht nach zwei
+   * Stationen („Abfahrten in Köln und Düsseldorf"), verschwand die zweite Tafel
+   * stillschweigend. Die Schwester-Funktion für Treffer macht es richtig und
+   * schlüsselt zusätzlich über die Kennung des Ergebnisses.
+   */
+  const id = `${botId}:board:${stop.code}:${board}`;
+  if (rest.some((m) => m.id === id)) return rest;
+  return [...rest, { id, kind: "board", stop, board, data, botId }];
 }
 
 function appendActionMessage(

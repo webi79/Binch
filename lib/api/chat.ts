@@ -146,7 +146,10 @@ export async function streamChat(req: ChatStreamRequest): Promise<void> {
     xhr.onreadystatechange = () => {
       // readyState 3 = LOADING (Daten kommen rein), 4 = DONE.
       if (xhr.readyState >= 3) {
+        // Es kommt etwas an — die Stillstands-Frist beginnt von vorn.
+        touch();
         if (xhr.status !== 0 && xhr.status !== 200 && xhr.readyState === 4) {
+          stopIdle();
           // HTTP-Fehler — Server hat einen Status != 200 geantwortet.
           reject(
             new ChatApiError(
@@ -168,12 +171,14 @@ export async function streamChat(req: ChatStreamRequest): Promise<void> {
         }
 
         if (xhr.readyState === 4) {
+          stopIdle();
           resolve();
         }
       }
     };
 
     xhr.onerror = () => {
+      stopIdle();
       reject(new Error("Chat API network error — server unreachable?"));
     };
 
@@ -194,10 +199,38 @@ export async function streamChat(req: ChatStreamRequest): Promise<void> {
      * anderthalb und sechzehn Sekunden, auch mit Flugsuche. Wer darüber liegt,
      * hängt.
      */
-    xhr.timeout = 60_000;
-    xhr.ontimeout = () => {
+    /**
+     * Gemessen wird STILLSTAND, nicht die Gesamtdauer.
+     *
+     * `xhr.timeout` deckelt die gesamte Anfrage. Genau das ist hier falsch: Eine
+     * mehrteilige Reise läuft über bis zu drei aufeinanderfolgende Suchen mit je
+     * 15 Sekunden Deckel, dazwischen die Antworten des Modells. Ein Zug, der
+     * fleißig Text liefert, wurde damit nach einer Minute mittendrin abgebrochen
+     * und als allgemeiner Fehler angezeigt.
+     *
+     * Der Zweck war ein anderer: Ein Zug, der HÄNGT, darf die Sperre nicht für
+     * immer halten (sonst nimmt der Chat nichts mehr an). Dagegen hilft eine
+     * Frist ohne Fortschritt — sie greift genauso schnell beim echten Hänger und
+     * gar nicht bei einer langen, aber lebendigen Antwort.
+     */
+    const IDLE_TIMEOUT_MS = 60_000;
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    const failIdle = () => {
+      idleTimer = null;
+      xhr.abort();
       reject(new Error("Chat API timeout"));
     };
+    const touch = () => {
+      if (idleTimer !== null) clearTimeout(idleTimer);
+      idleTimer = setTimeout(failIdle, IDLE_TIMEOUT_MS);
+    };
+    const stopIdle = () => {
+      if (idleTimer !== null) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+    };
+    touch();
 
     // AbortSignal-Bridge — wenn der Caller abbricht, XHR abort.
     // ‼️ React Native hat KEIN globales DOMException — die JS-Engine wirft
@@ -211,11 +244,15 @@ export async function streamChat(req: ChatStreamRequest): Promise<void> {
     };
     if (req.signal) {
       if (req.signal.aborted) {
+        stopIdle();
         xhr.abort();
         reject(makeAbortError());
         return;
       }
       req.signal.addEventListener("abort", () => {
+        // Die Frist mit abräumen — sonst feuert sie nach dem Abbruch noch
+        // einmal und lehnt ein bereits abgeschlossenes Versprechen ab.
+        stopIdle();
         xhr.abort();
         reject(makeAbortError());
       });
