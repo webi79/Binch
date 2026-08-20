@@ -32,16 +32,3 @@ export function markTransitionBusy(durationMs: number): void {
 export function isTransitionBusy(): boolean {
   return Date.now() < busyUntil;
 }
-
-/**
- * Für Bewegungen, die keinen gemeinsamen Startpunkt haben.
- *
- * Angemeldet wurden anfangs nur die vier HINwege — die Rückwege liefen alle
- * ungeschützt. Das ist genau der Regelfall: Man speichert etwas, und zweieinhalb
- * Sekunden später schließt man das Blatt. Die Uhr des Schreibvorgangs läuft dann
- * mit hoher Wahrscheinlichkeit ausgerechnet in die Rückfahrt. Also gilt die
- * Anmeldung jetzt für BEIDE Richtungen jeder Bewegung.
- */
-export function markMoving(durationMs: number): void {
-  markTransitionBusy(durationMs);
-}

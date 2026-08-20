@@ -13,7 +13,7 @@
  *  - DayCell als React.memo damit Selection-Changes nur 2 Cells re-rendern
  */
 import { memo, useCallback, useMemo, useState, type ReactNode, useRef } from "react";
-import { subscribeLayer } from "@/lib/nav/transitionLayer";
+import { subscribeLayer, holdLayer, rearmLayer } from "@/lib/nav/transitionLayer";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import { PICKER_IN, PICKER_OUT } from "@/lib/nav/overlayCover";
 import { useSheetSlide } from "@/lib/nav/sheetSlide";
@@ -329,8 +329,33 @@ const BinchDatePickerInner = function BinchDatePicker({
   const slide = useCallback(
     (show: boolean) => {
       const cfg = show ? PICKER_IN : PICKER_OUT;
-      if (!layeredRef.current) holdLayerFor(cfg.duration + (show ? 16 : 0));
+      /**
+       * Fehlt die Ebene, bekommt die Fahrt ein Bild Vorlauf.
+       *
+       * Ihr Aufbau ist im Projekt mit 66ms vermessen, die Fahrt dauert 260ms
+       * über die volle Fensterhöhe — ohne Vorlauf fehlen am Anfang rund neun
+       * Bilder, und die Kurve springt sichtbar hinein. Über den X-Knopf steht
+       * die Ebene längst vom Aufsetzen des Fingers; die Zurück-Geste hat diesen
+       * Moment nicht.
+       */
+      /**
+       * Beim ÖFFNEN die Ebene halten, beim SCHLIESSEN wieder scharf stellen.
+       *
+       * Sie wurde beim Berühren angefordert und verfällt nach 1,4 Sekunden von
+       * selbst — also mitten hinein, während man im Wähler steht und die Liste
+       * scrollt. Danach fehlt sie zusätzlich der Ausfahrt. Detail-, Ticket- und
+       * Such-Blatt halten ihre Unterlagen-Textur genau so; die Wähler hielten
+       * als einzige ihre eigene nicht.
+       */
+      if (show) holdLayer("pickerDate");
+      else rearmLayer("pickerDate");
+      const needsLayer = !layeredRef.current;
+      if (needsLayer) holdLayerFor(cfg.duration + (show ? 16 : 0));
       armMovingGuard(cfg.duration);
+      if (needsLayer) {
+        requestAnimationFrame(() => runSheet(show));
+        return;
+      }
       runSheet(show);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -205,6 +205,8 @@ function clearResultsParams() {
  * geschlossenen Zustand kein neues Objekt pro Auswertung baut.
  */
 const PARKED = { transform: [{ translateX: 100000 }] } as const;
+/** Nur für „andere Route liegt oben" — siehe `shellStyle`. */
+const HIDDEN_FOR_ROUTE = { opacity: 0 } as const;
 
 export function ResultsView() {
   // Parameter aus dem Store. Die Route schreibt sie hinein (siehe die Hülle in
@@ -262,20 +264,37 @@ export function ResultsView() {
    */
   const slideStyle = useAnimatedStyle(
     () =>
-      visible
-        ? {
-            transform: [
-              {
-                // Eigene Position aus dem gemeinsamen Fortschritt; dazu der
-                // Parallax, falls ein Detail-Blatt über DIESEM Screen liegt.
-                translateX:
-                  (1 - pushProgress(resultsPush.value)) * screenWidth +
-                  overlayCover.value * screenWidth * UNDERLAY_TRAVEL_FRAC,
-              },
-            ],
-          }
-        : PARKED,
-    [visible, screenWidth],
+      (() => {
+        /**
+         * Die „liegt hier überhaupt etwas?"-Frage kommt aus GETEILTEN WERTEN,
+         * nicht aus React.
+         *
+         * Als Abhängigkeit (`visible`) kippte sie in genau dem Durchgang, in
+         * dem dieser Bildschirm auf- oder zugeht — und eine geänderte
+         * Abhängigkeit beantwortet Reanimated mit Abriss und Neuanlage der
+         * Zuordnung. Der nächste Lauf baut daraufhin die topologische
+         * Reihenfolge über ALLE Zuordnungen der App neu auf, ausgerechnet im
+         * ersten Bild der Fahrt.
+         *
+         * Der Rückgabewert bleibt eine Modul-Konstante, solange nichts zu tun
+         * ist — nur so erkennt der flache Vergleich in Reanimated, dass sich
+         * nichts geändert hat, und lässt den nativen Schreibvorgang aus.
+         */
+        const p = pushProgress(resultsPush.value);
+        const cover = overlayCover.value;
+        if (p === 0 && cover === 0) return PARKED;
+        return {
+          transform: [
+            {
+              // Eigene Position aus dem gemeinsamen Fortschritt; dazu der
+              // Parallax, falls ein Detail-Blatt über DIESEM Screen liegt.
+              translateX:
+                (1 - p) * screenWidth + cover * screenWidth * UNDERLAY_TRAVEL_FRAC,
+            },
+          ],
+        };
+      })(),
+    [screenWidth],
   );
 
   // contentReady wird unten exakt am Slide-Ende via Animations-Callback
@@ -1129,35 +1148,39 @@ export function ResultsView() {
     { key: "direct", labelKey: "results.sort.direct" },
   ];
 
+  /**
+   * Der Stil der Wurzel EINMAL, nicht bei jedem Durchgang neu.
+   *
+   * `ResultsShell` ist ausdrücklich `memo` — mit der Begründung, dass ein
+   * Textur-Wechsel nicht den ganzen Baum neu rendern soll. Ein frisches Array
+   * als `style` hebt genau das in der Gegenrichtung wieder auf: Jeder
+   * Durchgang dieses Bildschirms ging durch die Schranke hindurch.
+   *
+   * Und die Wurzel ist zugleich der animierte Knoten. Ein frisches Objekt dort
+   * ist auf Fabric ein Commit auf genau dem Knoten, den Reanimated Bild für
+   * Bild beschreibt.
+   *
+   * Der Sonderfall bleibt: Nur wenn eine andere Route oben liegt (Karte), steht
+   * dieser Baum an seiner Endposition und muss ausgeblendet werden. Sonst
+   * versteckt ihn seine Position — der Bewegungswert ist dann 0 und legt ihn
+   * vollständig rechts außerhalb des Bildes ab, und was außerhalb liegt,
+   * zeichnet Android nicht.
+   */
+  const shellBase = useMemo(() => ({ backgroundColor: appBg }), [appBg]);
+  const shellStyle = useMemo(
+    () =>
+      hiddenForRoute
+        ? [styles.slideRoot, shellBase, slideStyle, HIDDEN_FOR_ROUTE]
+        : [styles.slideRoot, shellBase, slideStyle],
+    [hiddenForRoute, shellBase, slideStyle],
+  );
+
   return (
     <>
     <RouteWatch onChange={setHiddenForRoute} />
     <ResultsShell
       pointerEvents={hiddenForRoute || !visible ? "none" : "auto"}
-      style={[
-        styles.slideRoot,
-        { backgroundColor: appBg },
-        slideStyle,
-        // Im Ruhezustand versteckt ihn seine POSITION, nicht ein Extra-Stil.
-        //
-        // Steht keine Suche an, ist der Bewegungswert 0 — der Transform oben legt
-        // diesen Baum damit vollständig rechts außerhalb des Bildes ab, und was
-        // außerhalb liegt, zeichnet Android nicht. Das kostet nichts und ist
-        // zugleich der Startpunkt der Bewegung: Beim Öffnen wird nur noch
-        // geschoben, kein Layout, kein Aufbau.
-        //
-        // Die beiden Versuche davor waren beide falsch:
-        //   • `opacity: 0` ließ den Baum im Layout und behielt seinen erhöhten
-        //     Rang — eine bildschirmfüllende Ebene über allem, dauerhaft. Das
-        //     kostete überall: Scrollen, Tab-Wechsel, Leiste.
-        //   • `display: "none"` sparte das zwar, erzwang beim Anzeigen aber einen
-        //     vollen Layout-Durchlauf des ganzen Baums — genau die Arbeit, die der
-        //     Umbau loswerden sollte, und sie verschluckte die Slide.
-        //
-        // Nur für den Fall „andere Route liegt oben" (Karte) braucht es einen
-        // Stil: Dort steht der Baum an seiner Endposition und muss weg.
-        hiddenForRoute && { opacity: 0 },
-      ]}
+      style={shellStyle}
     >
       {/* Keine eigene Hintergrundfarbe: Der Rahmen darüber ist bereits
           bildschirmfüllend und deckend eingefärbt. Zwei deckende Flächen

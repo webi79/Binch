@@ -127,14 +127,6 @@ export function pushProgress(p: number): number {
   return p;
 }
 
-/**
- * Gemeinsamer Progress des Home→Search „Launch"-Übergangs (Xiaomi-Feeling).
- * 0 = Homescreen normal, 1 = Such-Screen voll offen. EIN Wert, aus dem ALLES
- * abgeleitet wird — das wachsende Splash-Fenster + der Content im
- * SearchHeroOverlay UND die Tiefe des Homescreens (scale/dim) im Root-Layout.
- * makeMutable, weil über zwei Komponenten geschrieben/gelesen.
- */
-export const searchLaunch = makeMutable(0);
 
 /**
  * Parallax-Weg der Unterlage als Bruchteil der Bildschirmbreite (negativ = links).
@@ -270,14 +262,35 @@ export function warmPushCurves(): void {
   warm(ticketPush, PUSH_SPRING);
   warm(settingsPush, PUSH_SPRING);
   warm(assistantPush, ASSISTANT_IN);
+  warm(searchHeroPush, PUSH_SPRING);
+  // Fehlte als einzige. Sie treibt zwei bildschirmfüllende Auswerter bei der
+  // Übergabe vom Such-Blatt an die Ergebnisliste — der allererste Übergang
+  // dorthin lief deshalb kalt.
+  warm(heroClipPush, PUSH_SPRING);
 }
 
 export function startResultsPush(): void {
   markTransitionBusy(PUSH_SPRING.duration);
+  /**
+   * Auch beim Textur-Riegel anmelden.
+   *
+   * An `isSheetMoving()` hängt die Regel in `transitionLayer.ts`, dass eine
+   * GPU-Ebene während einer Fahrt nicht abgerissen wird. Angemeldet haben sich
+   * bisher nur Bo, das Such-Blatt und die beiden Wähler — für Ergebnisliste,
+   * Detail- und Ticket-Blatt konnte die 1,4-Sekunden-Frist also mitten in die
+   * Fahrt fallen und die Ebene wegnehmen. Ein Ebenen-Abbau hält die laufende
+   * Bewegung an; genau das beschreibt `transitionLayer.ts` als den Fall, für
+   * den der Riegel überhaupt existiert.
+   */
+  setSheetMoving(true, "results");
   pushGen += 1;
   lastPushAt = Date.now();
   resultsPush.value = 0;
-  resultsPush.value = withTiming(1, PUSH_SPRING);
+  resultsPush.value = withTiming(1, PUSH_SPRING, (finished) => {
+    "worklet";
+    if (!finished) return;
+    runOnJS(setSheetMoving)(false, "results");
+  });
   // Beide Bewegungen im SELBEN Aufruf starten.
   //
   // Der Beschnitt des Such-Screens wurde vorher direkt im Tipp-Handler gestartet,
@@ -314,6 +327,87 @@ export function startResultsPush(): void {
  * Übergabe aus dem Such-Screen anfasst, laufen sie dort gar nicht erst an.
  */
 export const heroClipPush = makeMutable(0);
+
+/**
+ * Fortschritt des Such-Blattes: 0 = ganz rechts außerhalb, 1 = deckt den Schirm.
+ *
+ * Dasselbe Muster wie `resultsPush` und `assistantPush` — das Blatt kommt von
+ * rechts herein und schiebt den Landingscreen im Parallax mit. Vorher fuhr es
+ * von unten herein und hatte mit den übrigen Übergängen der App nichts gemein.
+ */
+export const searchHeroPush = makeMutable(0);
+
+let searchHeroMoving = false;
+/** Läuft die Fahrt schon? Als JS-Wert — Begründung siehe `isDetailsPushStarted`. */
+export function isSearchHeroPushStarted(): boolean {
+  return searchHeroMoving;
+}
+
+/**
+ * Im TIPP-Handler aufrufen, nicht im Öffnungs-Effekt.
+ *
+ * Bis eben startete die Bewegung erst am Ende einer Kette: Speicher schreiben
+ * (acht Felder auf einmal) → Effekt → zwei weitere Speicher-Schreibvorgänge →
+ * Commit → die Rücksetz-Effekte des Formulars mit acht `setState` → Effekt →
+ * ein Bild Wartezeit → los. Das sind zwei Bilder und drei Commits zwischen
+ * Finger und erster Bewegung, und genau die spürt man als Verzug.
+ *
+ * Alle anderen Übergänge der App starten im Tipp-Handler; der Fortschritt ist
+ * ein Modul-Wert und braucht den Bildschirm dafür gar nicht. Der Effekt im
+ * Blatt bleibt als Notausgang für Wege, die hier nicht vorbeikommen.
+ */
+let searchHeroArrivedCb: (() => void) | null = null;
+/**
+ * Was NACH der Einfahrt laufen soll — vom Blatt einmal hinterlegt.
+ *
+ * Nötig, weil die Kurve im Tipp-Handler startet, die Aufräumarbeit danach aber
+ * im Blatt liegt (Textur freigeben, Sonnenaufgang, Einblend-Takt). Ein fester
+ * Verteiler statt eines eingefangenen Rückrufs: Ein Worklet fängt seine
+ * Schließung beim Anlegen ein und sähe eine später gesetzte Funktion nie.
+ */
+export function setSearchHeroArrivedHandler(fn: (() => void) | null): void {
+  searchHeroArrivedCb = fn;
+}
+function searchHeroArrived(): void {
+  searchHeroArrivedCb?.();
+}
+
+export function startSearchHeroPush(): void {
+  markTransitionBusy(PUSH_SPRING.duration);
+  /**
+   * Auch beim Textur-Riegel anmelden, nicht nur bei der Leerlauf-Sperre.
+   *
+   * An `isSheetMoving()` hängt die Regel in `transitionLayer.ts`, dass eine
+   * GPU-Ebene während einer Fahrt NICHT abgerissen wird. Ohne die Anmeldung
+   * konnte die 1,4-Sekunden-Frist der Unterlagen-Textur mitten in die Fahrt
+   * fallen — ein Ebenen-Abbau hält die laufende Bewegung an. Genau das
+   * „manchmal ruckelt es, manchmal nicht". Bo meldet sich seit Längerem an,
+   * dieses Blatt nicht.
+   */
+  setSheetMoving(true, "searchHero");
+  searchHeroMoving = true;
+  // Kein Rückwurf auf 0 — dieselbe Begründung wie bei `startDetailsPush`: Wer
+  // mitten in der Ausfahrt erneut tippt, soll von dort weiterfahren, statt
+  // erst eine volle Breite nach rechts aus dem Bild zu springen.
+  searchHeroPush.value = withTiming(1, PUSH_SPRING, (finished) => {
+    "worklet";
+    if (!finished) return;
+    runOnJS(searchHeroArrived)();
+  });
+}
+
+/** Beim Schließen — der Aufrufer räumt danach auf. */
+export function endSearchHeroPush(): void {
+  markTransitionBusy(POP_SPRING.duration);
+  setSheetMoving(true, "searchHero");
+  searchHeroMoving = false;
+}
+
+/** Abmelden — vom Blatt aufgerufen, wenn die Fahrt wirklich durch ist. */
+export function searchHeroSettled(): void {
+  setSheetMoving(false, "searchHero");
+}
+
 
 /**
  * Fortschritt des Profil-Unterschirms: 0 = Hub, 1 = Unterschirm liegt oben.
@@ -460,8 +554,17 @@ export const PICKER_OUT = SHEET_OUT;
  *
  * 0 = unterhalb des Bildrands, 1 = oben angekommen.
  */
-export const ASSISTANT_IN = SHEET_IN;
-export const ASSISTANT_OUT = SHEET_OUT;
+/**
+ * Bo fährt die PUSH-Bewegung — dieselbe wie Ergebnisliste, Detail-Blatt und
+ * Profil-Unterschirm: von rechts herein, die Unterlage wandert im Parallax mit.
+ *
+ * Vorher war es ein Blatt von unten (`SHEET_IN`/`SHEET_OUT`). Das war eine
+ * zweite Sprache für dieselbe Sache — die App kennt genau einen Weg, wie ein
+ * Bildschirm über einen anderen kommt, und der steht hier oben. Wer die Kurven
+ * ändert, ändert sie für alle gemeinsam; genau dafür sind sie zentral.
+ */
+export const ASSISTANT_IN = PUSH_SPRING;
+export const ASSISTANT_OUT = POP_SPRING;
 
 export const assistantPush = makeMutable(0);
 
@@ -502,9 +605,14 @@ export function isTicketPushStarted(): boolean {
 }
 
 export function startTicketPush(): void {
+  setSheetMoving(true, "ticket");
   markTransitionBusy(PUSH_SPRING.duration);
   ticketMoving = true;
-  ticketPush.value = withTiming(1, PUSH_SPRING);
+  ticketPush.value = withTiming(1, PUSH_SPRING, (finished) => {
+    "worklet";
+    if (!finished) return;
+    runOnJS(setSheetMoving)(false, "ticket");
+  });
   overlayCover.value = withTiming(1, COVER_IN_SPRING);
 }
 
@@ -543,28 +651,27 @@ export function isDetailsPushStarted(): boolean {
 
 export function startDetailsPush(): void {
   markTransitionBusy(PUSH_SPRING.duration);
+  setSheetMoving(true, "details");
   detailsMoving = true;
   // Kein Rückwurf auf 0 davor. `withTiming` startet ohnehin beim aktuellen Wert
   // — und genau das ist hier das bessere Verhalten: Wer mitten in der Rückfahrt
   // erneut auf eine Karte tippt, soll von dort aus weiterfahren statt erst nach
   // rechts aus dem Bild zu springen. Der Wurf war zusätzlich ein eigener
   // Auftrag an den UI-Strang, also ein Zustellvorgang mehr im heikelsten Moment.
-  detailsPush.value = withTiming(1, PUSH_SPRING);
+  detailsPush.value = withTiming(1, PUSH_SPRING, (finished) => {
+    "worklet";
+    if (!finished) return;
+    runOnJS(setSheetMoving)(false, "details");
+  });
   overlayCover.value = withTiming(1, COVER_IN_SPRING);
 }
 
-/** Vom Blatt gesetzt, wenn es seine Rückfahrt selbst fährt (Schließen-Knopf,
- *  Zurück-Geste) — dort läuft `endDetailsPush` nicht. */
+/** Vom Blatt gesetzt, wenn es seine Rückfahrt fährt — die schreibt es selbst,
+ *  hier gibt es dafür keine Gegenfunktion (siehe `DetailsOverlay`). */
 export function setDetailsPushStopped(): void {
   detailsMoving = false;
 }
 
-export function endDetailsPush(): void {
-  markTransitionBusy(POP_SPRING.duration);
-  detailsMoving = false;
-  detailsPush.value = withTiming(0, POP_SPRING);
-  overlayCover.value = withTiming(0, COVER_OUT_SPRING);
-}
 
 /**
  * Startet Bos Bewegung SCHON BEIM TIPPEN, nicht erst wenn der Bildschirm steht.
@@ -604,7 +711,7 @@ export function startAssistantPush(): void {
   markTransitionBusy(ASSISTANT_IN.duration);
   setSheetMoving(true, "assistant");
   assistantMoving = true;
-  assistantPush.value = 0;
+  // Kein Rückwurf auf 0 — siehe `startDetailsPush`.
   assistantPush.value = withTiming(1, ASSISTANT_IN, (finished) => {
     "worklet";
     if (!finished) return;

@@ -16,29 +16,16 @@
 let active = false;
 
 /**
- * Beobachter der Übergabe.
+ * Der frühere Benachrichtigungs-Kanal für die Übergabe ist entfallen.
  *
- * Der Modul-Wert allein reichte nicht mehr: Der Such-Screen muss sich auf die
- * Bewegung VORBEREITEN, und zwar bevor sie anläuft (siehe die Hardware-Ebene im
- * SearchHeroOverlay). Dafür braucht genau eine Komponente eine Benachrichtigung.
- *
- * Das bleibt trotzdem außerhalb des Stores — die Begründung oben gilt weiter:
- * Ein Schreibvorgang dort weckt ALLE abonnierten Komponenten, und das im
- * Berührungs-Frame. Hier weckt es genau einen Beobachter.
+ * Er hatte genau einen Zuhörer — den Such-Screen, der sich damit auf die
+ * Bewegung vorbereitete. Der bereitet sich inzwischen über `subscribeHandoffLayer`
+ * darunter vor, und der Kanal hier hatte zuletzt keinen Abonnenten mehr:
+ * `beginSearchHandoff`/`endSearchHandoff` riefen bei jeder Suche eine
+ * Verteilerfunktion auf, die über eine leere Menge lief.
  */
 type HandoffListener = (active: boolean) => void;
-const listeners = new Set<HandoffListener>();
 
-export function subscribeSearchHandoff(fn: HandoffListener): () => void {
-  listeners.add(fn);
-  return () => {
-    listeners.delete(fn);
-  };
-}
-
-function emit(): void {
-  for (const fn of listeners) fn(active);
-}
 
 /**
  * Getrenntes Signal für die GPU-Textur des Such-Screens.
@@ -301,12 +288,10 @@ export function beginSearchHandoff(): void {
   // wenigstens jetzt anfordern.
   prepareHandoffLayer();
   active = true;
-  emit();
 }
 
 export function endSearchHandoff(): void {
   active = false;
-  emit();
   // Textur wieder freigeben — dauerhaft müsste sie bei jeder Änderung im
   // Formular neu entstehen.
   releaseHandoffLayer();

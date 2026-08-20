@@ -34,6 +34,19 @@ import { scaledStyles } from "@/lib/ui/compact";
 
 interface Props {
   recording: boolean;
+  /**
+   * Alles Laufende anhalten — für die Dauer einer Fahrt.
+   *
+   * Diese Leiste ist während einer Aufnahme der teuerste Dauerläufer im
+   * Assistenten: ein Worklet im Bild-Takt (der Sampler), ein Endlos-Pulsieren
+   * am Aufnahme-Punkt und ein Sekunden-Takt, der die Leiste jede Sekunde neu
+   * rendert. Schließt man den Assistenten währenddessen, liegt über dem Baum
+   * eine GPU-Textur — und was sich darunter bewegt, macht sie in jedem Bild
+   * ungültig. Dieselbe Begründung wie bei Bos Pause und den Tipp-Punkten.
+   *
+   * Die Aufnahme selbst läuft weiter; angehalten wird nur ihre Darstellung.
+   */
+  paused?: boolean;
   onPauseToggle: () => void;
   onDelete: () => void;
   onSend: () => void;
@@ -120,9 +133,11 @@ function Bar({ index, total, bufSV, color }: BarProps) {
 
 function Waveform({
   recording,
+  paused,
   micVolumeSV,
 }: {
   recording: boolean;
+  paused: boolean;
   micVolumeSV: SharedValue<number>;
 }) {
   const accent = useAccent();
@@ -177,8 +192,11 @@ function Waveform({
   // auch ohne Aufnahme. Solange der Assistent offen war, hing damit dauerhaft ein
   // Worklet im Bild-Takt, das nichts zu tun hatte.
   useEffect(() => {
-    frameCb.setActive(recording);
-  }, [frameCb, recording]);
+    // `paused` hält ihn auch für die Dauer einer Fahrt an — siehe dort. Die
+    // Balken behalten dabei ihre letzten Werte, genau wie beim Pausieren der
+    // Aufnahme.
+    frameCb.setActive(recording && !paused);
+  }, [frameCb, recording, paused]);
 
   const scrollStyle = useAnimatedStyle(() => {
     "worklet";
@@ -210,11 +228,24 @@ function Waveform({
 
 /* ──── Pulsierender Aufnahme-Dot ─────────────────────────────────── */
 
-function RecordingDot({ recording }: { recording: boolean }) {
+function RecordingDot({
+  recording,
+  paused,
+}: {
+  recording: boolean;
+  paused: boolean;
+}) {
   const accent = useAccent();
   const op = useSharedValue(1);
 
   useEffect(() => {
+    // Für die Dauer einer Fahrt hart auf voll — kein Ausblenden, das wäre
+    // wieder eine Animation unter der Textur.
+    if (paused) {
+      cancelAnimation(op);
+      op.value = 1;
+      return;
+    }
     if (!recording) {
       cancelAnimation(op);
       op.value = withTiming(0.4, { duration: 200 });
@@ -229,7 +260,7 @@ function RecordingDot({ recording }: { recording: boolean }) {
       false,
     );
     return () => cancelAnimation(op);
-  }, [recording, op]);
+  }, [recording, paused, op]);
 
   const dotStyle = useAnimatedStyle(() => ({ opacity: op.value }));
   return (
@@ -241,6 +272,7 @@ function RecordingDot({ recording }: { recording: boolean }) {
 
 export function VoiceRecordBar({
   recording,
+  paused = false,
   onPauseToggle,
   onDelete,
   onSend,
@@ -252,19 +284,23 @@ export function VoiceRecordBar({
   const [seconds, setSeconds] = useState(0);
 
   useEffect(() => {
-    if (!recording) return;
+    // Nicht während einer Fahrt: Der Takt rendert diese Leiste neu, und das ist
+    // ein Commit mitten in die Bewegung. Sichtbar ist davon nichts — die
+    // Anzeige steht höchstens eine knappe halbe Sekunde still, und zwar
+    // während der Bildschirm ohnehin wegfährt.
+    if (!recording || paused) return;
     const id = setInterval(() => setSeconds((s) => s + 1), 1000);
     return () => clearInterval(id);
-  }, [recording]);
+  }, [recording, paused]);
 
   return (
     <View style={[styles.panel, { backgroundColor: palette.s1, borderColor: palette.border }, { paddingBottom: bottomInset }]}>
       <View style={styles.topRow}>
         <View style={styles.timeBox}>
-          <RecordingDot recording={recording} />
+          <RecordingDot recording={recording} paused={paused} />
           <Text style={styles.time}>{fmtTime(seconds)}</Text>
         </View>
-        <Waveform recording={recording} micVolumeSV={micVolumeSV} />
+        <Waveform recording={recording} paused={paused} micVolumeSV={micVolumeSV} />
       </View>
 
       <View style={styles.actionRow}>

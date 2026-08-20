@@ -5,7 +5,7 @@
  * Button. Wird am Root-Level (app/_layout.tsx) mit `selectedTicket !== null`
  * gemountet, ähnlich zum DetailsOverlay-Pattern.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import {
   View,
   Text,
@@ -184,20 +184,37 @@ function TicketDetailSheet({
     }
     setMoving(true);
     endTicketPush();
-    ticketPush.value = withTiming(0, POP_SPRING, (finished?: boolean) => {
-      "worklet";
-      if (!finished) return;
-      runOnJS(setMoving)(false);
-      runOnJS(releaseUnderlayLayer)();
+    /**
+     * EIN Bild zwischen dem Ebenen-Wechsel und der Kurve.
+     *
+     * Hier stand beides in derselben Anweisungsfolge — als einziger Weg der
+     * App startete dieses Blatt die Kurve VOR seinem schwersten Commit. Die
+     * Zeile darüber kippt `renderToHardwareTextureAndroid` auf einer
+     * bildschirmfüllenden Ansicht; deren Rasterung ist im Projekt mit 66ms
+     * vermessen und lief damit in die ersten Bilder der 380ms-Rückfahrt.
+     *
+     * `withTiming` rechnet zeitbasiert weiter, während nichts gezeichnet wird —
+     * das erste sichtbare Bild zeigt die Kurve dann schon ein Stück weiter. Das
+     * ist der „Ruck" am Anfang. `DetailsOverlay` hat den Vorlauf bekommen und
+     * nennt dieses Blatt dort namentlich; hier fehlte er noch.
+     */
+    const raf = requestAnimationFrame(() => {
+      ticketPush.value = withTiming(0, POP_SPRING, (finished?: boolean) => {
+        "worklet";
+        if (!finished) return;
+        runOnJS(setMoving)(false);
+        runOnJS(releaseUnderlayLayer)();
+      });
+      // Siehe DetailsOverlay: nur zurücknehmen, wenn dieses Blatt den geteilten
+      // Wert auch gesetzt hat — sonst reißt eine Größenänderung den Parallax
+      // eines anderen Overlays auf 0. Im SELBEN Bild wie die Kurve darüber:
+      // beide gehören zusammen, ein Versatz wäre an der Kante zu sehen.
+      if (ownsCoverRef.current) {
+        ownsCoverRef.current = false;
+        overlayCover.value = withTiming(0, COVER_OUT_SPRING);
+      }
     });
-    // Siehe DetailsOverlay: nur zurücknehmen, wenn dieses Blatt den geteilten
-    // Wert auch gesetzt hat — sonst reißt eine Größenänderung den Parallax eines
-    // anderen Overlays auf 0.
-    if (ownsCoverRef.current) {
-      ownsCoverRef.current = false;
-      overlayCover.value = withTiming(0, COVER_OUT_SPRING);
-    }
-    return undefined;
+    return () => cancelAnimationFrame(raf);
   }, [open, screenWidth]);
 
   useEffect(() => () => { overlayCover.value = 0; }, []);
@@ -233,6 +250,20 @@ function TicketDetailSheet({
 
   const ticketCode = bookingRefFor(ticket);
 
+  /**
+   * Wurzel-Stil EINMAL — Array UND Farb-Objekt.
+   *
+   * Beide waren bei jedem Durchgang neu, auf genau dem Knoten, den Reanimated
+   * Bild für Bild beschreibt. Und dieses Blatt rendert während der Fahrt
+   * mehrfach (`moving`, PDF-Ansicht). Auf Fabric ist jedes frische Objekt dort
+   * ein Commit gegen die laufende Bewegung.
+   */
+  const sheetBg = useMemo(() => ({ backgroundColor: palette.bg }), [palette.bg]);
+  const sheetStyle = useMemo(
+    () => [styles.root, sheetBg, slideStyle],
+    [sheetBg, slideStyle],
+  );
+
   return (
     // renderToHardwareTextureAndroid: promotet das Sheet auf eine GPU-Layer.
     // Per Perfetto gemessen: ohne Layer wird der komplette Screen JEDEN
@@ -241,7 +272,7 @@ function TicketDetailSheet({
     // Statisch an (kein Mid-Flight-Toggle — der verursachte früher selbst
     // Stutter); Kosten: ~12MB GPU-Speicher solange gemountet.
     <Animated.View
-      style={[styles.root, { backgroundColor: palette.bg }, slideStyle]}
+      style={sheetStyle}
       // NUR während der Bewegung.
       //
       // Stand hier statisch, aus einer Zeit, in der „gemountet" gleich „offen"

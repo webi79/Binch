@@ -13,6 +13,7 @@ import {
   Platform,
   useWindowDimensions,
 } from "react-native";
+import { markTransitionBusy } from "@/lib/nav/transitionBusy";
 import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
   cancelAnimation,
@@ -478,6 +479,25 @@ const DetailsContent = memo(function DetailsContent({
       }
       return undefined;
     }
+    /**
+     * Anmelden — dieselbe Lücke wie bei der Ergebnisliste.
+     *
+     * Ohne sie gilt der Bildschirm während der Rückfahrt als ruhig, und die
+     * aufgeschobene Arbeit (Persistenz, Sekunden-Takt, die drei
+     * Leerlauf-Aufbauten) läuft hinein.
+     */
+    markTransitionBusy(POP_SPRING.duration);
+    /**
+     * EIN Bild Vorlauf, wie ihn `sheetSlide.ts` für beide Richtungen
+     * vorschreibt.
+     *
+     * Der Ablauf bis hierher: Loslassen → Speicher schreiben → über 140
+     * Selektoren wecken → Commit (darin kippt `pointerEvents` und der
+     * Wurzel-Stil) → Effekt → Kurve. Ohne das Bild dazwischen lief die
+     * Bewegung gegen genau diesen Commit an. Detail- und Ticket-Blatt waren
+     * die einzigen beiden, denen der Vorlauf auf der Rückfahrt fehlte.
+     */
+    const raf = requestAnimationFrame(() => {
     detailsPush.value = withTiming(0, POP_SPRING, (finished?: boolean) => {
       "worklet";
       // Die Textur der Unterlage lebt jetzt genau so lange wie die Bewegung.
@@ -498,11 +518,15 @@ const DetailsContent = memo(function DetailsContent({
     // `screenWidth` steht in den Abhängigkeiten, also läuft dieser Zweig auch bei
     // jeder Größenänderung (Drehen, Foldable, geteilter Bildschirm) — und zöge
     // den Parallax dann auf 0, während ein ANDERES Overlay ihn gerade benutzt.
+    //
+    // Im SELBEN Bild wie die Kurve darüber: Beide gehören zusammen, ein
+    // Versatz wäre an der Kante zu sehen.
     if (ownsCoverRef.current || wasMoving) {
       ownsCoverRef.current = false;
       overlayCover.value = withTiming(0, COVER_OUT_SPRING);
     }
-    return undefined;
+    });
+    return () => cancelAnimationFrame(raf);
   }, [open, screenWidth]);
 
   // Route-Detour („auf Karte zeigen" → andere Route): NUR den Parallax
@@ -806,45 +830,50 @@ const DetailsContent = memo(function DetailsContent({
 
   const currentLogoUrl = urls[logoIdx];
 
+  /**
+   * Der Stil der Wurzel EINMAL, nicht bei jedem Durchgang neu.
+   *
+   * Hier standen drei Objekt-Literale und ein Array-Literal auf genau dem
+   * Knoten, den Reanimated Bild für Bild beschreibt — und dieser Bildschirm
+   * rendert während der Fahrt mehrfach (Logo-Wechsel, `atRest`, Speicher).
+   * Auf Fabric ist jedes davon ein Commit gegen die laufende Bewegung.
+   *
+   * `elevation` bleibt an `atRest` geknüpft: Dauerhaft gesetzt verlangt es von
+   * Android auf einer bildschirmfüllenden Ansicht mit Rundung und Beschnitt in
+   * JEDEM Bild einen Schattenpass — auch im Ruhezustand, in dem gescrollt wird.
+   * Gebraucht wird er nur, während die Kante über die Unterlage läuft.
+   *
+   * `backgroundColor` ist dabei PFLICHT, nicht Deko: Ohne ihn berechnet Android
+   * die Schatten-Kontur aus den eckigen Grenzen, und ein eckiger Schatten füllt
+   * die runde Aussparung mit einem dunklen Quadrat — die Ecke WIRKT dann beim
+   * Herausgleiten wieder eckig.
+   */
+  const sheetChrome = useMemo(
+    () => ({
+      backgroundColor: palette.bg,
+      borderRadius: SCREEN_CORNER_RADIUS,
+      overflow: "hidden" as const,
+    }),
+    [palette.bg],
+  );
+  const sheetRank = useMemo(
+    // Höher als das Halt-Blatt (zIndex 100, elevation 16), damit dieses Blatt
+    // ganz vorne liegt, wenn es aus dem Umgebungs-Blatt heraus geöffnet wird.
+    () => ({ zIndex: 200, elevation: atRest ? 0 : 24 }),
+    [atRest],
+  );
+  const sheetStyle = useMemo(
+    () => [StyleSheet.absoluteFill, sheetRank, sheetChrome, slideStyle],
+    [sheetRank, sheetChrome, slideStyle],
+  );
+
   const origin = splitCity(originName);
   const destination = splitCity(destName);
 
   return (
     <Animated.View
       pointerEvents={open && !hiddenForRoute ? "auto" : "none"}
-      style={[
-        StyleSheet.absoluteFill,
-        // Höher als StopDetailSheet (zIndex 100, elevation 16) damit der
-        // Overlay GANZ VORNE liegt, wenn er via Departure-Tap aus dem
-        // Surroundings-Sheet geöffnet wird.
-        /**
-         * `elevation` NUR während der Bewegung.
-         *
-         * Dauerhaft gesetzt verlangt es von Android auf einer
-         * bildschirmfüllenden Ansicht mit Rundung und Beschnitt in JEDEM Bild
-         * einen Schattenpass — auch im Ruhezustand, in dem gescrollt wird. Die
-         * Ergebnisliste hat genau das an ihrer Wurzel deshalb entfernt, mit
-         * ausformulierter Begründung („ein guter Teil der Zähigkeit"); dieses
-         * Blatt war das einzige, das es behalten hat. Der Ortspicker macht es
-         * schon richtig (`elevation: layered ? 32 : 0`).
-         *
-         * Gebraucht wird der Schatten nur, während die Kante sichtbar über die
-         * Unterlage läuft — im Stand deckt das Blatt ohnehin alles.
-         */
-        { zIndex: 200, elevation: atRest ? 0 : 24 },
-        // Gerundete Ecken beim Reinsliden — reiner Transform-View, clipToOutline
-        // ist günstig (siehe SCREEN_CORNER_RADIUS).
-        //
-        // backgroundColor ist HIER PFLICHT, nicht Deko: Diese View trägt
-        // elevation:24. Ohne Background berechnet Android die Schatten-Outline aus
-        // den (eckigen) View-Bounds → ein ECKIGER Schatten füllt genau die runde
-        // Ecken-Aussparung mit einem dunklen Quadrat, sodass die Ecke beim
-        // Rausgleiten wieder eckig WIRKT. Mit Background wird die Outline rund und
-        // der Schatten folgt der Rundung. (results hat kein elevation,
-        // TicketDetailOverlay hat den Background schon.)
-        { backgroundColor: palette.bg, borderRadius: SCREEN_CORNER_RADIUS, overflow: "hidden" },
-        slideStyle,
-      ]}
+      style={sheetStyle}
     >
       <SafeAreaView style={[styles.root, { backgroundColor: palette.bg }]} edges={["top"]}>
         {/* Header: runde 40×40-Icon-Buttons, Heart wird beim Save komplett

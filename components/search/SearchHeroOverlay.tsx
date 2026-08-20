@@ -25,8 +25,8 @@ import { TAB_BAR_H } from "@/components/ui/BinchTabBar";
 import type { TravelMode } from "@/types/search";
 import { SearchHero } from "@/components/search/SearchHero";
 import { subscribeHandoffLayer, warmHandoffLayer, setSearchScreenOpenProbe, setSheetMoving, subscribeSheetMoving } from "@/lib/nav/searchHandoff";
-import { subscribeLayer } from "@/lib/nav/transitionLayer";
-import { resultsPush, heroClipPush, overlayCover as parallaxCover, pushProgress, UNDERLAY_TRAVEL_FRAC, SCREEN_CORNER_RADIUS, PUSH_SPRING, POP_SPRING, COVER_IN_SPRING, SHEET_IN, SHEET_OUT, markSheetMoving,
+import { holdLayer, layerGeneration, rearmLayer, releaseLayer, subscribeLayer } from "@/lib/nav/transitionLayer";
+import { resultsPush, heroClipPush, searchHeroPush, startSearchHeroPush, isSearchHeroPushStarted, endSearchHeroPush, searchHeroSettled, setSearchHeroArrivedHandler, overlayCover as parallaxCover, pushProgress, UNDERLAY_TRAVEL_FRAC, SCREEN_CORNER_RADIUS, PUSH_SPRING, POP_SPRING, COVER_IN_SPRING, SHEET_IN, SHEET_OUT, markSheetMoving,
   warmPushCurves,
 } from "@/lib/nav/overlayCover";
 import { haptic } from "@/lib/haptics";
@@ -37,7 +37,7 @@ import { scaledStyles } from "@/lib/ui/compact";
  *
  * Bewegung und Maße sind die des Anmelde-Screens (`BinchAuthScreen`): Dort steht
  * Die Zahlen und die Kurve stehen inzwischen zentral (SHEET_IN/SHEET_OUT),
- * hier dieselben Zahlen und dieselbe Kurve als geteilter Wert (`sheetY`) — dieser
+ * hier dieselben Zahlen und dieselbe Kurve als geteilter Wert — dieser
  * Baum bleibt dauerhaft gemountet und kann deshalb keine Ein-/Aussprung-Animation
  * bekommen.
  *
@@ -93,8 +93,17 @@ const FULLSCREEN: SearchOverlayLaunch = { x: 0, y: 0, w: SW, h: SH, color: APP_B
  * Wert; das Ergebnis ist dasselbe.
  */
 // Zentral vorgegeben — siehe SHEET_IN dort. Vorher standen die Zahlen hier.
-const SLIDE_IN = SHEET_IN;
-const SLIDE_OUT = SHEET_OUT;
+/**
+ * Das Such-Blatt fährt die PUSH-Bewegung — von rechts, mit Parallax auf dem
+ * Landingscreen. Dieselbe wie Ergebnisliste, Bo, Detail- und Ticket-Blatt.
+ *
+ * Vorher war es ein Blatt von unten (`SHEET_IN`/`SHEET_OUT`) samt wachsendem
+ * Startfenster auf der Kachel. Das war eine zweite Bewegungssprache für
+ * dieselbe Sache; die App kennt jetzt genau einen Weg, wie ein Bildschirm über
+ * einen anderen kommt.
+ */
+const SLIDE_IN = PUSH_SPRING;
+const SLIDE_OUT = POP_SPRING;
 // Weiche Splash-Ausblendung am Reveal (statt hartem Verschwinden) — deckt den
 // Swap-Übergang ab, sodass ein Timing-Race nicht durchblitzt. Länger als
 // WAVE_DELAY (150), damit auch der Wellen-Start noch mit-maskiert wird.
@@ -115,7 +124,7 @@ const WAVE_DELAY_MS = 150;
 
 /**
  * Wärmt beim App-Start die Reanimated/Fabric-Maschinerie auf — VÖLLIG isoliert
- * vom Launch-Zustandsautomaten (fasst weder `active` noch `searchLaunch` an,
+ * vom Launch-Zustandsautomaten (fasst `active` nicht an,
  * kann den Launch also nicht kaputtmachen, siehe der revertierte Prewarm-Bug).
  *
  * Warum nötig: Der ERSTE echte Kachel-Klick ruckelt einmalig, danach nie wieder.
@@ -241,6 +250,14 @@ export function SearchHeroOverlay() {
   const [resetTick, setResetTick] = useState(0);
   const rafRef = useRef<number | null>(null);
   const revealRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * Die beiden Nachlauf-Bilder des Schließens — sie MÜSSEN abbrechbar sein.
+   *
+   * `finishClose` räumt zwei Bilder nach dem Kurvenende auf. Wird in genau
+   * diesem Fenster wieder geöffnet, lief das Aufräumen bisher trotzdem — in den
+   * frisch geöffneten Bildschirm hinein. Siehe die Begründung dort.
+   */
+  const finishRafRef = useRef<number | null>(null);
 
   /** 0 = Content unsichtbar (Splash deckt), 1 = Content sichtbar. Harter
    *  Schalter, KEIN Fade — der Wechsel passiert, während der Splash vollflächig
@@ -254,15 +271,22 @@ export function SearchHeroOverlay() {
    *  gesetzt (sonst bliebe der Splash beim Schrumpfen unsichtbar). */
 
   /**
-   * Position des Blattes: 0 = oben angekommen, SH = unterhalb des Bildes.
+   * Fortschritt des Blattes: 0 = ganz rechts außerhalb, 1 = deckt den Schirm.
    *
    * Das ersetzt die gesamte Wachstums-Choreografie (Splash-Box, fliegendes
    * Symbol, Kachel-Geometrie, Radien-Morph). Der Screen ist keine Box mehr, die
    * aus einer Kachel wächst, sondern ein Blatt, das von unten hereinfährt.
    */
-  const sheetY = useSharedValue(0);
+  /**
+   * Der Fortschritt liegt MODULWEIT, nicht hier: 0 = ganz rechts außerhalb,
+   * 1 = deckt den Schirm. Der Landingscreen liest denselben Wert für seinen
+   * Parallax — zwei getrennte Werte könnten auseinanderlaufen, und schon das
+   * liest sich als Ruckeln (siehe `resultsPush`).
+   */
   /** Läuft die Bewegung? Nur dann eine GPU-Ebene — siehe Rückruf beim Öffnen. */
   const [moving, setMoving] = useState(false);
+  /** Zurücknehmen der vorgezogenen Textur, wenn aus dem Tipp nichts wird. */
+  const disarmRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /**
    * Auch während ein Picker darüber fährt eine Ebene halten.
    *
@@ -298,7 +322,26 @@ export function SearchHeroOverlay() {
      * diese Meldung nur noch mitgehört.
      */
     const flags = { loc: false, date: false, moving: false };
-    const apply = () => setPickerBusy(flags.loc || flags.date || flags.moving);
+    /**
+     * Bei GESCHLOSSENER Suche gar nichts tun.
+     *
+     * Dieser Baum hängt dauerhaft am Wurzel-Layout, und `subscribeSheetMoving`
+     * ist ein globaler Schalter OHNE Schlüssel — er meldet jede angemeldete
+     * Fahrt der App. Bo zu öffnen ließ damit das komplette Blatt neu rendern
+     * und flippte die Textur auf seiner bildschirmfüllenden Wurzel, in Bild 1
+     * von Bos Fahrt, obwohl der Such-Screen daran gar nicht beteiligt ist. Am
+     * Ende der Fahrt dasselbe noch einmal.
+     *
+     * `BinchHero` hat für genau diesen Fall längst einen Wächter und begründet
+     * ihn dort ausführlich; hier fehlte er.
+     */
+    const apply = () => {
+      if (useSearchStore.getState().searchOverlayMode == null) {
+        setPickerBusy(false);
+        return;
+      }
+      setPickerBusy(flags.loc || flags.date || flags.moving);
+    };
     const offLoc = subscribeLayer("pickerLocation", (v) => {
       flags.loc = v;
       apply();
@@ -339,16 +382,6 @@ export function SearchHeroOverlay() {
 
   const overlayVisible = useSharedValue(0);
 
-  // WARMUP der ECHTEN Expand-Worklets (splashStyle/flyStyle/backStyle) beim
-  // App-Start, hinter der 3,5s-BinchSplash. Ihr ERSTER Lauf ist sonst kalt →
-  // der allererste Expand ruckelt genau WÄHREND die Box wächst (vom User
-  // bestätigt). Die separate LaunchWarmup-View wärmt nur die Reanimated-Runtime
-  // allgemein, nicht DIESE Worklets. Hier fahren wir searchLaunch EINMAL durch:
-  // Splash/Icon sind dauerhaft gemountet, ihre Worklets laufen dabei wirklich an
-  // und sind danach warm. Unsichtbar (active=null → äußere opacity 0) und fasst
-  // den Zustandsautomaten NICHT an (kein setActive/session) — anders als der
-  // revertierte Prewarm, kann also nichts kaputtmachen. searchLaunch ist ein
-  // modulweiter Shared Value, der NUR vom Overlay gelesen wird (verifiziert).
   /**
    * Kam der Launch von einer Kachel?
    *
@@ -418,10 +451,69 @@ export function SearchHeroOverlay() {
     });
   }, []);
 
+  /**
+   * Den schweren Himmel-SVG schon beim BERÜHREN zeichnen lassen.
+   *
+   * Er ist der teuerste Baum dieses Bildschirms, und `display: none` heißt: Es
+   * gibt ihn noch gar nicht. Seine Erstzeichnung fiel damit in die ersten
+   * Bilder der Fahrt — und weil sie je nach Last mal in dieses Bild fällt und
+   * mal ins nächste, trat der Ruckler nur „manchmal" auf, vor allem beim ERSTEN
+   * Öffnen.
+   *
+   * Die Auslöser fordern den Inhalt jetzt schon an, wenn der Finger aufsetzt.
+   * Damit Android ihn auch wirklich zeichnet, muss die Hülle sichtbar sein —
+   * eine Ansicht mit Deckkraft 0 zeichnet es gar nicht erst. Zu sehen ist davon
+   * trotzdem nichts: Das Blatt steht zu diesem Zeitpunkt eine volle Breite
+   * rechts neben dem Bild.
+   */
+  const contentRequested = useSearchStore((st) => st.searchContentVisible);
+  useEffect(() => {
+    if (!contentRequested) return;
+    overlayVisible.value = 1;
+    /**
+     * Und wieder abräumen, wenn aus der Berührung kein Tipp wird.
+     *
+     * Der Vorlauf hängt am Aufsetzen des Fingers, und der führt nicht immer zu
+     * einem Öffnen — wer stattdessen wischt, ließe den schweren SVG sonst
+     * dauerhaft gelayoutet zurück. Unsichtbar, aber gelayoutet kostet er
+     * laufend Scroll-Leistung im Landingscreen; genau davor warnt der
+     * Kommentar am Schließ-Weg.
+     *
+     * Zwei Sekunden sind großzügig: Zwischen Aufsetzen und Loslassen liegen
+     * Zehntelsekunden, alles darüber war kein Vorlauf für dieses Öffnen.
+     */
+    if (active) return;
+    const id = setTimeout(() => {
+      const st = useSearchStore.getState();
+      if (st.searchOverlayMode != null) return;
+      overlayVisible.value = 0;
+      st.setSearchContentVisible(false);
+    }, 2000);
+    return () => clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [contentRequested, active]);
+
   useEffect(() => {
     if (mode) {
-      // Unter den Bildrand stellen, von wo aus gleich hereingefahren wird.
-      sheetY.value = SH;
+      /**
+       * Ein noch offenes Aufräumen des VORIGEN Schließens abbrechen.
+       *
+       * Es liegt zwei Bilder hinter dem Kurvenende und hätte `active` gleich
+       * wieder auf null gesetzt — mitten in diese Öffnung hinein. Was daraus
+       * folgt, steht bei `finishClose`.
+       */
+      if (finishRafRef.current !== null) {
+        cancelAnimationFrame(finishRafRef.current);
+        finishRafRef.current = null;
+      }
+      /**
+       * KEIN Zurücksetzen des Fortschritts mehr.
+       *
+       * Er steht seit dem Tipp-Handler auf einer laufenden Kurve. Ihn hier auf
+       * null zu setzen würgt genau die Bewegung ab, die der Nutzer schon sieht,
+       * und sie fängt zwei Bilder später von vorn an. Für die Wege ohne Kachel
+       * setzt `startSearchHeroPush` ihn ohnehin selbst.
+       */
       setMoving(true);
       setSheetMoving(true);
       // Den Himmel-SVG JETZT anlegen — ein Bild VOR dem Start der Bewegung.
@@ -442,10 +534,42 @@ export function SearchHeroOverlay() {
       // deckend. Aus DEMSELBEN Commit heraus laufen beide Effekte im selben
       // Durchgang, und der Reset gewinnt — der Vorhang blieb für immer zu. Das
       // Ausblenden gehört deshalb weiterhin in den rAF, einen Commit später.
+      // Steht seit dem Vorlauf beim Berühren schon auf `true` (siehe den
+      // Abonnenten weiter unten). Bleibt hier als Notausgang für die Wege, die
+      // keinen Berührungs-Moment haben (Sprachbefehl, Wiederherstellung).
       useSearchStore.getState().setSearchContentVisible(true);
-      // Noch NICHT sichtbar schalten — erst der rAF (nächster Frame) macht das,
-      // wenn Reanimated den Ausgangswert angewandt hat.
-      setLaunchActive(false);
+      /**
+       * Die Textur des Landingscreens halten, solange das Blatt darüber liegt.
+       *
+       * Angefordert wird sie beim Aufsetzen des Fingers und verfällt nach 1,4
+       * Sekunden. Wer länger sucht — also immer —, fuhr die Rückfahrt ohne
+       * Ebene, und der Landingscreen wird dabei mit seinen vier bildschirmhohen
+       * Bildkarten jedes Bild neu gezeichnet. Detail-, Ticket-Blatt und
+       * Ergebnisliste machen es seit Längerem richtig.
+       */
+      holdLayer("home");
+      /**
+       * SOFORT setzen — nicht erst im rAF darunter.
+       *
+       * Der Merker stand hier auf `false` und kippte erst ein Bild später auf
+       * `true`, mit der Begründung, sichtbar werden dürfe nichts, bevor
+       * Reanimated den Ausgangswert angewandt hat. Diese Begründung ist
+       * überholt: Sichtbarkeit hängt seit Längerem an `overlayVisible`, einem
+       * Wert auf dem UI-Strang (siehe `outerOpacityStyle`, wo genau das steht).
+       * Übrig geblieben ist ein einziger Verbraucher — `pointerEvents` auf der
+       * Wurzel.
+       *
+       * Der Preis dafür war hoch: Das Kippen ist ein SPEICHER-Schreibvorgang,
+       * weckt also jeden Selektor der App, rendert diesen Bildschirm neu und
+       * ändert eine Eigenschaft auf genau dem Knoten, den Reanimated gerade
+       * Bild für Bild beschreibt — und das im ERSTEN oder zweiten Bild der
+       * Einfahrt. Zusammen mit `setActive` in dieser Zeile ist es ein Commit
+       * statt zwei, und der liegt VOR der Bewegung.
+       *
+       * Zu früh anfassbar wird dadurch nichts: Das Blatt steht in diesem
+       * Durchgang noch eine volle Breite rechts neben dem Bild.
+       */
+      setLaunchActive(true);
       /**
        * SICHTBAR schalten, BEVOR die Bewegung anläuft.
        *
@@ -459,7 +583,7 @@ export function SearchHeroOverlay() {
        * füllenden Hardware-Ebene (im Projekt mit 66ms vermessen).
        *
        * Sichtbar wird dadurch nichts zu früh: Das Blatt steht in dieser Zeile
-       * auf `sheetY = SH`, also vollständig unterhalb des Bildrands.
+       * auf Fortschritt 0, steht also vollständig rechts neben dem Bild.
        */
       overlayVisible.value = 1;
       // Zuerst zurücksetzen (Screen ist noch unsichtbar), dann öffnen.
@@ -488,7 +612,8 @@ export function SearchHeroOverlay() {
         // Beschnitt zurücksetzen, sonst bliebe dieser Screen beim nächsten Öffnen
         // seitlich verschoben stehen.
         heroClipPush.value = 0;
-        sheetY.value = SH;
+        searchHeroPush.value = 0;
+        endSearchHeroPush();
         overlayVisible.value = 0;
         setActive(null);
         setLaunchActive(false);
@@ -508,6 +633,7 @@ export function SearchHeroOverlay() {
          */
         setMoving(false);
         setSheetMoving(false);
+        searchHeroSettled();
         // Hier sofort: In diesem Zweig ist nichts mehr zu sehen.
         useSearchStore.getState().setSearchContentVisible(false);
       } else {
@@ -516,24 +642,153 @@ export function SearchHeroOverlay() {
         // 50ms kürzer (so macht es der Auth-Screen).
         setMoving(true);
         setSheetMoving(true);
-        sheetY.value = withTiming(SH, SLIDE_OUT, (finished) => {
+        // Und die Ebene der Unterlage für die Rückfahrt scharf stellen.
+        rearmLayer("home");
+        /**
+         * Den Merker JETZT zurücknehmen, nicht erst am Ende der Kurve.
+         *
+         * An ihm hängt der Notausgang für die Wege ohne Kachel (Reiseziel-Karte,
+         * Buchen-Knopf). Bliebe er stehen, würde beim nächsten Öffnen über einen
+         * dieser Wege gar keine Bewegung mehr starten — das Blatt käme ohne
+         * Fahrt ins Bild.
+         *
+         * Und ein Bild Vorlauf für die Ausfahrt, wie ihn `sheetSlide.ts` für
+         * beide Richtungen vorschreibt: Der Ebenen-Wechsel eine Zeile darüber
+         * fiel sonst ins erste Bild der Rückfahrt.
+         */
+        endSearchHeroPush();
+        markSheetMoving(SLIDE_OUT.duration);
+        // Und die Unterlagen-Textur am Ende der Rückfahrt freigeben statt sie
+        // 1,4 Sekunden später von selbst verfallen zu lassen — siehe Bo.
+        {
+          const gen = layerGeneration("home");
+          /**
+           * Mit ABSTAND, nicht 40ms hinter der Kurve.
+           *
+           * Das Abreißen einer Textur ist kein Buchhaltungs-Schritt: Die
+           * bildschirmfüllende Ebene des Landingscreens wird verworfen, und die
+           * Fläche darunter muss einmal komplett neu gezeichnet werden — mit ihren
+           * vier fast bildschirmhohen Bildkarten. 40ms nach dem Ende hieß: genau im
+           * Nachklang der Bewegung, wo der Parallax gerade ausläuft und das Auge
+           * noch daran hängt. Das ist der Teil von „der Parallax ruckelt", der gar
+           * nicht mehr in der Fahrt liegt.
+           *
+           * Weit genug weg vom Ende, weit genug vor der 1,4-Sekunden-Frist, gegen
+           * die diese Freigabe überhaupt eingebaut wurde.
+           */
+          setTimeout(() => releaseLayer("home", gen), SLIDE_OUT.duration + 260);
+        }
+        requestAnimationFrame(() => {
+        searchHeroPush.value = withTiming(0, SLIDE_OUT, (finished) => {
           if (finished) {
             overlayVisible.value = 0;
-            runOnJS(setActive)(null);
-            runOnJS(setLaunchActive)(false);
-            runOnJS(setMoving)(false);
+            /**
+             * Nur das Nötigste im Abschluss-Bild — der Rest zwei Bilder später.
+             *
+             * Hier standen sieben Schritte auf einem Haufen, darunter ZWEI
+             * Speicher-Schreibvorgänge (`setActive`, `setLaunchActive`,
+             * `hideSearchContent`) und der `display:none`-Schalter des
+             * schwersten SVG der App — bildgenau auf dem Kurvenende, dessen
+             * letztes Bild noch in der Komposition stecken kann.
+             *
+             * Ebenen-Abbau und Abmelden bleiben hier: Sie gehören zur Bewegung
+             * und sind billig. Alles, was den Baum umbaut, wartet.
+             */
+            /**
+             * `setMoving(false)` steht NICHT mehr hier.
+             *
+             * Es kippt die Textur-Eigenschaft auf genau dem Knoten, den
+             * Reanimated eben noch Bild für Bild beschrieben hat — bildgenau
+             * auf dem Abschluss, dessen letztes Bild noch in der Komposition
+             * stecken kann. Es ist im Nachlauf ebenso richtig aufgehoben wie
+             * die drei Schritte dort und kostet dann niemanden mehr etwas.
+             */
             runOnJS(setSheetMoving)(false);
-            // ERST JETZT den Himmel abschalten — er fährt mit hinaus. Vorher
-            // blieb eine schwarze Fläche übrig. Abschalten muss er trotzdem:
-            // unsichtbar, aber gelayoutet kostet er dauerhaft Scroll-Leistung
-            // im Landingscreen.
-            runOnJS(hideSearchContent)();
+            runOnJS(searchHeroSettled)();
+            runOnJS(finishClose)();
           }
         });
+        });
       }
+    } else if (isSearchHeroPushStarted()) {
+      /**
+       * NOTAUSGANG: zu, aber `active` war schon weg.
+       *
+       * Beide Zweige darüber hängen an `active`. Steht der Bildschirm im Bild,
+       * während die Zahl null ist, fällt ein Schließen zwischen sie — und dann
+       * bleibt das Blatt für immer stehen: sichtbar, ohne Zurück-Pfeil, ohne
+       * Griff auf die Zurück-Geste, für Berührungen durchlässig. Der Tab-Druck
+       * unter ihm wechselt zwar den Tab, zu sehen ist davon aber nichts. Genau
+       * dieser Zustand war zu beobachten.
+       *
+       * Die Ursache dafür ist eine Zeile weiter oben behoben (`finishClose`).
+       * Dieser Ausgang bleibt trotzdem: Er kostet im Normalfall einen
+       * Zahlenvergleich, und er macht die Klasse als solche unmöglich, statt
+       * nur den einen bekannten Weg hinein.
+       *
+       * `isSearchHeroPushStarted()` ist dafür der richtige Prüfstein: ein
+       * JS-Merker, gesetzt vom Start der Fahrt, zurückgenommen vom Schließen.
+       * Steht er beim Schließen noch, gab es eine Fahrt, die nie abgeschlossen
+       * wurde. Beim ersten Durchlauf nach dem Start steht er auf falsch, hier
+       * passiert also nichts. Den Fortschritt selbst zu LESEN wäre der falsche
+       * Weg — ein Lesezugriff aus React sperrt beide Stränge gegeneinander,
+       * siehe die Warnungen in `overlayCover.ts`.
+       */
+      heroClipPush.value = 0;
+      searchHeroPush.value = 0;
+      endSearchHeroPush();
+      overlayVisible.value = 0;
+      setLaunchActive(false);
+      setMoving(false);
+      setSheetMoving(false);
+      searchHeroSettled();
+      useSearchStore.getState().setSearchContentVisible(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, session]);
+
+  /**
+   * Der schwere Teil des Aufräumens — zwei Bilder nach dem Kurvenende.
+   *
+   * Zwei Speicher-Schreibvorgänge und der Abbau des Himmel-SVG. Siehe die
+   * Begründung am Abschluss-Rückruf.
+   */
+  const finishClose = () => {
+    finishRafRef.current = requestAnimationFrame(() => {
+      finishRafRef.current = requestAnimationFrame(() => {
+        finishRafRef.current = null;
+        /**
+         * LEBEND-PRÜFUNG — ohne sie legt dieses Aufräumen den Bildschirm lahm.
+         *
+         * Zwischen dem Kurvenende und diesen zwei Bildern kann längst wieder
+         * geöffnet worden sein (Blatt zu, Finger gleich wieder auf einer
+         * Kachel). Dann steht der Bildschirm hier VOLL im Bild, und das
+         * Aufräumen des vorigen Durchgangs setzte trotzdem `active` auf null.
+         * Was danach fehlt, hängt alles an dieser einen Zahl:
+         *
+         *   • Der Zurück-Pfeil oben links wird gar nicht erst gerendert.
+         *   • Der Griff auf die Zurück-Geste meldet sich nicht an — sie fiel
+         *     durch bis zum System und schloss die ganze App.
+         *   • Die Wurzel steht auf `pointerEvents: none`, im Blatt lässt sich
+         *     also nichts mehr anfassen.
+         *   • Und der Ausweg fehlt ebenfalls: Der Schließ-Zweig unten hängt an
+         *     `active`, ein Tab-Druck lief damit ins Leere. Das Blatt blieb
+         *     stehen, tot, über allem.
+         *
+         * `hideSearchContent` hatte diese Prüfung schon; die drei Zeilen
+         * daneben nicht. Sie gehört an den Anfang, nicht in die Mitte.
+         */
+        if (useSearchStore.getState().searchOverlayMode != null) return;
+        // Die Textur der Fahrt — siehe den Abschluss-Rückruf. Wurde inzwischen
+        // wieder geöffnet, greift der Ausstieg darüber, und sie bleibt stehen:
+        // Dann FÄHRT der Bildschirm ja auch wieder.
+        setMoving(false);
+        setActive(null);
+        setLaunchActive(false);
+        hideSearchContent();
+      });
+    });
+  };
 
   const hideSearchContent = () => {
     // Nur, wenn inzwischen nicht schon wieder geöffnet wurde.
@@ -571,18 +826,41 @@ export function SearchHeroOverlay() {
     if (!active) return;
     if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
     rafRef.current = requestAnimationFrame(() => {
-      // JETZT sichtbar schalten: Reanimated hat den animierten Style ab hier
-      // angewandt → der Splash sitzt auf der Kachel, das Icon auch. Der versteckte
-      // erste Frame (Glitch) ist übersprungen.
-      setLaunchActive(true);
-      sheetY.value = SH;
-      markSheetMoving();
-      sheetY.value = withTiming(0, SLIDE_IN, (finished) => {
-        if (!finished) return;
-        // Textur nur für die Dauer der Bewegung — darunter liegt der Hero-SVG,
-        // dauerhaft wäre sie bei jeder Formular-Eingabe neu zu rastern.
-        runOnJS(setMoving)(false);
-        runOnJS(setSheetMoving)(false);
+      // `setLaunchActive` steht NICHT mehr hier, sondern im Öffnungs-Zweig
+      // oben — die Begründung dazu ebenfalls. Dieser Rückruf schreibt damit
+      // keinen React-Zustand mehr, er meldet nur noch an und hinterlegt den
+      // Verteiler. Nichts davon löst einen Commit aus.
+      // Mit der PUSH-Dauer anmelden, nicht mit der Blatt-Dauer — sonst gilt der
+      // Bildschirm 130ms zu kurz als „fährt", und alles, was darauf wartet
+      // (Texturen, Leerlauf-Arbeit), fällt in die letzten Bilder der Bewegung.
+      markSheetMoving(SLIDE_IN.duration);
+      /**
+       * Die Kurve wird hier NICHT (neu) gestartet.
+       *
+       * Sie läuft seit dem Tipp-Handler. Sie hier noch einmal von null
+       * loszuschicken hieße, die schon sichtbare Bewegung abzuwürgen und zwei
+       * Bilder später neu anzusetzen — genau der Sprung, den der Vorlauf
+       * vermeiden soll. Der Notausgang darunter greift nur für Wege ohne
+       * Kachel (Reiseziel-Karte, Buchen-Knopf, Sprachbefehl).
+       */
+      if (!isSearchHeroPushStarted()) startSearchHeroPush();
+      /**
+       * Läuft auf dem JS-Strang — der Verteiler in `overlayCover` springt
+       * bereits über `runOnJS` herüber. Deshalb hier KEIN weiteres `runOnJS`.
+       */
+      setSearchHeroArrivedHandler(() => {
+        /**
+         * Textur nur für die Dauer der Bewegung — darunter liegt der Hero-SVG,
+         * dauerhaft wäre sie bei jeder Formular-Eingabe neu zu rastern.
+         *
+         * Ein Bild Abstand, wie am Ende der Ausfahrt: Der Schalter sitzt auf
+         * dem animierten Knoten, und dieser Rückruf läuft auf dem Abschluss der
+         * Kurve — deren letztes Bild kann noch in der Komposition stecken.
+         */
+        requestAnimationFrame(() => setMoving(false));
+        setSheetMoving(false);
+        // Auch beim Textur-Riegel abmelden — siehe `startSearchHeroPush`.
+        searchHeroSettled();
         /**
          * Sonnenaufgang und Einblend-Takt erst JETZT — nach der Bewegung.
          *
@@ -600,12 +878,15 @@ export function SearchHeroOverlay() {
          * Jetzt trägt die Bewegung einen vollständig statischen Baum — genau das
          * Modell des Anmelde-Screens, an dem sie nachgebaut ist.
          */
-        runOnJS(onReveal)();
+        onReveal();
       });
     });
     return () => {
       if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
       if (revealRef.current) clearTimeout(revealRef.current);
+      // Den Verteiler leeren — sonst liefe die Aufräumarbeit eines alten
+      // Durchgangs in einen neuen hinein.
+      setSearchHeroArrivedHandler(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
@@ -613,6 +894,21 @@ export function SearchHeroOverlay() {
   useEffect(() => {
     if (Platform.OS !== "android" || !active) return;
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      /**
+       * Liegt ein WÄHLER darüber, gehört der Druck ihm.
+       *
+       * Android ruft die Zuhörer in umgekehrter Anmeldereihenfolge auf — und
+       * die Wähler melden sich beim Aufbau im Leerlauf an (Sekunde 4 bzw. 5),
+       * dieses Blatt erst beim Öffnen. Es meldet sich also SPÄTER an und gewinnt
+       * damit gegen den Wähler, der gerade obenauf liegt. Ergebnis: Die
+       * Zurück-Geste schloss zuerst das Blatt und danach erst den Wähler, also
+       * genau verkehrt herum.
+       *
+       * `false` heißt „nicht meiner" — dann kommt der Wähler dran, so wie es
+       * sein soll.
+       */
+      const st = useSearchStore.getState();
+      if (st.locationPickerRequest !== null || st.datePickerRequest !== null) return false;
       close();
       return true;
     });
@@ -621,25 +917,6 @@ export function SearchHeroOverlay() {
 
   // Kachel-Rect aus dem State (kein Shared-Value-Lag). In die Worklets wird es
   // als konstanter Wert eingefangen — es ändert sich pro Launch, nicht pro Frame.
-
-  // SPLASH — DUAL-MODE, je nach Richtung (closing):
-  //
-  // ÖFFNEN via transform:scale (butterweich; kein Pro-Frame-Layout/Clip). Feste
-  // Ecken (runde Oberkante = Geräte-Radius, EckIGE Unterkante = 0, bündig zur
-  // Nav-Bar) → KEINE Radius-Animation → kein Clip-Flacker während des Wachsens.
-  // Die Box-Form (rund oben, eckig unten) skaliert konsistent von Kachel → Vollbild.
-  //
-  // SCHLIESSEN via Layout (left/top/width/height + animierte Radien) — so schrumpft
-  // die Box mit EXAKTEN, sauber runden Ecken auf die Kachel (TILE_RADIUS an allen
-  // vier). transform:scale würde die Ecken nahe der Kachel non-uniform verzerren
-  // (wirkt spitz). Pro-Frame-Layout ist beim Schließen unkritisch (kurz, weniger
-  // beobachtet, kein Reveal danach).
-  //
-  // Beide Zweige liefern DIESELBEN Keys (konsistent für Reanimated). Bei p=1
-  // stimmen beide überein (Vollbild, runde Oberkante, eckige Unterkante) → der
-  // Übergang Öffnen→Schließen ist nahtlos.
-
-
 
   // Äußere Overlay-Sichtbarkeit — UI-Thread (overlayVisible), synchron mit dem
   // Wachstum. Ersetzt das frühere React-Gate `active && launchActive`.
@@ -655,8 +932,25 @@ export function SearchHeroOverlay() {
    */
   const sheetStyle = useAnimatedStyle(() => ({
     transform: [
-      { translateY: sheetY.value },
-      { translateX: -winW * pushProgress(heroClipPush.value) },
+      {
+        /**
+         * Hereinfahren von rechts UND das Wegschieben bei der Übergabe an die
+         * Ergebnisliste — in EINEM Wert. Die beiden treten nie gleichzeitig auf.
+         *
+         * Die Strecke ist `winW`, das LAUFENDE Maß — anders als bei den
+         * Blättern von unten, und mit Absicht: Die Regel in `sheetSlide.ts`
+         * gilt der HÖHE, weil die unter `adjustResize` mit der Tastatur
+         * wandert. Die Breite tut das nicht (Hochkant festgelegt).
+         *
+         * Und hier hängt mehr daran: Die Ergebnisliste rechnet ebenfalls mit
+         * `useWindowDimensions`. Eine andere Quelle wich um ein paar Pixel ab,
+         * und übrig blieb ein schmaler Streifen am linken Rand, in dem der
+         * Such-Screen durchschien — siehe den Kommentar bei `winW` oben.
+         */
+        translateX:
+          (1 - pushProgress(searchHeroPush.value)) * winW -
+          winW * pushProgress(heroClipPush.value),
+      },
     ],
   }));
 
@@ -781,6 +1075,46 @@ export function SearchHeroOverlay() {
       {active ? (
         <Animated.View style={[styles.backWrap, { top: insets.top + 10 }]}>
           <Pressable
+            /**
+             * Die GPU-Textur schon beim AUFSETZEN des Fingers.
+             *
+             * Ihr Aufbau ist im Projekt mit 66ms vermessen, bei einem
+             * Bildbudget von 8,3ms — also acht Bilder. Bisher kippte `moving`
+             * erst im Schließ-Effekt, ein einziges Bild vor dem Start der
+             * Kurve; der Rest lief in deren erste Bilder hinein. Genau dieselbe
+             * Staffelung hat Bos X-Knopf seit Längerem, und dort ist sie
+             * ausführlich begründet.
+             *
+             * Zwischen Aufsetzen und Loslassen liegen 80 bis 150ms, die ohnehin
+             * verstreichen. Zu sehen ist von der Textur nichts — sie ist eine
+             * Momentaufnahme derselben Fläche.
+             */
+            onPressIn={() => {
+              if (disarmRef.current) {
+                clearTimeout(disarmRef.current);
+                disarmRef.current = null;
+              }
+              setMoving(true);
+            }}
+            /**
+             * Und zurücknehmen, wenn daraus kein Schließen wird.
+             *
+             * Mit Abstand, denn beim echten Tipp läuft `onPressOut` VOR
+             * `onPress` — sofort zurückgenommen fehlte die Textur genau dem
+             * Fall, für den sie angelegt wurde. Die Prüfung darin
+             * unterscheidet beide Fälle sauber: Ist inzwischen geschlossen,
+             * hat der Abschluss der Kurve `moving` längst selbst
+             * zurückgesetzt, und hier ist nichts mehr zu tun.
+             */
+            onPressOut={() => {
+              if (disarmRef.current) clearTimeout(disarmRef.current);
+              disarmRef.current = setTimeout(() => {
+                disarmRef.current = null;
+                if (useSearchStore.getState().searchOverlayMode != null) {
+                  setMoving(false);
+                }
+              }, 400);
+            }}
             onPress={() => {
               haptic("button");
               close();

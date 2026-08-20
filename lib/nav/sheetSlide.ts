@@ -40,6 +40,20 @@ import { setSheetMoving } from "./searchHandoff";
  */
 export function useSheetSlide(key: string, park: number) {
   const y = useSharedValue(park);
+  /**
+   * Die laufende Fahrt als reine JS-Angabe — siehe `from` unten.
+   *
+   * Reicht aus, um die aktuelle Lage zu SCHÄTZEN, ohne den geteilten Wert zu
+   * lesen. Die Kurve ist zwar geglättet, für die Frage „wie viel Weg ist noch
+   * übrig" genügt aber der lineare Anteil der verstrichenen Zeit — daraus wird
+   * nur die Dauer skaliert, nicht die Position gesetzt.
+   */
+  const motionRef = useRef<{ from: number; to: number; at: number; dur: number }>({
+    from: park,
+    to: park,
+    at: 0,
+    dur: 1,
+  });
   const rafRef = useRef<number | null>(null);
 
   const style = useAnimatedStyle(() => ({
@@ -70,7 +84,25 @@ export function useSheetSlide(key: string, park: number) {
        * Fortsetzung. Nach unten begrenzt, sonst zuckt es bei sehr kurzen
        * Wegen.
        */
-      const from = y.value;
+      /**
+       * Der Ausgangspunkt kommt aus einem JS-Merker, NICHT aus `y.value`.
+       *
+       * Ein Lesezugriff auf einen geteilten Wert ist von JS aus kein
+       * Feldzugriff, sondern ein SYNCHRONER Sprung in die UI-Laufzeit, der
+       * beide Stränge gegeneinander sperrt. `overlayCover.ts` verbietet das an
+       * zwei Stellen wörtlich — und hier stand es unbemerkt in der gemeinsamen
+       * Fahrt, also bei jedem Öffnen und Schließen beider Wähler, direkt vor
+       * dem Anmelden.
+       *
+       * Der Merker wird bei jedem Start und jedem Parken fortgeschrieben. Er
+       * kann nur dann vom echten Wert abweichen, wenn eine Kurve unterwegs
+       * abgebrochen wurde — und für diesen Fall ist eine konservative Schätzung
+       * völlig ausreichend: Sie bestimmt allein, wie stark die Dauer bei einer
+       * Umkehr gekürzt wird.
+       */
+      const m = motionRef.current;
+      const t = Math.min(1, Math.max(0, (Date.now() - m.at) / m.dur));
+      const from = m.from + (m.to - m.from) * t;
       const rest = show ? from : park - from;
       /**
        * Boden bei 0,15 statt 0,35 — sonst wird die Umkehr ZÄHER, je kürzer sie
@@ -84,6 +116,7 @@ export function useSheetSlide(key: string, park: number) {
       const cfgScaled = { duration: dur, easing: cfg.easing };
       markSheetMoving(dur);
       setSheetMoving(true, key);
+      motionRef.current = { from, to: show ? 0 : park, at: Date.now(), dur: Math.max(1, dur) };
       rafRef.current = requestAnimationFrame(() => {
         rafRef.current = null;
         onFrame?.(show);
@@ -141,6 +174,7 @@ export function useSheetSlide(key: string, park: number) {
       setSheetMoving(false, key);
     }
     cancelAnimation(y);
+    motionRef.current = { from: park, to: park, at: 0, dur: 1 };
     y.value = park;
   }, [key, park, y]);
 

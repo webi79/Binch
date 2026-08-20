@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 
 /**
  * EIN Zeitgeber für alle Countdowns statt einer pro Karte.
@@ -27,6 +28,19 @@ let timer: ReturnType<typeof setInterval> | null = null;
 let now = Date.now();
 
 function tick(): void {
+  /**
+   * NICHT, während etwas fährt.
+   *
+   * Ein Takt weckt jede sichtbare Abfahrtstafel — jede rendert dabei ihren
+   * SVG-Ring neu, und animierte SVG-Eigenschaften machen die ganze Fläche
+   * ungültig. Alle zehn Sekunden trifft das irgendwann eine laufende Bewegung,
+   * und weil es eben nur irgendwann trifft, ist es genau ein „manchmal ruckelt
+   * es".
+   *
+   * Übersprungen wird nur dieser eine Takt; der nächste kommt ohnehin in zehn
+   * Sekunden, und eine Minutenanzeige verträgt das mühelos.
+   */
+  if (isTransitionBusy()) return;
   now = Date.now();
   for (const fn of listeners) fn(now);
 }

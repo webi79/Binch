@@ -31,6 +31,7 @@ import { BinchSplash } from "@/components/ui/BinchSplash";
 import { KeyboardHeightProbe } from "@/lib/nav/keyboardHeight";
 import { SettingsSubOverlay } from "@/app/(tabs)/settings";
 import { BinchTabBar } from "@/components/ui/BinchTabBar";
+import { AssistantHost } from "@/components/assistant/AssistantHost";
 import { BinchAuthScreen } from "@/components/auth/BinchAuthScreen";
 import { AuthHydrator } from "@/components/auth/AuthHydrator";
 import { migrateTicketImagesToFiles } from "@/lib/saved/ticketImages";
@@ -248,20 +249,6 @@ export default function RootLayout() {
               }}
             >
               <Stack.Screen name="(tabs)" />
-              {/* Bo genauso — aus demselben Grund wie beim Suchen darunter.
-                  OHNE das nimmt der Stack den vorigen Bildschirm aus dem Bild,
-                  sobald navigiert wird. Bo fährt dann über SCHWARZ herein statt
-                  über den Landingscreen, und weil die Navigation im
-                  Tipp-Handler passiert, ist das Schwarz schon da, bevor Bo
-                  überhaupt losgefahren ist. */}
-              <Stack.Screen
-                name="assistant"
-                options={{
-                  presentation: "transparentModal",
-                  animation: "none",
-                  contentStyle: { backgroundColor: "transparent" },
-                }}
-              />
               {/* search als transparentModal: der vorige Screen (z.B. der
                   Home-Tab) bleibt DARUNTER gemountet & sichtbar während der
                   Slide-In läuft. */}
@@ -294,6 +281,9 @@ export default function RootLayout() {
                 Ergebnisliste und den Detail-Blättern, die den ganzen Bildschirm
                 für sich beanspruchen. */}
             <BinchTabBar />
+            {/* Bo NACH der Leiste — nur so kann er sie überdecken. Die
+                Begründung steht in `AssistantHost`. */}
+            <AssistantHost />
 
             {/* NACH der Leiste: Das Verlaufs-Blatt kommt vom unteren Rand und
                 deckt sie mit ab. Davor gerendert lag die halbdurchsichtige

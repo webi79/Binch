@@ -1,5 +1,7 @@
-import { ReactNode, createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import { subscribeLayer, prepareLayer } from "@/lib/nav/transitionLayer";
+import { ReactNode, createContext, useCallback, useContext, useEffect, useRef, useState, useMemo } from "react";
+import { subscribeLayer, prepareLayer, holdLayer, rearmLayer } from "@/lib/nav/transitionLayer";
+import { markTransitionBusy } from "@/lib/nav/transitionBusy";
+import { setSheetMoving } from "@/lib/nav/searchHandoff";
 import {
   preloadSettingsSub,
   subscribeSettingsPreload,
@@ -1601,6 +1603,24 @@ export function SettingsSubOverlay() {
       setMoving(true);
       setSettled(false);
       const id = requestAnimationFrame(() => {
+        /**
+         * Die Bewegung ANMELDEN — hier fehlte es als einzigem Übergang der App.
+         *
+         * Zwei Dinge hängen daran, und beide fielen bisher ungeschützt in diese
+         * Fahrt: Die Persistenz des Speichers serialisiert über 50 KB und
+         * braucht dafür 10 bis 30ms auf dem JS-Strang; sie wartet auf eine
+         * Leerlauf-Lücke, und die ist während einer Bewegung erfüllt (die läuft
+         * ja auf dem UI-Strang). Und der Riegel in `transitionLayer.ts` lässt
+         * eine GPU-Ebene nur dann nicht abreißen, wenn eine Fahrt angemeldet
+         * ist — ohne die Anmeldung konnte die 1,4-Sekunden-Frist der
+         * Hub-Textur mitten hineinfallen.
+         */
+        markTransitionBusy(PUSH_SPRING.duration);
+        setSheetMoving(true, "settingsSub");
+        // Die Textur des Hubs halten, solange der Unterschirm darüber liegt —
+        // sie ist beim Berühren angefordert worden und verfiele sonst nach
+        // 1,4 Sekunden, also lange vor dem Zurückgehen.
+        holdLayer("settings");
         settingsPush.value = 0;
         settingsPush.value = withTiming(1, PUSH_SPRING, (finished?: boolean) => {
           "worklet";
@@ -1632,13 +1652,27 @@ export function SettingsSubOverlay() {
     const id = setTimeout(() => {
       setDisplay(null);
       setMoving(false);
-    }, POP_SPRING.duration);
+          /**
+       * Mit Abstand — siehe Bo. Bildgenau auf das Kurvenende gesetzt, reißt
+       * dieser Wecker den Unterschirm-Baum rund ein Bild zu früh ab, und
+       * `setTimeout` trifft ohnehin nicht das Bild.
+       */
+    }, POP_SPRING.duration + 120);
     return () => clearTimeout(id);
   }, [sub]);
 
   const style = useAnimatedStyle(() => ({
     transform: [{ translateX: (1 - settingsPush.value) * screenW }],
   }));
+
+  /** Wecker für das späte Leeren — siehe `back`. Muss beim Abbau sterben. */
+  const clearSubRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (clearSubRef.current) clearTimeout(clearSubRef.current);
+    },
+    [],
+  );
 
   const back = useCallback(() => {
     haptic("button");
@@ -1656,10 +1690,34 @@ export function SettingsSubOverlay() {
      * ändert sich also nichts.
      */
     setMoving(true);
+    // Rückfahrt genauso anmelden — sie ist der Regelfall, in den die
+    // Leerlauf-Arbeit fällt: Man stellt etwas ein, und Sekunden später geht man
+    // zurück. Die Uhr des Schreibvorgangs läuft dann mit hoher
+    // Wahrscheinlichkeit genau dort hinein.
+    markTransitionBusy(POP_SPRING.duration);
+    // Und die Hub-Textur für die Rückfahrt wieder scharf stellen.
+    rearmLayer("settings");
     requestAnimationFrame(() => {
-      settingsPush.value = withTiming(0, POP_SPRING);
-      setSettingsSub(null);
+      settingsPush.value = withTiming(0, POP_SPRING, (finished?: boolean) => {
+        "worklet";
+        if (!finished) return;
+        runOnJS(setSheetMoving)(false, "settingsSub");
+      });
     });
+    /**
+     * Der Speicher-Schreibvorgang liegt HINTER der Kurve, nicht in ihrem
+     * ersten Bild.
+     *
+     * Er stand im selben rAF-Rückruf wie der Kurvenstart — also genau dort, wo
+     * er nicht sein soll: Er weckt über 140 Selektoren und kippt zusätzlich
+     * `pointerEvents` auf dem animierten Knoten. Der Inhalt bleibt bis dahin
+     * über die Anzeige-Ablage stehen, es ist also nichts zu sehen.
+     */
+    if (clearSubRef.current) clearTimeout(clearSubRef.current);
+    clearSubRef.current = setTimeout(() => {
+      clearSubRef.current = null;
+      setSettingsSub(null);
+    }, POP_SPRING.duration + 120);
   }, [setSettingsSub]);
 
   /**
@@ -1678,6 +1736,23 @@ export function SettingsSubOverlay() {
     return () => h.remove();
   }, [sub, back]);
 
+  /**
+   * Beide Ablagen liegen VOR dem Ausstieg unten.
+   *
+   * Hooks müssen in jedem Durchgang in derselben Zahl und Reihenfolge laufen.
+   * Standen sie hinter `if (!display) return null`, lief die Komponente
+   * geschlossen mit zwei Hooks weniger — und beim Öffnen brach React genau
+   * deshalb ab.
+   */
+  const subSheetChrome = useMemo(
+    () => ({ backgroundColor: appBg, zIndex: 90 }),
+    [appBg],
+  );
+  const subSheetStyle = useMemo(
+    () => [StyleSheet.absoluteFillObject, styles.subSheet, subSheetChrome, style],
+    [subSheetChrome, style],
+  );
+
   if (!display) return null;
 
   return (
@@ -1692,12 +1767,7 @@ export function SettingsSubOverlay() {
        * Verhalten ändert.
        */
       pointerEvents={sub ? "auto" : "none"}
-      style={[
-        StyleSheet.absoluteFillObject,
-        styles.subSheet,
-        { backgroundColor: appBg, zIndex: 90 },
-        style,
-      ]}
+      style={subSheetStyle}
       // Für die DAUER der Bewegung eine GPU-Ebene: Der Unterschirm ist ein
       // langer Baum mit eigenen Grafiken und würde sonst in jedem Bild der
       // Bewegung neu gezeichnet. Dauerhaft darf sie nicht sein — dann entstünde

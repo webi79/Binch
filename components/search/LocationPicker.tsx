@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { PICKER_IN, PICKER_OUT } from "@/lib/nav/overlayCover";
 import { useSheetSlide } from "@/lib/nav/sheetSlide";
 import { setSheetMoving } from "@/lib/nav/searchHandoff";
-import { prepareLayer, releaseLayer } from "@/lib/nav/transitionLayer";
+import { prepareLayer, releaseLayer, holdLayer, rearmLayer } from "@/lib/nav/transitionLayer";
 import { subscribeLayer } from "@/lib/nav/transitionLayer";
 import {
   Dimensions,
@@ -171,10 +171,23 @@ const LocationPickerInner = function LocationPicker({
     setQuery("");
   }, [session]);
 
+  /** Liegt ein Auftrag an? Fällt schon im Berührungs-Bild — siehe `enabled`. */
+  const request = useSearchStore((st) => st.locationPickerRequest !== null);
   const { data: results, isLoading, isError, error } = useQuery({
     queryKey: ["locations", mode, debounced],
     queryFn: () => fetchLocations(debounced, mode),
-    enabled: visible && debounced.trim().length >= 2,
+    /**
+     * Auch an den Auftrag geknüpft, nicht nur an die verzögerte Sichtbarkeit.
+     *
+     * `visible` kippt erst 80ms NACH dem Ende der Ausfahrt — die Abfrage lief
+     * also noch die kompletten 260ms der Rückfahrt weiter. Löst die
+     * Autocomplete-Antwort in diesem Fenster auf, rendert der Wähler samt
+     * Trefferliste komplett neu, mitten in seiner eigenen Fahrt. Nachstellbar
+     * mit: tippen, dann sofort schließen.
+     *
+     * Der Auftrag im Speicher fällt dagegen schon im Berührungs-Bild.
+     */
+    enabled: visible && request && debounced.trim().length >= 2,
     staleTime: 5 * 60 * 1000,
     // Mehrfacher Retry mit kurzem Backoff — verhindert dass ein einzelner
     // Cold-Start-Timeout den Search-Flow blockiert (User musste sonst über
@@ -364,9 +377,48 @@ const LocationPickerInner = function LocationPicker({
        * werden die übrigen mitgenommen — Zurück-Geste, Verdunkelungs-Tipp,
        * Auswahl über die Umgebungs-Karte.
        */
+      /**
+       * War die Tastatur offen ODER fehlt die Ebene, bekommt die Fahrt ein
+       * zusätzliches Bild Vorlauf.
+       *
+       * Das ist der am häufigsten spürbare Ruckler der App, und er entsteht aus
+       * drei Dingen, die nur hier zusammentreffen:
+       *
+       *  • Das Schließen der Tastatur erzwingt unter `adjustResize` eine
+       *    Neuvermessung des GESAMTEN Wurzelbaums — rund 250ms, also fast die
+       *    ganze Fahrt.
+       *  • `holdLayerFor` legt die bildschirmfüllende Ebene an, wenn sie nicht
+       *    schon vom Berühren her steht. Deren Aufbau ist mit 66ms vermessen.
+       *  • Diese Fahrt ist mit 260ms über die volle Fensterhöhe die schnellste
+       *    der App — rund 105 Punkt pro Bild. Jedes verlorene Bild ist hier
+       *    optisch teurer als bei jedem Seitwärts-Slide.
+       *
+       * Die häufigen Wege (Zeile antippen, X-Knopf) verlegen beides längst aufs
+       * Aufsetzen des Fingers und laufen sauber. Die übrigen — Zurück-Geste,
+       * Verdunkelungs-Tipp, Auswahl über die Umgebungs-Karte — haben keinen
+       * solchen Moment. Für sie wird die Arbeit hier erledigt und die Kurve ein
+       * Bild später angestoßen, statt sie dagegen anlaufen zu lassen.
+       */
+      const kbWasOpen = !show && Keyboard.isVisible();
       if (!show) Keyboard.dismiss();
-      if (!layeredRef.current) holdLayerFor(cfg.duration + (show ? 16 : 0));
+      /**
+       * Beim ÖFFNEN die Ebene halten, beim SCHLIESSEN wieder scharf stellen.
+       *
+       * Sie wurde beim Berühren angefordert und verfällt nach 1,4 Sekunden von
+       * selbst — also mitten hinein, während man im Wähler steht und die Liste
+       * scrollt. Danach fehlt sie zusätzlich der Ausfahrt. Detail-, Ticket- und
+       * Such-Blatt halten ihre Unterlagen-Textur genau so; die Wähler hielten
+       * als einzige ihre eigene nicht.
+       */
+      if (show) holdLayer("pickerLocation");
+      else rearmLayer("pickerLocation");
+      const needsLayer = !layeredRef.current;
+      if (needsLayer) holdLayerFor(cfg.duration + (show ? 16 : 0));
       armMovingGuard(cfg.duration);
+      if (kbWasOpen || needsLayer) {
+        requestAnimationFrame(() => runSheet(show));
+        return;
+      }
       runSheet(show);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps

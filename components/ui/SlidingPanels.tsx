@@ -10,8 +10,8 @@
  * pro Frame neu compositet — sie sind einfach Children einer einzigen
  * sich bewegenden View. Wirkt wie ein durchgehender Pager (Shazam-Style).
  */
-import { Children, useEffect, useState } from "react";
-import { SHEET_OUT } from "@/lib/nav/overlayCover";
+import { Children, useEffect, useState, useRef } from "react";
+import { SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import { Platform, StyleSheet, useWindowDimensions, View } from "react-native";
 import Animated, {
   runOnJS,
@@ -43,6 +43,8 @@ export function SlidingPanels({ activeIndex, children }: Props) {
   // Lösung: bei activeIndex-Wechsel rasterize=true setzen, nach Animation-
   // Ende auf false. Außerhalb des Slides ist die Tree wieder normal.
   const [rasterize, setRasterize] = useState(false);
+  /** Erster Durchgang? Dann ist nichts zu bewegen — siehe Effekt. */
+  const startedRef = useRef(false);
 
   useEffect(() => {
     /**
@@ -55,6 +57,28 @@ export function SlidingPanels({ activeIndex, children }: Props) {
      * fehlte es, und zwar an drei Stellen gleichzeitig (Saved-Reiter,
      * Ergebnis-Richtung, Datums-Modus).
      */
+    /**
+     * Beim ERSTEN Durchgang gar nichts tun.
+     *
+     * Der Effekt läuft auch beim Einhängen — und fährt dort eine Kurve zum
+     * SELBEN Wert, legt also eine bildschirmfüllende Ebene an und räumt sie
+     * wieder ab, für eine Bewegung, die es nicht gibt. Beim Saved-Reiter fällt
+     * das in den Tab-Wechsel, der ihn aufbaut.
+     */
+    if (!startedRef.current) {
+      startedRef.current = true;
+      tx.value = -activeIndex * screenW;
+      return;
+    }
+    /**
+     * Die Bewegung ANMELDEN — hier fehlte es ganz.
+     *
+     * Ohne sie ist `isTransitionBusy()` während dieser 260ms falsch, und die
+     * aufgeschobene Arbeit (Persistenz, Sekunden-Takt, die drei
+     * Leerlauf-Aufbauten) darf hineinlaufen. Sie läuft an drei Stellen:
+     * Saved-Reiter, Ergebnis-Richtung und Datums-Modus.
+     */
+    markSheetMoving(SHEET_OUT.duration);
     setRasterize(true);
     const id = requestAnimationFrame(() => {
     tx.value = withTiming(

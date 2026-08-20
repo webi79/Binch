@@ -2,7 +2,6 @@ import { memo, useCallback, useEffect, useRef } from "react";
 import { Image, Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Animated, { useAnimatedStyle } from "react-native-reanimated";
-import { assistantPush } from "@/lib/nav/overlayCover";
 import { router, usePathname } from "expo-router";
 
 import { noteTabPress, usePressBounce } from "@/lib/motion";
@@ -81,23 +80,6 @@ const TABS = [
  */
 const HIDE_ON = ["/search/route-map", "/search/voice"] as const;
 
-/**
- * Bo blendet die Leiste aus, statt sie verschwinden zu lassen.
- *
- * Bo steht nicht im HIDE_ON darüber, und das ist Absicht. Der Pfad wechselt
- * schon beim Antippen, die Bewegung fährt danach noch. Wäre Bo in der Liste,
- * wäre die Leiste im ersten Bild weg, während unten noch der Landingscreen zu
- * sehen ist — ein Loch am unteren Rand für die ganze Fahrt, und beim
- * Zurückkommen dasselbe verkehrt herum.
- *
- * Der Zeitpunkt ergibt sich aus der Geometrie, nicht aus einem Gefühl: Bo steigt
- * von unten, und die Leiste steht ganz unten. Bo hat sie also schon nach einem
- * Bruchteil seines Weges vollständig überdeckt — genau dann soll sie weg sein.
- * Der Bruchteil ist ihre eigene Höhe, geteilt durch die Bildschirmhöhe; siehe
- * `fadeStyle`. Danach bliebe sie sonst als Schemen über Bo stehen, denn im
- * Wurzel-Layout wird sie NACH ihm gezeichnet.
- */
-const ASSISTANT_PATH = "/assistant";
 
 const ACTIVE = "#FFFFFF";
 const INACTIVE = "#8A8A90";
@@ -372,7 +354,8 @@ export function BinchTabBar() {
    * aktiv ist, und `router.navigate` schaltet um. Das geht durch denselben
    * Navigator und schaltet die Seiten weiterhin nativ um.
    */
-  const savedBadge = useSearchStore((st) => st.savedBadge);
+  // Zähler im Speicher, hier nur „gibt es überhaupt etwas?" — siehe dort.
+  const savedBadge = useSearchStore((st) => st.savedBadge > 0);
   const pathname = usePathname();
   /**
    * Verstecken über eine SPERRLISTE, nicht über eine Erlaubnisliste.
@@ -433,7 +416,11 @@ export function BinchTabBar() {
     //    Die Abfrage davor ist nicht Zierde: `closeSearchOverlay` ist ein
     //    ungeschütztes set().
     if (useSearchStore.getState().searchOverlayMode != null) {
-      useSearchStore.getState().closeSearchOverlay();
+      useSearchStore.getState().// MIT `true`: der Sofort-Zweig ohne Bewegung. Ohne das Argument fuhr das
+      // Blatt seine volle Ausfahrt über den Tab-Wechsel hinweg — und der
+      // Kommentar im Blatt beschreibt für genau diesen Fall einen Weg, den der
+      // Code gar nicht nahm.
+      closeSearchOverlay(true);
     }
     haptic("button");
   }, []);
@@ -443,7 +430,20 @@ export function BinchTabBar() {
    * überall und braucht keine Fallunterscheidung. Nur die Tipp-Sperre unten
    * braucht den Pfad: Auf halb durchsichtige Symbole soll man nicht drücken.
    */
-  const onAssistant = pathname.startsWith(ASSISTANT_PATH);
+  /**
+   * Bo überdeckt die Leiste inzwischen wirklich — sie muss nichts mehr tun.
+   *
+   * Er hängt seit dem Umbau NACH dieser Leiste im Wurzel-Layout und fährt als
+   * Push von rechts über sie hinweg. Vorher lag er im Navigations-Stapel, also
+   * davor, und konnte sie baulich nicht überdecken; deshalb stand hier ein
+   * Ausblenden. Das war beim Blatt von unten unauffällig (er hatte sie ohnehin
+   * gleich verdeckt) und beim Push von rechts sichtbar falsch: Die Leiste war
+   * nach einem Zehntel der Fahrt weg, während Bo noch fast ganz rechts stand.
+   *
+   * Geblieben ist nur die Frage, ob sie noch anfassbar sein soll — und das ist
+   * sie nicht, solange Bo darüber liegt.
+   */
+  const onAssistant = useSearchStore((st) => st.assistantOpen);
   /**
    * Ab welchem Anteil von Bos Weg liegt er vollständig über der Leiste?
    *
@@ -453,8 +453,6 @@ export function BinchTabBar() {
    * dieselbe wieder hinauf: Die Leiste ist exakt so lange zu sehen, wie sie
    * nicht verdeckt ist.
    */
-  const { height: winH } = useWindowDimensions();
-  const coverFrac = Math.max(0.01, (BAR_H + insets.bottom) / winH);
 
   /**
    * Die Deckkraft hängt am Pfad UND am Wert, nicht nur am Wert.
@@ -465,11 +463,27 @@ export function BinchTabBar() {
    * dort zwar von der Liste verdeckt, doch das ist eine Eigenschaft der
    * Reihenfolge im Wurzel-Layout und keine, auf die man sich verlassen sollte.
    */
-  const fadeStyle = useAnimatedStyle(() => {
-    if (!onAssistant) return { opacity: 1 };
-    return { opacity: 1 - Math.min(1, assistantPush.value / coverFrac) };
-  });
-
+  /**
+   * Die Leiste GEHT MIT dem Landingscreen — sie verschwindet nicht mehr vorweg.
+   *
+   * Hier stand `opacity: 1 - p / coverFrac` mit `coverFrac = Leistenhöhe /
+   * Fensterhöhe`, also rund 0,1. Das war für Bos frühere Bewegung gerechnet: Er
+   * kam von UNTEN, und sobald er die Leistenhöhe überfahren hatte, war sie
+   * ohnehin verdeckt — das Ausblenden fiel nicht auf.
+   *
+   * Seit Bo von RECHTS hereinfährt, stimmt diese Geometrie nicht mehr: Nach 10%
+   * der Fahrt ist die Leiste komplett weg, während Bo noch fast ganz rechts
+   * steht. Genau das sieht man als „die Leiste verschwindet einfach".
+   *
+   * Jetzt läuft sie denselben Weg wie der Landingscreen, dem sie gehört: nach
+   * links im Parallax, dabei über die volle Fahrt ausblendend. Sie zieht sich
+   * also mit ihrem Bildschirm zurück, statt vorweg zu verschwinden.
+   *
+   * Warum nicht einfach dahinter? Weil Bo im Router-Stapel liegt und der im
+   * Wurzel-Layout VOR der Leiste steht — er kann sie baulich nicht überdecken.
+   * Ergebnisliste und Detail-Blatt können es, weil sie danach stehen. Bo dorthin
+   * zu holen hieße, ihn aus dem Stapel zu nehmen; das ist ein eigener Umbau.
+   */
   if (hidden) return null;
 
   return (
@@ -482,7 +496,6 @@ export function BinchTabBar() {
           height: BAR_H + insets.bottom,
           backgroundColor: BAR_TINT[theme] ?? BAR_TINT.gray,
         },
-        fadeStyle,
       ]}
       // Der Inhalt scheint durch: Die Fläche ist dunkel getönt statt deckend,
       // und die Seiten darunter haben volle Höhe (die Bibliothek gibt ihnen

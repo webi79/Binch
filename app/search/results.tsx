@@ -25,6 +25,7 @@ import { CommonActions, useNavigation } from "@react-navigation/native";
 import { runOnJS, withTiming } from "react-native-reanimated";
 import { useSearchStore } from "@/stores/searchStore";
 import { resultsPush, POP_SPRING } from "@/lib/nav/overlayCover";
+import { markTransitionBusy } from "@/lib/nav/transitionBusy";
 import { skipNextScreenEntrance } from "@/lib/motion";
 
 export default function ResultsRoute() {
@@ -98,6 +99,21 @@ export default function ResultsRoute() {
       // KEIN Ebenen-Aufbau hier. Er stand unmittelbar vor dem Start der
       // Rückfahrt — und 66ms Aufbau passen nicht in ein Fenster von einem Bild.
       // Genau derselbe Fehler wie auf dem Hinweg, nur andersherum.
+      /**
+       * Die Rückfahrt ANMELDEN — hier fehlte es.
+       *
+       * `isTransitionBusy()` war damit während dieser 380ms falsch, und daran
+       * hängen fünf Verbraucher, die dann hineinlaufen dürfen: die Persistenz
+       * des Speichers (10 bis 30ms Serialisierung), der gemeinsame Sekunden-
+       * Takt, und die drei Leerlauf-Aufbauten von Bo und den beiden Wählern.
+       *
+       * Die liegen bei 4200, 5200 und 6400ms nach dem Start, und genau in
+       * diesem Fenster ist man typischerweise das erste Mal in der
+       * Ergebnisliste. Trifft ein 300ms-Wiederversuch das Fenster, committet
+       * der schwerste Baum der App mitten in der Rückfahrt — einmal pro
+       * App-Lauf, rein zeitabhängig. Also genau ein „vereinzelter Aussetzer".
+       */
+      markTransitionBusy(POP_SPRING.duration);
       if (timerRef.current) clearTimeout(timerRef.current);
       timerRef.current = setTimeout(finish, POP_SPRING.duration + 300);
       requestAnimationFrame(() => {

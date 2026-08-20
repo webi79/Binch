@@ -284,6 +284,46 @@ interface SearchStore {
    *  (clipToOutline-Bug). NUR währenddessen — Dauer-Textur kostet Scroll-Perf. */
   launchActive: boolean;
   setLaunchActive: (v: boolean) => void;
+  /**
+   * Ist Bo offen? — er ist eine Überlagerung am Wurzel-Layout, keine Route.
+   *
+   * Der Grund steht bei `AssistantScreen`: Als Route lag er im Navigations-
+   * Stapel, und der steht im Wurzel-Layout vor der Tab-Leiste — überdecken
+   * konnte er sie damit nicht.
+   *
+   * NICHT persistiert (siehe `partialize`): Beim nächsten App-Start soll der
+   * Landingscreen kommen, nicht ein aufgeklappter Chat.
+   */
+  assistantOpen: boolean;
+  /**
+   * Bo IM VORAUS aufbauen, ohne ihn zu öffnen.
+   *
+   * Gesetzt beim Aufsetzen des Fingers auf die Suchleiste. Der Bildschirm ist
+   * dann schon gebaut, wenn die Bewegung losgeht — geparkt außerhalb des
+   * Bildes und deshalb unsichtbar. Genau der Weg, den Wähler und Such-Blatt
+   * längst gehen: Zwischen Aufsetzen und Loslassen liegen 80 bis 150ms, die
+   * ohnehin verstreichen; der Aufbau des schwersten Baums der App gehört
+   * dorthin und nicht in die ersten Bilder der Fahrt.
+   *
+   * Bleibt gesetzt, wenn aus der Berührung kein Tipp wird — dann ist Bo eben
+   * warm für das nächste Mal. Zurückgesetzt wird er nie zur Laufzeit; er
+   * verschwindet mit dem App-Lauf.
+   */
+  assistantPreload: boolean;
+  preloadAssistant: () => void;
+  /** Kam der Aufruf über das Mikrofon? Dann startet Bo die Spracheingabe. */
+  assistantAutoVoice: boolean;
+  /**
+   * Zählt JEDES Öffnen — auch eines, das auf ein noch laufendes Schließen trifft.
+   *
+   * Bo braucht einen Auslöser für „doch wieder auf", und `assistantOpen` taugt
+   * dafür nicht: Der Merker steht während der ganzen Ausfahrt noch auf `true`
+   * (er fällt erst, wenn die Kurve durch ist), ein erneutes Öffnen ändert ihn
+   * also gar nicht. Ein Zähler ändert sich immer.
+   */
+  assistantOpenSeq: number;
+  openAssistant: (autoVoice?: boolean) => void;
+  closeAssistant: () => void;
   /** true erst NACH dem Reveal (Content sichtbar). Gatet den schweren Hero-SVG:
    *  WÄHREND die Box wächst (Suche offen, aber noch nicht revealed) muss er weg —
    *  react-native-svg compositet sein Hardware-Layer sonst pro Frame mit (auch
@@ -520,7 +560,20 @@ interface SearchStore {
    * App-Neustart nicht überleben — sonst klebt er nach Tagen noch dort und
    * bedeutet nichts mehr.
    */
-  savedBadge: boolean;
+  /**
+   * Wie viele ungesehene Tickets seit dem letzten Blick in „Gespeichert"?
+   *
+   * War ein Ja/Nein und wurde beim ENTFERNEN bewusst nicht zurückgenommen —
+   * mit der Begründung, dort sei nichts Neues zu sehen. Das stimmt nur, wenn
+   * noch etwas Ungesehenes übrig ist: Wer ein Ticket speichert und dasselbe
+   * gleich wieder verwirft, hatte den Punkt danach dauerhaft an der Leiste,
+   * obwohl es nichts mehr zu sehen gab.
+   *
+   * Als Zähler geht beides auf: Speichern zählt hoch, Verwerfen wieder herunter
+   * (nicht unter null), und der Blick in den Tab setzt auf null. Zwei speichern,
+   * eins verwerfen lässt den Punkt also stehen — richtig, eines ist ja noch da.
+   */
+  savedBadge: number;
   clearSavedBadge: () => void;
   tickets: Ticket[];
   addTicket: (t: Omit<Ticket, "id" | "createdAt">) => void;
@@ -661,6 +714,52 @@ export const useSearchStore = create<SearchStore>()(
       launchActive: false,
       setLaunchActive: (v) => {
         if (v !== get().launchActive) set({ launchActive: v });
+      },
+      assistantOpen: false,
+      assistantPreload: false,
+      preloadAssistant: () => {
+        if (!get().assistantPreload) set({ assistantPreload: true });
+      },
+      assistantAutoVoice: false,
+      assistantOpenSeq: 0,
+      openAssistant: (autoVoice = false) => {
+        /**
+         * KEIN vorzeitiger Ausstieg mehr — er war der Kern des Fehlers.
+         *
+         * Hier stand `if (get().assistantOpen) return;`, gedacht als Schutz vor
+         * überflüssigen Schreibvorgängen. Nur gilt Bo während seiner GANZEN
+         * Ausfahrt weiterhin als offen: Der Merker fällt erst, wenn die Kurve
+         * durch ist und der Baum abgebaut wird. Wer in diesem Fenster erneut
+         * tippt — also bei jedem schnellen Auf und Zu —, lief damit in einen
+         * stillen Ausstieg: Die Kurve fuhr zwar zurück nach oben (der
+         * Tipp-Handler startet sie unabhängig davon), aber der Bildschirm
+         * erfuhr nie, dass er wieder geöffnet wurde. Der Wecker des
+         * ABGEBROCHENEN Schließens lief weiter und baute Bo mitten in seiner
+         * Einfahrt ab — er fuhr herein und war sofort wieder weg.
+         *
+         * Das Such-Blatt hat dieses Problem nie gehabt: Sein Zustand liegt in
+         * EINEM Speicherfeld, das beim Schließen sofort fällt und beim Öffnen
+         * sofort wieder steht. Ein erneutes Öffnen ist dort einfach der nächste
+         * Wechsel dieses Feldes.
+         */
+        set((s) => ({
+          assistantOpen: true,
+          assistantAutoVoice: autoVoice,
+          assistantOpenSeq: s.assistantOpenSeq + 1,
+        }));
+      },
+      closeAssistant: () => {
+        if (!get().assistantOpen) return;
+        /**
+         * Den Vorbereitungs-Merker MIT zurücknehmen.
+         *
+         * Sonst bliebe Bo nach dem Schließen gemountet, und der Bildschirm
+         * würde nie abgebaut — sein Aufräumen (Timer, Abos, Strom-Abbruch,
+         * Zurücksetzen der Fahrt) hängt aber genau daran. So bleibt der
+         * Lebenszyklus derselbe wie vorher: aufgebaut beim Berühren,
+         * abgebaut beim Schließen.
+         */
+        set({ assistantOpen: false, assistantAutoVoice: false, assistantPreload: false });
       },
       settingsSub: null,
       setSettingsSub: (v) => set({ settingsSub: v }),
@@ -1102,6 +1201,8 @@ export const useSearchStore = create<SearchStore>()(
           return {
             savedTrips: state.savedTrips.filter((t) => t.id !== id),
             savedTripSignatures: sigs,
+            // Herunterzählen, nicht unter null — siehe `savedBadge`.
+            savedBadge: Math.max(0, state.savedBadge - 1),
           };
         }),
       toggleSavedTrip: (result, passengers) =>
@@ -1115,6 +1216,7 @@ export const useSearchStore = create<SearchStore>()(
                 (t) => tripSignature(t) !== sig,
               ),
               savedTripSignatures: sigs,
+              savedBadge: Math.max(0, state.savedBadge - 1),
             };
           }
           const trip: SavedTrip = {
@@ -1129,9 +1231,7 @@ export const useSearchStore = create<SearchStore>()(
           return {
             savedTrips: [trip, ...state.savedTrips],
             savedTripSignatures: sigs,
-            // Nur beim HINZUFÜGEN — beim Entfernen weiter oben bewusst nicht,
-            // dort ist nichts Neues zu sehen.
-            savedBadge: true,
+            savedBadge: state.savedBadge + 1,
             savedToast: {
               key: Date.now(),
               resultId: result.id,
@@ -1171,12 +1271,12 @@ export const useSearchStore = create<SearchStore>()(
             savedTripSignatures: new Set(kept.map((t) => tripSignature(t))),
           };
         }),
-      savedBadge: false,
+      savedBadge: 0,
       clearSavedBadge: () => {
         // Nur schreiben, wenn wirklich etwas zu löschen ist: Ein ungeschütztes
         // set() weckt ALLE Abonnenten — und das hier läuft bei jedem Fokus des
         // Saved-Tabs, also mitten im Tab-Wechsel.
-        if (get().savedBadge) set({ savedBadge: false });
+        if (get().savedBadge > 0) set({ savedBadge: 0 });
       },
       tickets: [],
       addTicket: (t) =>

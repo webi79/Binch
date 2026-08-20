@@ -31,10 +31,11 @@ import {
   Dimensions,
 } from "react-native";
 import { useAppBg, usePalette } from "@/lib/theme/appBg";
-import { useLocalSearchParams, useRouter } from "expo-router";
-import { useIsFocused } from "@react-navigation/native";
+import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { keyboardHeight } from "@/lib/nav/keyboardHeight";
+import { holdLayer, layerGeneration, rearmLayer, releaseLayer } from "@/lib/nav/transitionLayer";
+import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import {
   appendStreamText,
   peekStreamText,
@@ -61,6 +62,7 @@ import { Send, Mic, AlertTriangle, RotateCw, X } from "lucide-react-native";
 import {
   assistantPush,
   isAssistantPushStarted,
+  pushProgress,
   startAssistantPush,
   endAssistantPush,
   ASSISTANT_IN,
@@ -163,21 +165,19 @@ type Msg =
  *  - Reine In-Memory-Persistenz reicht für den Tab-Wechsel-Use-Case.
  */
 /**
- * Die Fahrstrecke EINMAL beim Laden, aus der Fenster-Höhe.
+ * Die Fahrstrecke EINMAL beim Laden, aus der Fenster-BREITE.
  *
  * Vorher `useWindowDimensions()`. Beide Hälften davon waren falsch, und
  * `lib/nav/sheetSlide.ts` schreibt beide ausdrücklich anders vor:
  *
- *  - LAUFEND gelesen schrumpft der Wert unter `adjustResize` mit der Tastatur.
- *    Genau die wird beim Schließen heruntergefahren — die verbleibende Strecke
- *    `(1-p) * screenH` sprang also mitten in der Ausfahrt um die Tastaturhöhe.
- *  - Und jedes Maß-Ereignis rendert dabei den GANZEN Bildschirm neu, samt aller
- *    gemounteten Zeilen. Bei vollem Verlauf sind das Dutzende.
+ *  - LAUFEND gelesen ist es ein Maß-Ereignis, das den GANZEN Bildschirm neu
+ *    rendert, samt aller gemounteten Zeilen — bei vollem Verlauf Dutzende.
+ *  - Und unter `adjustResize` wandert die Fenstergröße mit der Tastatur.
  *
  * Die Ausrichtung ist auf Hochkant festgelegt (`app.config.js`), der Wert
  * ändert sich also auch sonst nicht.
  */
-const PARK_Y = Dimensions.get("window").height;
+const PARK_X = Dimensions.get("window").width;
 
 /**
  * Takt des Text-Puffers — 100ms statt 50.
@@ -196,6 +196,9 @@ const PARK_Y = Dimensions.get("window").height;
  * Gegend. Die Hälfte der Arbeit fällt damit ersatzlos weg.
  */
 const TEXT_FLUSH_MS = 100;
+
+/** Hebt die „wenige Nachrichten oben"-Verankerung auf — siehe `threadContentStyle`. */
+const NO_END_ANCHOR = { flexGrow: 0, justifyContent: "flex-start" } as const;
 
 let persistedMessages: Msg[] = [];
 let persistedMood: BoMood = "waving";
@@ -237,14 +240,57 @@ const MAX_CHAT_MESSAGES = 80;
  * Inhalt um einen Renderdurchlauf nach hinten, und weil die Slide schon beim
  * Antippen losfährt, war das erste Bild der Bewegung eine leere Fläche.
  */
-export default function AssistantScreen() {
+/**
+ * Bo — jetzt eine Überlagerung am Wurzel-Layout, keine Route mehr.
+ *
+ * Der Grund ist die Zeichen-Reihenfolge: Als Route lag dieser Bildschirm im
+ * `<Stack>`, und der steht im Wurzel-Layout VOR der Tab-Leiste. Damit konnte Bo
+ * sie baulich nicht überdecken — er fuhr darunter durch, und die Leiste musste
+ * ausgeblendet werden, was beim Push von rechts als „sie verschwindet einfach"
+ * auffiel. Ergebnisliste und Detail-Blatt haben dieses Problem nie gehabt: Sie
+ * stehen nach der Leiste.
+ *
+ * Geöffnet wird jetzt über den Speicher (`assistantOpen`) statt über den Router.
+ * Alles andere an diesem Bildschirm bleibt, wie es war.
+ */
+export function AssistantScreen() {
   const palette = usePalette();
   const appBg = useAppBg();
   const t = useT();
   const accent = useAccent();
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const isFocused = useIsFocused();
+  /**
+   * „Ist Bo IM VORDERGRUND?" — offen reicht nicht.
+   *
+   * `useIsFocused` gab es nur, weil dieser Bildschirm eine Route war, und es
+   * bedeutete: sichtbar und bedienbar. Der bloße Offen-Schalter bedeutet das
+   * NICHT — Bo bleibt offen, wenn er selbst die Ergebnisliste aufmacht, und die
+   * liegt dann deckend über ihm.
+   *
+   * Der Unterschied ist nicht kosmetisch, daran hängen vier Dinge:
+   *   • die Zurück-Taste. Früher gab Bo seinen Griff ab, sobald die Liste kam;
+   *     jetzt hielte er ihn und würde SICH schließen statt der Liste.
+   *   • die Spracheingabe. Sie startet nach jeder Sprechpause neu, solange Bo
+   *     „im Vordergrund" ist — hinter der Liste liefe das Mikrofon weiter.
+   *   • die Tastatur, die beim Übergang eingeklappt werden muss.
+   *   • Bos animierte SVG-Eigenschaften und der 60-Sekunden-Leerlaufwinker,
+   *     die sonst hinter einer deckenden Fläche weiterlaufen.
+   *
+   * `resultsParams != null` ist exakt die Sichtbarkeit der Ergebnisliste (siehe
+   * `ResultsView`), also genau der Zustand, den `useIsFocused` hier abgebildet
+   * hat.
+   */
+  const isFocused = useSearchStore((st) => st.assistantOpen && st.resultsParams == null);
+  /**
+   * Jedes Öffnen einzeln — auch das, das ein laufendes Schließen unterbricht.
+   *
+   * `isFocused` taugt dafür nicht: Der Merker steht während der ganzen Ausfahrt
+   * noch, ein erneutes Öffnen ändert ihn also nicht, und alles, was daran
+   * hängt, liefe nicht wieder an. Begründung im Speicher bei
+   * `assistantOpenSeq`.
+   */
+  const openSeq = useSearchStore((st) => st.assistantOpenSeq);
 
   /**
    * Erst zurückfahren, dann zurücknavigieren.
@@ -270,8 +316,12 @@ export default function AssistantScreen() {
   const screenShellStyle = useMemo(
     () => ({
       backgroundColor: palette.bg,
+      // Gerundete führende Kante wie bei jedem anderen Push — und `overflow`
+      // dazu, damit der Inhalt der runden Form folgt. Auf Android ist das
+      // `clipToOutline`, also GPU-seitig; der reine Verschiebe-Fall ist genau
+      // der, für den das günstig ist (siehe SCREEN_CORNER_RADIUS).
       borderRadius: SCREEN_CORNER_RADIUS,
-      elevation: 24,
+      overflow: "hidden" as const,
     }),
     [palette.bg],
   );
@@ -286,6 +336,8 @@ export default function AssistantScreen() {
   /** Das Bild Vorlauf der Ausfahrt — muss beim Abbau mit weg, sonst stellt es
    *  danach noch einen Wecker, der irgendwohin zurücknavigiert. */
   const closeRafRef = useRef<number | null>(null);
+  /** Freigabe der Unterlagen-Textur am Ende der Ausfahrt — muss abbrechbar sein. */
+  const releaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /**
    * Was das Schließen kostet, passiert schon beim BERÜHREN des Knopfes.
    *
@@ -312,6 +364,9 @@ export default function AssistantScreen() {
       disarmTimerRef.current = null;
     }
     setClosing(true);
+    // Und die Ebene der Unterlage wieder scharf stellen — sie soll die
+    // Rückfahrt tragen und danach von selbst verfallen (siehe `holdLayer` oben).
+    rearmLayer("home");
     // Bo hält auch schon an. Sonst fällt sein Anhalten — Abbruch von 15 Werten,
     // Neustart von nichts, aber ein Render des ganzen Bildschirms — in genau
     // den Durchgang, in dem die Ausfahrt losläuft.
@@ -332,6 +387,7 @@ export default function AssistantScreen() {
   useEffect(() => () => {
     if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
     if (disarmTimerRef.current) clearTimeout(disarmTimerRef.current);
+    if (releaseTimerRef.current) clearTimeout(releaseTimerRef.current);
     if (closeRafRef.current !== null) cancelAnimationFrame(closeRafRef.current);
   }, []);
   const closeScreen = useCallback(() => {
@@ -416,12 +472,50 @@ export default function AssistantScreen() {
     closeRafRef.current = requestAnimationFrame(() => {
       closeRafRef.current = null;
       endAssistantPush();
+      /**
+       * Die Textur des Landingscreens am Ende der Rückfahrt FREIGEBEN.
+       *
+       * Sie wurde nur wieder scharf gestellt (`rearmLayer` beim Berühren), fiel
+       * also erst 1,4 Sekunden später von selbst weg — und damit mitten hinein,
+       * während der Nutzer im Landingscreen schon wieder scrollt. Ein
+       * Ebenen-Abbau über einer scrollenden Fläche ist genau der Ruckler, der
+       * zeitlich nichts mehr mit dem Blatt zu tun hat und deshalb wie zufällige
+       * Trägheit wirkt. `DetailsOverlay` beschreibt das an seiner Stelle
+       * ausführlich und macht es richtig.
+       */
+      const gen = layerGeneration("home");
+      releaseTimerRef.current = setTimeout(() => {
+        releaseTimerRef.current = null;
+        releaseLayer("home", gen);
+      /**
+       * Mit ABSTAND, nicht 40ms hinter der Kurve.
+       *
+       * Das Abreißen einer Textur ist kein Buchhaltungs-Schritt: Die
+       * bildschirmfüllende Ebene des Landingscreens wird verworfen, und die
+       * Fläche darunter muss einmal komplett neu gezeichnet werden — mit ihren
+       * vier fast bildschirmhohen Bildkarten. 40ms nach dem Ende hieß: genau im
+       * Nachklang der Bewegung, wo der Parallax gerade ausläuft und das Auge
+       * noch daran hängt. Das ist der Teil von „der Parallax ruckelt", der gar
+       * nicht mehr in der Fahrt liegt.
+       *
+       * Weit genug weg vom Ende, weit genug vor der 1,4-Sekunden-Frist, gegen
+       * die diese Freigabe überhaupt eingebaut wurde.
+       */
+      }, ASSISTANT_OUT.duration + 260);
       closeTimerRef.current = setTimeout(() => {
         // Kein `canGoBack`-Zweig mehr nötig? Doch: Wer über eine Verknüpfung
         // direkt hier landet, hat keine Vorgeschichte zum Zurückgehen.
-        if (router.canGoBack()) router.back();
-        else router.navigate("/");
-      }, ASSISTANT_OUT.duration);
+        useSearchStore.getState().closeAssistant();
+        /**
+         * Mit Abstand, nicht bildgenau auf das Kurvenende.
+         *
+         * Der Wecker steht im selben Bild-Vorlauf wie der Start der Kurve, läuft
+         * also rund ein Bild VOR ihr aus. `router.back()` baut dann den
+         * kompletten Bo-Baum ab, während der Parallax des Landingscreens noch an
+         * derselben Kurve hängt — im letzten Bild springt beides. Und
+         * `setTimeout` ist ohnehin nicht bildgenau.
+         */
+      }, ASSISTANT_OUT.duration + 120);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router, armClose]);
@@ -440,21 +534,51 @@ export default function AssistantScreen() {
   useEffect(() => {
     if (!isFocused) return;
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
-      closeScreen();
+      /**
+       * Erst die Vorarbeit, dann ein Bild später die Fahrt.
+       *
+       * Der X-Knopf bekommt diese Staffelung geschenkt: Textur und Anhalten
+       * liegen an seinem `onTouchStart`, die Kurve an `onPress` — dazwischen
+       * die 80 bis 150ms des Fingers. Die Zurück-Geste hat keinen solchen
+       * Moment; ohne das Aufteilen fiele der Ebenen-Aufbau (im Projekt mit 66ms
+       * vermessen) in die ersten Bilder der Ausfahrt.
+       */
+      armClose();
+      /**
+       * Die Tastatur gehört in DIESES Bild, nicht ins nächste.
+       *
+       * `armClose` nimmt sie bewusst nicht mit: Es hängt am Aufsetzen des
+       * Fingers, und ein abgebrochener Tipp soll die Tastatur nicht schließen.
+       * Beim X-Knopf erledigt das deshalb `onPressIn`. Die Zurück-Geste hat
+       * keinen dieser beiden Momente — dort lief das Schließen erst in
+       * `closeScreen`, also ein einziges Bild vor dem Start der Ausfahrt.
+       *
+       * Unter `adjustResize` ist das kein billiger Aufruf: Das Fenster wird
+       * kleiner, und daraus folgt eine Neuvermessung des GESAMTEN Baums — samt
+       * jeder gemounteten Nachrichten-Zeile. Sie wird also mit dem Verlauf
+       * teurer und fiel genau in die Ausfahrt. Das ist der Teil von „das
+       * Schließen wird mit jeder Nachricht schlechter", der nur die Geste
+       * betrifft — und deshalb nur manchmal auftrat.
+       */
+      chatInputRef.current?.blur();
+      Keyboard.dismiss();
+      requestAnimationFrame(() => closeScreen());
       return true;
     });
     return () => sub.remove();
-  }, [closeScreen, isFocused]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [closeScreen, isFocused, armClose]);
   /** Neustart-Zeitgeber der Spracheingabe — muss beim Verlassen sterben. */
   const restartRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const isFocusedRef = useRef(true);
+  const isFocusedRef = useRef(isFocused);
   isFocusedRef.current = isFocused;
   const locale = useSearchStore((s) => s.locale);
   const currency = useSearchStore((s) => s.currency);
   const openAuthOverlay = useSearchStore((s) => s.openAuthOverlay);
 
   // ?autoVoice=1 wird vom Home-Mic-Tap mitgeschickt → wir starten Voice direkt.
-  const params = useLocalSearchParams<{ autoVoice?: string }>();
+  // Kam der Aufruf über das Mikrofon? Früher ein Routen-Parameter.
+  const params = { autoVoice: useSearchStore.getState().assistantAutoVoice ? "1" : undefined };
 
   // Initial-Werte aus dem Module-Level-State: erste Mount = leere Liste,
   // jedes spätere Re-Mount kriegt die vorhin geführte Konversation zurück.
@@ -526,7 +650,7 @@ export default function AssistantScreen() {
    */
   const bubbleReadyRef = useRef<string | null>(null);
   /** Siehe `flushText` — hier nur deklariert, damit `send` drankommt. */
-  const flushTextRef = useRef<(() => void) | null>(null);
+  const flushTextRef = useRef<((force?: boolean) => void) | null>(null);
   // Letzte Such-Params aus einem vorherigen Turn — Server ist stateless,
   // deshalb müssen WIR die mitsenden damit Cross-Turn-Tools wie
   // open_all_results funktionieren („zeig mir alle gefundenen Verbindungen"
@@ -1034,10 +1158,23 @@ export default function AssistantScreen() {
   // autoVoice=1 vom Home-Mic-Tap: einmalig nach Mount starten.
   const autoVoiceFiredRef = useRef(false);
   useEffect(() => {
-    if (params.autoVoice === "1" && !autoVoiceFiredRef.current) {
-      autoVoiceFiredRef.current = true;
-      void startVoice();
-    }
+    if (params.autoVoice !== "1" || autoVoiceFiredRef.current) return;
+    autoVoiceFiredRef.current = true;
+    /**
+     * ERST NACH der Fahrt, nicht sofort.
+     *
+     * `startVoice` fragt die Berechtigung ab und startet die native
+     * Erkennungs-Session — Dienst-Anbindung, Audio-Fokus, dazu ein
+     * `setListening(true)`, also ein voller Neu-Render. Das lief bislang rund
+     * ein Bild in die laufende Einfahrt hinein.
+     *
+     * Derselbe Abstand wie beim Wecker, der Bo wieder anlaufen lässt. Der
+     * Unterschied ist für den Nutzer nicht zu bemerken: Das Mikrofon geht
+     * dreiviertel Sekunden nach dem Tipp an, und bis dahin fährt der
+     * Bildschirm ohnehin noch.
+     */
+    const id = setTimeout(() => void startVoice(), ASSISTANT_IN.duration + 320);
+    return () => clearTimeout(id);
   }, [params.autoVoice, startVoice]);
 
   // Wenn der Tab den Focus verliert (User wechselt zu Home etc.): laufende
@@ -1098,11 +1235,26 @@ export default function AssistantScreen() {
     const hasUserMessage = messagesRef.current.some((m) => m.kind === "user");
     if (hasUserMessage) return;
     if (Math.random() >= 0.75) return;
-    setMood("waving");
+    /**
+     * ERST NACH der Fahrt winken.
+     *
+     * `setMood` rendert den kompletten Bildschirm neu — und der Fokus-Wechsel,
+     * an dem das hier hängt, kippt in Bild 1 der 430ms-Einfahrt. Das traf ein
+     * VIERTEL aller Öffnungen und war damit buchstäblich das „manchmal ruckelt
+     * es beim Reinsliden": mal winkt er, mal nicht, und nur wenn er winkt,
+     * liegt der Render in der Bewegung.
+     *
+     * Derselbe Abstand wie bei Bos Wiederanlauf — vorher steht er ohnehin
+     * still, ein Stimmungswechsel wäre bis dahin gar nicht zu sehen.
+     */
+    const waveId = setTimeout(() => setMood("waving"), ASSISTANT_IN.duration + 320);
     const id = setTimeout(() => {
       setMood((current) => (current === "waving" ? "idle" : current));
-    }, 4500);
-    return () => clearTimeout(id);
+    }, ASSISTANT_IN.duration + 320 + 4500);
+    return () => {
+      clearTimeout(waveId);
+      clearTimeout(id);
+    };
   }, [isFocused]);
 
   // Periodic Idle-Wink: alle 60s winkt Bo kurz wenn er gerade idled und
@@ -1155,7 +1307,7 @@ export default function AssistantScreen() {
          * an den Server schickt. Bos eigene vorige Antwort wäre dort still
          * abgeschnitten gewesen.
          */
-        flushTextRef.current?.();
+        flushTextRef.current?.(true);
         /**
          * Auch den halben Text retten.
          *
@@ -1386,7 +1538,7 @@ export default function AssistantScreen() {
       } finally {
         // Rest ausgeben, bevor der Turn zumacht — sonst fehlten die letzten
         // bis zu 50ms Text.
-        flushTextRef.current?.();
+        flushTextRef.current?.(true);
         if (abortRef.current === ctrl) abortRef.current = null;
         // Nur aufräumen, wenn noch DIESE Antwort läuft. Wurde die alte
         // abgebrochen und schon die nächste losgeschickt, machte dieser Block
@@ -1420,6 +1572,7 @@ export default function AssistantScreen() {
          * den der nächste Turn an den Server schickt — sonst wäre eine
          * abgebrochene Antwort für Bo nie passiert.
          */
+        flushTextRef.current?.(true);
         const streamed = takeStreamText(botId);
         if (streamed !== null && streamed.length > 0) {
           setMessages((prev) => commitBotText(prev, botId, streamed));
@@ -1462,13 +1615,37 @@ export default function AssistantScreen() {
    */
   const textBufRef = useRef<{ botId: string; text: string } | null>(null);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const flushText = useCallback(() => {
+  /**
+   * @param force Aufschub übergehen. Nötig am ENDE eines Turns und beim Abbau:
+   *        Dort wird der Strom-Speicher in die Nachricht übernommen, und ein
+   *        noch gepufferter Rest wäre sonst verloren.
+   */
+  const flushText = useCallback((force = false) => {
     if (flushTimerRef.current) {
       clearTimeout(flushTimerRef.current);
       flushTimerRef.current = null;
     }
     const buf = textBufRef.current;
     if (!buf || buf.text.length === 0) return;
+    /**
+     * NICHT ausgeben, solange etwas fährt.
+     *
+     * Der Strom läuft weiter, wenn man mitten in einer Antwort etwas öffnet
+     * oder schließt — die Ergebnisliste aus Bo heraus, eine Ergebniskarte, Bo
+     * selbst. Jede Ausgabe lässt die Blase wachsen, und das ist ein echter
+     * Yoga-Durchgang über den Inhalts-Container samt einer Maß-Meldung pro
+     * gemounteter Zeile. Zehnmal pro Sekunde trifft das eine 380ms-Fahrt mit
+     * hoher Wahrscheinlichkeit — und weil es eben nur mit Wahrscheinlichkeit
+     * trifft, ist es ein „manchmal ruckelt es".
+     *
+     * Der Puffer bleibt stehen und wird gleich danach ausgegeben; für den
+     * Lesefluss ist eine Verzögerung von unter einer halben Sekunde nicht von
+     * der normalen Antwortzeit zu unterscheiden.
+     */
+    if (!force && isTransitionBusy()) {
+      flushTimerRef.current = setTimeout(() => flushTextRef.current?.(), 120);
+      return;
+    }
     textBufRef.current = null;
     /**
      * Der Text geht in den Strom-Speicher, NICHT in die Liste.
@@ -1495,6 +1672,21 @@ export default function AssistantScreen() {
       if (event.type !== "text") flushText();
       switch (event.type) {
         case "mood":
+          /**
+           * Auch die Stimmung wartet, solange etwas fährt.
+           *
+           * `setMood` rendert diesen Bildschirm komplett neu — zweieinhalbtausend
+           * Zeilen. Der Strom liefert Stimmungswechsel zu beliebigen
+           * Zeitpunkten; fällt einer in eine Fahrt, ist das derselbe Ruck wie
+           * beim Text-Ausgeben daneben, nur seltener und damit noch schwerer zu
+           * fassen. Zu sehen ist von der Verzögerung nichts: Während einer Fahrt
+           * steht Bo ohnehin still.
+           */
+          if (isTransitionBusy()) {
+            const mood = event.mood;
+            setTimeout(() => setMood(mood), 140);
+            return;
+          }
           setMood(event.mood);
           return;
         case "text": {
@@ -1669,6 +1861,9 @@ export default function AssistantScreen() {
   // Message bei index=0 steht (mit `inverted` ist das visuell der Bottom).
   // useMemo damit nicht bei jedem Render ein neues Array entsteht.
   const reversedMessages = useMemo(() => [...messages].reverse(), [messages]);
+  /** Die fünf neuesten — siehe `data` an der Liste. Eigener Merker, damit die
+   *  Schranke der Liste nicht bei jedem Durchgang bricht. */
+  const enteringSlice = useMemo(() => reversedMessages.slice(0, 5), [reversedMessages]);
 
 
 
@@ -1732,6 +1927,21 @@ export default function AssistantScreen() {
 
 
   /**
+   * Steht HIER oben, weil der Inhalts-Stil der Liste davon abhängt (siehe
+   * `threadContentStyle`). Die ausführliche Begründung zu `entering` steht
+   * weiter unten bei den beiden Weckern, die es zurücksetzen.
+   */
+  const [entering, setEntering] = useState(true);
+  /**
+   * Wird während der Fahrt WIRKLICH gekürzt?
+   *
+   * Nur dann, wenn es überhaupt mehr als fünf Nachrichten gibt. Bei kürzerem
+   * Verlauf ist die Kürzung wirkungslos — und die Layout-Ausnahme darunter
+   * wäre dann eine Verschiebung ohne Grund.
+   */
+  const sliced = entering && reversedMessages.length > enteringSlice.length;
+
+  /**
    * Mindesthöhe = VOLLE Listenhöhe. Das ist keine Willkür.
    *
    * Ich hatte sie kurz auf die nutzbare Höhe gesetzt, um daran ablesen zu
@@ -1765,8 +1975,24 @@ export default function AssistantScreen() {
        * Überhang gibt es nichts, das aus dem Bild geschoben würde.
        */
       { paddingTop: contentPaddingBottom, paddingBottom: THREAD_TOP_GAP + (flowing ? kbPad : 0) },
+      /**
+       * Solange gekürzt wird, NICHT am oberen Rand verankern.
+       *
+       * `flexGrow: 1` + `justifyContent: "flex-end"` schiebt wenige Nachrichten
+       * an den visuellen OBEREN Rand — bei kurzen Unterhaltungen ist das genau
+       * richtig und ausdrücklich so gebaut. Während der Einfahrt kennt die
+       * Liste aber nur die fünf neuesten, und die sahen damit aus wie eine
+       * kurze Unterhaltung: Sie standen oben, und als der Rest nachrückte,
+       * rutschten sie nach unten. Das ist das „oben fehlen Nachrichten, die
+       * ploppen rein und alles verschiebt sich".
+       *
+       * Ohne die Verankerung packen sie am Flussanfang — in der gespiegelten
+       * Liste also unten, wo sie hingehören. Der Rest füllt danach nach oben
+       * auf, ohne dass sich etwas verschiebt.
+       */
+      sliced ? NO_END_ANCHOR : null,
     ],
-    [contentPaddingBottom, flowing, kbPad],
+    [contentPaddingBottom, flowing, kbPad, sliced],
   );
 
   /**
@@ -2022,61 +2248,92 @@ export default function AssistantScreen() {
     transform: [{ translateY: slideShift.value }],
   }));
 
-  const slideStyle = useAnimatedStyle(() => ({
-    transform: [{ translateY: (1 - assistantPush.value) * PARK_Y }],
-  }));
+  const slideStyle = useAnimatedStyle(() => {
+    const p = pushProgress(assistantPush.value);
+    return {
+      transform: [{ translateX: (1 - p) * PARK_X }],
+      /**
+       * Höhe NUR während der Fahrt — im Stand null.
+       *
+       * Auf Android schlägt `elevation` den `zIndex` bei der Zeichenreihenfolge.
+       * Mit einer festen 24 lag Bo damit über allem, was weniger hat — auch über
+       * dem Halt-Blatt (16), das er selbst öffnet. Es ging auf, war aber
+       * unsichtbar hinter ihm. Der `zIndex` konnte das gar nicht richten.
+       *
+       * Gebraucht wird die Höhe nur für den Schatten an der führenden Kante,
+       * damit man die runde Ecke überhaupt sieht (Bos Hintergrund ist derselbe
+       * Wert wie der des Landingscreens darunter). Im Stand gibt es keine
+       * Kante mehr — dort darf sie weg, und die Staffelung stimmt wieder:
+       * Halt-Blatt 16, Ergebnisliste 150, Detail- und Ticket-Blatt 200 liegen
+       * dann alle über ihm.
+       *
+       * `elevation` steht auf Reanimateds Liste der schnellen Eigenschaften,
+       * läuft hier also ohne Umweg über einen Commit.
+       */
+      elevation: p > 0.001 && p < 0.999 ? 24 : 0,
+    };
+  });
   /**
-   * Die Fahrt startet ERST, wenn dieser Bildschirm einmal gezeichnet ist.
+   * Die Fahrt läuft SCHON, wenn dieser Bildschirm zum ersten Mal zeichnet.
    *
-   * Das ist der Unterschied zu allen anderen Blättern der App — und der Grund,
-   * warum ausgerechnet dieses hier ruckelt. Ortswähler, Datumswähler und
-   * Such-Blatt sind dauerhaft gemountet und AUSSERHALB des Bildes geparkt; für
-   * sie ist eine Fahrt reines Verschieben. `useSheetSlide` lässt trotzdem noch
-   * ein Bild dazwischen zeichnen, und der Kommentar dort nennt den Grund
-   * wörtlich: der Unterschied zwischen „die Bewegung läuft gegen den Aufbau an"
-   * und „sie hat den Strang für sich".
+   * Angestoßen wird sie im Tipp-Handler des Landingscreens — genau wie bei
+   * jedem anderen Push der App (Ergebnisliste, Detail-Blatt, Ticket-Blatt,
+   * Profil-Unterschirm). Der Bildschirm baut sich also WÄHREND der Bewegung
+   * auf, und das ist hier die richtige Reihenfolge.
    *
-   * Bo hatte weder das eine noch das andere. Die Kurve lief im Tipp-Handler des
-   * Landingscreens los, der Bildschirm mountete danach — Kopfzeile, Bos SVG,
-   * die Liste samt ihrer ersten Zeilen und die Eingabeleiste entstanden also
-   * MITTEN in der Bewegung. Und dieser Aufbau wächst mit dem Verlauf: Je mehr
-   * Nachrichten, desto mehr Zeilen liegen im ersten Fenster.
+   * Ich hatte es zwischenzeitlich umgedreht — erst mounten, dann fahren — um
+   * den Aufbau aus der Bewegung herauszuhalten. Das hat den Aufbau nicht
+   * billiger gemacht, sondern nur nach VORNE verschoben: Zwischen Fingerdruck
+   * und erster Bewegung lag dann die komplette Erstellung des Bildschirms,
+   * inklusive fünfzehn Nachrichten-Zeilen mit Ergebniskarten. Genau das ist als
+   * Eingabe-Verzug zu spüren, und es wird mit dem Gewicht des Verlaufs
+   * schlimmer — also dasselbe Problem, nur an einer Stelle, an der es sich
+   * schlechter anfühlt.
    *
-   * Jetzt: mounten, EIN Bild zeichnen lassen, dann fahren. Solange steht der
-   * Bildschirm geparkt eine volle Höhe unter dem Bild — zu sehen ist davon
-   * nichts, es beginnt nur um den Aufbau später. Dafür läuft die Fahrt danach
-   * gegen nichts mehr an.
+   * Der Hebel ist nicht die Reihenfolge, sondern die MENGE: Was in der
+   * Bewegung entsteht, muss klein sein. Dafür sorgen die Listen-Parameter
+   * weiter unten (`entering`), und der Rest rückt nach, wenn die Fahrt durch
+   * ist.
+   *
+   * Der Haken hier bleibt als Notausgang: Wer über eine Verknüpfung direkt
+   * hier landet, hat keinen Tipp-Handler durchlaufen — ohne ihn stünde der
+   * Bildschirm für immer neben dem Sichtfeld.
    */
   useEffect(() => {
     // Über ein Modul-Flag, NICHT über `assistantPush.value`. Ein Lesezugriff aus
     // React ist ein synchroner Sprung in die UI-Laufzeit, der beide Stränge
     // gegeneinander sperrt — und dieser hier lag mitten in Bos laufender Kurve.
     // Die beiden anderen Bewegungen haben ihr Gegenstück längst.
+    // Sofort, ohne Bild-Vorlauf: Normalerweise läuft die Kurve längst (der
+    // Tipp-Handler hat sie gestartet), und dieser Zweig greift nur beim
+    // Direkteinstieg. Dort auf ein Bild zu warten, verzögert nur.
+    // NUR wenn wirklich geöffnet wird. Beim reinen Vorbereiten (Finger liegt
+    // auf der Suchleiste, Bo ist geparkt) darf sich nichts bewegen.
+    if (!isFocused) return;
+    if (!isAssistantPushStarted()) startAssistantPush();
     /**
-     * ZWEI Bilder, nicht eins.
+     * Die Textur des Landingscreens HALTEN, solange Bo darüber liegt.
      *
-     * Nach dem ersten Commit ist der Baum gemountet, aber noch nicht vermessen:
-     * Die native Layout-Runde läuft danach, und ihre `onLayout`-Meldungen
-     * kommen erst im Bild darauf in JS an. An denen hängt hier alles Weitere —
-     * die Lage und Höhe jeder Zeile, die Listenhöhe, die Buchhaltung der
-     * Virtualisierung. Mit nur einem Bild Vorlauf fiel diese Rückrunde exakt in
-     * die ersten Bilder der Kurve.
+     * Sie wird beim Aufsetzen des Fingers angefordert und verfällt nach 1,4
+     * Sekunden von selbst. Wer länger in Bo bleibt — also praktisch immer —,
+     * fuhr die Rückfahrt damit ohne Ebene: Der Landingscreen wandert 380ms lang
+     * um 30% der Breite und wird dabei jedes Bild neu gezeichnet, mit vier fast
+     * bildschirmhohen Bildkarten darin.
+     *
+     * Detail-Blatt, Ticket-Blatt und Ergebnisliste machen genau das seit
+     * Längerem; Bo war die einzige Überlagerung ohne dieses Paar. Das ist das
+     * perfekte „manchmal ruckelt es": schnell zu = glatt, normal = nicht.
      */
-    let raf: number | null = requestAnimationFrame(() => {
-      raf = requestAnimationFrame(() => {
-        raf = null;
-        if (!isAssistantPushStarted()) startAssistantPush();
-      });
-    });
+    holdLayer("home");
     return () => {
-      if (raf !== null) cancelAnimationFrame(raf);
       // Beim Verschwinden zurücksetzen — ohne Animation, der Bildschirm ist ja
       // weg. Sonst bliebe der Landingscreen darunter für immer um seine
       // Parallax-Strecke verschoben, wenn Bo je auf einem anderen Weg als über
       // `closeScreen` verlassen wird (Verknüpfung, Wiederherstellung).
       resetAssistantPush();
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isFocused]);
 
   /**
    * Bo steht still, solange der Bildschirm fährt.
@@ -2114,10 +2371,156 @@ export default function AssistantScreen() {
    * wird also weniger AUFgebaut. Beim Schließen gibt es nichts zu gewinnen —
    * der Bildschirm verschwindet ohnehin.
    */
-  const [entering, setEntering] = useState(true);
+
+  /**
+   * Die Tipp-Punkte an dieselbe Sperre hängen wie Bo.
+   *
+   * Sie sind der einzige weitere Dauerläufer in diesem Baum, und die
+   * ausführliche Begründung steht bei `setDotsPaused`. Zwei Fälle:
+   *
+   *  • `sliding` — während der Fahrt. Die Textur der Ausfahrt liegt über diesem
+   *    Baum, und was sich darunter bewegt, macht sie in jedem Bild ungültig.
+   *  • `!isFocused` — Bo liegt hinter der Ergebnisliste. Dort liefen die Punkte
+   *    unsichtbar weiter und kosteten trotzdem in jedem Bild UI-Zeit, auch
+   *    während DEREN Bewegungen.
+   */
+  useEffect(() => {
+    setDotsPaused(sliding || !isFocused);
+  }, [sliding, isFocused]);
+
   const enterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const windowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /**
+   * `entering` WIEDER scharf stellen, sobald Bo den Vordergrund verliert.
+   *
+   * Der Merker war ein Einweg-Riegel: einmal auf falsch, blieb er es für die
+   * ganze Lebensdauer des Bildschirms. Bo wird aber nicht nur ab- und wieder
+   * aufgebaut — er BLEIBT stehen, wenn er selbst die Ergebnisliste öffnet
+   * („Alle Treffer anzeigen"). `isFocused` fällt dort auf falsch, der Baum
+   * bleibt. Kommt der Nutzer zurück, läuft dieselbe Einfahrt noch einmal — nur
+   * mit `entering === false`.
+   *
+   * Und das ist der teure Unterschied. Mit dem Merker kennt die Liste während
+   * der Fahrt fünf Einträge, hält eine Bildschirmhöhe und taktet alles Weitere
+   * hinter die Bewegung. Ohne ihn sind es zwölf Einträge, fünf Bildschirmhöhen
+   * und der Eil-Pfad der Virtualisierung, der mitten in der Fahrt synchron
+   * nachrendert. Jede dieser Zeilen bringt zwei Reanimated-Zuordnungen mit, und
+   * jede neue Zuordnung wirft die sortierte Reihenfolge ALLER Zuordnungen weg.
+   * Genau deshalb wurde diese Einfahrt mit jeder Nachricht schlechter, während
+   * die erste nach dem Aufbau sauber lief.
+   *
+   * MIT ABSTAND, nicht sofort: Das Verkleinern baut Zeilen ab, und das läuft auf
+   * dem UI-Strang. Im Moment des Fokus-Verlusts fährt gerade die Ergebnisliste
+   * herein — dort gehört es nicht hinein. Eine Fahrtlänge später steht alles,
+   * und Bo ist ohnehin verdeckt: Zu sehen ist von der Umstellung nichts.
+   */
   useEffect(() => {
+    if (isFocused) return;
+    // Beim Schließen nicht mehr — der Baum verschwindet gleich ganz, ein
+    // Umbau kurz davor wäre reine Arbeit im letzten Bild der Ausfahrt.
+    if (closingRef.current) return;
+    const id = setTimeout(() => {
+      enteringRef.current = true;
+      setEntering(true);
+      // Bo hält dabei ebenfalls wieder an — die nächste Einfahrt soll ihn
+      // stillstehend antreffen, so wie die erste.
+      setSliding(true);
+    }, ASSISTANT_IN.duration + 200);
+    return () => clearTimeout(id);
+  }, [isFocused]);
+  useEffect(() => {
+    /**
+     * Die Wecker hängen am ÖFFNEN, nicht am Aufbau.
+     *
+     * Seit der Bildschirm schon beim Berühren der Suchleiste aufgebaut wird
+     * (geparkt, unsichtbar), sind das zwei verschiedene Zeitpunkte. Liefen sie
+     * beim Aufbau los, wäre die Einfahrt vorbei, bevor sie überhaupt beginnt —
+     * die Liste stünde dann schon voll da und Bo liefe, während die Fahrt noch
+     * ansteht.
+     */
+    if (!isFocused) return;
+    /**
+     * Ein noch laufendes Schließen ABBRECHEN — hier liegt der Unterschied zum
+     * Such-Blatt, nach dem du gefragt hast.
+     *
+     * Das Such-Blatt hat gar keinen Schließ-Vorgang, den man unterbrechen
+     * könnte: Sein Zustand ist EIN Speicherfeld, das beim Schließen sofort
+     * fällt und beim Öffnen sofort wieder steht. Der Effekt dort reagiert auf
+     * beide Richtungen gleich, ein Wechsel mittendrin ist schlicht der nächste
+     * Wechsel dieses Feldes.
+     *
+     * Bo schließt dagegen in einer FOLGE, die über eine halbe Sekunde läuft:
+     * Riegel setzen, Textur an, Bo anhalten, ein Bild warten, Kurve, und ganz
+     * am Ende ein Wecker, der den Baum abbaut. Nichts davon war rücknehmbar.
+     * Wer in diesem Fenster wieder öffnete, bekam:
+     *
+     *   • den Abbau-Wecker mitten in die Einfahrt (Bo fährt herein und ist
+     *     sofort wieder weg — das ist das sichtbar „Buggy"),
+     *   • `closingRef` dauerhaft gesetzt, das X und die Zurück-Geste also tot,
+     *   • `closing` dauerhaft gesetzt, die GPU-Textur blieb über der Fläche
+     *     stehen, auf der man gleich wieder scrollt,
+     *   • `sliding` dauerhaft gesetzt, Bo blieb also eingefroren,
+     *   • und die eingefrorene Tastatur-Zahl, die nie wieder auftaute.
+     *
+     * Alles davon wird hier zurückgenommen. Der Auslöser ist der Zähler in den
+     * Abhängigkeiten, nicht `isFocused` — siehe dort.
+     */
+    if (closeTimerRef.current) {
+      clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+    if (closeRafRef.current !== null) {
+      cancelAnimationFrame(closeRafRef.current);
+      closeRafRef.current = null;
+    }
+    closingRef.current = false;
+    if (releaseTimerRef.current) {
+      clearTimeout(releaseTimerRef.current);
+      releaseTimerRef.current = null;
+    }
+    /**
+     * Auch den Rücknahme-Wecker des Knopfes, sonst greift er MITTEN in die
+     * Wieder-Einfahrt.
+     *
+     * `onPressOut` stellt ihn beim Loslassen auf 400ms — gedacht für den Fall,
+     * dass aus dem Tipp doch kein Schließen wird. Nach einem abgebrochenen
+     * Schließen fände er `closingRef` auf falsch und täte genau das, was er
+     * soll: Textur weg, Bo wieder anlaufen lassen. Nur läge das jetzt rund
+     * 300ms in der laufenden Einfahrt, und Bos Anlaufen bricht 15 Werte ab und
+     * startet vier animierte SVG-Eigenschaften. Der Wecker am Ende der
+     * Einfahrt erledigt beides ohnehin, an der richtigen Stelle.
+     */
+    if (disarmTimerRef.current) {
+      clearTimeout(disarmTimerRef.current);
+      disarmTimerRef.current = null;
+    }
+    /**
+     * Und die Textur der Unterlage wieder festhalten.
+     *
+     * Beim regulären Öffnen erledigt das der Effekt an `isFocused`; der läuft
+     * bei einem unterbrochenen Schließen aber nicht, weil sich `isFocused`
+     * dabei gar nicht ändert. Ohne diese Zeile liefe die Textur 1,4 Sekunden
+     * nach der Berührung von selbst ab — mitten in die Sitzung hinein, und die
+     * nächste Ausfahrt hätte keine mehr.
+     */
+    holdLayer("home");
+    /**
+     * Die Tastatur-Zahl wieder AUFTAUEN.
+     *
+     * `closeScreen` friert sie ein, damit Leiste und Nachrichten während der
+     * Ausfahrt nicht springen; zurückgesetzt wurde sie nie, weil der Baum
+     * danach ohnehin verschwand. Sobald ein Schließen abgebrochen werden kann,
+     * gilt das nicht mehr: Der Wert bliebe für den Rest der Sitzung auf dem
+     * Stand von damals stehen, und die Tastatur bewegte danach nichts mehr.
+     *
+     * Auf dem UI-Strang geschrieben, wie schon beim Einfrieren — ein
+     * Schreibzugriff aus React sperrt beide Stränge gegeneinander.
+     */
+    runOnUI(() => {
+      "worklet";
+      kbFreeze.value = -1;
+    })();
     /**
      * Die gehaltene Strecke wächst ERST NACH der Einfahrt, mit Abstand.
      *
@@ -2148,7 +2551,17 @@ export default function AssistantScreen() {
         setFlowing(flowingPendingRef.current);
         flowingPendingRef.current = null;
       }
-    }, ASSISTANT_IN.duration + 560);
+      /**
+       * Dicht hinter das Kurvenende, nicht mehr weit dahinter.
+       *
+       * Hier standen 560ms, weil an dieser Stelle ein Schwung Zeilen nachrückt
+       * und das nicht in die letzten Bilder fallen sollte. Seit die Liste
+       * während der Fahrt nur fünf Einträge kennt (siehe `data`), ist das
+       * Nachrücken aber zugleich das SICHTBARE Auffüllen der Fläche darüber —
+       * eine halbe Sekunde später wäre es ein Nachklappen. 120ms reichen, um
+       * aus der Bewegung heraus zu sein.
+       */
+    }, ASSISTANT_IN.duration + 120);
     enterTimerRef.current = setTimeout(() => {
       enterTimerRef.current = null;
       // Nicht mehr, wenn schon geschlossen wird: Sonst hebt genau dieser Wecker
@@ -2157,6 +2570,18 @@ export default function AssistantScreen() {
       // Öffnen ist das nicht theoretisch.
       if (closingRef.current) return;
       setSliding(false);
+      /**
+       * Und die Ausfahrt-Textur abräumen, falls dieses Öffnen ein Schließen
+       * unterbrochen hat.
+       *
+       * Bei einem normalen Öffnen steht der Merker ohnehin auf falsch, hier
+       * passiert dann nichts. Nach einem abgebrochenen Schließen trägt die
+       * Fläche dagegen noch die GPU-Ebene von damals — und eine dauerhafte
+       * Ebene über einer Fläche, in der gleich gescrollt wird, ist teurer als
+       * keine. Genau hier ist die richtige Stelle: Die Einfahrt ist durch, die
+       * Ebene hat sie noch getragen.
+       */
+      setClosing(false);
       // Ab jetzt ziehen neu eintreffende Zeilen ein — vorher fährt der ganze
       // Bildschirm, da wäre es Bewegung in der Bewegung.
       allowEnter.current = true;
@@ -2170,12 +2595,16 @@ export default function AssistantScreen() {
        * animierte SVG-Eigenschaften — und die machen die ganze Fläche ungültig.
        * Der Nachbar-Wecker hat seine Luft aus genau demselben Grund bekommen.
        */
-    }, ASSISTANT_IN.duration + 220);
+      // Bo läuft NACH dem Nachfüllen wieder an, nicht dazwischen: Sein Start
+      // bricht 15 Werte ab und startet rund zehn Endlos-Ketten, darunter vier
+      // animierte SVG-Eigenschaften.
+    }, ASSISTANT_IN.duration + 320);
     return () => {
       if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
       if (windowTimerRef.current) clearTimeout(windowTimerRef.current);
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isFocused, openSeq]);
 
   const onDragStart = useCallback(() => {
     if (scrollEndTimeoutRef.current) {
@@ -2208,7 +2637,32 @@ export default function AssistantScreen() {
     () => (
     <AnimatedThread
       ref={scrollRef}
-      data={reversedMessages}
+      /**
+       * WÄHREND der Fahrt nur die fünf neuesten — und das ist der Hebel gegen
+       * „mit jeder Nachricht ruckeliger".
+       *
+       * `updateCellsBatchingPeriod={700}` weiter unten sollte das Nachrücken aus
+       * der Fahrt heraushalten. Es tut das ab sechs Nachrichten NICHT:
+       * `VirtualizedList` hat einen Eil-Pfad, der beim ersten Zellen-Maß prüft,
+       * ob die unterste gerenderte Zelle noch INNERHALB des Fensters liegt — und
+       * genau das ist beim Aufbau der Fall. Dann löscht er den Wecker und
+       * rendert SYNCHRON nach, mitten in der Bewegung.
+       *
+       * Wie viel dabei entsteht, hängt an der Bildschirmhöhe geteilt durch die
+       * mittlere Zeilenhöhe: bei kurzen Textblasen rund zehn Zeilen, bei
+       * Ergebniskarten weniger. Zwischen fünf und zwölf Nachrichten verdoppelt
+       * sich die Arbeit in der Fahrt also, darüber sättigt sie — exakt das
+       * beschriebene Bild.
+       *
+       * Sind es nur fünf Einträge, ist die unterste GLEICH der letzten, der
+       * Eil-Pfad kann gar nicht erst greifen, und in der Fahrt mounten genau
+       * fünf Zellen — unabhängig davon, wie lang der Verlauf ist.
+       *
+       * Der Rest kommt, sobald die Bewegung steht (siehe den Wecker für
+       * `entering`, jetzt dicht hinter dem Kurvenende). Er füllt die Fläche
+       * OBEN, und dort zieht der Tiefen-Effekt ihn ohnehin auf 12% Deckkraft.
+       */
+      data={sliced ? enteringSlice : reversedMessages}
       keyExtractor={keyExtractor}
       renderItem={renderItem}
       inverted
@@ -2264,30 +2718,19 @@ export default function AssistantScreen() {
        */
       windowSize={entering ? 1 : 5}
       /**
-       * 10 statt 20 — das ist eine UNTERGRENZE, kein Startwert.
-       *
-       * Die Liste hält die Anfangs-Region dauerhaft im Baum („zurück nach
-       * oben"-Optimierung). Bei 20 blieben also immer zwanzig Zeilen
-       * gemountet, egal wie weit man zurückscrollt, und die haben alle
-       * mitgerechnet.
-       *
-       * Von 10 auf 4 heruntergesetzt, weil dieselbe Zahl auch die Größe des
-       * ERSTEN Aufbaus bestimmt — und der fällt mit der Einfahrt zusammen.
-       * Vier Zeilen füllen den sichtbaren Bereich; der Rest kommt in Häppchen
-       * nach, oberhalb des Bildrands.
-       */
-      /**
-       * Wieder größer — und jetzt ist das richtig herum.
+       * WÄHREND der Fahrt klein, danach groß.
        *
        * Die Zahl ist beides: die erste Region UND die Untergrenze, die dauerhaft
-       * gemountet bleibt. Sie stand auf 4, weil der erste Aufbau mit der
-       * Einfahrt zusammenfiel und deshalb so klein wie möglich sein sollte.
-       * Seit die Fahrt erst nach dem ersten Bild startet, ist genau das Gegenteil
-       * richtig: Was hier entsteht, entsteht VOR der Bewegung. Was dagegen in
-       * Häppchen nachrückt, fällt mitten hinein — und bei langem Verlauf ist die
-       * Fläche über den letzten vier Nachrichten nicht leer, sondern voll.
+       * gemountet bleibt. Was hier steht, entsteht in den ersten Bildern der
+       * Bewegung — fünfzehn Zeilen mit Ergebniskarten sind dort zu viel, und
+       * ihr Gewicht wächst mit dem Verlauf.
        *
-       * Fünfzehn — und das ist eine Untergrenze mit Grund, keine Schätzung.
+       * Fünf decken den unteren, sofort sichtbaren Teil ab; der Rest rückt nach,
+       * wenn die Fahrt durch ist, und liegt oben — dort, wo der Tiefen-Effekt
+       * ihn ohnehin auf 12% Deckkraft zieht.
+       *
+       * Den Eil-Pfad, der diese Zahl sonst überstimmen würde, sperrt der
+       * gekürzte Datensatz oben aus (siehe `data`).
        *
        * `VirtualizedList` hat einen Eil-Pfad: Liegt die unterste gerenderte
        * Zelle noch INNERHALB des Fensters, rendert sie sofort und synchron
@@ -2296,14 +2739,8 @@ export default function AssistantScreen() {
        * nicht, mountet die Liste also trotzdem mitten in der Fahrt weiter.
        * Erst wenn er darüber hinausreicht, greift der Takt.
        *
-       * Zehn deckte auf einem hohen Gerät eine Bildschirmhöhe ab
-       * (einzeilige Blasen ~53 Punkt, dazu der reservierte Platz für die
-       * Leiste). Das ist wichtig, weil das Nachrücken für die Dauer der Fahrt
-       * gedehnt wird: Was die erste Region nicht abdeckt, bliebe solange leer.
-       * Zusammen mit `windowSize={1}` bleibt danach ohnehin fast nichts mehr
-       * nachzuladen. Mehr wäre nur Vorrat, der dauerhaft gemountet bliebe.
        */
-      initialNumToRender={15}
+      initialNumToRender={entering ? 5 : 12}
       maxToRenderPerBatch={6}
       /**
        * Und was danach noch fehlt, rückt erst NACH der Fahrt nach.
@@ -2332,6 +2769,7 @@ export default function AssistantScreen() {
       onThreadContentSize,
       threadContentStyle,
       entering,
+      enteringSlice,
       onDragStart,
       onDragStop,
       onMomentumStop,
@@ -2375,18 +2813,31 @@ export default function AssistantScreen() {
        * Das stimmte — solange die Kurve im Tipp-Handler losfuhr und der Aufbau
        * in sie hineinfiel.
        *
-       * Seit die Fahrt erst nach dem ersten Bild startet, ist der Baum fertig,
-       * bevor sie beginnt: Die erste Region ist gemountet, das Nachrücken ist
-       * für die Dauer der Fahrt gedehnt, und Bo steht still (`sliding`). Der
-       * Inhalt ändert sich während der Einfahrt also nicht mehr — und damit
-       * gilt hier dieselbe Rechnung wie überall sonst im Projekt: ohne Ebene
-       * werden bei jedem Bild sämtliche Kinder neu gezeichnet (gemessene 14,7ms
-       * gegen ein Budget von 8,3ms), mit Ebene ist ein Bild ein Blit.
+       * Und sie gilt weiterhin: Die Kurve startet im Tipp-Handler des
+       * Landingscreens, dieser Bildschirm mountet also WÄHREND der Fahrt. Seine
+       * ersten fünf Zeilen entstehen in den ersten Bildern — eine Ebene wäre
+       * dort sofort wieder ungültig und damit teurer als keine.
        *
-       * `sliding` ist schon beim ersten Rendern wahr, die Ebene entsteht also
-       * im selben Durchgang wie der Aufbau — vor der Bewegung, nicht in ihr.
+       * Für die AUSFAHRT ist es umgekehrt: Der Inhalt steht fest, Bo ist
+       * angehalten, und ohne Ebene würden bei jedem Bild sämtliche Kinder neu
+       * gezeichnet (im Projekt mit 14,7ms gegen ein Budget von 8,3ms vermessen).
        */
-      renderToHardwareTextureAndroid={sliding || closing}
+      /**
+       * IMMER fangen, solange der Bildschirm da ist.
+       *
+       * Hier stand `closing ? "none" : "auto"` — genau verkehrt herum. Die
+       * Absicht war richtig: Während der Ausfahrt gibt diese bildschirmfüllende
+       * Wurzel den Landingscreen von links her frei, und ein Tipp auf dessen
+       * Suchleiste startet Bo wieder — während die Doppeldruck-Sperre noch steht
+       * und der Abbau-Wecker läuft. Er fährt dann herein und wird 500ms später
+       * trotzdem abgebaut.
+       *
+       * Nur bewirkt `none` das GEGENTEIL: Es macht Bo für Berührungen
+       * durchlässig, der Tipp erreicht den Landingscreen also erst recht.
+       * Gebraucht wird das Fangen — und zwar über die ganze Ausfahrt, bis der
+       * Baum wirklich weg ist.
+       */
+      renderToHardwareTextureAndroid={closing}
     >
         {/* Slim Top-Bar: Binch-Logo links, Close-Button rechts. Da wir die
             FloatingTabBar im Chat verstecken, ist X der einzige Weg zurück
@@ -2490,6 +2941,9 @@ export default function AssistantScreen() {
       {voiceMode ? (
         <VoiceRecordBar
           recording={listening}
+          // Während der Fahrt steht ihre Darstellung still — Begründung im
+          // Prop selbst. Die Aufnahme läuft weiter.
+          paused={sliding}
           onPauseToggle={() => {
             if (listening) stopVoice();
             else void startVoice();
@@ -2927,6 +3381,24 @@ function makeRecedingCell(
     const depth = useAnimatedStyle(() => {
       const e = progress.value;
       const inn = enter.value;
+      /**
+       * UNGEMESSEN heißt UNSICHTBAR — sonst blitzt die Zeile auf.
+       *
+       * Die Tiefe wird aus Lage und Höhe der Zeile gerechnet, und beide kennt
+       * erst ihre erste Messung. Bis dahin steht `progress` auf null, also auf
+       * „ganz vorn": Eine Zeile, die eigentlich weit hinten liegt und mit 12%
+       * Deckkraft erscheinen soll, wird für ein bis zwei Bilder in voller
+       * Größe und Deckkraft gezeichnet und kippt dann zurück.
+       *
+       * Sichtbar wird das genau dort, wo Zeilen nachrücken: nach der Einfahrt,
+       * wenn der Rest des Verlaufs oben auffüllt. Das ist das „die Nachrichten
+       * blitzen oben auf".
+       *
+       * Ungemessen bedeutet auch: noch an keiner Stelle. Sie gar nicht zu
+       * zeichnen ist damit nicht nur ruhiger, sondern ehrlicher — und es kostet
+       * nichts, denn das erste Maß kommt im nächsten Bild.
+       */
+      if (h.value === 0) return { opacity: 0 };
       return {
         opacity: (1 - (1 - RECEDE_MIN_OPACITY) * e) * inn,
         transform: [
@@ -3218,6 +3690,52 @@ function RichText({ text, accent }: { text: string; accent: string }) {
   );
 }
 
+/**
+ * Laufen die Tipp-Punkte gerade? — EIN Merker für alle drei.
+ *
+ * WARUM DAS ÜBERHAUPT NÖTIG IST:
+ *
+ * Die Punkte sind der einzige Dauerläufer in Bos Baum außer Bo selbst — sechs
+ * Endlos-Animationen (drei Punkte mal Lage und Deckkraft). Und Bos Ausfahrt
+ * legt genau über diesen Baum eine GPU-Textur. Eine Textur ist aber eine
+ * GERASTERTE MOMENTAUFNAHME: Ändert ein Nachfahre etwas, wird sie im selben
+ * Bild ungültig und muss neu hochgeladen werden.
+ *
+ * Solange die Punkte laufen, passiert das in JEDEM Bild der Fahrt. Die Textur
+ * ist damit nicht nur wirkungslos, sondern teurer als keine — der ganze
+ * Bildschirm samt Verlauf wird jedes Bild neu gezeichnet UND jedes Bild
+ * hochgeladen. Dieselbe Begründung steht wörtlich an Bos eigener Pause und am
+ * Sonnenaufgang des Such-Blattes.
+ *
+ * Zu sehen sind die Punkte nur, während Bo antwortet. Genau dann schließt man
+ * ihn aber gern — und dann ist es kein „manchmal" mehr, sondern jedes Mal.
+ *
+ * WARUM EIN MODUL-VERTEILER STATT EINES PROPS: Die Punkte stecken in einer
+ * Listen-Blase. Ein Prop müsste durch `renderItem` und den Memo-Vergleich, und
+ * jede Änderung daran renderte JEDE gemountete Blase neu — mitten in der Fahrt,
+ * also genau das, was hier vermieden werden soll. Über einen Verteiler weckt es
+ * die drei Punkte und sonst niemanden; `lib/assistant/streamText.ts` begründet
+ * dasselbe Vorgehen ausführlicher.
+ */
+let dotsPaused = false;
+const dotsListeners = new Set<(paused: boolean) => void>();
+
+function setDotsPaused(paused: boolean): void {
+  if (dotsPaused === paused) return;
+  dotsPaused = paused;
+  for (const fn of dotsListeners) fn(paused);
+}
+
+/** Meldet sofort den aktuellen Stand — ein frisch gemounteter Punkt soll nicht
+ *  loslaufen, wenn gerade gefahren wird. */
+function subscribeDotsPaused(fn: (paused: boolean) => void): () => void {
+  dotsListeners.add(fn);
+  fn(dotsPaused);
+  return () => {
+    dotsListeners.delete(fn);
+  };
+}
+
 function Dot({ delay }: { delay: number }) {
   // Wave-Animation auf Reanimated-Worklet: jeder Dot bobst sanft hoch & runter
   // (translateY -6 → 0) und glow't dabei (opacity 0.35 → 1). Mit phase-versetztem
@@ -3228,32 +3746,53 @@ function Dot({ delay }: { delay: number }) {
   const op = useSharedValue(0.35);
 
   useEffect(() => {
-    // Sequence pro Dot: hoch → runter → kurze Pause → repeat
-    // Cycle-Dauer: 320+320+360 = 1000ms. Mit Phase-Offsets 0/120/240ms
-    // (siehe Dot-Call-Site) ergibt sich der Wellen-Effekt.
-    ty.value = withDelay(
-      delay,
-      withRepeat(
-        withSequence(
-          withTiming(-6, { duration: 320, easing: Easing.inOut(Easing.ease) }),
-          withTiming(0, { duration: 320, easing: Easing.inOut(Easing.ease) }),
-          withTiming(0, { duration: 360 }), // pause am Boden
+    /**
+     * Anhalten heißt auch hier: in die RUHESTELLUNG, nicht irgendwo stehen
+     * bleiben.
+     *
+     * `cancelAnimation` lässt den Wert dort, wo er zufällig war — ein Punkt
+     * fröre also halb angehoben und halb durchsichtig ein und führe so aus dem
+     * Bild. Dieselbe Falle wie bei Bos Pose, und dieselbe Antwort: hart auf den
+     * Ruhewert setzen. Sichtbar ist der Sprung nicht, denn er passiert im
+     * Berührungs-Bild des Schließens, und der Bildschirm fährt danach weg.
+     */
+    const apply = (paused: boolean) => {
+      cancelAnimation(ty);
+      cancelAnimation(op);
+      if (paused) {
+        ty.value = 0;
+        op.value = 0.35;
+        return;
+      }
+      // Sequence pro Dot: hoch → runter → kurze Pause → repeat
+      // Cycle-Dauer: 320+320+360 = 1000ms. Mit Phase-Offsets 0/120/240ms
+      // (siehe Dot-Call-Site) ergibt sich der Wellen-Effekt.
+      ty.value = withDelay(
+        delay,
+        withRepeat(
+          withSequence(
+            withTiming(-6, { duration: 320, easing: Easing.inOut(Easing.ease) }),
+            withTiming(0, { duration: 320, easing: Easing.inOut(Easing.ease) }),
+            withTiming(0, { duration: 360 }), // pause am Boden
+          ),
+          -1,
         ),
-        -1,
-      ),
-    );
-    op.value = withDelay(
-      delay,
-      withRepeat(
-        withSequence(
-          withTiming(1, { duration: 320, easing: Easing.inOut(Easing.ease) }),
-          withTiming(0.35, { duration: 320, easing: Easing.inOut(Easing.ease) }),
-          withTiming(0.35, { duration: 360 }),
+      );
+      op.value = withDelay(
+        delay,
+        withRepeat(
+          withSequence(
+            withTiming(1, { duration: 320, easing: Easing.inOut(Easing.ease) }),
+            withTiming(0.35, { duration: 320, easing: Easing.inOut(Easing.ease) }),
+            withTiming(0.35, { duration: 360 }),
+          ),
+          -1,
         ),
-        -1,
-      ),
-    );
+      );
+    };
+    const off = subscribeDotsPaused(apply);
     return () => {
+      off();
       cancelAnimation(ty);
       cancelAnimation(op);
     };
@@ -3315,7 +3854,30 @@ const HERO_TOP = TOPBAR_TOP + TOPBAR_CONTENT_H + 14 - HERO_PULL_UP;
 const styles = scaledStyles({
   // `overflow` ist zwingend: Ohne es rundet Android zwar den Rahmen, aber die
   // Kinder malen weiter bis in die Ecken.
-  root: { flex: 1, backgroundColor: C.bg, overflow: "hidden" },
+  /**
+   * ABSOLUT bildschirmfüllend, nicht `flex: 1`.
+   *
+   * Als Route lag dieser Bildschirm allein im Stapel und füllte ihn mit `flex`.
+   * Seit er als Überlagerung am Wurzel-Layout hängt, ist er dort ein
+   * GESCHWISTER des Stapels — beide mit `flex: 1` teilen sich die Höhe, und Bo
+   * begann auf halber Strecke. Genau das war im Bild zu sehen.
+   *
+   * `zIndex` so gewählt, dass Bo ÜBER der Tab-Leiste (kein zIndex, also 0) und
+   * UNTER allem liegt, was er selbst öffnen kann:
+   *
+   *   Halt-Blatt 100 · Ergebnisliste 150 · Detail-/Ticket-Blatt 200
+   *
+   * Mit 120 lag er über dem Halt-Blatt — und das steht im Wurzel-Layout sogar
+   * VOR ihm. Tippte man im Chat auf eine Abfahrtstafel, öffnete sich das Blatt
+   * also hinter Bo: unsichtbar, aber da. Genau der Fall, den der Nutzer
+   * gemeldet hat.
+   */
+  root: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 50,
+    backgroundColor: C.bg,
+    overflow: "hidden",
+  },
 
   // Position des Schriftzugs — 1:1 zum Landingscreen, siehe TOPBAR_TOP oben.
   topbar: {

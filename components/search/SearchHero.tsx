@@ -200,6 +200,10 @@ interface Props {
 // setActive). Dieser schwere Baum pro Commit neu = fehlende Frames genau in der
 // Expand-Animation. Mit memo rendert er nur noch, wenn sich wirklich einer seiner
 // Props ändert (mode / entrance / bg / reset).
+/** Leeres Fehler-Set als Konstante — ein neues wäre bei jedem Räumen eine
+ *  neue Kennung und damit ein Render, den es nicht braucht. */
+const NO_ERRORS: Set<ErrorField> = new Set();
+
 function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }: Props) {
   // Screen-Hintergrund (Theme): Container, Formular, Scrim und der BinchHero-
   // „melt" müssen exakt dieselbe Farbe tragen wie die Launch-Box am Ende.
@@ -280,7 +284,7 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
 
   // Welche Felder beim letzten Submit fehlerhaft waren → rote Border. Wird
   // sobald der User das jeweilige Feld ausfüllt automatisch geleert.
-  const [errors, setErrors] = useState<Set<ErrorField>>(() => new Set());
+  const [errors, setErrors] = useState<Set<ErrorField>>(NO_ERRORS);
   /** Druck-Effekt wie an den Kategorie-Kacheln im Landingscreen. */
   const ctaBounce = usePressBounce();
   const clearError = (field: ErrorField) =>
@@ -558,7 +562,22 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
   const submitLockRef = useRef(false);
 
   function handleSubmit() {
-    finishAnim();
+    /**
+     * KEIN `finishAnim()` mehr hier.
+     *
+     * Es setzt `animFinished`, und daran hängt `heroPaused` — also ein
+     * kompletter Neu-Render dieses Baums samt der drei SVG-Wurzeln des Hero.
+     * Das landete im selben Commit wie `startResultsPush()` weiter unten, und
+     * zwar INNERHALB des Knotens, der seit dem Aufsetzen des Fingers eine
+     * bildschirmfüllende Textur trägt. Eine Ebene, deren Inhalt sich ändert,
+     * muss neu gerastert werden — die Vorbereitung war damit nicht nur
+     * wirkungslos, sondern teurer als keine.
+     *
+     * Gebraucht wird es hier auch nicht: Der Bildschirm verschwindet gleich
+     * hinter der Ergebnisliste, und beim nächsten Öffnen setzt der Aufbau die
+     * Animation ohnehin neu auf. Für den Fehler-Zweig unten steht es weiterhin
+     * (dort bleibt der Bildschirm stehen) — genau wie an den Feld-Handlern.
+     */
     // Fehlende/ungültige Felder einsammeln und rot umrandet markieren.
     const missing = new Set<ErrorField>();
     if (!origin) missing.add("origin");
@@ -577,13 +596,22 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
       // gleich darunter rendert `setErrors` den schweren Baum neu — mit
       // liegender Textur heißt das Neurasterung der ganzen Fläche.
       releaseHandoffLayer();
+      // Hier schon: Der Bildschirm bleibt stehen, die Animation soll ruhen.
+      finishAnim();
       // Visuelles Feedback via roter Border auf den fehlenden Feldern reicht —
       // ein zusätzlicher Alert würde den User unnötig unterbrechen.
       setErrors(missing);
       haptic("error");
       return;
     }
-    setErrors(new Set());
+    /**
+     * Nur räumen, wenn wirklich etwas darin steht.
+     *
+     * Ein neues `Set` ist immer eine neue Kennung — der Zustandswechsel lief
+     * also garantiert, auch wenn gar kein Fehler markiert war. Ein Render mehr
+     * im Bild des Übergangs, für nichts.
+     */
+    if (errors.size > 0) setErrors(NO_ERRORS);
     submitLockRef.current = true;
     setTimeout(() => {
       submitLockRef.current = false;

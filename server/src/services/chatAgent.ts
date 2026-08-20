@@ -891,7 +891,16 @@ interface ResolvedLoc {
 }
 
 type EndpointResolution =
-  | { status: "ok"; loc: ResolvedLoc }
+  | {
+      status: "ok";
+      loc: ResolvedLoc;
+      /**
+       * Wenn der Ort über den Geocoder aufgelöst wurde: die anderen Halte in
+       * der Nähe. Bo bekommt sie zu sehen, damit er weiß, WELCHE Stationen
+       * gemeint sein könnten, und wechseln kann, wenn der Nutzer widerspricht.
+       */
+      viaPlace?: { query: string; nearby: ResolvedLoc[] };
+    }
   | { status: "ambiguous"; candidates: ResolvedLoc[] }
   | { status: "not_found" };
 
@@ -948,6 +957,21 @@ async function loadEndpointCoords(
  */
 const POI_MAX_STOP_DISTANCE_M = 1200;
 
+/**
+ * Ländername → ISO-3166-alpha2, für den Länderfilter des Geocoders.
+ *
+ * Klein und ausdrücklich statt einer Bibliothek: Es sind genau die Länder, für
+ * die wir Halte im Bestand haben. Fehlt eines, läuft der Geocoder eben ohne
+ * Filter — dann trägt der Abgleich am Ergebnis (`expectedCountry` unten) die
+ * Prüfung allein.
+ */
+const COUNTRY_ISO: Record<string, string> = {
+  Germany: "DE", Austria: "AT", Switzerland: "CH", France: "FR",
+  Italy: "IT", Spain: "ES", Portugal: "PT", Netherlands: "NL",
+  Belgium: "BE", Luxembourg: "LU", "Czech Republic": "CZ", Poland: "PL",
+  Hungary: "HU", Slovakia: "SK", Denmark: "DK", "United Kingdom": "GB",
+};
+
 async function resolvePoiToStop(
   q: string,
   mode: TravelMode,
@@ -965,10 +989,19 @@ async function resolvePoiToStop(
    * von Rom nach Rio ist mit dem Zug ohnehin keine.
    */
   expectedCountry?: string | null,
-): Promise<ResolvedLoc | null> {
+): Promise<{ loc: ResolvedLoc; nearby: ResolvedLoc[] } | null> {
   let place: Awaited<ReturnType<typeof motisGeocode>> = null;
   try {
-    place = await motisGeocode(q);
+    /**
+     * MIT Länderangabe, wenn wir eine haben.
+     *
+     * Ohne sie greift der Geocoder daneben, und zwar genau so, wie es sein
+     * eigener Kommentar beschreibt: Für „Rom Rathaus" liefert er
+     * „Rommelshausen Rathaus" bei Stuttgart — er matcht „Rom" mitten im Wort,
+     * wie es unsere Datenbanksuche auch tut. Mit `IT` bleiben nur italienische
+     * Treffer übrig.
+     */
+    place = await motisGeocode(q, undefined, expectedCountry ? COUNTRY_ISO[expectedCountry] : undefined);
   } catch {
     return null;
   }
@@ -1006,17 +1039,96 @@ async function resolvePoiToStop(
     .orderBy(
       sql`(${locations.latitude} - ${place.lat})*(${locations.latitude} - ${place.lat}) + (${locations.longitude} - ${place.lon})*(${locations.longitude} - ${place.lon}) ASC`,
     )
-    .limit(1);
+    // Mehrere, damit Bo WEISS, welche Stationen dort in Frage kommen — an
+    // einem Platz halten oft Metro, Bus und Tram unter verschiedenen Namen.
+    .limit(6);
 
-  const row = rows[0];
-  if (!row || row.latitude == null || row.longitude == null) return null;
-  if (expectedCountry && row.country && row.country !== expectedCountry) return null;
-  return {
-    code: row.code,
-    label: row.label,
-    city: row.city ?? null,
-    country: row.country ?? null,
-  };
+  const usable = rows.filter(
+    (r) =>
+      r.latitude != null &&
+      r.longitude != null &&
+      !(expectedCountry && r.country && r.country !== expectedCountry),
+  );
+  const row = usable[0];
+  if (!row) return null;
+  const toLoc = (r: (typeof usable)[number]): ResolvedLoc => ({
+    code: r.code,
+    label: r.label,
+    city: r.city ?? null,
+    country: r.country ?? null,
+  });
+  return { loc: toLoc(row), nearby: usable.slice(0, 5).map(toLoc) };
+}
+
+/**
+ * Was kennen wir in dieser Stadt überhaupt? — für die Rückfrage.
+ *
+ * Bleibt ein Ende unauflösbar, ist ein blankes „nicht gefunden" die schlechteste
+ * Antwort: Der Nutzer weiß dann nicht, ob es an der Schreibweise liegt, an der
+ * Sprache oder daran, dass es den Halt nicht gibt. Und es gibt einen sehr
+ * konkreten Fall, der genau so aussieht: „Rathaus in Rom". Der Halt heißt dort
+ * nicht Rathaus, sondern trägt den italienischen Namen — kein Geocoder der Welt
+ * übersetzt das.
+ *
+ * Deshalb bekommt Bo eine Auswahl aus DER STADT, in der das andere Ende liegt.
+ * Damit kann er konkret fragen („meinst du Colosseo, Circo Massimo oder …?")
+ * statt zu raten oder abzulehnen — und das ist der Unterschied zwischen einer
+ * Rückfrage, die weiterhilft, und einer Absage.
+ *
+ * Sortiert nach Länge der Bezeichnung: Kurze Namen sind in aller Regel die
+ * Hauptknoten („Colosseo" vor „Colosseo/Salvi N."), und genau die meint jemand,
+ * der einen Ort nennt.
+ */
+async function knownStopsInCity(
+  city: string,
+  mode: TravelMode,
+  /** Bezugspunkt: das bereits aufgelöste Ende. Liegt in derselben Stadt. */
+  near: { latitude: number; longitude: number } | null,
+  limit = 8,
+): Promise<ResolvedLoc[]> {
+  const rows = await db
+    .select({
+      code: locations.code,
+      label: locations.label,
+      city: locations.city,
+      country: locations.country,
+    })
+    .from(locations)
+    .where(and(eq(locations.city, city), eq(locations.type, mode)))
+    /**
+     * Nach NÄHE zum anderen Ende, nicht nach Namenslänge.
+     *
+     * Kurze Namen zu bevorzugen klang plausibel und war es nicht: In Rom kamen
+     * dabei „Reti", „Lodi", „Mirti" heraus — beliebige Tram-Halte am Stadtrand.
+     * Der Bezugspunkt ist die bessere Auskunft: Wer vom Kolosseum irgendwohin
+     * will, dem hilft eine Liste der Halte in dessen Umgebung.
+     *
+     * Ohne Bezugspunkt bleibt die Reihenfolge der Datenbank — dann ist die
+     * Liste nur ein Beleg dafür, dass wir die Stadt überhaupt kennen.
+     */
+    .orderBy(
+      near
+        ? sql`(${locations.latitude} - ${near.latitude})*(${locations.latitude} - ${near.latitude}) + (${locations.longitude} - ${near.longitude})*(${locations.longitude} - ${near.longitude}) ASC`
+        : sql`${locations.code} ASC`,
+    )
+    .limit(limit * 4);
+  // Entdoppeln: An einem Platz stehen oft mehrere Halte gleichen Namens
+  // (Richtungen, Bahnsteige). Für eine Rückfrage zählt der Name, nicht der Mast.
+  const seen = new Set<string>();
+  const out: ResolvedLoc[] = [];
+  for (const r of rows) {
+    const key = r.label.toLowerCase().trim();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      code: r.code,
+      label: r.label,
+      city: r.city ?? null,
+      country: r.country ?? null,
+    });
+    if (out.length >= limit) break;
+  }
+  return out;
 }
 
 async function resolveJourneyEndpoint(
@@ -1088,8 +1200,10 @@ async function resolveJourneyEndpoint(
   if (!top) {
     // Kein Halt dieses Namens — vielleicht ist es gar keiner, sondern ein ORT.
     if (!poi?.allow) return { status: "not_found" };
-    const nearby = await resolvePoiToStop(q, mode, poi.expectedCountry);
-    if (nearby) return { status: "ok", loc: nearby };
+    const found = await resolvePoiToStop(q, mode, poi.expectedCountry);
+    if (found) {
+      return { status: "ok", loc: found.loc, viaPlace: { query: q, nearby: found.nearby } };
+    }
     return { status: "not_found" };
   }
   if (trimmed.length === 1) return { status: "ok", loc: top };
@@ -1593,34 +1707,77 @@ async function execTool(
        * Land; tun sie es nicht, findet der zweite Anlauf eben nichts und es
        * bleibt beim ehrlichen „nicht gefunden".
        */
-      if (originRes.status === "not_found" || destRes.status === "not_found") {
-        // Land der Gegenseite, falls sie aufgelöst hat. Sind beide Enden ein
-        // Ort, gibt es keine — dann trägt allein der eigene Bestand die
-        // Prüfung: Was der Geocoder danebengreift, hat dort keinen Halt in
-        // 1200 Metern und fällt durch.
-        const originCountry = originRes.status === "ok" ? originRes.loc.country : null;
-        const destCountry = destRes.status === "ok" ? destRes.loc.country : null;
-        if (originRes.status === "not_found") {
-          originRes = await resolveJourneyEndpoint(input.origin, mode, {
-            allow: true,
-            expectedCountry: destCountry,
-          });
-        }
-        if (destRes.status === "not_found") {
-          destRes = await resolveJourneyEndpoint(input.destination, mode, {
-            allow: true,
-            expectedCountry: originCountry,
-          });
-        }
+      /**
+       * Ort-Rückfall NACHEINANDER — das erste Ergebnis nagelt das Land fest.
+       *
+       * Parallel wäre hier falsch, und der Fall ist vermessen: „vom Kolosseum
+       * zum Rathaus in Rom" scheitert an BEIDEN Enden in der Datenbanksuche
+       * („Rom Rathaus" trifft dort nur „ROMmerskirchen" und „ROMmelshausen" —
+       * die Suche matcht mitten im Wort, und die Namensprüfung wirft sie
+       * korrekt weg). Im Rückfall liefert der Geocoder für „Rom Kolosseum"
+       * richtig Rom, für „Rom Rathaus" aber „Rommelshausen Rathaus" bei
+       * Stuttgart — er macht denselben Wortmitten-Treffer.
+       *
+       * Laufen beide gleichzeitig, kennt keiner das Land des anderen und die
+       * Reise endet in Baden-Württemberg. Nacheinander gibt das erste Ende dem
+       * zweiten die Landesangabe mit, und die geht in den Länderfilter des
+       * Geocoders — dort bleiben nur italienische Treffer übrig.
+       */
+      if (originRes.status === "not_found") {
+        originRes = await resolveJourneyEndpoint(input.origin, mode, {
+          allow: true,
+          expectedCountry: destRes.status === "ok" ? destRes.loc.country : null,
+        });
+      }
+      if (destRes.status === "not_found") {
+        destRes = await resolveJourneyEndpoint(input.destination, mode, {
+          allow: true,
+          expectedCountry: originRes.status === "ok" ? originRes.loc.country : null,
+        });
       }
       if (originRes.status !== "ok" || destRes.status !== "ok") {
         // Kein Fehler, sondern ein Dialog-Schritt: Bo bekommt Kandidaten
         // bzw. not_found und fragt den User nach — exakt die UX, die vorher
         // der find_location-Zwischenschritt geliefert hat.
         const problems: unknown[] = [];
+        /**
+         * Die Stadt der Gegenseite — daraus wird die Auswahl für die Rückfrage.
+         *
+         * Hat ein Ende aufgelöst, wissen wir, wo die Reise spielt. „Rathaus in
+         * Rom" findet keinen Halt, weil er dort anders heißt — aber wir können
+         * zeigen, was es in Rom gibt, statt bloß „nicht gefunden" zu melden.
+         */
+        const knownCity =
+          originRes.status === "ok"
+            ? originRes.loc.city
+            : destRes.status === "ok"
+              ? destRes.loc.city
+              : null;
+        const anchorCode =
+          originRes.status === "ok"
+            ? originRes.loc.code
+            : destRes.status === "ok"
+              ? destRes.loc.code
+              : null;
+        const anchor = anchorCode ? await loadEndpointCoords(anchorCode) : null;
+        const inCity = knownCity
+          ? await knownStopsInCity(
+              knownCity,
+              mode,
+              anchor?.latitude != null && anchor.longitude != null
+                ? { latitude: anchor.latitude, longitude: anchor.longitude }
+                : null,
+            )
+          : [];
         const describe = (endpoint: "origin" | "destination", q: string, r: EndpointResolution) => {
           if (r.status === "not_found") {
-            problems.push({ endpoint, query: q, not_found: true });
+            problems.push({
+              endpoint,
+              query: q,
+              not_found: true,
+              // Was es in der Stadt gibt, in der das andere Ende liegt.
+              ...(inCity.length > 0 ? { knownIn: knownCity, candidates: inCity } : {}),
+            });
           } else if (r.status === "ambiguous") {
             problems.push({ endpoint, query: q, ambiguous: true, candidates: r.candidates });
           }
@@ -1635,7 +1792,7 @@ async function execTool(
             clarification_needed: true,
             problems,
             instruction:
-              "Do not guess. For ambiguous endpoints ASK the user which one they mean — show human labels (you may translate for display, never show codes). When they pick, call search_journey again passing the candidate's label VERBATIM or its code — NOT your own translation of it. For not_found: retry once with the English/local spelling yourself, then ask the user.",
+              "Do not guess. For ambiguous endpoints ASK the user which one they mean — show human labels (you may translate for display, never show codes). When they pick, call search_journey again passing the candidate's label VERBATIM or its code — NOT your own translation of it. For not_found: if `candidates` is present, those are REAL stops we have in `knownIn` — name a few of them and ask which one the user means (the place they named is probably one of these under its local name; e.g. a city hall in Italy is not called 'Rathaus'). Retry once with the local-language spelling yourself before asking.",
           }),
           isError: false,
         };

@@ -29,6 +29,10 @@ import { useRouter } from "expo-router";
 import { OnFocusLost } from "@/lib/nav/FocusSentinel";
 import {
   resultsPush,
+  assistantPush,
+  startAssistantPush,
+  searchHeroPush,
+  startSearchHeroPush,
   pushProgress,
   UNDERLAY_TRAVEL_FRAC,
 } from "@/lib/nav/overlayCover";
@@ -47,7 +51,6 @@ import Animated, {
 } from "react-native-reanimated";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
-import { HomeContentDepth } from "@/components/search/HomeLaunchDepth";
 import { GUTTER, SPACE, HEADING_TOP, HEADING_GAP, useNavbarSpace } from "@/lib/theme/spacing";
 import { ScreenHeading, HEADING_LINE_HEIGHT } from "@/components/ui/ScreenHeading";
 import { MOTION } from "@/lib/motion";
@@ -312,19 +315,37 @@ function ParallaxScroll({
    *    Öffnen und Schließen neu gerendert — genau im Bild des Übergangs. Das ist
    *    derselbe Grund, aus dem der Textur-Schalter hier liegt und nicht dort.
    */
-  const searchClosed = useSearchStore((st) => st.searchOverlayMode == null);
   const { width: screenW } = useWindowDimensions();
-  const parallaxStyle = useAnimatedStyle(
-    () =>
-      searchClosed
-        ? {
-            transform: [
-              { translateX: pushProgress(resultsPush.value) * screenW * UNDERLAY_TRAVEL_FRAC },
-            ],
-          }
-        : NO_HOME_PARALLAX,
-    [searchClosed, screenW],
-  );
+  /**
+   * Die Unterlage wandert für JEDEN Bildschirm, der von rechts über sie kommt.
+   *
+   * Bisher stand hier allein die Ergebnisliste. Seit Bo und das Such-Blatt
+   * denselben Weg nehmen, sind es drei — und weil immer nur einer davon fährt,
+   * genügt der größte Wert. Ein `Math.max` ist im Worklet nichts, und es
+   * erspart drei getrennte Auswerter auf derselben bildschirmfüllenden Fläche.
+   *
+   * Die Ergebnisliste bleibt an eine Bedingung geknüpft: Sucht man AUS dem
+   * Such-Blatt heraus, liegt das dazwischen — dann ist ES die Unterlage, nicht
+   * dieser Baum, und der Parallax gehört nicht hierher.
+   *
+   * Diese Bedingung kommt jetzt aus einem GETEILTEN WERT, nicht aus dem
+   * Speicher. Der Unterschied ist keine Kosmetik: Als React-Abhängigkeit
+   * (`searchClosed`) kippte sie in genau dem Durchgang, in dem sich das Blatt
+   * öffnet — und Reanimated beantwortet eine geänderte Abhängigkeit mit Abriss
+   * und Neuanlage der Zuordnung. Der nächste Lauf baut daraufhin die
+   * topologische Reihenfolge ÜBER ALLE Zuordnungen der App neu auf, und das
+   * ausgerechnet im ersten Bild der Bewegung.
+   *
+   * Über die Lage des Blattes gefragt ist es zugleich genauer: Nicht „ist es
+   * angefordert", sondern „deckt es tatsächlich".
+   */
+  const parallaxStyle = useAnimatedStyle(() => {
+    const sheet = pushProgress(searchHeroPush.value);
+    const results = sheet > 0.99 ? 0 : pushProgress(resultsPush.value);
+    const p = Math.max(results, pushProgress(assistantPush.value), sheet);
+    if (p === 0) return NO_HOME_PARALLAX;
+    return { transform: [{ translateX: p * screenW * UNDERLAY_TRAVEL_FRAC }] };
+  }, [screenW]);
   return (
     <Animated.ScrollView
       // Reanimated setzt auf seinen Scroll-Flächen ungefragt scrollEventThrottle=1
@@ -433,6 +454,23 @@ function TransportTile({
   const launchRect = useRef<SearchOverlayLaunch | null>(null);
 
   const capture = (e: GestureResponderEvent) => {
+    /**
+     * Die Textur für die Unterlage JETZT anfordern, beim Aufsetzen.
+     *
+     * Dieser Bildschirm wandert beim Öffnen der Suche 430ms lang um 30% der
+     * Breite — mit vier fast bildschirmhohen Bildkarten darin. Ohne Ebene wird
+     * das jedes Bild neu gezeichnet (im Projekt mit 14,7ms gegen 8,3ms Budget
+     * vermessen). Der Weg zu Bo und der zur Ergebnisliste machen es längst so;
+     * ausgerechnet der häufigste Weg — der Tipp auf eine Kachel — nicht.
+     *
+     * Der Aufbau kostet gemessene 66ms und gehört deshalb zwischen Aufsetzen
+     * und Loslassen, nicht in den Start der Bewegung.
+     */
+    prepareLayer("home");
+    // Den schweren Himmel-SVG des Such-Blattes jetzt schon zeichnen lassen —
+    // Begründung dort beim Abonnenten. Ohne das fällt seine Erstzeichnung in
+    // die ersten Bilder der Fahrt.
+    useSearchStore.getState().setSearchContentVisible(true);
     const { pageX, pageY, locationX, locationY } = e.nativeEvent;
     const { w, h } = size.current;
     if (w > 0 && h > 0 && pageX != null && locationX != null) {
@@ -461,7 +499,13 @@ function TransportTile({
     // `pointerEvents: none`, die Kacheln darunter sind also weiter tippbar.
     if (useSearchStore.getState().searchOverlayMode != null) return;
     haptic("button");
+    // Bewegung zuerst, Speicher danach — wie bei jedem anderen Push. Der
+    // Fortschritt ist ein Modul-Wert und braucht den Bildschirm nicht.
+    // Erst der Commit, dann die Kurve — siehe die Begründung beim Weg zu Bo.
+    // Dieser Aufruf schreibt acht Felder auf einmal, und das Blatt setzt daraufhin
+    // neun weitere Zustände zurück. Das gehört vor die Bewegung, nicht hinein.
     openSearchOverlay(id, launchRect.current ?? undefined);
+    requestAnimationFrame(startSearchHeroPush);
   };
 
   return (
@@ -667,9 +711,16 @@ const DestinationCard = memo(function DestinationCard({ d }: { d: Destination })
     <Animated.View style={[CARD_ENTER_FROM, cardAnim]}>
       <RippleTouch
         style={[styles.card, { backgroundColor: palette.s2 }]}
+        // Textur der Unterlage beim Aufsetzen — siehe `capture` bei den
+        // Kacheln. Dieser Weg hatte sie als einziger nicht.
+        onTouchStart={() => {
+          prepareLayer("home");
+          useSearchStore.getState().setSearchContentVisible(true);
+        }}
         onPress={() => {
           haptic("button");
           openSearchOverlay(d.mode);
+          requestAnimationFrame(startSearchHeroPush);
         }}
       >
         <ImageBackground
@@ -714,10 +765,15 @@ const DestinationCard = memo(function DestinationCard({ d }: { d: Destination })
             </View>
             <RippleTouch
               style={styles.cta}
+              onTouchStart={() => {
+                prepareLayer("home");
+                useSearchStore.getState().setSearchContentVisible(true);
+              }}
               onPress={(e) => {
                 e.stopPropagation?.();
                 haptic("important");
                 openSearchOverlay(d.mode);
+                requestAnimationFrame(startSearchHeroPush);
               }}
             >
               <GradientFill />
@@ -796,7 +852,7 @@ export default function HomeScreen() {
     <OnFocusLost run={closeOpenSearchOnLeave} />
     {/* HomeContentDepth: NUR der Home-Inhalt dunkelt beim Launch ab (Dim) —
         die native Tab-Bar bleibt statisch. */}
-    <HomeContentDepth>
+    <View style={styles.fill}>
     <View style={[styles.root, { backgroundColor: appBg }]}>
       <StatusBar barStyle="light-content" backgroundColor="transparent" translucent />
       {/* Unterlay-Parallax: Tippt man im Verlauf auf eine Reise, slidet die
@@ -829,22 +885,58 @@ export default function HomeScreen() {
                * das seit Längerem (`RecentCard`), der zu Bo nicht — dabei ist
                * hier mehr zu zeichnen.
                */
-              onTouchStart={() => prepareLayer("home")}
+              onTouchStart={() => {
+                prepareLayer("home");
+                /**
+                 * Bo schon JETZT aufbauen — er ist geparkt und unsichtbar.
+                 *
+                 * Zwischen Aufsetzen und Loslassen liegen 80 bis 150ms, die
+                 * ohnehin verstreichen. Ohne diesen Vorlauf mountet der
+                 * schwerste Baum der App (3500 Zeilen, Bos SVG, die Liste, die
+                 * Eingabeleiste) im SELBEN Bild, in dem die Kurve losläuft — die
+                 * ersten Bilder der Fahrt gehen dann für den Aufbau drauf.
+                 *
+                 * Genau der Weg, den Wähler, Such-Blatt und die Texturen längst
+                 * gehen: vorbereiten beim Berühren, bewegen beim Loslassen.
+                 */
+                useSearchStore.getState().preloadAssistant();
+              }}
               /**
-               * NUR navigieren — die Fahrt startet Bo selbst, nach seinem
-               * ersten Bild.
+               * Bewegung zuerst, Navigation danach — wie bei jedem anderen Push.
                *
-               * Vorher lief die Kurve hier los und der Bildschirm baute sich
-               * mitten in ihr auf. Die Begründung steht ausführlich am
-               * Gegenstück in `app/assistant.tsx`; kurz: Jedes andere Blatt der
-               * App fährt erst, wenn es fertig gezeichnet ist, und genau daran
-               * lag es, dass sich dieses hier anders anfühlte.
+               * Der Fortschritt ist ein Modul-Wert; er fängt also im
+               * Berührungs-Bild an zu laufen, noch bevor der Bildschirm
+               * überhaupt existiert. Sichtbar wird das sofort am Parallax des
+               * Landingscreens — genau das ist die Rückmeldung „es passiert
+               * etwas", und sie ist der Grund, warum die anderen Übergänge sich
+               * unmittelbar anfühlen.
+               */
+              /**
+               * Erst der schwere Commit, DANN die Kurve — ein Bild später.
+               *
+               * Ich hatte es zwischenzeitlich andersherum: Kurve sofort,
+               * Speicher-Schreibvorgang im nächsten Bild. Das fühlte sich an,
+               * als müsse sich die Bewegung „einen Ruck geben" — und genau das
+               * war es auch. `AssistantScreen` hat 3764 Zeilen und hängt selbst
+               * an `assistantOpen`; kippt der Schalter, rendert die ganze
+               * Komponente neu. Im nächsten Bild heißt: mitten in Bild 2 der
+               * Fahrt. Die Kurve rechnet zeitbasiert weiter, während nichts
+               * gezeichnet wird, und das nächste sichtbare Bild zeigt sie schon
+               * ein Stück weiter — der Ruck.
+               *
+               * Umgekehrt passiert derselbe Render, während noch nichts in
+               * Bewegung ist. Er kostet dann nichts Sichtbares: Bo ist längst
+               * aufgebaut (Leerlauf-Vorlauf), es ist ein reiner Neu-Durchlauf
+               * ohne Mount. Und die Textur der Unterlage bekommt dadurch ein
+               * Bild mehr Zeit, fertig zu werden.
                */
               onPress={() => {
-                router.navigate("/assistant");
+                useSearchStore.getState().openAssistant();
+                requestAnimationFrame(startAssistantPush);
               }}
               onMicPress={() => {
-                router.navigate({ pathname: "/assistant", params: { autoVoice: "1" } });
+                useSearchStore.getState().openAssistant(true);
+                requestAnimationFrame(() => startAssistantPush());
               }}
             />
 
@@ -949,7 +1041,7 @@ export default function HomeScreen() {
           ))}
       </ParallaxScroll>
     </View>
-    </HomeContentDepth>
+    </View>
     </>
   );
 }
@@ -958,6 +1050,8 @@ export default function HomeScreen() {
 const styles = scaledStyles({
   root: { flex: 1, backgroundColor: C.bg },
   scroll: { flex: 1 },
+  /** Ersetzt den früheren Launch-Tiefe-Wrapper — der war nur noch flex:1. */
+  fill: { flex: 1 },
   // paddingBottom: 0 — die Nav-Bar reserviert ihren eigenen Platz unter der
   // ScrollView (überlagert sie nicht). Der `card.marginBottom: 16` ist also
   // direkt der sichtbare Abstand zwischen letzter Card und Nav-Bar. Damit

@@ -179,6 +179,34 @@ function BoInner({ state = "idle", size = 128, paused = false }: Props) {
     // gesetzt werden — sonst rendert Bo z.B. im sad-Static mit der waving-
     // Init-Pose (rot=-3) statt mit der ruhigen sad-Pose (rot=0).
     if (paused) {
+      /**
+       * ANHALTEN heißt: in eine saubere Pose, nicht mitten in der Bewegung.
+       *
+       * Der Abbruch ganz oben lässt JEDEN Wert dort stehen, wo er zufällig
+       * gerade war — und dieser Zweig setzte danach nur die Leuchtstärke. Alles
+       * andere fror also mitten in seiner Schleife ein: Augen halb zu, Mund
+       * offen, Arm mitten im Winken, Körper gestaucht und gekippt.
+       *
+       * Und genau hier hält Bo an: `paused` ist `!isFocused || isScrolling ||
+       * sliding`, und `sliding` wird beim BERÜHREN des X gesetzt. Die kaputte
+       * Pose steht damit während der gesamten Ausfahrt im Bild — auf einem
+       * Bildschirm, der sich bewegt und auf dem Bo das Größte ist. Das ist das
+       * gemeldete „Bo sieht beim Zurücksliden buggy aus".
+       *
+       * Am schlimmsten sind die Augen. Sie sind dunkle Flächen, die beim
+       * Blinzeln auf 4% ausblenden; friert der Wert dort ein, scheint Bos heller
+       * Körper durch die Augenhöhlen — er steht mit weißen Augen da. Der
+       * Kommentar weiter unten beschreibt genau diesen Fall und behebt ihn auch
+       * — aber erst beim FORTSETZEN, hinter diesem `return`. Auf dem Weg in die
+       * Pause fehlte er.
+       *
+       * Gesetzt wird hart, nicht über eine Kurve: Eine Kurve liefe in die Fahrt
+       * hinein, und beim nächsten Abbruch stünde der Wert wieder irgendwo
+       * dazwischen. Sichtbar ist der Sprung kaum — er stellt die Ruhepose her,
+       * die Bo ohnehin die meiste Zeit hat.
+       */
+      eyeBlink.value = 1;
+      mouthYap.value = 1;
       if (state === "sad") {
         // Mid-of-Loop-Werte aus der sad-Animation: sanfter Ruhe-Zustand.
         ty.value = 8;
@@ -186,6 +214,24 @@ function BoInner({ state = "idle", size = 128, paused = false }: Props) {
         eyeLookY.value = 4.25;
         glowOp.value = 0.12;
       } else {
+        /**
+         * Die Ruhepose — dieselben Werte wie im Zustandswechsel-Reset oben.
+         *
+         * `ty` bleibt bewusst ausgespart: Das ist nur die Schwebehöhe, und dort
+         * stehenzubleiben sieht nach Schweben aus, nicht nach Fehler. Der Reset
+         * oben lässt den Wert aus demselben Grund aus.
+         */
+        tx.value = 0;
+        rot.value = 0;
+        sx.value = 1;
+        sy.value = 1;
+        eyeLookX.value = 0;
+        eyeLookY.value = 0;
+        armRot.value = -7;
+        sweatY.value = -4;
+        sweatOp.value = 0;
+        glowScale.value = 1;
+        sparkle.value = 0;
         glowOp.value = state === "error" ? 0 : 0.18;
       }
       return;
