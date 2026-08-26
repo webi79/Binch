@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef } from "react";
 import { Image, Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Animated, { useAnimatedStyle } from "react-native-reanimated";
@@ -389,6 +389,25 @@ export function BinchTabBar() {
   const activeHref = activeHrefRef.current;
 
   const go = useCallback((routeName: string, href: string, focused: boolean) => {
+    /**
+     * HIER wird die Textur des Landingscreens NICHT mehr angefordert.
+     *
+     * Der Gedanke war: Solange der Tab verdeckt war, wurde er nicht gezeichnet;
+     * fordert man die Ebene erst nach dem Wechsel an, rastert Android dieselbe
+     * Fläche ein zweites Mal. Also vorher anfordern, dann geht die erste
+     * Zeichnung direkt in die Ebene.
+     *
+     * Am Gerät kam dabei ein sichtbarer Fehler heraus: ein schwarzer Balken am
+     * oberen Rand, der erst nach ein bis zwei Sekunden die Hintergrundfarbe
+     * annahm. Der Puffer einer GPU-Ebene entsteht leer — wird sie angelegt,
+     * bevor die Seite gezeichnet ist, sieht man genau das. Und der erhoffte
+     * Gewinn blieb aus: Der gemeldete Ruckler beim Wechsel Umgebung →
+     * Landingscreen → Bo war unverändert.
+     *
+     * Ein Eingriff, der einen sichtbaren Fehler einbringt und die Ursache nicht
+     * trifft, gehört zurückgenommen. Die Ebene wird wieder dort angefordert, wo
+     * sie sicher ist: beim Aufsetzen des Fingers, wenn die Seite längst steht.
+     */
     // ZUERST der Wechsel — alles andere danach. Siehe Kopf der Datei.
     // Auf dem aktiven Tab entfällt er; der Rest unten läuft trotzdem.
     if (!focused) router.navigate(href as never);
@@ -443,7 +462,6 @@ export function BinchTabBar() {
    * Geblieben ist nur die Frage, ob sie noch anfassbar sein soll — und das ist
    * sie nicht, solange Bo darüber liegt.
    */
-  const onAssistant = useSearchStore((st) => st.assistantOpen);
   /**
    * Ab welchem Anteil von Bos Weg liegt er vollständig über der Leiste?
    *
@@ -484,19 +502,52 @@ export function BinchTabBar() {
    * Ergebnisliste und Detail-Blatt können es, weil sie danach stehen. Bo dorthin
    * zu holen hieße, ihn aus dem Stapel zu nehmen; das ist ein eigener Umbau.
    */
+  /**
+   * Der Wurzel-Stil EINMAL, nicht pro Durchgang neu.
+   *
+   * Ein frisches Array oder Objekt auf einem animierten Knoten ist auf Fabric
+   * nicht bloß Arbeit für den Vergleicher, sondern ein Commit auf genau dem
+   * Knoten, den Reanimated Bild für Bild beschreibt. Dieselbe Änderung wie an
+   * Detail-, Ticket- und Profil-Blatt.
+   */
+  const barStyle = useMemo(
+    () => [
+      styles.bar,
+      {
+        paddingBottom: insets.bottom,
+        height: BAR_H + insets.bottom,
+        backgroundColor: BAR_TINT[theme] ?? BAR_TINT.gray,
+      },
+    ],
+    [insets.bottom, theme],
+  );
+
   if (hidden) return null;
 
   return (
     <Animated.View
-      pointerEvents={onAssistant ? "none" : "auto"}
-      style={[
-        styles.bar,
-        {
-          paddingBottom: insets.bottom,
-          height: BAR_H + insets.bottom,
-          backgroundColor: BAR_TINT[theme] ?? BAR_TINT.gray,
-        },
-      ]}
+      /**
+       * IMMER anfassbar — die Ausnahme für Bo war ein Fehler.
+       *
+       * Hier stand `onAssistant ? "none" : "auto"`, und der Merker dahinter gilt
+       * über Bos GANZE Ausfahrt: Er fällt erst, wenn die Kurve durch ist, rund
+       * eine halbe Sekunde nachdem Bo aus dem Bild gefahren ist. In diesem
+       * Fenster war die Leiste für Berührungen durchlässig — ein Tipp auf einen
+       * Tab fiel durch auf das, was darunter lag, und öffnete dort etwas
+       * anderes. Genau das gemeldete „der Tab-Wechsel kommt nicht an, stattdessen
+       * lande ich im Such-Screen".
+       *
+       * Gebraucht wird die Ausnahme gar nicht: Bo hängt seit dem Umbau NACH
+       * dieser Leiste im Wurzel-Layout, wird also über ihr gezeichnet — und die
+       * Berührungsverteilung fragt von oben nach unten. Solange er das Feld
+       * deckt, bekommt er den Tipp; sobald er weg ist, die Leiste. Das ist genau
+       * das gewünschte Verhalten, und es braucht keinen Merker.
+       *
+       * Die Ausnahme stammt aus der Zeit, als Bo eine Route war und BAULICH
+       * unter der Leiste lag. Damals war sie richtig.
+       */
+      pointerEvents="auto"
+      style={barStyle}
       // Der Inhalt scheint durch: Die Fläche ist dunkel getönt statt deckend,
       // und die Seiten darunter haben volle Höhe (die Bibliothek gibt ihnen
       // `fullWidth`, sobald eine eigene Leiste gesetzt ist).

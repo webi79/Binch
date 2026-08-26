@@ -10,7 +10,7 @@
  * pro Frame neu compositet — sie sind einfach Children einer einzigen
  * sich bewegenden View. Wirkt wie ein durchgehender Pager (Shazam-Style).
  */
-import { Children, useEffect, useState, useRef } from "react";
+import { Children, useEffect, useMemo, useRef, useState } from "react";
 import { SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import { Platform, StyleSheet, useWindowDimensions, View } from "react-native";
 import Animated, {
@@ -103,20 +103,29 @@ export function SlidingPanels({ activeIndex, children }: Props) {
     transform: [{ translateX: tx.value }],
   }));
 
+  /**
+   * Die Schiene EINMAL, nicht pro Durchgang.
+   *
+   * Sie sitzt auf dem animierten Knoten, der die Panel-Fahrt trägt — und ein
+   * frisches Objekt dort ist auf Fabric ein Commit gegen ebendiese Bewegung.
+   * Die Werte hängen allein an Bildschirmbreite und Anzahl der Flächen; beides
+   * ändert sich nicht, während gefahren wird.
+   */
+  const railStyle = useMemo(
+    () => [
+      { flexDirection: "row" as const, width: screenW * panels.length, flex: 1 },
+      style,
+    ],
+    [screenW, panels.length, style],
+  );
+
   return (
     <View style={s.viewport}>
       <Animated.View
         collapsable={false}
         renderToHardwareTextureAndroid={Platform.OS === "android" && rasterize}
         shouldRasterizeIOS={Platform.OS === "ios" && rasterize}
-        style={[
-          {
-            flexDirection: "row",
-            width: screenW * panels.length,
-            flex: 1,
-          },
-          style,
-        ]}
+        style={railStyle}
       >
         {panels.map((panel, i) => (
           <View key={i} style={[s.slot, { width: screenW }]}>

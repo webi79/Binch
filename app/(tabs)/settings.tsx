@@ -953,13 +953,31 @@ function BackHeader({ title, onBack }: { title: string; onBack: () => void }) {
   return (
     <View style={styles.backHeader}>
       <ScreenHeading>{title}</ScreenHeading>
-      <RippleTouch
+      {/**
+       * `Pressable` statt `RippleTouch` — genau wie Bos X und das
+       * Ticket-Blatt.
+       *
+       * Die Material-Welle ist eine Animation auf einer Ansicht INNERHALB des
+       * Blattes — und über dem Blatt liegt während der Ausfahrt eine
+       * GPU-Textur. Eine Textur ist eine gerasterte Momentaufnahme: Was sich
+       * darunter bewegt, macht sie in jedem Bild ungültig, und dann wird die
+       * bildschirmfüllende Fläche jedes Bild neu gezeichnet UND neu
+       * hochgeladen (im Projekt mit 14,7ms gegen ein Budget von 8,3ms
+       * vermessen). Die Welle läuft beim Loslassen aus — also genau in die
+       * ersten Bilder der Kurve hinein.
+       *
+       * Verloren geht dabei nichts: Der Knopf verschwindet im selben Moment
+       * mit dem Blatt aus dem Bild, seine Welle sieht ohnehin niemand zu Ende.
+       * Die beiden meistbenutzten Schließ-Knöpfe der App machen es seit jeher
+       * so.
+       */
+        }
+      <Pressable
         onPress={onBack}
-        borderless
         style={({ pressed }) => [styles.backHeaderBtn, pressed && { opacity: 0.7 }]}
       >
         <X size={16} color={C.white} strokeWidth={2.5} />
-      </RippleTouch>
+      </Pressable>
     </View>
   );
 }

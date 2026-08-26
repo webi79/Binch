@@ -870,28 +870,58 @@ const DetailsContent = memo(function DetailsContent({
   const origin = splitCity(originName);
   const destination = splitCity(destName);
 
+  /** Wurzel-Fläche des Inhalts EINMAL — siehe `sheetStyle` daneben. */
+  const rootStyle = useMemo(
+    () => [styles.root, { backgroundColor: palette.bg }],
+    [palette.bg],
+  );
+
   return (
     <Animated.View
       pointerEvents={open && !hiddenForRoute ? "auto" : "none"}
       style={sheetStyle}
     >
-      <SafeAreaView style={[styles.root, { backgroundColor: palette.bg }]} edges={["top"]}>
+      <SafeAreaView style={rootStyle} edges={["top"]}>
         {/* Header: runde 40×40-Icon-Buttons, Heart wird beim Save komplett
             lime mit schwarzem Icon (kräftigeres Visual als nur Heart-Fill). */}
         <View style={styles.header}>
           <View style={styles.headerLeft}>
-            <RippleTouch onPress={onClose} hitSlop={6} style={[styles.roundBtn, { backgroundColor: palette.s2 }]}>
+            {/**
+             * `Pressable` statt `RippleTouch` — genau wie Bos X und das
+             * Ticket-Blatt.
+             *
+             * Die Material-Welle ist eine Animation auf einer Ansicht INNERHALB des
+             * Blattes — und über dem Blatt liegt während der Ausfahrt eine
+             * GPU-Textur. Eine Textur ist eine gerasterte Momentaufnahme: Was sich
+             * darunter bewegt, macht sie in jedem Bild ungültig, und dann wird die
+             * bildschirmfüllende Fläche jedes Bild neu gezeichnet UND neu
+             * hochgeladen (im Projekt mit 14,7ms gegen ein Budget von 8,3ms
+             * vermessen). Die Welle läuft beim Loslassen aus — also genau in die
+             * ersten Bilder der Kurve hinein.
+             *
+             * Verloren geht dabei nichts: Der Knopf verschwindet im selben Moment
+             * mit dem Blatt aus dem Bild, seine Welle sieht ohnehin niemand zu Ende.
+             * Die beiden meistbenutzten Schließ-Knöpfe der App machen es seit jeher
+             * so.
+             */
+        }
+            <Pressable onPress={onClose} hitSlop={6} style={[styles.roundBtn, { backgroundColor: palette.s2 }]}>
               <ArrowLeft color={C.text} size={20} strokeWidth={2} />
-            </RippleTouch>
+            </Pressable>
             <Text style={styles.title} numberOfLines={1}>
               {t("details.title")}
             </Text>
           </View>
           <View style={styles.headerRight}>
-            <RippleTouch onPress={onShare} hitSlop={6} style={[styles.roundBtn, { backgroundColor: palette.s2 }]}>
+            {/* Dieselbe Begründung wie am Zurück-Knopf links: Die Welle läuft
+                beim Loslassen in die gehaltene Textur des Blattes hinein. Sie
+                galt für alle drei Knöpfe dieser Zeile, war aber nur an einem
+                umgesetzt — die beiden hier haben die Textur weiterhin in jedem
+                Bild der Ausfahrt ungültig gemacht. */}
+            <Pressable onPress={onShare} hitSlop={6} style={[styles.roundBtn, { backgroundColor: palette.s2 }]}>
               <Share2 color={C.text} size={18} strokeWidth={2} />
-            </RippleTouch>
-            <RippleTouch
+            </Pressable>
+            <Pressable
               onPress={onToggleFav}
               hitSlop={6}
               style={[styles.roundBtn, { backgroundColor: palette.s2 }]}
@@ -902,7 +932,7 @@ const DetailsContent = memo(function DetailsContent({
                 size={18}
                 strokeWidth={2}
               />
-            </RippleTouch>
+            </Pressable>
           </View>
         </View>
 

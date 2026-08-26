@@ -28,7 +28,7 @@ import { SlidingPanels } from "@/components/ui/SlidingPanels";
 import { useAccent } from "@/lib/theme/accent";
 import { useAppBg } from "@/lib/theme/appBg";
 import { overlayCover, UNDERLAY_TRAVEL_FRAC } from "@/lib/nav/overlayCover";
-import { subscribeLayer } from "@/lib/nav/transitionLayer";
+import { subscribeLayer, releaseLayer } from "@/lib/nav/transitionLayer";
 
 /**
  * Subscribe-only-when-focused. Subscribt nur an `useSearchStore` wenn
@@ -36,6 +36,18 @@ import { subscribeLayer } from "@/lib/nav/transitionLayer";
  * bottom tabs), und ihre Store-Subscriptions würden sonst bei jedem Save
  * für unsichtbare Tabs feuern und Re-Renders triggern.
  */
+/**
+ * Als MODUL-Funktion, nicht als frische Schließung im JSX.
+ *
+ * Der Handler sitzt auf einem animierten Knoten. Eine neue Funktions-Kennung
+ * pro Durchgang ist dort dasselbe wie ein neues Stil-Objekt: ein Fabric-Commit
+ * auf genau der Ansicht, die Reanimated Bild für Bild beschreibt. `releaseLayer`
+ * braucht nur einen festen Schlüssel — die Funktion kann also einmal existieren.
+ */
+function releaseSavedLayer(): void {
+  releaseLayer("saved");
+}
+
 function useFocusedStoreSnapshot<T>(
   isFocused: boolean,
   selector: (s: SearchStoreState) => T,
@@ -112,6 +124,19 @@ export default function SavedScreen() {
   const [showModal, setShowModal] = useState(false);
   const isFocused = useIsFocused();
   const navbarSpace = useNavbarSpace();
+  /**
+   * Die Innenabstände der drei Listen EINMAL, nicht pro Durchgang.
+   *
+   * Als Literal im JSX ist jedes davon bei jedem Rendern ein frisches Objekt —
+   * und damit ein geänderter Stil-Prop auf dem Scroll-Container, den Fabric
+   * committen muss. Dieser Bildschirm rendert bei jedem Reiter-Wechsel, jedem
+   * Speichern und jeder Rückkehr neu; die Zahl darin ändert sich dabei nie.
+   */
+  const padBottom = useMemo(() => ({ paddingBottom: navbarSpace }), [navbarSpace]);
+  const padBottomGutter = useMemo(
+    () => ({ paddingBottom: navbarSpace, paddingHorizontal: GUTTER }),
+    [navbarSpace],
+  );
   /**
    * Beim Betreten den roten Punkt löschen.
    *
@@ -283,7 +308,7 @@ export default function SavedScreen() {
         {savedTrips.length === 0 ? (
           <ScrollView
             className="flex-1"
-            contentContainerStyle={{ paddingBottom: navbarSpace }}
+            contentContainerStyle={padBottom}
             showsVerticalScrollIndicator={false}
           >
 
@@ -292,6 +317,10 @@ export default function SavedScreen() {
           </ScrollView>
         ) : (
           <SectionList
+            // Wer scrollt, bekommt keine Textur — Begründung an der
+            // Ticket-Liste weiter unten. Die Reise-Karten fordern sie beim
+            // Aufsetzen genauso an.
+            onScrollBeginDrag={releaseSavedLayer}
             /**
              * Ausdrücklicher Stil, KEIN `className`.
              *
@@ -307,7 +336,7 @@ export default function SavedScreen() {
             renderItem={renderTrip}
             renderSectionHeader={renderTripSection}
             stickySectionHeadersEnabled={false}
-            contentContainerStyle={{ paddingBottom: navbarSpace, paddingHorizontal: GUTTER }}
+            contentContainerStyle={padBottomGutter}
             showsVerticalScrollIndicator={false}
             // Nur das Sichtbare aufbauen. Eine gespeicherte Reise ist eine große
             // Karte — mehr als sechs passen ohnehin nicht auf den Bildschirm.
@@ -320,6 +349,18 @@ export default function SavedScreen() {
 
         {/* TICKETS */}
         <FlatList
+      /**
+           * Wer scrollt, bekommt keine Textur — sie sofort wieder abgeben.
+           *
+           * Die Karten dieser Liste fordern die bildschirmfüllende Ebene beim
+           * AUFSETZEN des Fingers an, weil ihr Aufbau 66ms dauert und deshalb nicht
+           * in den Start einer Bewegung fallen darf. Wird aus dem Aufsetzen aber ein
+           * SCROLLEN, lag sie bis zu 1,4 Sekunden über einer bewegten Fläche — und
+           * dort ist eine Ebene teurer als gar keine: Sie wird in jedem Bild
+           * ungültig und muss neu hochgeladen werden. Ein Tipp erreicht diese Zeile
+           * nie. Dieselbe Behandlung wie im Landingscreen.
+           */
+          onScrollBeginDrag={releaseSavedLayer}
           // Ausdrücklich, aus demselben Grund wie bei der Liste darüber —
           // hier würde `className` zwar greifen, aber zwei Schreibweisen für
           // dasselbe nebeneinander laden nur zum nächsten Irrtum ein.
@@ -342,7 +383,7 @@ export default function SavedScreen() {
           // Herzen liefen dann im verdeckten Panel weiter, während man nebenan
           // arbeitet. Die Doku der Eigenschaft beschreibt genau diesen Fall.
           ListEmptyComponent={<EmptyState tab="tickets" active={tab === "tickets"} />}
-          contentContainerStyle={{ paddingBottom: navbarSpace }}
+          contentContainerStyle={padBottom}
           showsVerticalScrollIndicator={false}
           windowSize={5}
           initialNumToRender={5}

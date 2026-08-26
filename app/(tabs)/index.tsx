@@ -11,6 +11,7 @@ import {
   type GestureResponderEvent,
   type StyleProp,
   type ViewStyle,
+  ScrollView,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import {
@@ -54,7 +55,7 @@ import { haptic } from "@/lib/haptics";
 import { GUTTER, SPACE, HEADING_TOP, HEADING_GAP, useNavbarSpace } from "@/lib/theme/spacing";
 import { ScreenHeading, HEADING_LINE_HEIGHT } from "@/components/ui/ScreenHeading";
 import { MOTION } from "@/lib/motion";
-import { subscribeLayer, prepareLayer } from "@/lib/nav/transitionLayer";
+import { subscribeLayer, prepareLayer, releaseLayer } from "@/lib/nav/transitionLayer";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { RecentCard } from "@/components/home/RecentCard";
@@ -285,6 +286,18 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
  * Knoten trifft. Läge er im Landingscreen selbst, rendete dessen ganzer Baum im
  * Berührungs-Frame neu.
  */
+/**
+ * Als MODUL-Funktion, nicht als frische Schließung im JSX.
+ *
+ * Der Handler sitzt auf einem animierten Knoten. Eine neue Funktions-Kennung
+ * pro Durchgang ist dort dasselbe wie ein neues Stil-Objekt: ein Fabric-Commit
+ * auf genau der Ansicht, die Reanimated Bild für Bild beschreibt. `releaseLayer`
+ * braucht nur einen festen Schlüssel — die Funktion kann also einmal existieren.
+ */
+function releaseHomeLayer(): void {
+  releaseLayer("home");
+}
+
 function ParallaxScroll({
   style,
   contentContainerStyle,
@@ -296,6 +309,20 @@ function ParallaxScroll({
 }) {
   const [layered, setLayered] = useState(false);
   useEffect(() => subscribeLayer("home", setLayered), []);
+
+  /**
+   * Beim Zurückkommen wird die Textur NICHT vorab angefordert — ausprobiert und
+   * verworfen.
+   *
+   * Sie zu früh anzulegen brachte einen schwarzen Balken am oberen Rand: Der
+   * Puffer einer GPU-Ebene entsteht leer, und wird sie angefordert, bevor die
+   * Seite nach dem Tab-Wechsel gezeichnet ist, sieht man ihn. Den gemeldeten
+   * Ruckler hat es dabei nicht behoben.
+   *
+   * Angefordert wird sie deshalb weiterhin beim Aufsetzen des Fingers — dann
+   * steht die Seite längst, und der Aufbau fällt in die 80 bis 150ms, die
+   * ohnehin verstreichen.
+   */
 
   /**
    * Der Parallax liegt HIER, nicht im Landingscreen — und er läuft nur, wenn
@@ -347,22 +374,75 @@ function ParallaxScroll({
     return { transform: [{ translateX: p * screenW * UNDERLAY_TRAVEL_FRAC }] };
   }, [screenW]);
   return (
-    <Animated.ScrollView
-      // Reanimated setzt auf seinen Scroll-Flächen ungefragt scrollEventThrottle=1
-      // (component/ScrollView.js), also EIN Ereignis pro Bild — bei 120Hz 120 pro
-      // Sekunde zum JS-Thread. Diese Fläche hat aber gar keinen onScroll-Handler
-      // (der Parallax hängt an geteilten Werten auf dem UI-Thread), die Ereignisse
-      // sind also restlos Abfall. Explizit gesetzt heißt: weg damit.
-      scrollEventThrottle={16}
-      style={[style, parallaxStyle]}
-      contentContainerStyle={contentContainerStyle}
-      showsVerticalScrollIndicator={false}
+    /**
+     * TRANSFORM UND TEXTUR AUF EINER SCHLICHTEN HÜLLE — nicht auf der ScrollView.
+     *
+     * Beides saß bis eben direkt auf der Scroll-Fläche. Eine ScrollView ist aber
+     * der komplizierteste Knoten, den man dafür wählen kann: eine ViewGroup mit
+     * eigener Ungültigkeits-Logik — Fling-Maschinerie, Überzieh-Effekt,
+     * Scroll-Buchhaltung. Eine schlichte `View` hat davon nichts; sie wird
+     * gerastert und verschoben, mehr nicht.
+     *
+     * Das Projekt macht es an anderer Stelle bereits so: Beide Wähler tragen
+     * ihre Textur auf einer inneren Hülle, ausdrücklich mit dieser Begründung,
+     * und ihre Fahrten sind sauber.
+     *
+     * Der Inhalt bleibt unverändert: Die Hülle nimmt sich die volle Fläche
+     * (`flex: 1`), die Scroll-Fläche darin behält ihren Stil vom Aufrufer —
+     * dort steht ohnehin nur `flex: 1`. Layout-seitig ändert sich also nichts.
+     *
+     * ZURÜCKDREHEN: Hülle entfernen, `parallaxStyle` und den Textur-Schalter
+     * zurück auf die Scroll-Fläche, und aus `ScrollView` wieder
+     * `Animated.ScrollView` machen.
+     */
+    <Animated.View
+      style={[FILL, parallaxStyle]}
+      collapsable={false}
       renderToHardwareTextureAndroid={Platform.OS === "android" && layered}
     >
+    <ScrollView
+      // KEIN `scrollEventThrottle` mehr nötig: Der Wert stand hier, weil
+      // Reanimated auf SEINEN Scroll-Flächen ungefragt 1 setzt — ein Ereignis
+      // pro Bild zum JS-Strang, für eine Fläche ohne `onScroll`-Handler. Eine
+      // gewöhnliche `ScrollView` schickt ohne Handler gar keine.
+      /**
+       * WER SCROLLT, BEKOMMT KEINE TEXTUR — sie sofort wieder abgeben.
+       *
+       * Die Textur dieser Fläche wird beim AUFSETZEN des Fingers angefordert
+       * (Kacheln, Reiseziel-Karten, Suchleiste, Verlaufs-Karten — überall
+       * `onTouchStart`), weil ihr Aufbau 66ms dauert und deshalb nicht in den
+       * Start einer Bewegung fallen darf. Das ist für einen TIPP richtig.
+       *
+       * Nur wird aus einem Aufsetzen in einer Liste sehr oft ein SCROLLEN. Dann
+       * lag hier bis zu 1,4 Sekunden lang eine bildschirmfüllende GPU-Ebene auf
+       * genau der Fläche, die gerade gescrollt wird — und eine Ebene über einer
+       * bewegten Fläche ist teurer als gar keine: Sie wird in jedem Bild
+       * ungültig und muss neu hochgeladen werden. Der Landingscreen trägt vier
+       * fast bildschirmhohe Bildkarten, das Neuzeichnen ist mit 14,7ms gegen ein
+       * Budget von 8,3ms vermessen.
+       *
+       * Genau davor warnen die Kommentare in `transitionLayer.ts` und im
+       * Ortswähler wörtlich — der hat dafür `unstable_pressDelay`. Ein rohes
+       * Berührungs-Ereignis kennt diese Verzögerung nicht, also wird hier
+       * andersherum aufgeräumt: Sobald der Griff wirklich ein Scrollen ist, ist
+       * die Ebene falsch und geht weg. Ein Tipp erreicht diese Zeile nie.
+       *
+       * Deckt alle Anforderer auf einen Schlag ab, weil sie sich dieselbe Fläche
+       * teilen.
+       */
+      onScrollBeginDrag={releaseHomeLayer}
+      style={style}
+      contentContainerStyle={contentContainerStyle}
+      showsVerticalScrollIndicator={false}
+    >
       {children}
-    </Animated.ScrollView>
+    </ScrollView>
+    </Animated.View>
   );
 }
+
+/** Volle Fläche für die Parallax-Hülle — als Konstante, nicht pro Durchgang neu. */
+const FILL = { flex: 1 } as const;
 
 /** Ruhestellung des Parallax — als Konstante, kein neues Objekt pro Auswertung. */
 const NO_HOME_PARALLAX = { transform: [{ translateX: 0 }] } as const;
@@ -887,6 +967,28 @@ export default function HomeScreen() {
                */
               onTouchStart={() => {
                 prepareLayer("home");
+                /**
+                 * KEINE Textur für Bos EINfahrt — ausprobiert und verworfen.
+                 *
+                 * Der Gedanke war schlüssig: Das Such-Blatt schaltet seine Ebene
+                 * vor der Kurve ein und fährt als ein fertiges Bild, Bo lief
+                 * ohne. Am Gerät wurde es dadurch SCHLECHTER, und zwar auf zwei
+                 * Arten gleichzeitig — neue Ruckler bei der Einfahrt und ein
+                 * sichtbares Weichzeichnen von Schriftzug und Maskottchen.
+                 *
+                 * Der Grund: Bos Baum steht während der Einfahrt NICHT still.
+                 * Die fünf Zeilen bekommen darin ihre erste Messung, und der
+                 * Tiefen-Effekt schreibt daraufhin pro Zeile Deckkraft und
+                 * Transform — eine Zeile ohne Maß ist ausdrücklich unsichtbar
+                 * und wird erst mit dem ersten Maß sichtbar. Eine GPU-Ebene ist
+                 * aber eine gerasterte Momentaufnahme: Ändert ein Nachfahre
+                 * etwas, wird sie im selben Bild ungültig und muss neu
+                 * hochgeladen werden. Sie war damit teurer als keine — dieselbe
+                 * Falle wie bei den Tipp-Punkten, nur andersherum entdeckt.
+                 *
+                 * Für die AUSFAHRT gilt das nicht: Dort steht der Inhalt fest.
+                 * Deshalb hat Bo dort weiterhin eine.
+                 */
                 /**
                  * Bo schon JETZT aufbauen — er ist geparkt und unsichtbar.
                  *

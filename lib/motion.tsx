@@ -19,13 +19,11 @@ import Animated, {
   Easing,
   FadeInDown,
   ReduceMotion,
-  makeMutable,
   useAnimatedStyle,
   useSharedValue,
   withDelay,
   withSpring,
   withTiming,
-  type SharedValue,
 } from "react-native-reanimated";
 
 /**
@@ -138,7 +136,7 @@ export const MOTION = {
  * Mit der Direktive wird die Funktion auf BEIDE Threads kopiert; die
  * JS-Aufrufer (Reveal, revealEntering) rufen sie unverändert weiter auf.
  */
-export function staggerDelay(index: number): number {
+function staggerDelay(index: number): number {
   const i = Math.max(index, 0);
   const decay = 1 - MOTION.stagger / MOTION.maxDelay;
   return Math.round(MOTION.maxDelay * (1 - Math.pow(decay, i)));
@@ -253,7 +251,7 @@ function consumeSkipEntrance(): boolean {
 }
 
 /** true = der Nutzer klickt gerade schnell durch die Tabs. */
-export function isRapidNav(): boolean {
+function isRapidNav(): boolean {
   // Zusätzlich die Frische prüfen: Sonst würde ein alter `true`-Stand noch für
   // Screens gelten, die gar nicht über die Tab-Leiste kommen (Bo, Suche).
   return rapidNav && Date.now() - lastTabPressAt < RAPID_NAV_MS;
@@ -287,18 +285,6 @@ interface Entrance {
    *  lange danach nachgewachsen ist (siehe `waveBase`). */
   focusedAt: number;
   /**
-   * Zählt hoch, wenn die laufende Welle SOFORT fertig werden soll.
-   *
-   * Ausgelöst vom ersten Scroll-Griff (RevealScrollView.onScrollBeginDrag):
-   * Wer scrollt, will Inhalt sehen, keine Choreografie — und die noch laufenden
-   * Opacity/TranslateY-Animationen plus die Vorhang-Overlays der großen Karten
-   * konkurrieren auf dem UI-Thread genau mit diesem Scroll. Das war der Ruckler
-   * „Tab wechseln und sofort scrollen". Jedes Reveal springt dann direkt auf
-   * fertig; die anstehenden withDelay-Ketten werden durch die Zuweisung
-   * abgebrochen.
-   */
-  finishWave: SharedValue<number>;
-  /**
    * false = die Welle ist noch NICHT scharf; Reveals bleiben stumm im
    * Versteckt-Zustand (progress 0), OHNE zu animieren. Nur im manuellen Modus
    * relevant: Der Such-Screen mountet verdeckt VOR der Expansion — ohne diese
@@ -312,8 +298,6 @@ interface Entrance {
 const EntranceContext = createContext<Entrance>({
   generation: 0,
   focusedAt: 0,
-  // Modulweiter Default, falls ein Reveal ohne ScreenEntrance läuft.
-  finishWave: makeMutable(0),
   armed: true,
   instant: false,
 });
@@ -365,13 +349,11 @@ export function ScreenEntrance({
   resetTrigger?: number;
 }) {
   const focused = useIsFocused();
-  const finishWave = useSharedValue(0);
   const manual = trigger !== undefined;
   const firstManual = useRef(true);
   const [entrance, setEntrance] = useState<Entrance>(() => ({
     generation: 0,
     focusedAt: Date.now(),
-    finishWave,
     // Manuell: erst stumm (nicht scharf). Fokus-getrieben: sofort scharf.
     armed: !manual,
     // Ohne Welle schon beim ERSTEN Render vollständig da — sonst blitzte der
@@ -387,15 +369,14 @@ export function ScreenEntrance({
     setEntrance((e) => ({
       generation: e.generation + 1,
       focusedAt: Date.now(),
-      finishWave,
-      armed: true,
+        armed: true,
       // Sperre hat Vorrang: Wer aus einem laufenden Ladevorgang zurückkommt,
       // soll den Screen einfach vorfinden (siehe skipNextScreenEntrance).
       // wave={false} → gar keine Welle (siehe dort). `instant` ist genau der
       // Zustand „alles sofort vollständig da", den es dafür schon gibt.
       instant: !wave || consumeSkipEntrance() || isRapidNav(),
     }));
-  }, [focused, finishWave, manual, wave]);
+  }, [focused, manual, wave]);
   useEffect(() => {
     if (!manual) return;
     // Den Mount-Lauf überspringen: der Effect feuert auch beim ersten Render,
@@ -408,8 +389,7 @@ export function ScreenEntrance({
     setEntrance((e) => ({
       generation: e.generation + 1,
       focusedAt: Date.now(),
-      finishWave,
-      armed: true,
+        armed: true,
       // `wave` gilt AUCH im manuellen Modus.
       //
       // Hier stand fest `false` mit der Begründung „beim manuellen Trigger ist
@@ -422,7 +402,7 @@ export function ScreenEntrance({
       // der Bewegung, mit fünf zusätzlich bewegten Ansichten.
       instant: !wave,
     }));
-  }, [trigger, finishWave, manual, wave]);
+  }, [trigger, manual, wave]);
   // Entwaffnen (siehe resetTrigger oben): Reveals sofort auf versteckt, ohne
   // Animation. Der erste Lauf wird übersprungen — beim Mount ist ohnehin nichts
   // eingeblendet.
@@ -497,16 +477,15 @@ export function Reveal({
   large = false,
   style,
 }: RevealProps) {
-  const { generation, focusedAt, finishWave, armed, instant } = useContext(EntranceContext);
+  const { generation, focusedAt, armed, instant } = useContext(EntranceContext);
   const reduceMotion = useReduceMotion();
   const progress = useSharedValue(0);
 
   // Hier stand eine Reaktion auf `finishWave` („Scroll-Griff → Welle sofort
-  // fertig"). Hochgezählt wurde dieser Wert einzig von `RevealScrollView` — und
-  // die Komponente wird nirgends mehr verwendet, seit die Wellen aus den Tabs
-  // raus sind. Die Reaktion horchte also auf einen Wert, der sich nie ändert:
-  // ein Mapper pro Reveal auf dem UI-Thread, dauerhaft, für nichts. Im
-  // Such-Screen sind das fünf Stück, die während des Öffnens mitlaufen.
+  // fertig"): ein Mapper pro Reveal auf dem UI-Thread, dauerhaft, für einen
+  // Wert, der sich nie ändert. Hochgezählt wurde er einzig von
+  // `RevealScrollView`, und die war schon damals ohne Verwendung. Inzwischen ist
+  // beides weg — Komponente wie Wert.
 
   useEffect(() => {
     // reduceMotion: Systemeinstellung. instant: schnelles Tab-Durchklicken →
@@ -610,54 +589,6 @@ export function revealEntering(index: number) {
 // ---------------------------------------------------------------------------
 
 /**
- * ScrollView, unter der {@link ScrollReveal} läuft.
- *
- * Hier hing mal eine Sichtbarkeitsprüfung dran (Scroll-Position + gemessene
- * Element-Position), damit Elemente erst einblenden, wenn man sie hereinscrollt.
- * Das ist DREIMAL schiefgegangen:
- *
- *   1. Reanimateds `measure()` im Worklet → App-Absturz („Value is null,
- *      expected an Object"), sobald die native View noch nicht im Baum hängt.
- *   2. `measureInWindow` auf der Animated.View → deren Ref ist die
- *      Wrapper-Instanz, die Methode gibt es dort nicht. Der Optional-Chain lief
- *      still ins Leere: JEDER TAB LEER.
- *   3. Mit Notausstiegs-Timer → Tab kam eine Sekunde leer herein und alles
- *      erschien dann auf einmal, statt in der Welle.
- *
- * Der gemeinsame Nenner ist die imperative Messung. Sie kann fehlschlagen, und
- * wenn sie fehlschlägt, sieht der User einen LEEREN SCREEN — der schlechteste
- * mögliche Ausgang für eine Verschönerung. Deshalb ist sie raus: Die Welle
- * hängt jetzt an nichts mehr außer dem Fokus und dem Index, und kann damit
- * nichts mehr verstecken.
- *
- * Bleibt als Komponente erhalten, damit die Screens nichts davon mitkriegen —
- * und als Ort, an dem ein Einblenden-beim-Scrollen später wieder andocken kann,
- * dann aber additiv (nie unsichtbar als Ausgangszustand).
- */
-export function RevealScrollView({
-  children,
-  onScrollBeginDrag,
-  ...props
-}: React.ComponentProps<typeof Animated.ScrollView>) {
-  const { finishWave } = useContext(EntranceContext);
-  return (
-    <Animated.ScrollView
-      {...props}
-      onScrollBeginDrag={(e) => {
-        // Wer scrollt, will Inhalt sehen — die Welle sofort beenden, damit die
-        // laufenden Animationen nicht mit dem Scroll um den UI-Thread kämpfen.
-        finishWave.value = finishWave.value + 1;
-        // Der Prop-Typ erlaubt auch SharedValue-Handler (useAnimatedScrollHandler);
-        // durchreichen können wir nur normale Funktionen — mehr nutzt hier keiner.
-        if (typeof onScrollBeginDrag === "function") onScrollBeginDrag(e);
-      }}
-    >
-      {children}
-    </Animated.ScrollView>
-  );
-}
-
-/**
  * Ein Element der Welle. Verhält sich exakt wie {@link Reveal} — der eigene Name
  * bleibt, weil die Screens ihn benutzen und weil hier später das Einblenden beim
  * Scrollen wieder andocken soll.
@@ -688,8 +619,8 @@ export function ScrollReveal({
  * spürbar nach. Sie stehen hier, damit ein zweiter Knopf sich nicht „ungefähr
  * so" anfühlt, sondern gleich.
  */
-export const PRESS_SCALE = 0.93;
-export const PRESS_IN = { damping: 18, stiffness: 320, mass: 0.7 } as const;
+const PRESS_SCALE = 0.93;
+const PRESS_IN = { damping: 18, stiffness: 320, mass: 0.7 } as const;
 export const PRESS_OUT = { damping: 15, stiffness: 200, mass: 0.8 } as const;
 
 /**

@@ -14,7 +14,7 @@
  * Map-Marker-Kontext. Im Chat tappt der User nur — wer Details will, sucht
  * die Verbindung über Bo direkt oder im Search-Tab.
  */
-import { memo, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { View, Text, Pressable, StyleSheet, ActivityIndicator } from "react-native";
 import { useQuery } from "@tanstack/react-query";
 import { useIsFocused } from "@react-navigation/native";
@@ -22,6 +22,7 @@ import { useSearchStore } from "@/stores/searchStore";
 import { openStopSheet } from "@/components/surroundings/stopSheetAnimation";
 import { haptic } from "@/lib/haptics";
 import { useNowTicker } from "@/lib/ui/nowTicker";
+import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import Svg, { Circle } from "react-native-svg";
 import { Plane, Train, Bus, Ship, ChevronRight, type LucideIcon } from "lucide-react-native";
 import { useAccent } from "@/lib/theme/accent";
@@ -80,11 +81,49 @@ function StopBoardCardInner({ stop, initialBoard, initialData }: Props) {
   const t = useT();
   const palette = usePalette();
   const [board, setBoard] = useState<BoardKind>(initialBoard);
+  /** Wiederversuch der aufgeschobenen Abfrage — muss beim Abbau sterben. */
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // useQuery mit per-Board-Key — Tab-Switch lädt aus Cache wenn schon
   // gefetcht, sonst frischer Call. 30s staleTime damit der User keine
   // Refetches pro Re-Render bekommt.
+  /**
+   * Die Abfrage wartet, bis KEINE Fahrt mehr läuft.
+   *
+   * Diese Karte steht im Bo-Verlauf, und der Verlauf mountet seine Zeilen
+   * während der Einfahrt. `useQuery` fragt beim Mounten nach, sobald die Daten
+   * älter als 30 Sekunden sind — die Antwort trifft dann irgendwann in den
+   * folgenden Zehntelsekunden ein und rendert die Karte neu, mitsamt ihrem
+   * SVG-Ring. Animierte SVG-Eigenschaften machen die ganze Fläche ungültig,
+   * und beim Schließen liegt darüber zusätzlich eine GPU-Textur, die davon in
+   * jedem Bild verworfen wird.
+   *
+   * Weil der Zeitpunkt am Netz hängt, trifft es mal die Fahrt und mal nicht —
+   * genau das „manchmal ruckelt es beim Öffnen". Und es fragt obendrein
+   * stoßweise nach, wenn mehrere Tafeln gleichzeitig nachrücken.
+   *
+   * Aufgeschoben, nicht abgeschafft: Sobald die Bewegung durch ist, läuft die
+   * Abfrage wie bisher. Bis dahin zeigt die Karte, was der Server mit der
+   * Nachricht mitgeliefert hat (`initialData`) — also nichts Leeres.
+   */
+  const [queryReady, setQueryReady] = useState(!isTransitionBusy());
+  useEffect(() => {
+    if (queryReady) return;
+    const id = setTimeout(function attempt() {
+      if (isTransitionBusy()) {
+        timerRef.current = setTimeout(attempt, 200);
+        return;
+      }
+      setQueryReady(true);
+    }, 200);
+    timerRef.current = id;
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, [queryReady]);
+
   const { data, isLoading, isError } = useQuery({
+    enabled: queryReady,
     queryKey: ["assistant.stopboard", stop.code, board],
     queryFn: () =>
       board === "departures" ? fetchStopDepartures(stop.code) : fetchStopArrivals(stop.code),
@@ -162,7 +201,18 @@ function StopBoardCardInner({ stop, initialBoard, initialData }: Props) {
         })}
       </View>
 
-      {isLoading ? (
+      {/**
+        * `!queryReady` MUSS hier mit hinein — sonst zeigt die Karte „keine
+        * Abfahrten", obwohl noch gar nicht gefragt wurde.
+        *
+        * TanStack Query v5: Eine ABGESCHALTETE Abfrage steht auf `pending` mit
+        * `fetchStatus: "idle"` — und damit ist `isLoading` FALSCH. Solange der
+        * Aufschub läuft, war also weder Laden noch Fehler wahr, und die
+        * Trefferliste leer: Die Karte behauptete für die Dauer des Aufschubs,
+        * es gebe keine Abfahrten, und sprang danach auf den Lader und dann auf
+        * die Daten. Diesen Zustand gab es vor dem Aufschub nicht.
+        */}
+      {isLoading || !queryReady ? (
         <View style={styles.loadingWrap}>
           <ActivityIndicator color={accent.solid} size="small" />
         </View>

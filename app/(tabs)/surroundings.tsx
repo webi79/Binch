@@ -9,6 +9,7 @@ import { router } from "expo-router";
 import { useIsFocused } from "@react-navigation/native";
 import { Freeze } from "react-freeze";
 import { msSinceTabPress } from "@/lib/motion";
+import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import {
   MapSurface,
   type MapLayerType,
@@ -184,7 +185,26 @@ export default function SurroundingsScreen() {
     let id: ReturnType<typeof setTimeout>;
     const schedule = (delay: number) => {
       id = setTimeout(() => {
-        if (msSinceTabPress() < FREEZE_QUIET_MS) {
+        /**
+         * Auch WARTEN, solange etwas fährt — hier fehlte die zweite Bedingung.
+         *
+         * Der Aufschub fragt bisher nur, ob der letzte TAB-TIPP frisch ist. Das
+         * deckt schnelles Durchklicken ab, aber nicht den häufigsten Fall
+         * danach: Man kommt von der Karte zurück in den Landingscreen und
+         * öffnet dort etwas — Bo, die Suche, eine Karte. Der Freeze-Commit
+         * hängt den kompletten Kartenbaum ab, und er fiel dann genau in DEREN
+         * Einfahrt.
+         *
+         * Das erklärt auch, warum es nur BEIM ERSTEN MAL nach einem Tab-Wechsel
+         * auffällt: Der Freeze ist pro Karten-Besuch ein einziges Ereignis. Ist
+         * er durch, sind alle weiteren Fahrten sauber — bis man wieder auf die
+         * Karte geht.
+         *
+         * Dieselbe Prüfung wie überall sonst, mit Wiederversuch statt Verzicht:
+         * Eingefroren werden MUSS am Ende, sonst läuft der GL-Strang der Karte
+         * unsichtbar weiter.
+         */
+        if (msSinceTabPress() < FREEZE_QUIET_MS || isTransitionBusy()) {
           schedule(FREEZE_QUIET_MS);
           return;
         }
@@ -209,7 +229,49 @@ export default function SurroundingsScreen() {
   const pickerOverMap = useSearchStore((st) => st.locationPickerRequest !== null);
   /** Liegt die Suche darüber? Dann ist die Karte sicher nicht zu sehen. */
   const searchOverMap = useSearchStore((st) => st.searchOverlayMode != null);
-  const frozen = (!isFocused && freezeArmed) || pickerOverMap || searchOverMap;
+  /**
+   * Und BO — er fehlte in dieser Aufzählung, und das war der Unterschied.
+   *
+   * Gemeldet als: „Vom Umgebungs-Tab direkt Bo öffnen ruckelt, das Such-Blatt
+   * von derselben Stelle aus nicht." Gleicher Tab-Wechsel, gleicher
+   * Landingscreen, gleicher Parallax, gleiche Unterlagen-Textur — es konnte also
+   * an keinem davon liegen. Der Unterschied steht in dieser Zeile:
+   *
+   *   • Das Such-Blatt setzt beim Tippen `searchOverlayMode`. Damit wird
+   *     `frozen` im TIPP-Bild wahr, der GL-Strang der Karte hält an, und die
+   *     Fahrt bekommt den Bildschirm für sich.
+   *   • Bo setzte nichts dergleichen. Die Karte lief unsichtbar weiter — mit
+   *     ihrem eigenen Render-Strang, ihrer Marker-Ebene und ihrer
+   *     Ausschnitts-Abfrage — mitten in Bos Einfahrt hinein.
+   *
+   * Der aufgeschobene Freeze beim Tab-Wechsel deckt das NICHT ab; im Gegenteil.
+   * Er wartet inzwischen ausdrücklich, solange etwas fährt — und hielt die Karte
+   * damit über die volle Länge von Bos Fahrt am Laufen. Der Aufschub ist
+   * richtig, aber er ist ein Schutz für den Freeze-COMMIT, kein Ersatz für das
+   * Einfrieren selbst.
+   *
+   * Bo deckt den ganzen Bildschirm; sichtbar ist die Karte dabei nie.
+   */
+  const assistantOverMap = useSearchStore((st) => st.assistantOpen);
+  /**
+   * Und das Verlaufs-Blatt — dieselbe Regel, letzte Lücke.
+   *
+   * Der aufgeschobene Freeze greift erst eine halbe Sekunde nach dem Verlassen
+   * des Tabs. In diesem Fenster läuft die Karte weiter, und alles, was man in
+   * dieser Zeit öffnet, fährt gegen sie an. Wähler, Suche und Bo sind abgedeckt;
+   * das Verlaufs-Blatt war der einzige Weg vom Landingscreen aus, der es nicht
+   * war.
+   *
+   * Damit gilt die Regel vollständig: Was den Bildschirm deckt, hält die Karte
+   * an — unabhängig davon, ob der Aufschub schon gegriffen hat.
+   */
+  const historyOverMap = useSearchStore((st) => st.recentHistoryOverlayOpen);
+  const frozen =
+    (!isFocused && freezeArmed) ||
+    pickerOverMap ||
+    searchOverMap ||
+    assistantOverMap ||
+    historyOverMap;
 
   const [mapMounted, setMapMounted] = useState(false);
   /**
@@ -222,14 +284,96 @@ export default function SurroundingsScreen() {
    * zurücksetzen und erst wieder freigeben, wenn MapLibre erneut fertig
    * gemeldet hat.
    */
+  /** Wurde die Karte in diesem App-Lauf schon einmal enthüllt? Dann ist jeder
+   *  weitere Durchgang ein Auftauen, kein Kaltstart — siehe unten. */
+  const everRevealedRef = useRef(false);
   const [mapTilesRendered, setMapTilesRendered] = useState(false);
+  /**
+   * MITTEN IM LADEN VERLASSEN? Dann die Karte ABBAUEN, nicht nur einfrieren.
+   *
+   * Gemeldet als: „Zum Karten-Tab, gleich wieder zurück, bevor sie fertig ist —
+   * dann ruckelt Bos Fahrt. Lasse ich sie fertig laden, ist es glatt."
+   *
+   * Das passt genau zu dem, was die Karte tut. Sie holt Vektor-Kacheln von einem
+   * freien Server; jede muss dekodiert, in Geometrie übersetzt und über die rund
+   * zwanzig Stil-Ebenen tesselliert werden, dazu die Schriftzeichen als eigene
+   * Dateien. Diese Arbeit läuft auf EIGENEN Arbeits-Strängen von MapLibre — und
+   * die kümmert weder `<Freeze>` (das hält nur React an) noch `display: none`
+   * (das hält nur das Zeichnen an). Sie rechnen weiter und nehmen der Fahrt die
+   * Rechenzeit weg.
+   *
+   * Ist die Karte dagegen FERTIG, ist Ruhe: keine offenen Anfragen, nichts mehr
+   * zu tesselieren. Deshalb ist genau dieser Fall glatt.
+   *
+   * Also: fertig geladen → stehen lassen (Rückkehr ist dann sofort da).
+   * Mitten im Laden verlassen → abbauen, was die offene Arbeit mit abbricht. Was
+   * dabei verloren geht, war ohnehin unvollständig, und beim Zurückkommen wird
+   * es neu geholt — dann aber, ohne einer Animation im Weg zu stehen.
+   */
+  useEffect(() => {
+    if (!frozen) return;
+    /**
+     * Der Prüfstein ist eine ABLAGE, nicht der Zustand — und das ist hier
+     * entscheidend.
+     *
+     * Mit `mapTilesRendered` stand hier ein Wert, den der Schwester-Effekt
+     * unten im SELBEN Durchgang auf falsch setzt. Ablauf: Dieser Effekt läuft
+     * zuerst, sieht „fertig geladen" und steigt aus; der Schwester-Effekt
+     * löscht das Merkmal; dadurch ändert sich die Abhängigkeit, dieser Effekt
+     * läuft ERNEUT — und findet jetzt „nicht fertig". Der Wächter war damit
+     * tot, und die Karte wurde bei JEDEM Verdecken abgebaut statt nur beim
+     * Verlassen mitten im Laden.
+     *
+     * Ausgelöst hat das alles, was `frozen` setzt — auch der Ortswähler, den
+     * man AUS der Karte heraus öffnet. Wer dort einen Ort suchte, zerstörte die
+     * Karte damit und baute sie beim Schließen komplett neu auf: neue
+     * GL-Fläche, Stil neu geparst, alle Kacheln und Schriftzeichen neu geholt.
+     *
+     * Die Ablage überlebt den Zwischenzustand, weil sie nur beim echten
+     * Fertig-Melden gesetzt wird.
+     */
+    if (wasFullyLoadedRef.current) return;
+    /**
+     * Und nur, wenn der Tab wirklich VERLASSEN wurde.
+     *
+     * `frozen` gilt auch, wenn bloß etwas darüberliegt — Wähler, Suche, Bo,
+     * Verlaufs-Blatt. In diesen Fällen kommt man unmittelbar auf die Karte
+     * zurück; sie abzubauen wäre in jedem Fall falsch.
+     */
+    if (isFocused) return;
+    if (!mapMounted) return;
+    wasFullyLoadedRef.current = false;
+    setMapMounted(false);
+  }, [frozen, isFocused, mapMounted]);
+
   useEffect(() => {
     if (frozen) {
-      setMapTilesRendered(false);
-      // Und das Bauteil wieder scharf stellen — sonst meldet es nach dem
-      // Auftauen nie wieder „fertig" und das Skelett bliebe bis zur Notbremse
-      // über einer längst gemalten Karte liegen.
-      mapRef.current?.rearm();
+      /**
+       * Das Skelett NUR zurückholen, wenn die Fläche auch wirklich verschwindet.
+       *
+       * Es stand hier bedingungslos — und das war der Grund für „beim ersten Mal
+       * lädt die Karte schnell, danach dauert es viel länger".
+       *
+       * Der Ablauf: Beim Einfrieren kam das Skelett zurück. Beim Auftauen kann
+       * MapLibre sein „fertig" aber gar nicht noch einmal melden — die
+       * GL-Fläche wurde nie zerstört, es gibt also kein neues Ereignis. Was das
+       * Skelett dann wegnimmt, ist ausschließlich die Notbremse. Der ERSTE
+       * Besuch war schnell, weil dort das echte Signal kam; jeder weitere wartete
+       * auf den Wecker und sah dabei aus wie „lädt".
+       *
+       * Bleibt die Karte stehen, sind ihre Pixel noch da. Dann gehört kein
+       * Skelett darüber, und beim Zurückkommen ist sie sofort sichtbar.
+       *
+       * Wird sie dagegen abgebaut (Tab verlassen, bevor sie fertig war — siehe
+       * den Effekt darüber), ist das Skelett richtig: Dahinter ist dann wirklich
+       * nichts.
+       */
+      if (!wasFullyLoadedRef.current) {
+        setMapTilesRendered(false);
+        // Und das Bauteil wieder scharf stellen, damit es nach dem Neuaufbau
+        // wieder melden kann.
+        mapRef.current?.rearm();
+      }
       return;
     }
     if (!mapMounted) return;
@@ -242,7 +386,50 @@ export default function SurroundingsScreen() {
      * immer über einer funktionierenden Karte. Vier Sekunden decken den
      * gemessenen Bereich (0,3 bis 4,7s pro Kachelsatz) mit ab.
      */
-    const id = setTimeout(() => setMapTilesRendered(true), 4000);
+    /**
+     * NACH dem Auftauen viel kürzer als beim ersten Aufbau.
+     *
+     * Die vier Sekunden sind für den KALTSTART bemessen — dort deckt sie der
+     * gemessene Bereich von 0,3 bis 4,7s pro Kachelsatz. Nach einem Auftauen
+     * gilt davon nichts: Die Kacheln liegen im Zwischenspeicher, die Kamera
+     * steht, MapLibre hat nichts nachzuladen.
+     *
+     * Und genau hier lag der gemeldete Fehler: Beim Auftauen meldet die Karte
+     * ihr „fertig" offenbar NICHT noch einmal (`react-freeze` baut den Baum
+     * nicht ab, also entsteht auch keine neue GL-Fläche, die es melden könnte).
+     * Was die Karte enthüllte, war deshalb nicht das Signal, sondern diese
+     * Notbremse — bei jedem Tab-Wechsel aufs Neue, immer nach derselben
+     * Zeitspanne. Genau das „exakt fünf Sekunden".
+     *
+     * Kurz genug, dass man es kaum sieht; lang genug, dass ein echter
+     * Neuaufbau der Fläche noch dazwischenkommen darf.
+     */
+    let id: ReturnType<typeof setTimeout>;
+    const reveal = () => {
+      /**
+       * Nicht, während etwas fährt.
+       *
+       * Diese Zeile ist ein Commit im Karten-Baum, und sie fällt Sekunden nach
+       * dem Tab-Wechsel — also mit hoher Wahrscheinlichkeit in einen Moment, in
+       * dem längst etwas anderes offen ist. Ungeprüft landete sie dann in
+       * DESSEN Fahrt.
+       */
+      if (isTransitionBusy()) {
+        id = setTimeout(reveal, 200);
+        return;
+      }
+      // ERST HIER merken, nicht beim Stellen des Weckers.
+      //
+      // Beim schnellen Tab-Wechsel wird dieser Effekt mehrfach ab- und wieder
+      // aufgebaut, und jeder Aufräumer nimmt seinen Wecker mit. Wurde der Merker
+      // schon beim Stellen gesetzt, galt der allererste Kaltstart nach einem
+      // einzigen abgebrochenen Anlauf bereits als „schon mal enthüllt" — die
+      // Karte bekäme dann 700ms statt vier Sekunden und würde freigegeben,
+      // bevor überhaupt eine Kachel da ist.
+      everRevealedRef.current = true;
+      setMapTilesRendered(true);
+    };
+    id = setTimeout(reveal, everRevealedRef.current ? 700 : 4000);
     return () => clearTimeout(id);
   }, [frozen, mapMounted]);
   /**
@@ -509,7 +696,16 @@ export default function SurroundingsScreen() {
    */
   const frozenRef = useRef(frozen);
   frozenRef.current = frozen;
+  /**
+   * Hat die Karte in diesem Aufbau je „fertig" gemeldet?
+   *
+   * Als Ablage, nicht als Zustand: Sie wird von keinem Effekt zurückgesetzt und
+   * überlebt damit den Durchgang, in dem `mapTilesRendered` kurz auf falsch
+   * steht. Zurückgesetzt wird sie genau dort, wo die Fläche wirklich verschwindet.
+   */
+  const wasFullyLoadedRef = useRef(false);
   const onMapRendered = useCallback(() => {
+    wasFullyLoadedRef.current = true;
     if (frozenRef.current) return;
     setMapTilesRendered(true);
   }, []);
@@ -689,6 +885,20 @@ export default function SurroundingsScreen() {
 
   return (
     <Freeze freeze={frozen}>
+    {/**
+      * KEIN eigenes `display: none` — das war wirkungslos.
+      *
+      * Der Gedanke war richtig: Solange die Karte verdeckt ist, soll Android
+      * ihre Ansicht auf GONE setzen, damit nichts mehr gezeichnet wird. Nur
+      * ist dieser `View` ein KIND von `<Freeze>` — und das wirft bei
+      * `freeze === true`, bevor die Kinder überhaupt gerendert werden. Der
+      * Stil erreichte den Commit also nie.
+      *
+      * Nötig ist er auch nicht: Fabric versteckt einen suspendierten Teilbaum
+      * von sich aus über `cloneHiddenInstance` mit genau diesem `display:
+      * none`. Das gewünschte Ergebnis war also die ganze Zeit da — nur nicht
+      * aus dem Grund, der hier stand.
+      */}
     <View style={styles.root} onLayout={onRootLayout}>
       {/* MapSurface mountet darunter, MapSkeleton liegt DARÜBER und fadet
           erst raus wenn MapLibre seine Tiles tatsächlich gerendert hat.

@@ -4,6 +4,7 @@
  * obere Teil der Bordkarte garantiert identisch in beiden Screens.
  */
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import { View, Text, StyleSheet } from "react-native";
 import { useNavigation } from "@react-navigation/native";
 import {
@@ -311,6 +312,10 @@ export function useDepartureCountdown(departTime?: string) {
     if (!focused) return;
     const id = setInterval(() => {
       if (!focusedRef.current) return;
+      // Und nicht, während etwas fährt: Bos Fahrt trifft er nie (Bo öffnet vom
+      // Landingscreen), die Fahrt des Ticket-Blatts aus diesem Reiter heraus
+      // sehr wohl. Dieselbe Prüfung wie im geteilten Takt in `lib/ui/nowTicker.ts`.
+      if (isTransitionBusy()) return;
       // Siehe unten: `focused` steht in den Abhängigkeiten, der Zeitgeber läuft
       // ohne Fokus also gar nicht erst. Die Abfrage bleibt als zweite Sicherung.
       setNow(Date.now());

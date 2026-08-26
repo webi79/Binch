@@ -138,7 +138,10 @@ export function DatePickerHost() {
      * Kosten hat das Warten keine: Wer ein Feld antippt, bevor der Wecker
      * fällt, baut es über den Vorlauf beim Berühren ohnehin sofort auf.
      */
-    id = setTimeout(attempt, 5200);
+    // Nach Bo, nicht davor: Er hängt an der Suchleiste auf dem Landingscreen
+    // und ist damit als Erstes erreichbar; dieser Wähler steckt hinter einem
+    // Tipp und einer Fahrt. Siehe `AssistantHost`.
+    id = setTimeout(attempt, 6400);
     return () => clearTimeout(id);
   }, [mounted]);
   /**

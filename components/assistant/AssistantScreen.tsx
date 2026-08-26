@@ -11,7 +11,7 @@
  *   - Voice via expo-speech-recognition: Tap-to-Talk, Transkript landet im
  *     Input-Feld, User bestätigt mit Send (kein Auto-Send → keine Versehen)
  */
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   View,
   Text,
@@ -61,6 +61,7 @@ import Animated, {
 import { Send, Mic, AlertTriangle, RotateCw, X } from "lucide-react-native";
 import {
   assistantPush,
+  setAssistantArrivedHandler,
   isAssistantPushStarted,
   pushProgress,
   startAssistantPush,
@@ -177,6 +178,36 @@ type Msg =
  * Die Ausrichtung ist auf Hochkant festgelegt (`app.config.js`), der Wert
  * ändert sich also auch sonst nicht.
  */
+/**
+ * DIE FÜHRENDE KANTE — Schatten und Rundung gehören ZUSAMMEN.
+ *
+ * `0` = beides aus (aktueller Versuchsstand), `24` = der ursprüngliche Look.
+ *
+ * Warum eine Zahl für zwei Dinge: Die Rundung ist ohne Schatten UNSICHTBAR. Bos
+ * Hintergrund ist derselbe Farbwert wie der des Landingscreens darunter — eine
+ * Aussparung in der Ecke gibt also dieselbe Farbe frei, die dort ohnehin liegt.
+ * Getrennt geschaltet zahlt man die eine für nichts.
+ *
+ * Und sie kostet mehr als gedacht. Der Kommentar in `overlayCover.ts` behauptet,
+ * Android löse `borderRadius` + `overflow: hidden` über `clipToOutline`, also
+ * GPU-seitig und ohne Neurastern pro Bild. Für RN 0.81 stimmt das nicht:
+ * `BackgroundStyleApplicator.kt` ruft bei runden Ecken `canvas.clipPath(...)`
+ * (Zeile 380/398) und legt in `createPaddingBoxPath` bei JEDEM Aufruf einen
+ * frischen `Path` an. Über Bos EINfahrt liegt keine GPU-Ebene (die gibt es nur
+ * beim Schließen) — die bildschirmfüllende Fläche wird also in jedem der rund
+ * fünfzig Bilder durch einen nicht-rechteckigen Clip gerastert.
+ *
+ * Das ist der Teil, der NICHT mit der Zahl der Nachrichten wächst: Er fällt bei
+ * leerem Verlauf genauso an.
+ *
+ * Zurückdrehen ist eine Zahl. Wer den Schatten zurückholt, bekommt die Rundung
+ * automatisch mit — und umgekehrt.
+ */
+const SLIDE_LIFT = 0;
+/** Abgeleitet, damit der Typ eng bleibt — `as const` geht an einem
+ *  Bedingungs-Ausdruck nicht. */
+const SHELL_OVERFLOW: "hidden" | "visible" = SLIDE_LIFT > 0 ? "hidden" : "visible";
+
 const PARK_X = Dimensions.get("window").width;
 
 /**
@@ -316,12 +347,11 @@ export function AssistantScreen() {
   const screenShellStyle = useMemo(
     () => ({
       backgroundColor: palette.bg,
-      // Gerundete führende Kante wie bei jedem anderen Push — und `overflow`
-      // dazu, damit der Inhalt der runden Form folgt. Auf Android ist das
-      // `clipToOutline`, also GPU-seitig; der reine Verschiebe-Fall ist genau
-      // der, für den das günstig ist (siehe SCREEN_CORNER_RADIUS).
-      borderRadius: SCREEN_CORNER_RADIUS,
-      overflow: "hidden" as const,
+      // Gerundete führende Kante — gemeinsam mit dem Schatten geschaltet.
+      // Ohne ihn ist sie unsichtbar, und sie ist pro Bild ein `clipPath` über
+      // die volle Fläche. Begründung samt Beleg bei `SLIDE_LIFT`.
+      borderRadius: SLIDE_LIFT > 0 ? SCREEN_CORNER_RADIUS : 0,
+      overflow: SHELL_OVERFLOW,
     }),
     [palette.bg],
   );
@@ -415,6 +445,40 @@ export function AssistantScreen() {
      */
     chatInputRef.current?.blur();
     Keyboard.dismiss();
+    /**
+     * Eine laufende Antwort HIER beenden, nicht erst beim Abbau.
+     *
+     * Bisher hing das am Abbau des Bildschirms: Strom abbrechen, angefangenen
+     * Text retten, Punkte-Blase entfernen. Seit Bo dauerhaft gemountet bleibt
+     * (siehe `AssistantHost`), läuft der Abbau im Regelfall gar nicht mehr —
+     * und ohne diese Zeilen liefe die Anfrage nach dem Schließen weiter, für
+     * eine Antwort, die niemand mehr sieht.
+     *
+     * Der Unterschied zur Abbau-Fassung ist wesentlich: Dort war `setMessages`
+     * wirkungslos, also musste in den Modul-Speicher geschrieben werden. Hier
+     * lebt der Bildschirm weiter — der Spiegel-Effekt an `messages` würde einen
+     * direkten Schreibvorgang im nächsten Durchgang überschreiben, und der
+     * gerettete Text wäre still weg. Deshalb ausschließlich über die Setzer.
+     */
+    if (streamingBotIdRef.current) {
+      const botId = streamingBotIdRef.current;
+      abortRef.current?.abort();
+      abortRef.current = null;
+      // Zuerst den Puffer leeren, sonst fehlt der letzte Satzteil — dieselbe
+      // Begründung wie in der Abbau-Fassung.
+      flushTextRef.current?.(true);
+      const streamed = takeStreamText(botId);
+      setMessages((prev) => {
+        const withText =
+          streamed !== null && streamed.length > 0
+            ? commitBotText(prev, botId, streamed)
+            : prev;
+        return withText.filter((m) => m.kind !== "typing");
+      });
+      setMood("idle");
+      bubbleReadyRef.current = null;
+      streamingBotIdRef.current = null;
+    }
     /**
      * `setKbOffset(0)` steht hier bewusst NICHT mehr.
      *
@@ -768,6 +832,20 @@ export function AssistantScreen() {
       kbGate.value = 1;
     });
     const hideSub = Keyboard.addListener("keyboardDidHide", () => {
+      // Auch das ist ein Commit — und er trifft die Ausfahrt zuverlässig, weil
+      // dort die Tastatur geschlossen wird. Während einer Fahrt ist der Wert
+      // ohnehin eingefroren (`kbFreeze`), das Nachziehen kann also warten.
+      if (isTransitionBusy()) {
+        kbOffsetTimerRef.current = setTimeout(function retry() {
+          if (isTransitionBusy()) {
+            kbOffsetTimerRef.current = setTimeout(retry, 120);
+            return;
+          }
+          kbOffsetTimerRef.current = null;
+          setKbOffset(0);
+        }, 120);
+        return;
+      }
       setKbOffset(0);
     });
     return () => {
@@ -916,7 +994,40 @@ export function AssistantScreen() {
   const [kbPadOffset, setKbPadOffset] = useState(initialKbHeight);
   useEffect(() => {
     if (kbOffset === kbPadOffset) return;
-    const id = setTimeout(() => setKbPadOffset(kbOffset), 320);
+    /**
+     * Dieser Wecker fiel MITTEN in die Ausfahrt — und er wird mit dem Verlauf
+     * teurer.
+     *
+     * Ablauf: Tipp auf das X, `onPressIn` meldet das Feld ab, der Fokus-Verlust
+     * setzt die Tastatur-Zahl auf null — und damit startet dieser Wecker im
+     * BERÜHRUNGS-Bild. Die Kurve läuft erst 80 bis 150ms später los. Bei 320ms
+     * landet er also 170 bis 240ms in der 380ms-Ausfahrt, genau in ihrer Mitte.
+     *
+     * Was daran hängt, ist nicht klein: Der Innenabstand ändert sich, damit ist
+     * der Stil des Listeninhalts ein neues Array, damit bricht die Merkschranke
+     * der Liste — sie rendert komplett neu, Yoga läuft über den ganzen
+     * Inhalts-Container, und JEDE gemountete Zeile meldet ein neues Layout.
+     * Jede dieser Meldungen schreibt einen geteilten Wert, der zwei weitere
+     * Auswerter und einen nativen Schreibvorgang auslöst. Bei zwanzig Zeilen
+     * sind das zwanzig Layout-Ereignisse und vierzig Auswerter-Läufe, gebündelt
+     * in ein bis zwei Bilder.
+     *
+     * Und die Zahl der Zeilen ist die Zahl der Nachrichten: Die Verkleinerung
+     * auf fünf läuft erst nach dem Fokus-Verlust plus 630ms, also NACH der
+     * Ausfahrt.
+     */
+    let id: ReturnType<typeof setTimeout>;
+    const attempt = () => {
+      // Beim Schließen gar nicht mehr: Die Scroll-Strecke wird nie wieder
+      // gebraucht, der Bildschirm verschwindet.
+      if (closingRef.current) return;
+      if (isTransitionBusy()) {
+        id = setTimeout(attempt, 200);
+        return;
+      }
+      setKbPadOffset(kbOffset);
+    };
+    id = setTimeout(attempt, 320);
     return () => clearTimeout(id);
   }, [kbOffset, kbPadOffset]);
   const kbPad = kbPadOffset > 0 ? kbPadOffset + BAR_LIFT_FROM_KB : 0;
@@ -973,7 +1084,12 @@ export function AssistantScreen() {
    * läuft also herunter — und damit rechnete JEDE gemountete Zeile ihre Tiefe
    * und ihren Transform bei JEDEM Bild neu, mitten in der Ausfahrt. Genau diese
    * Last wächst mit der Zahl der Nachrichten, weil dann mehr Zeilen gemountet
-   * sind. Eingefroren ändert sich nichts mehr, also rechnet auch nichts mehr;
+   * sind. Eingefroren wird der Wert nicht mehr WEITERGEREICHT — der Auswerter
+   * selbst läuft weiter, denn seine Eingänge sammelt Reanimated aus der
+   * Schließung, nicht aus dem tatsächlich ausgeführten Zweig. Gestoppt wird die
+   * Ausbreitung erst eine Ebene später, durch die Gleichheitsprüfung beim
+   * Schreiben. Kosten hier: zwei Vergleiche pro Bild, vernachlässigbar — aber
+   * wer hinter den frühen Ausstieg einen teureren Rumpf legt, zahlt ihn voll;
    * der Bildschirm fährt als Ganzes weg, verschieben kann sich darin ohnehin
    * nichts mehr.
    */
@@ -994,7 +1110,24 @@ export function AssistantScreen() {
   // damit der User nicht immer dieselbe Begrüßung sieht.
   useEffect(() => {
     if (messages.length === 0) {
-      setMessages([{ id: idGen(), kind: "bot", text: pickWelcome(locale) }]);
+      // Beim allerersten Öffnen fällt dieser Commit sonst in Bild 1 der
+      // Einfahrt — und ein Commit pausiert dort die Kurve (siehe die
+      // Begründung an der Leisten-Höhe). Ein Bild später ist die Begrüßung
+      // genauso da; zu sehen ist der Unterschied nicht, weil die Fläche
+      // darüber ohnehin erst nachrückt.
+      const welcome = () => {
+        if (isTransitionBusy()) {
+          welcomeTimerRef.current = setTimeout(welcome, 120);
+          return;
+        }
+        welcomeTimerRef.current = null;
+        setMessages((prev) =>
+          prev.length === 0
+            ? [{ id: idGen(), kind: "bot", text: pickWelcome(locale) }]
+            : prev,
+        );
+      };
+      welcome();
     }
     /**
      * Der Wecker aus dem Winken heraus gilt IMMER, nicht nur beim allerersten
@@ -1216,8 +1349,49 @@ export function AssistantScreen() {
       }
       if (listening) stopVoice();
       Keyboard.dismiss();
-      setKbOffset(0);
-      kbGate.value = 0;
+      /**
+       * Das Tor und die Zahl NICHT im selben Bild — hier startet gerade eine
+       * FREMDE Fahrt.
+       *
+       * Dieser Zweig läuft, wenn Bo den Vordergrund verliert, und der häufigste
+       * Weg dorthin ist „Alle Treffer anzeigen": Die Ergebnisliste setzt ihre
+       * Parameter und startet ihre Einfahrt im SELBEN Durchgang. Fällt das Tor
+       * hier, stürzt die Tastatur-Zahl auf null — und daran hängt nicht nur die
+       * Leiste, sondern über die Verschiebung JEDE gemountete Zeile. Bei N
+       * Zeilen sind das 2N+3 Auswerter plus N native Schreibvorgänge, im ersten
+       * Bild einer 430ms-Fahrt.
+       *
+       * Eine Fahrtlänge später kostet es niemanden etwas: Bo ist zu dem
+       * Zeitpunkt vollständig verdeckt.
+       */
+      const closeGate = () => {
+        /**
+         * ABBRECHEN, wenn Bo den Vordergrund inzwischen zurückhat.
+         *
+         * Dieser Effekt hat kein Aufräumen — der Wecker überlebt also einen
+         * Fokus-Wechsel. Wer aus der Ergebnisliste schnell zu Bo zurückkommt,
+         * bekäme das Tor sonst zugezogen, WÄHREND Bo wieder offen ist: Die
+         * Leiste folgte der Tastatur dann nicht mehr, bis das nächste
+         * Auftauchen sie wieder aufmacht.
+         *
+         * Die Ablage statt der Zustandsgröße, weil dieser Rückruf aus einer
+         * alten Schließung stammt — `isFocused` darin wäre der Stand von
+         * damals.
+         */
+        if (isFocusedRef.current) {
+          gateTimerRef.current = null;
+          return;
+        }
+        if (isTransitionBusy()) {
+          gateTimerRef.current = setTimeout(closeGate, 200);
+          return;
+        }
+        gateTimerRef.current = null;
+        setKbOffset(0);
+        kbGate.value = 0;
+      };
+      if (gateTimerRef.current) clearTimeout(gateTimerRef.current);
+      gateTimerRef.current = setTimeout(closeGate, 0);
     } else if (Keyboard.isVisible()) {
       kbGate.value = 1;
     }
@@ -1268,10 +1442,39 @@ export function AssistantScreen() {
     // unmounted no-op ist, aber das Closure hält ungenutzte Refs).
     let innerTimeout: ReturnType<typeof setTimeout> | null = null;
     const interval = setInterval(() => {
+      /**
+       * NICHT, während etwas fährt — und das ist das perfekte „manchmal".
+       *
+       * `setMood` rendert den kompletten Bildschirm neu, und der
+       * Zustandswechsel bricht in Bo 15 Werte ab und startet rund zehn
+       * Endlos-Ketten, darunter vier animierte SVG-Eigenschaften. Genau dafür
+       * hat der einmalige Begrüßungs-Wink weiter oben längst seinen Abstand
+       * bekommen; dieser Takt hier hatte ihn nie.
+       *
+       * Er läuft alle 60 Sekunden, solange Bo im Vordergrund und untätig ist —
+       * und `isFocused` bleibt während der GANZEN Ausfahrt wahr (es fällt erst,
+       * wenn die Kurve durch ist). Ein Takt gegen ein Fenster von gut 400ms
+       * trifft also hin und wieder, scheinbar zufällig. Und weil `mood` in den
+       * Abhängigkeiten steht, verschiebt sich die Phase bei jedem
+       * Stimmungswechsel zusätzlich.
+       *
+       * Übersprungen wird nur dieser eine Takt; der nächste kommt in einer
+       * Minute. Ein Winken, das niemand angefordert hat, ist der billigste
+       * Verzicht der ganzen App.
+       */
+      if (isTransitionBusy()) return;
       setMood("waving");
-      innerTimeout = setTimeout(() => {
+      const backToIdle = () => {
+        // Auch der Rückweg: Er liegt drei Sekunden später und kann damit
+        // genauso in eine Fahrt fallen. Hier wird nachgeholt statt verzichtet —
+        // sonst bliebe Bo winkend stehen.
+        if (isTransitionBusy()) {
+          innerTimeout = setTimeout(backToIdle, 300);
+          return;
+        }
         setMood((current) => (current === "waving" ? "idle" : current));
-      }, 3000);
+      };
+      innerTimeout = setTimeout(backToIdle, 3000);
     }, 60_000);
     return () => {
       clearInterval(interval);
@@ -1284,6 +1487,26 @@ export function AssistantScreen() {
     return () => {
       abortRef.current?.abort();
       abortRef.current = null;
+      if (moodTimerRef.current) {
+        clearTimeout(moodTimerRef.current);
+        moodTimerRef.current = null;
+      }
+      if (gateTimerRef.current) {
+        clearTimeout(gateTimerRef.current);
+        gateTimerRef.current = null;
+      }
+      if (drainTimerRef.current) {
+        clearTimeout(drainTimerRef.current);
+        drainTimerRef.current = null;
+      }
+      if (kbOffsetTimerRef.current) {
+        clearTimeout(kbOffsetTimerRef.current);
+        kbOffsetTimerRef.current = null;
+      }
+      if (welcomeTimerRef.current) {
+        clearTimeout(welcomeTimerRef.current);
+        welcomeTimerRef.current = null;
+      }
       /**
        * Den GEMERKTEN Zustand mit aufräumen, nicht nur den lebenden.
        *
@@ -1615,6 +1838,16 @@ export function AssistantScreen() {
    */
   const textBufRef = useRef<{ botId: string; text: string } | null>(null);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Aufgeschobener Stimmungswechsel — muss beim Abbau sterben. */
+  const moodTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Aufgeschobenes Schließen des Tastatur-Tors — muss beim Abbau sterben. */
+  const gateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Höhe der Eingabeleiste, gemessen während einer Fahrt — siehe dort. */
+  const pendingBarHeightRef = useRef<number | null>(null);
+  /** Aufgeschobenes Nachziehen der Tastatur-Zahl. */
+  const kbOffsetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Aufgeschobene Begrüßung. */
+  const welcomeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /**
    * @param force Aufschub übergehen. Nötig am ENDE eines Turns und beim Abbau:
    *        Dort wird der Strom-Speicher in die Nachricht übernommen, und ein
@@ -1666,9 +1899,61 @@ export function AssistantScreen() {
   }, []);
   flushTextRef.current = flushText;
 
+  /** Aufgeschobene Strom-Ereignisse, in Eingangsreihenfolge. */
+  const eventQueueRef = useRef<{ event: ChatStreamEvent; botId: string }[]>([]);
+  const drainTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Spiegel auf den Behandler — der Abfluss darf nicht an einer alten
+   *  Schließung hängen. */
+  const handleStreamEventRef = useRef<
+    ((event: ChatStreamEvent, botId: string) => void) | null
+  >(null);
+  const scheduleDrain = useCallback(() => {
+    if (drainTimerRef.current) return;
+    const run = () => {
+      if (isTransitionBusy()) {
+        drainTimerRef.current = setTimeout(run, 120);
+        return;
+      }
+      drainTimerRef.current = null;
+      // ZUERST leeren, dann anwenden: Sonst reihte der Behandler die Ereignisse
+      // sofort wieder ein, weil die Schlange noch als nicht leer gilt.
+      const pending = eventQueueRef.current;
+      eventQueueRef.current = [];
+      for (const item of pending) {
+        handleStreamEventRef.current?.(item.event, item.botId);
+      }
+    };
+    drainTimerRef.current = setTimeout(run, 120);
+  }, []);
+
   // Stream-Event-Handler — closure over botId der aktuellen Antwort.
   const handleStreamEvent = useCallback(
     (event: ChatStreamEvent, botId: string) => {
+      /**
+       * Während einer Fahrt wird EINGEREIHT statt angewandt.
+       *
+       * Von den sieben Ereignissen des Stroms waren nur zwei abgesichert —
+       * Stimmung und Text. Die anderen fünf (`search_result`, `stop_board`,
+       * `action`, `error`, `done`) schreiben alle in die Nachrichtenliste, und
+       * jeder dieser Schreibvorgänge ist ein neues Datenfeld: Die Liste rendert
+       * durch, mountet eine neue Zelle, und die bringt zwei neue
+       * Reanimated-Zuordnungen mit. Jede Anmeldung verwirft die sortierte
+       * Reihenfolge ALLER Zuordnungen der App, die im nächsten Bild komplett
+       * neu aufgebaut wird.
+       *
+       * Der Inhalt ist dabei nicht klein: `stop_board` mountet eine Tafel mit
+       * SVG-Ring, `search_result` eine Ergebniskarte mit Logo und Verlauf. Ein
+       * Erst-Zeichnen liegt weit über dem Bildbudget.
+       *
+       * Eingereiht statt einzeln gegattert, weil die REIHENFOLGE zählt: Ein
+       * `done` vor seinem letzten `text` würde die Antwort abschneiden. Solange
+       * die Schlange nicht leer ist, geht deshalb auch alles Neue hinein.
+       */
+      if (isTransitionBusy() || eventQueueRef.current.length > 0) {
+        eventQueueRef.current.push({ event, botId });
+        scheduleDrain();
+        return;
+      }
       if (event.type !== "text") flushText();
       switch (event.type) {
         case "mood":
@@ -1683,8 +1968,32 @@ export function AssistantScreen() {
            * steht Bo ohnehin still.
            */
           if (isTransitionBusy()) {
+            /**
+             * WIEDERVERSUCH, kein fester Aufschub — das war zu kurz gedacht.
+             *
+             * Hier standen feste 140ms. Eine Fahrt dauert aber 380 bis 430ms:
+             * Ein Stimmungswechsel, der kurz nach ihrem Start eintrifft, wurde
+             * damit nicht hinter sie geschoben, sondern in ihre MITTE. Genau
+             * dort ist er am teuersten — und in `Bo.tsx` zündete er an dieser
+             * Stelle bis eben zwölf 200ms-Animationen auf SVG-treibenden
+             * Werten (siehe die Begründung am dortigen Pausen-Ausstieg).
+             *
+             * Der Text-Ausgeber daneben macht es seit jeher richtig: Er stellt
+             * sich alle 120ms neu und prüft dabei JEDES MAL erneut. Genau das
+             * hier auch. Der Wiederversuch selbst ist nur ein
+             * Zeitstempel-Vergleich und stört keine Bewegung.
+             */
             const mood = event.mood;
-            setTimeout(() => setMood(mood), 140);
+            const apply = () => {
+              if (isTransitionBusy()) {
+                moodTimerRef.current = setTimeout(apply, 120);
+                return;
+              }
+              moodTimerRef.current = null;
+              setMood(mood);
+            };
+            if (moodTimerRef.current) clearTimeout(moodTimerRef.current);
+            moodTimerRef.current = setTimeout(apply, 120);
             return;
           }
           setMood(event.mood);
@@ -1808,8 +2117,10 @@ export function AssistantScreen() {
           return;
       }
     },
-    [t],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [t, scheduleDrain],
   );
+  handleStreamEventRef.current = handleStreamEvent;
 
   // Sync send + setVoiceMode + voiceMode in Refs damit die Speech-
   // Recognition-Event-Handler (oben definiert) auf die jeweils aktuelle
@@ -2248,31 +2559,66 @@ export function AssistantScreen() {
     transform: [{ translateY: slideShift.value }],
   }));
 
+
   const slideStyle = useAnimatedStyle(() => {
     const p = pushProgress(assistantPush.value);
-    return {
-      transform: [{ translateX: (1 - p) * PARK_X }],
-      /**
-       * Höhe NUR während der Fahrt — im Stand null.
-       *
-       * Auf Android schlägt `elevation` den `zIndex` bei der Zeichenreihenfolge.
-       * Mit einer festen 24 lag Bo damit über allem, was weniger hat — auch über
-       * dem Halt-Blatt (16), das er selbst öffnet. Es ging auf, war aber
-       * unsichtbar hinter ihm. Der `zIndex` konnte das gar nicht richten.
-       *
-       * Gebraucht wird die Höhe nur für den Schatten an der führenden Kante,
-       * damit man die runde Ecke überhaupt sieht (Bos Hintergrund ist derselbe
-       * Wert wie der des Landingscreens darunter). Im Stand gibt es keine
-       * Kante mehr — dort darf sie weg, und die Staffelung stimmt wieder:
-       * Halt-Blatt 16, Ergebnisliste 150, Detail- und Ticket-Blatt 200 liegen
-       * dann alle über ihm.
-       *
-       * `elevation` steht auf Reanimateds Liste der schnellen Eigenschaften,
-       * läuft hier also ohne Umweg über einen Commit.
-       */
-      elevation: p > 0.001 && p < 0.999 ? 24 : 0,
-    };
+    /**
+     * NUR der Transform — und genau das ist der Unterschied zum Such-Blatt.
+     *
+     * Hier stand zusätzlich `elevation` in jedem Bild. Seit die führende Kante
+     * abgeschaltet ist (`SLIDE_LIFT = 0`), war der Wert konstant null — der
+     * Zweig also tot, geschrieben wurde er trotzdem.
+     *
+     * Und das ist nicht gratis: Reanimated vergleicht den zurückgegebenen Stil
+     * flach. `transform` ist bei jeder Auswertung ein FRISCHES Array, gilt also
+     * immer als geändert — und damit wird das ganze Objekt nativ geschrieben,
+     * `elevation` eingeschlossen. Eine Höhe zu setzen fasst auf Android die
+     * Kontur der Ansicht an (`invalidateOutline`), und das zieht ein Neuzeichnen
+     * nach sich. Fünfzig Mal während der Fahrt, auf einer bildschirmfüllenden
+     * Fläche.
+     *
+     * Das Such-Blatt gibt ausschließlich `transform` zurück — und genau seine
+     * Fahrt ist die, die sich glatt anfühlt. Bo war der einzige Push der App mit
+     * einer zweiten Eigenschaft im Bild-Takt.
+     *
+     * Kommt die Kante zurück, gehört `elevation` NICHT hierher, sondern in einen
+     * Stil, der nur beim Wechsel von "steht" auf "fährt" neu gesetzt wird.
+     */
+    return { transform: [{ translateX: (1 - p) * PARK_X }] };
   });
+
+  /**
+   * Das Stil-ARRAY einmal, nicht nur die Objekte darin.
+   *
+   * Die inneren Objekte waren längst memoisiert, das Array darum herum nicht —
+   * damit wechselte die Prop-Kennung auf dem animierten Knoten trotzdem bei
+   * jedem Durchgang. Dieselbe halbe Sache steckte in Tab-Leiste und
+   * `SlidingPanels` und ist dort schon behoben.
+   */
+  const rootStyle = useMemo(
+    () => [
+        styles.root,
+        /**
+         * Runde Ecken wie bei jeder anderen Slide — plus der Schatten, ohne den
+         * man sie nicht sehen KANN.
+         *
+         * Der Radius war schon gesetzt und tat auch, was er soll. Sichtbar wurde
+         * er trotzdem nicht: Bos Hintergrund ist exakt derselbe Wert wie der des
+         * Landingscreens darunter (beide `palette.bg`), die Aussparung in der
+         * Ecke gab also dieselbe Farbe frei, die dort ohnehin schon lag. Eine
+         * unsichtbare Kante ist von einer eckigen nicht zu unterscheiden.
+         *
+         * Genau dafür tragen die anderen Überlagerungen `elevation` — bei
+         * `DetailsOverlay` steht die Begründung ausführlich daneben, samt der
+         * Falle, dass der Hintergrund dabei PFLICHT ist: Ohne ihn berechnet
+         * Android die Schatten-Kontur aus den eckigen Grenzen und füllt die runde
+         * Aussparung wieder mit einem dunklen Quadrat.
+         */
+        screenShellStyle,
+        slideStyle,],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [screenShellStyle, slideStyle],
+  );
   /**
    * Die Fahrt läuft SCHON, wenn dieser Bildschirm zum ersten Mal zeichnet.
    *
@@ -2310,7 +2656,36 @@ export function AssistantScreen() {
     // NUR wenn wirklich geöffnet wird. Beim reinen Vorbereiten (Finger liegt
     // auf der Suchleiste, Bo ist geparkt) darf sich nichts bewegen.
     if (!isFocused) return;
-    if (!isAssistantPushStarted()) startAssistantPush();
+    /**
+     * EIN BILD SPÄTER — sonst hebt dieser Notausgang die Staffelung auf, die er
+     * gar nicht betrifft.
+     *
+     * Der Tipp-Handler im Landingscreen staffelt bewusst: erst der
+     * Speicher-Schreibvorgang, dann EIN BILD SPÄTER die Kurve. Die Begründung
+     * steht dort ausführlich — der schwere Neu-Durchlauf dieses Bildschirms soll
+     * VOR der Bewegung liegen, nicht in ihrem zweiten Bild („als müsse sich die
+     * Bewegung einen Ruck geben").
+     *
+     * Genau das lief hier ins Leere. Ein passiver Effekt wird in React Native
+     * über die Aufgaben-Warteschlange eingeplant, ein `requestAnimationFrame`
+     * über den Bild-Takt — der Effekt gewinnt das Rennen typischerweise. Er
+     * startete die Kurve also im SELBEN Bild wie der Commit, und der rAF des
+     * Tipp-Handlers fand sie danach bereits laufend vor und tat nichts mehr.
+     * Die Staffelung war damit still ausgehebelt, obwohl beide Stellen sie
+     * beschreiben.
+     *
+     * Das Such-Blatt hat denselben Notausgang — und es legt ihn in einen rAF.
+     * Genau dieser Unterschied bleibt sonst übrig, wenn man alles andere
+     * angeglichen hat.
+     *
+     * Gebraucht wird der Ausgang nur für Wege OHNE Tipp-Handler
+     * (Verknüpfung, Wiederherstellung, Sprachbefehl); dort kostet ein Bild
+     * nichts.
+     */
+    let startRaf: number | null = requestAnimationFrame(() => {
+      startRaf = null;
+      if (!isAssistantPushStarted()) startAssistantPush();
+    });
     /**
      * Die Textur des Landingscreens HALTEN, solange Bo darüber liegt.
      *
@@ -2326,6 +2701,10 @@ export function AssistantScreen() {
      */
     holdLayer("home");
     return () => {
+      if (startRaf !== null) {
+        cancelAnimationFrame(startRaf);
+        startRaf = null;
+      }
       // Beim Verschwinden zurücksetzen — ohne Animation, der Bildschirm ist ja
       // weg. Sonst bliebe der Landingscreen darunter für immer um seine
       // Parallax-Strecke verschoben, wenn Bo je auf einem anderen Weg als über
@@ -2390,6 +2769,8 @@ export function AssistantScreen() {
 
   const enterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const windowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Netz für den Fall, dass die Einfahrt nie ankommt — siehe unten. */
+  const safetyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /**
    * `entering` WIEDER scharf stellen, sobald Bo den Vordergrund verliert.
@@ -2417,16 +2798,39 @@ export function AssistantScreen() {
    */
   useEffect(() => {
     if (isFocused) return;
-    // Beim Schließen nicht mehr — der Baum verschwindet gleich ganz, ein
-    // Umbau kurz davor wäre reine Arbeit im letzten Bild der Ausfahrt.
-    if (closingRef.current) return;
-    const id = setTimeout(() => {
+    /**
+     * AUCH beim Schließen — und das ist seit dem verzögerten Abbau der Punkt.
+     *
+     * Hier stand ein Ausstieg für den Schließ-Fall, begründet damit, dass der
+     * Baum ohnehin gleich verschwindet. Das stimmte, solange er 300ms später
+     * abgebaut wurde. Inzwischen wartet der Abbau auf eine echte Lücke (siehe
+     * `AssistantHost`) — und dann ist es genau umgekehrt richtig: Erst den
+     * Verlauf auf fünf Zeilen zurückräumen, DANN abbauen. Jede gemountete Zeile
+     * bringt zwei Reanimated-Zuordnungen mit, und deren Entfernen verwirft die
+     * sortierte Reihenfolge aller Zuordnungen der App. Ein kleiner Baum ist
+     * billiger abzubauen als ein großer.
+     */
+    let id: ReturnType<typeof setTimeout>;
+    const attempt = () => {
+      /**
+       * Und auch das wartet auf eine Lücke.
+       *
+       * Es ist ein Commit, und er fällt in ein Fenster, in dem der Nutzer
+       * typischerweise schon das Nächste geöffnet hat. Ungeprüft landete er
+       * dann in DESSEN Fahrt — dieselbe Falle wie beim Abbau, nur eine
+       * Zehntelsekunde früher.
+       */
+      if (isTransitionBusy()) {
+        id = setTimeout(attempt, 200);
+        return;
+      }
       enteringRef.current = true;
       setEntering(true);
       // Bo hält dabei ebenfalls wieder an — die nächste Einfahrt soll ihn
       // stillstehend antreffen, so wie die erste.
       setSliding(true);
-    }, ASSISTANT_IN.duration + 200);
+    };
+    id = setTimeout(attempt, ASSISTANT_IN.duration + 200);
     return () => clearTimeout(id);
   }, [isFocused]);
   useEffect(() => {
@@ -2542,6 +2946,28 @@ export function AssistantScreen() {
      * Einfahrt, und er wird mit dem Verlauf schlimmer, weil mehr Zeilen
      * nachrücken.
      */
+    /**
+     * Beide Wecker hängen an der ANKUNFT der Kurve, nicht an einer Stoppuhr.
+     *
+     * Sie standen auf `ASSISTANT_IN.duration + x` — gemessen ab dem Moment, in
+     * dem dieser Effekt lief. Das ist nicht derselbe Moment, in dem die Kurve
+     * startet: Dazwischen liegen mindestens ein Bild Vorlauf und, bei Last,
+     * deutlich mehr. Wird die Fahrt unterbrochen und läuft weiter, stimmt die
+     * Rechnung ohnehin nicht mehr. Die Uhr lief also regelmäßig zu FRÜH ab, und
+     * dann fiel das Nachrücken der Liste oder Bos Wiederanlauf in die letzten
+     * Bilder der Bewegung.
+     *
+     * Der Abschluss-Rückruf der Kurve weiß genau, wann der Bildschirm steht.
+     * Ab da gelten die beiden Abstände unverändert weiter — erst der Inhalt,
+     * dann Bo, aus den Gründen, die an beiden Weckern stehen.
+     */
+    let armed = false;
+    const arm = () => {
+      if (armed) return;
+      armed = true;
+      startEntryTimers();
+    };
+    const startEntryTimers = () => {
     windowTimerRef.current = setTimeout(() => {
       windowTimerRef.current = null;
       if (closingRef.current) return;
@@ -2561,7 +2987,7 @@ export function AssistantScreen() {
        * eine halbe Sekunde später wäre es ein Nachklappen. 120ms reichen, um
        * aus der Bewegung heraus zu sein.
        */
-    }, ASSISTANT_IN.duration + 120);
+    }, 120);
     enterTimerRef.current = setTimeout(() => {
       enterTimerRef.current = null;
       // Nicht mehr, wenn schon geschlossen wird: Sonst hebt genau dieser Wecker
@@ -2598,10 +3024,26 @@ export function AssistantScreen() {
       // Bo läuft NACH dem Nachfüllen wieder an, nicht dazwischen: Sein Start
       // bricht 15 Werte ab und startet rund zehn Endlos-Ketten, darunter vier
       // animierte SVG-Eigenschaften.
-    }, ASSISTANT_IN.duration + 320);
+    }, 320);
+    };
+
+    setAssistantArrivedHandler(arm);
+    /**
+     * Notausgang: Kommt die Kurve nie an, muss es trotzdem weitergehen.
+     *
+     * Eine unterbrochene Bewegung meldet sich mit `finished === false` und ruft
+     * den Verteiler gar nicht. Ohne dieses Netz bliebe die Liste dauerhaft auf
+     * fünf Zeilen und Bo für immer angehalten. Großzügig bemessen — er soll nur
+     * greifen, wenn wirklich etwas schiefging.
+     */
+    safetyTimerRef.current = setTimeout(arm, ASSISTANT_IN.duration + 600);
     return () => {
       if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
       if (windowTimerRef.current) clearTimeout(windowTimerRef.current);
+      if (safetyTimerRef.current) clearTimeout(safetyTimerRef.current);
+      // Den Verteiler leeren — sonst liefe die Arbeit eines alten Durchgangs in
+      // einen neuen hinein.
+      setAssistantArrivedHandler(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isFocused, openSeq]);
@@ -2783,27 +3225,7 @@ export function AssistantScreen() {
     // geschützt → er steht immer über dem Inputbar, egal ob Keyboard auf
     // oder zu ist.
     <Animated.View
-      style={[
-        styles.root,
-        /**
-         * Runde Ecken wie bei jeder anderen Slide — plus der Schatten, ohne den
-         * man sie nicht sehen KANN.
-         *
-         * Der Radius war schon gesetzt und tat auch, was er soll. Sichtbar wurde
-         * er trotzdem nicht: Bos Hintergrund ist exakt derselbe Wert wie der des
-         * Landingscreens darunter (beide `palette.bg`), die Aussparung in der
-         * Ecke gab also dieselbe Farbe frei, die dort ohnehin schon lag. Eine
-         * unsichtbare Kante ist von einer eckigen nicht zu unterscheiden.
-         *
-         * Genau dafür tragen die anderen Überlagerungen `elevation` — bei
-         * `DetailsOverlay` steht die Begründung ausführlich daneben, samt der
-         * Falle, dass der Hintergrund dabei PFLICHT ist: Ohne ihn berechnet
-         * Android die Schatten-Kontur aus den eckigen Grenzen und füllt die runde
-         * Aussparung wieder mit einem dunklen Quadrat.
-         */
-        screenShellStyle,
-        slideStyle,
-      ]}
+      style={rootStyle}
       /**
        * Textur für BEIDE Richtungen — die Einfahrt kann das jetzt auch.
        *
@@ -2836,6 +3258,30 @@ export function AssistantScreen() {
        * durchlässig, der Tipp erreicht den Landingscreen also erst recht.
        * Gebraucht wird das Fangen — und zwar über die ganze Ausfahrt, bis der
        * Baum wirklich weg ist.
+       */
+      /**
+       * Die Textur gehört auf DIESE Wurzel — der Versuch, sie tiefer zu legen,
+       * ist gescheitert.
+       *
+       * Der Gedanke war: Auf Android verliert Text in einer GPU-Ebene seine
+       * Subpixel-Glättung, und weil die Ebene beim Aufsetzen des Fingers
+       * entsteht, änderten der Schriftzug „Binch" und Bo ihr Aussehen, während
+       * der Bildschirm noch stillstand. Also wurde sie auf die Nachrichtenliste
+       * verlegt, damit die Kopfzeile scharf bleibt.
+       *
+       * Am Gerät war die Ausfahrt danach deutlich SCHLECHTER — und zwar
+       * ausgeprägter, je mehr Nachrichten im Verlauf standen. Das ist die
+       * Handschrift von „pro Zeile compositet statt als ein Bild geschoben":
+       * Auf einer inneren Hülle deckt die Ebene den bewegten Knoten nicht mehr
+       * ab, der Rest des Baumes hängt also weiterhin einzeln an der Bewegung.
+       *
+       * Die weichere Rasterung ist der Preis dafür, und sie ist der kleinere:
+       * Sie ist ein Aussehen, das andere war ein Ruckeln. Wer sie loswerden
+       * will, muss an der ZEIT ansetzen, nicht am Ort — die Ebene erst ein Bild
+       * vor der Kurve anlegen statt beim Aufsetzen. Dann fällt der Wechsel in
+       * die Bewegung und ist nicht mehr zu sehen; dafür liegt ein Teil des
+       * Aufbaus (66ms) wieder in der Fahrt. Das ist eine Abwägung, keine
+       * Verbesserung, und deshalb steht sie hier nur als Notiz.
        */
       renderToHardwareTextureAndroid={closing}
     >
@@ -2935,15 +3381,44 @@ export function AssistantScreen() {
         style={[styles.inputbarWrap, inputbarWrapStyle, barAnimStyle]}
         onLayout={(e) => {
           const h = e.nativeEvent.layout.height;
-          if (Math.abs(h - inputbarHeight) > 1) setInputbarHeight(h);
+          /**
+           * NICHT während der Fahrt — jeder Commit hält die Kurve an.
+           *
+           * Belegt in Reanimateds eigener Quelle: Kommt ein Commit von React,
+           * klont der Commit-Hook den Shadow-Tree-Pfad für JEDEN animierten
+           * Knoten der App und pausiert danach ausdrücklich Reanimateds eigene
+           * Commits („if we didn't pause Reanimated commits, it could lead to
+           * RN commits being delayed until the animation is finished"). Ein
+           * `setState` mitten in der Einfahrt ist damit kein bisschen
+           * Mehrarbeit, sondern eine PAUSE der Bewegung.
+           *
+           * Die Zahl selbst eilt nicht: Sie steuert nur den Innenabstand am
+           * unteren Listenrand, und ihr Startwert wird gerechnet statt geraten
+           * (siehe dort) — die Abweichung ist im Regelfall null.
+           */
+          if (Math.abs(h - inputbarHeight) <= 1) return;
+          if (isTransitionBusy()) {
+            pendingBarHeightRef.current = h;
+            return;
+          }
+          pendingBarHeightRef.current = null;
+          setInputbarHeight(h);
         }}
       >
       {voiceMode ? (
         <VoiceRecordBar
           recording={listening}
-          // Während der Fahrt steht ihre Darstellung still — Begründung im
-          // Prop selbst. Die Aufnahme läuft weiter.
-          paused={sliding}
+          /**
+           * Still, während etwas fährt — UND solange Bo nicht zu sehen ist.
+           *
+           * Hier stand nur `sliding`. Verliert Bo den Vordergrund, ohne
+           * abgebaut zu werden — er öffnet die Ergebnisliste selbst, oder er
+           * steht nach dem Schließen noch geparkt da —, lief der
+           * Wellenform-Sampler im Bild-Takt weiter, unsichtbar, und damit auch
+           * während FREMDER Bewegungen. Die Aufnahme selbst läuft weiter;
+           * angehalten wird nur ihre Darstellung.
+           */
+          paused={sliding || !isFocused}
           onPauseToggle={() => {
             if (listening) stopVoice();
             else void startVoice();

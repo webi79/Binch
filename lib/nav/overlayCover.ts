@@ -149,7 +149,13 @@ export const UNDERLAY_TRAVEL_FRAC = -0.30;
  *
  * Umgesetzt via `borderRadius` + `overflow: "hidden"`. Das ist HIER günstig: Der
  * View wird nur VERSCHOBEN (nicht ein Kind darin rotiert), also nutzt Android
- * `clipToOutline` für den runden Clip — GPU-beschleunigt, kein Neurastern pro
+ * Umgesetzt via `borderRadius` + `overflow: hidden`. ACHTUNG: Die frühere
+ * Behauptung, Android nutze dafür `clipToOutline` (GPU-seitig, kein Neurastern
+ * pro Bild), stimmt für RN 0.81 NICHT. `BackgroundStyleApplicator.kt` ruft bei
+ * runden Ecken `canvas.clipPath(...)` und legt in `createPaddingBoxPath` bei
+ * jedem Aufruf einen frischen `Path` an — der Clip fällt also pro Bild an. Über
+ * einer Fläche ohne GPU-Ebene ist das ein echter Posten; siehe `SLIDE_LIFT` in
+ * `AssistantScreen.tsx`.
  * Frame (anders als beim Swap-Button, wo ein Kind IM Clip rotierte).
  *
  * Der Wert kommt jetzt vom ECHTEN Geräteradius (natives Modul screen-corners):
@@ -707,6 +713,23 @@ export function markSheetMoving(durationMs: number = SHEET_IN.duration): void {
  * eine Berührung angefordert wurde, konnte also mitten in seiner Fahrt
  * ablaufen und sie anhalten. Genau das „manchmal ruckelt es, manchmal nicht".
  */
+/**
+ * Was NACH Bos Einfahrt laufen soll — vom Bildschirm einmal hinterlegt.
+ *
+ * Dasselbe Muster wie beim Such-Blatt (`setSearchHeroArrivedHandler`), und aus
+ * demselben Grund: Die Kurve startet im Tipp-Handler des Landingscreens, die
+ * Arbeit danach liegt aber im Bildschirm. Ein fester Verteiler statt eines
+ * eingefangenen Rückrufs — ein Worklet fängt seine Schließung beim Anlegen ein
+ * und sähe eine später gesetzte Funktion nie.
+ */
+let assistantArrivedCb: (() => void) | null = null;
+export function setAssistantArrivedHandler(fn: (() => void) | null): void {
+  assistantArrivedCb = fn;
+}
+function assistantArrived(): void {
+  assistantArrivedCb?.();
+}
+
 export function startAssistantPush(): void {
   markTransitionBusy(ASSISTANT_IN.duration);
   setSheetMoving(true, "assistant");
@@ -716,6 +739,19 @@ export function startAssistantPush(): void {
     "worklet";
     if (!finished) return;
     runOnJS(setSheetMoving)(false, "assistant");
+    /**
+     * Und melden, dass der Bildschirm wirklich STEHT.
+     *
+     * Daran hängt, wann Bo wieder anlaufen darf. Vorher tat das eine Stoppuhr
+     * im Bildschirm — und eine Stoppuhr misst ab dem Zeitpunkt, an dem sie
+     * gestellt wurde, nicht ab dem Start der Kurve. Zwischen beidem liegen
+     * mindestens ein Bild Vorlauf und, bei Last, deutlich mehr. Wird die Fahrt
+     * unterbrochen und läuft weiter, stimmt sie ohnehin nicht mehr.
+     *
+     * Der Abschluss-Rückruf weiß es genau: Er läuft, wenn der Wert sein Ziel
+     * erreicht hat.
+     */
+    runOnJS(assistantArrived)();
   });
 }
 

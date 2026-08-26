@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode, useMemo } from "react";
 import {
   StyleSheet,
   View,
@@ -921,6 +921,11 @@ export function SearchHeroOverlay() {
   // Äußere Overlay-Sichtbarkeit — UI-Thread (overlayVisible), synchron mit dem
   // Wachstum. Ersetzt das frühere React-Gate `active && launchActive`.
   const outerOpacityStyle = useAnimatedStyle(() => ({ opacity: overlayVisible.value }));
+  /** Lage des Zurück-Pfeils EINMAL — er sitzt im fahrenden Baum. */
+  const backWrapStyle = useMemo(
+    () => [styles.backWrap, { top: insets.top + 10 }],
+    [insets.top],
+  );
 
   /**
    * Hereinfahren von unten UND der seitliche Beschnitt bei der Übergabe an die
@@ -1073,7 +1078,7 @@ export function SearchHeroOverlay() {
 
       {/* Zurück-Pfeil oben links. */}
       {active ? (
-        <Animated.View style={[styles.backWrap, { top: insets.top + 10 }]}>
+        <Animated.View style={backWrapStyle}>
           <Pressable
             /**
              * Die GPU-Textur schon beim AUFSETZEN des Fingers.

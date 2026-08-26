@@ -150,30 +150,28 @@ function BoInner({ state = "idle", size = 128, paused = false }: Props) {
     const stateChanged = lastSetupRef.current !== state;
     lastSetupRef.current = state;
 
-    if (!isFirstRunRef.current && stateChanged) {
-      // Cross-State-Reset — smoother Übergang zur neutralen Pose (200ms
-      // withTiming statt instant assignment). Wenn der neue State danach
-      // einen Wert selber animiert (z.B. neue ty/rot via withSequence),
-      // überschreibt das die withTiming hier — kein Konflikt, der State-
-      // spezifische Code macht seine eigene smooth-Transition. Werte die
-      // der neue State NICHT anfasst (z.B. armRot wenn man von waving auf
-      // idle wechselt) gleiten über diese withTiming sanft auf neutral.
-      const T_RESET = { duration: 200, easing: EASE };
-      tx.value = withTiming(0, T_RESET);
-      rot.value = withTiming(0, T_RESET);
-      sx.value = withTiming(1, T_RESET);
-      sy.value = withTiming(1, T_RESET);
-      eyeBlink.value = withTiming(1, T_RESET);
-      eyeLookX.value = withTiming(0, T_RESET);
-      eyeLookY.value = withTiming(0, T_RESET);
-      mouthYap.value = withTiming(1, T_RESET);
-      armRot.value = withTiming(-7, T_RESET);
-      sweatY.value = withTiming(-4, T_RESET);
-      sweatOp.value = withTiming(0, T_RESET);
-      glowScale.value = withTiming(1, T_RESET);
-    }
-    isFirstRunRef.current = false;
-
+    /**
+     * PAUSIERT? Dann hier raus — VOR dem Zustandswechsel-Block.
+     *
+     * Der Block darunter ist der teuerste Teil dieser Datei: zwölf
+     * `withTiming` über 200ms, und sie treiben allesamt Werte, an denen
+     * SVG-Eigenschaften hängen. Animierte SVG-Eigenschaften machen die GANZE
+     * Fläche ungültig — sie wird also 200ms lang in jedem Bild neu gerastert.
+     *
+     * Er stand vor dem Ausstieg, und das war die Falle: Fällt ein
+     * Stimmungswechsel in denselben Durchgang, in dem `paused` wahr wird — und
+     * genau das passiert, wenn eine Fahrt losgeht, weil React beide
+     * Zustandswechsel zu EINEM Rendern zusammenfasst —, dann startete Bo zwölf
+     * Animationen und kehrte erst DANACH zurück, weil er ja pausiert ist. Die
+     * Animationen liefen trotzdem weiter, auf demselben UI-Strang wie die
+     * Slide, exakt in ihren ersten Bildern. Es sah aus, als würde die Slide
+     * ruckeln; in Wahrheit rechnete Bo gegen sie an.
+     *
+     * Verloren geht nichts: Der weiche Übergang ist für einen SICHTBAREN
+     * Zustandswechsel gedacht. Ist Bo angehalten, sieht ihn ohnehin niemand —
+     * der Zweig unten stellt die Zielpose hart her, und das ist dasselbe
+     * Ergebnis in null statt in zwölf mal 200ms.
+     */
     // Wenn pausiert: keine Worklets starten. Aber für State-spezifische
     // Posen müssen die Shared-Values auf einen sinnvollen statischen Wert
     // gesetzt werden — sonst rendert Bo z.B. im sad-Static mit der waving-
@@ -234,8 +232,33 @@ function BoInner({ state = "idle", size = 128, paused = false }: Props) {
         sparkle.value = 0;
         glowOp.value = state === "error" ? 0 : 0.18;
       }
+      isFirstRunRef.current = false;
       return;
     }
+
+    if (!isFirstRunRef.current && stateChanged) {
+      // Cross-State-Reset — smoother Übergang zur neutralen Pose (200ms
+      // withTiming statt instant assignment). Wenn der neue State danach
+      // einen Wert selber animiert (z.B. neue ty/rot via withSequence),
+      // überschreibt das die withTiming hier — kein Konflikt, der State-
+      // spezifische Code macht seine eigene smooth-Transition. Werte die
+      // der neue State NICHT anfasst (z.B. armRot wenn man von waving auf
+      // idle wechselt) gleiten über diese withTiming sanft auf neutral.
+      const T_RESET = { duration: 200, easing: EASE };
+      tx.value = withTiming(0, T_RESET);
+      rot.value = withTiming(0, T_RESET);
+      sx.value = withTiming(1, T_RESET);
+      sy.value = withTiming(1, T_RESET);
+      eyeBlink.value = withTiming(1, T_RESET);
+      eyeLookX.value = withTiming(0, T_RESET);
+      eyeLookY.value = withTiming(0, T_RESET);
+      mouthYap.value = withTiming(1, T_RESET);
+      armRot.value = withTiming(-7, T_RESET);
+      sweatY.value = withTiming(-4, T_RESET);
+      sweatOp.value = withTiming(0, T_RESET);
+      glowScale.value = withTiming(1, T_RESET);
+    }
+    isFirstRunRef.current = false;
 
     const blink = () => {
       // Bewusster, langsamer Blink alle ~10s. Schließ-/Öffnungszeiten sind

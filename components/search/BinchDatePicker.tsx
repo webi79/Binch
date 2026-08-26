@@ -107,7 +107,20 @@ function monthFrom(y: number, m: number): number {
  * Einmal beim Laden gelesen ist auch die Fenster-Höhe unbedenklich: Zu dem
  * Zeitpunkt gibt es keine Tastatur, die sie verkleinern könnte.
  */
+
 const PARK_Y = Dimensions.get("window").height;
+
+/**
+ * Innenabstände der Scroll-Flächen als KONSTANTEN.
+ *
+ * Als Literal im JSX ist jedes davon bei jedem Durchgang ein frisches Objekt —
+ * und damit ein geänderter Stil-Prop auf dem Scroll-Container, den Fabric
+ * committen muss. Dieser Wähler rendert bei jeder Monats-Bewegung und jeder
+ * Auswahl neu; die Werte selbst haben sich dabei nie geändert.
+ */
+const PAD_BOTTOM_120 = { paddingBottom: 120 } as const;
+const PAD_H20_B120 = { paddingHorizontal: 20, paddingBottom: 120 } as const;
+const PAD_V70 = { paddingVertical: 70 } as const;
 
 type Mode = "specific" | "flexible";
 
@@ -999,7 +1012,7 @@ const DatePickerContent = memo(function DatePickerContent({
               scrollEnabled={mode === "specific"}
               onEndReached={onEndReached}
               onEndReachedThreshold={0.5}
-              contentContainerStyle={{ paddingBottom: 120 }}
+              contentContainerStyle={PAD_BOTTOM_120}
               showsVerticalScrollIndicator={false}
             />
           </View>
@@ -1021,7 +1034,7 @@ const DatePickerContent = memo(function DatePickerContent({
           </View>
           <ScrollView
             style={{ flex: 1 }}
-            contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 120 }}
+            contentContainerStyle={PAD_H20_B120}
             showsVerticalScrollIndicator={false}
             // Nur aktiv im Flexibel-Mode — friert das offscreen-Panel ein.
             scrollEnabled={mode === "flexible"}
@@ -1371,7 +1384,7 @@ function Wheel({
       showsVerticalScrollIndicator={false}
       snapToInterval={ITEM}
       decelerationRate="fast"
-      contentContainerStyle={{ paddingVertical: 70 }}
+      contentContainerStyle={PAD_V70}
       contentOffset={{ x: 0, y: idx * ITEM }}
       onMomentumScrollEnd={(e) => {
         const i = Math.round(e.nativeEvent.contentOffset.y / ITEM);

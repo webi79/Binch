@@ -1,5 +1,6 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useState, useRef } from "react";
 import { SHEET_IN, SHEET_OUT } from "@/lib/nav/overlayCover";
+import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import {
   View,
   Text,
@@ -496,7 +497,23 @@ function NextHero({
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (!sheetOpen) return;
-    const id = setInterval(() => setNow(Date.now()), 1_000);
+    /**
+     * Kein Takt, während etwas fährt.
+     *
+     * Er rendert diese Zeile jede Sekunde neu, samt ihrem SVG-Ring — und
+     * animierte SVG-Eigenschaften machen die ganze Fläche ungültig. Bei einem
+     * Takt pro Sekunde gegen Fahrten von 300 bis 430ms trifft das regelmäßig,
+     * aber eben nicht immer: wieder ein „manchmal".
+     *
+     * Bo hat für genau dieses Problem längst einen geteilten, geprüften Takt
+     * (`lib/ui/nowTicker.ts`); dieses Blatt hat seinen eigenen behalten. Die
+     * Prüfung wird hier nachgezogen, ohne die Sekunden-Genauigkeit anzutasten:
+     * Übersprungen wird nur der eine Takt, der nächste kommt in einer Sekunde.
+     */
+    const id = setInterval(() => {
+      if (isTransitionBusy()) return;
+      setNow(Date.now());
+    }, 1_000);
     return () => clearInterval(id);
   }, [sheetOpen]);
 

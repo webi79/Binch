@@ -109,6 +109,18 @@ const priceForSort = (p: number) => (p > 0 ? p : Number.MAX_SAFE_INTEGER);
  * Schließt den Such-Screen, sobald die Ergebnis-Liste ihn wirklich verdeckt.
  * Tut nichts, wenn gar keine Übergabe lief (z.B. Aufruf aus dem Verlauf).
  */
+/**
+ * Als MODUL-Funktion, nicht als frische Schließung im JSX.
+ *
+ * Der Handler sitzt auf einem animierten Knoten. Eine neue Funktions-Kennung
+ * pro Durchgang ist dort dasselbe wie ein neues Stil-Objekt: ein Fabric-Commit
+ * auf genau der Ansicht, die Reanimated Bild für Bild beschreibt. `releaseLayer`
+ * braucht nur einen festen Schlüssel — die Funktion kann also einmal existieren.
+ */
+function releaseResultsLayer(): void {
+  releaseLayer("results");
+}
+
 function finishSearchHandoff(): void {
   if (!isSearchHandoff()) return;
   endSearchHandoff();
@@ -208,6 +220,11 @@ const PARKED = { transform: [{ translateX: 100000 }] } as const;
 /** Nur für „andere Route liegt oben" — siehe `shellStyle`. */
 const HIDDEN_FOR_ROUTE = { opacity: 0 } as const;
 
+/** Schlüssel einer Ergebnis-Zeile — als Modul-Funktion, nicht pro Durchgang neu. */
+function resultKey(r: SearchResult): string {
+  return `${r.direction ?? "OUTBOUND"}-${r.id}`;
+}
+
 export function ResultsView() {
   // Parameter aus dem Store. Die Route schreibt sie hinein (siehe die Hülle in
   // app/search/results.tsx) — hier gelesen, damit dieser Baum nicht an der Route
@@ -302,6 +319,30 @@ export function ResultsView() {
   // wenn der Slide fertig ist. Kein hartcodiertes setTimeout(320) das je
   // nach Mount-Speed zu früh oder zu spät feuern könnte.
   const [contentReady, setContentReady] = useState(false);
+  /**
+   * Leben die Karten der Liste gerade? — der Hebel gegen „nach einer Suche ist
+   * die ganze App langsamer".
+   *
+   * Dieser Bildschirm bleibt bewusst dauerhaft gemountet: Ihn pro Aufruf zu
+   * bauen war teuer, und das Ab- und Wiederaufbauen des Detail-Blattes hat
+   * nachweislich native Ansichten liegengelassen. An dieser Entscheidung ändert
+   * sich hier NICHTS — die Hülle, die Kopfzeile und die Liste selbst bleiben
+   * stehen.
+   *
+   * Was nicht stehenbleiben muss, sind die KARTEN. Nach einer Suche hielt die
+   * Liste fünf Bildschirmhöhen davon gemountet, für den Rest des App-Laufs:
+   * jede mit Logo, Verlauf und einer Reanimated-Zuordnung. Und jede neu
+   * gemountete Zuordnung — auch die von Bos Zeilen beim Öffnen — verwirft die
+   * sortierte Reihenfolge ALLER Zuordnungen der App, die im nächsten Bild neu
+   * aufgebaut wird. Genau deshalb wurde jede spätere Bewegung schlechter,
+   * sobald man einmal gesucht hatte.
+   *
+   * Die Daten selbst bleiben im Abfrage-Speicher liegen; freigegeben werden nur
+   * die Ansichten. Beim Zurückkehren baut die Liste sie neu auf — nach der
+   * Fahrt, an derselben Stelle, an der auch eine frische Suche ihren Inhalt
+   * einblendet (`contentReady`).
+   */
+  const [listAlive, setListAlive] = useState(false);
   /** Textur für die Zeit, in der ein Detail-Blatt über dieser Liste fährt. */
 
 
@@ -897,6 +938,12 @@ export function ResultsView() {
     [mode, origin, destination, departDate, departTime, returnDate, passengers, currency, travelClass, nearbyRequested],
   );
 
+  /** Aufgeschobener Eintrag der stillen Auffrischung — muss beim Abbau sterben. */
+  const commitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (commitTimerRef.current) clearTimeout(commitTimerRef.current);
+  }, []);
+
   useEffect(() => {
     if (!origin || !destination || !departDate) return;
     const intervalMs = 5 * 60 * 1000; // 5 Min
@@ -947,7 +994,31 @@ export function ResultsView() {
            */
           nearbyRequested ? { nearby: true } : undefined,
         );
-        queryClient.setQueryData(queryKey, fresh);
+        /**
+         * NOCH EINMAL prüfen — die Prüfung oben ist zu diesem Zeitpunkt alt.
+         *
+         * Zwischen ihr und dieser Zeile liegt eine vollständige Netz-Anfrage,
+         * also leicht eine halbe Sekunde. Ob beim START der Auffrischung
+         * gerade etwas fuhr, sagt nichts darüber aus, ob es das JETZT tut —
+         * und geschrieben wird erst hier: `setQueryData` lässt den gesamten
+         * Ergebnis-Baum neu rendern.
+         *
+         * Weil der Zeitpunkt am Netz hängt, trifft es mal eine Fahrt und mal
+         * nicht. Das ist das übriggebliebene „vereinzelt ruckelt es noch".
+         *
+         * Verschoben, nicht verworfen: Die Antwort ist da und wird
+         * eingetragen, sobald nichts mehr fährt. Ein Wiederversuch alle 150ms
+         * ist ein Zeitstempel-Vergleich und stört keine Bewegung.
+         */
+        const commit = () => {
+          if (isTransitionBusy()) {
+            commitTimerRef.current = setTimeout(commit, 150);
+            return;
+          }
+          commitTimerRef.current = null;
+          queryClient.setQueryData(queryKey, fresh);
+        };
+        commit();
       } catch {
         // Refresh fehlgeschlagen → bestehende Daten bleiben.
       }
@@ -1175,6 +1246,37 @@ export function ResultsView() {
     [hiddenForRoute, shellBase, slideStyle],
   );
 
+  /**
+   * Anschalten sofort, Abschalten mit Abstand und nur im Leerlauf.
+   *
+   * `contentReady` kippt am ENDE der Einfahrt auf wahr und bleibt es über die
+   * ganze Ausfahrt — die Karten sind also da, solange man sie sehen kann, und
+   * die Rückfahrt trägt ihren vollen Inhalt.
+   *
+   * Erst danach wird freigegeben, und zwar nicht bildgenau: Ein Abbau von
+   * zwanzig Karten ist der teuerste Commit dieses Bildschirms, und direkt hinter
+   * einer Bewegung ist er am schlechtesten aufgehoben — dort sieht man ihn als
+   * Nachklang. Dieselbe Behandlung wie Bos Abbau: Abstand plus Prüfung, ob
+   * gerade etwas fährt, mit Wiederversuch.
+   */
+  useEffect(() => {
+    if (contentReady) {
+      if (!listAlive) setListAlive(true);
+      return;
+    }
+    if (!listAlive) return;
+    let id: ReturnType<typeof setTimeout>;
+    const attempt = () => {
+      if (isTransitionBusy()) {
+        id = setTimeout(attempt, 200);
+        return;
+      }
+      setListAlive(false);
+    };
+    id = setTimeout(attempt, 1500);
+    return () => clearTimeout(id);
+  }, [contentReady, listAlive]);
+
   return (
     <>
     <RouteWatch onChange={setHiddenForRoute} />
@@ -1308,6 +1410,16 @@ export function ResultsView() {
             <Text style={styles.retryBtnText}>{t("results.retry")}</Text>
           </RippleTouch>
         </View>
+      ) : !listAlive ? (
+        /**
+         * Freigegeben — hier steht bewusst NICHTS.
+         *
+         * Die Liste mit leerem Datensatz stehenzulassen wäre die naheliegende
+         * Variante, aber sie hätte ihren Leer-Zustand gerendert: darin steckt
+         * ein Bo mit 138 Punkt Kantenlänge. Ein schwerer SVG-Baum statt der
+         * Karten ist kein Gewinn.
+         */
+        null
       ) : showDirectionToggle ? (
         // Outbound + Return side-by-side im Pager — Hin/Rück-Toggle triggert
         // nur einen translateX, FlatLists bleiben gemountet → smoother
@@ -1640,10 +1752,35 @@ const RouteHeader = memo(function RouteHeader({
           </Text>
           {loading ? <LoadingDots active={loading} /> : null}
         </View>
-        <RippleTouch onPress={onChange} style={[styles.rhChangeBtn, { backgroundColor: palette.s3 }]}>
+        {/**
+          * „Ändern" ist der Haupt-Ausgang dieser Liste — und der lief bisher
+          * OHNE Textur zurück.
+          *
+          * Der Schalter dafür ist längst verdrahtet (`subscribeLayer("results")`
+          * an der bewegten Wurzel), angefordert wurde die Fläche aber nur beim
+          * Berühren einer Ergebnis-Karte — also für den Fall, dass die Liste
+          * UNTERLAGE des Detail-Blattes wird. Für ihre eigene Rückfahrt hat sie
+          * nie jemand angefordert: Eine Liste voller Karten mit Logos und
+          * Verläufen wurde damit in jedem Bild der Ausfahrt neu gezeichnet.
+          *
+          * Angefordert wird beim AUFSETZEN, wie überall sonst: Der Aufbau ist im
+          * Projekt mit 66ms vermessen, bei 8,3ms Bildbudget, und gehört deshalb
+          * in die 80 bis 150ms des Fingers statt in die ersten Bilder der Kurve.
+          *
+          * Und `Pressable` statt `RippleTouch`: Die Material-Welle läuft beim
+          * Loslassen aus — mitten in die eben angelegte Textur hinein, die sie
+          * dann in jedem Bild ungültig machen würde. Mit Welle wäre die Ebene
+          * schlechter als gar keine. Dieselbe Begründung wie an den
+          * Schließ-Knöpfen von Detail-Blatt und Profil-Unterschirm.
+          */}
+        <Pressable
+          onTouchStart={() => prepareLayer("results")}
+          onPress={onChange}
+          style={[styles.rhChangeBtn, { backgroundColor: palette.s3 }]}
+        >
           <Text style={styles.rhChangeText}>{t("results.change")}</Text>
           <ArrowLeftRight color={C.text} size={14} />
-        </RippleTouch>
+        </Pressable>
       </View>
     </View>
   );
@@ -1831,6 +1968,18 @@ function ResultsListView({
 
   return (
     <Animated.FlatList
+      /**
+       * Wer scrollt, bekommt keine Textur — sie sofort wieder abgeben.
+       *
+       * Die Karten dieser Liste fordern die bildschirmfüllende Ebene beim
+       * AUFSETZEN des Fingers an, weil ihr Aufbau 66ms dauert und deshalb nicht
+       * in den Start einer Bewegung fallen darf. Wird aus dem Aufsetzen aber ein
+       * SCROLLEN, lag sie bis zu 1,4 Sekunden über einer bewegten Fläche — und
+       * dort ist eine Ebene teurer als gar keine: Sie wird in jedem Bild
+       * ungültig und muss neu hochgeladen werden. Ein Tipp erreicht diese Zeile
+       * nie. Dieselbe Behandlung wie im Landingscreen.
+       */
+      onScrollBeginDrag={releaseResultsLayer}
       // Hier BEWUSST kein eigener Wert: Anders als bei den reinen Scroll-Flächen
       // hängt eine FlatList immer ihren eigenen onScroll an (Virtualisierung,
       // onEndReached, Sichtbarkeits-Buchhaltung). Die Ereignisse gehen hier also
@@ -1846,7 +1995,7 @@ function ResultsListView({
       // angezeigt wird — die ursprüngliche Absicht bleibt also erhalten.
       key={`${direction}-${listIdentity}`}
       data={data}
-      keyExtractor={(r) => `${r.direction ?? "OUTBOUND"}-${r.id}`}
+      keyExtractor={resultKey}
       renderItem={renderItem}
       // Virtualisierung: ohne diese Limits rendert FlatList (default windowSize
       // 21) bei ~74 Treffern praktisch ALLE Karten gleichzeitig — jede mit

@@ -19,7 +19,7 @@ import { TravelMode } from "@/types/search";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { haptic } from "@/lib/haptics";
-import { prepareLayer } from "@/lib/nav/transitionLayer";
+import { prepareLayer, releaseLayer } from "@/lib/nav/transitionLayer";
 import { startResultsPush } from "@/lib/nav/overlayCover";
 import { scaledStyles } from "@/lib/ui/compact";
 
@@ -158,6 +158,22 @@ function RecentCardInner({ search, bordered = false }: { search: RecentSearch; b
   // wenn die Lücke schon zu ist; dadurch gibt es keinen Sprung mehr.
   useEffect(() => {
     if (!collapsing) return;
+    /**
+     * Die Textur des Landingscreens MUSS hier weg.
+     *
+     * Angefordert hat sie das Aufsetzen des Fingers auf diese Karte (siehe
+     * `onTouchStart` unten) — gedacht für den Fall, dass daraus ein Tipp auf die
+     * Suche wird. Aus einem Langdruck plus Tipp auf den Mülleimer wird stattdessen
+     * DIESE Animation, und die ist der denkbar schlechteste Inhalt für eine
+     * gehaltene Ebene: Sie fährt `height` und `marginBottom` auf null, also echte
+     * Layout-Werte. Jedes Bild ist damit ein Yoga-Durchgang, der den Inhalt der
+     * Scroll-Fläche verändert — und macht die bildschirmfüllende Textur darüber
+     * jedes Mal ungültig. Sie wird dann in jedem Bild neu gezeichnet UND neu
+     * hochgeladen (14,7ms gegen 8,3ms Budget), statt einmal.
+     *
+     * Ohne Ebene ist es die gewöhnliche Layout-Animation, die sie vorher war.
+     */
+    releaseLayer("home");
     collapse.value = withTiming(0, { duration: 220, easing: EASING_OUT }, (finished) => {
       "worklet";
       if (finished) runOnJS(removeRecentSearch)(search.id);
