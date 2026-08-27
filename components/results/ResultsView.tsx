@@ -67,7 +67,7 @@ import { useAccent } from "@/lib/theme/accent";
 import { MOTION, revealEntering } from "@/lib/motion";
 import { endSearchHandoff, isSearchHandoff } from "@/lib/nav/searchHandoff";
 import { FIELD_H, GUTTER } from "@/lib/theme/spacing";
-import { holdLayer, prepareLayer, releaseLayer, subscribeLayer } from "@/lib/nav/transitionLayer";
+import { prepareLayer, releaseLayer, subscribeLayer } from "@/lib/nav/transitionLayer";
 import { scaledStyles } from "@/lib/ui/compact";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 
@@ -528,21 +528,6 @@ export function ResultsView() {
       // nur beim ersten Mal da, und die gestaffelte Freigabe des Inhalts liefe
       // ab dem zweiten Mal gar nicht mehr.
       setContentReady(false);
-      /**
-       * OHNE Generation freigeben — die hier mitzugeben ist wirkungslos.
-       *
-       * Der Wächter in `releaseLayer` vergleicht die übergebene Generation mit
-       * der aktuellen und steigt aus, wenn inzwischen jemand neu angefordert
-       * hat. Dafür muss sie beim BEGINN des Vorgangs festgehalten werden — so
-       * machen es das Ticket- und das Detail-Blatt. Hier wurde sie im Moment
-       * der Freigabe gelesen, war also zwangsläufig gleich: Der Vergleich
-       * konnte nie greifen.
-       *
-       * Ehrlicher ist, sie wegzulassen: Diese Stelle läuft beim Schließen der
-       * Ergebnisliste, und dort SOLL die Textur der Unterlage weg. Vor dem
-       * Abriss zur Unzeit schützt inzwischen der Bewegungs-Riegel im Modul.
-       */
-      releaseLayer("home");
       return;
     }
     // Notbremse fürs Nachziehen der Route: Wird die Bewegung unterbrochen, läuft
@@ -554,22 +539,6 @@ export function ResultsView() {
       useSearchStore.getState().setPendingResultsRoute(null);
       router.push({ pathname: "/search/results", params: pending });
     }, 1500);
-    // Für die Dauer dieser Suche: eigene Textur an, Textur der Unterlage halten.
-    // Die Textur der Unterlage wird NICHT hier angefordert.
-    //
-    // Hier wäre sie zu spät: Dieser Effekt läuft unmittelbar vor der Bewegung,
-    // und der Aufbau einer bildschirmfüllenden Ebene ist im Projekt mit 66ms
-    // vermessen (saved.tsx). Die Unterlage stünde damit still, während die Slide
-    // schon läuft — genau das „der Parallax kommt zu spät".
-    //
-    // Sie wird stattdessen im bestätigten Tipp angefordert (RecentCard, SearchHero).
-    // Das ist früh genug für den Vorlauf und spät genug, um nicht bei jeder
-    // Berührung anzuspringen, die in Wirklichkeit ein Scrollen wird.
-    //
-    // Hier wird sie nur GEHALTEN: Solange dieser Bildschirm darüber liegt, ist die
-    // Unterlage verdeckt und nicht scrollbar — die Textur kostet nichts und steht
-    // für die Rückfahrt bereit. Ohne das fiele sie nach 1,4s mitten im Stehen weg.
-    holdLayer("home");
     // DIREKT starten, ein Bild später.
     //
     // Vorher hing der Start an `onLayout` des Slide-Roots — und der feuert beim

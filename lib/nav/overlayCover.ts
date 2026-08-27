@@ -730,6 +730,30 @@ function assistantArrived(): void {
   assistantArrivedCb?.();
 }
 
+/**
+ * Die Fahrt ANMELDEN, bevor sie startet.
+ *
+ * Bos Öffnung läuft über drei Schritte: Tipp → `openAssistant()` → ein Bild
+ * Vorlauf → `startAssistantPush()`. Angemeldet wurde die Bewegung bisher erst
+ * im letzten Schritt. Dazwischen liegt ein Bild, in dem `isTransitionBusy()`
+ * noch falsch meldet — und auf genau diese Prüfung wartet die halbe App:
+ * die Persistenz des Speichers, das Aufräumen des Such-Blattes, die
+ * Wiederversuche in
+ * Bos eigenem Bildschirm. Alles, was sich aufgeschoben hat, darf in diesem
+ * einen Bild landen — und schiebt damit den Vorlauf-Rahmen nach hinten, in dem
+ * die Kurve losgehen soll.
+ *
+ * Das Such-Blatt kennt das Loch nicht: Es startet seine Kurve schon im
+ * Berührungs-Bild und meldet damit ab dem ersten Moment Bewegung an. Genau das
+ * ist der Grund, warum ausgerechnet Bos Einfahrt die unruhigere der beiden ist.
+ *
+ * `markTransitionBusy` nimmt immer den späteren Zeitpunkt, die Anmeldung im
+ * Kurvenstart bleibt also gültig und überschreibt nichts.
+ */
+export function armAssistantPush(): void {
+  markTransitionBusy(ASSISTANT_IN.duration + 48);
+}
+
 export function startAssistantPush(): void {
   markTransitionBusy(ASSISTANT_IN.duration);
   setSheetMoving(true, "assistant");

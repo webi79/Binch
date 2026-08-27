@@ -14,6 +14,7 @@ import {
   type ViewStyle,
 } from "react-native";
 import { useIsFocused } from "@react-navigation/native";
+import { markTransitionBusy } from "@/lib/nav/transitionBusy";
 import Animated, {
   cancelAnimation,
   Easing,
@@ -218,6 +219,27 @@ let rapidNav = false;
  * sollte. Der Navigator sieht dagegen jeden Tipp.
  */
 export function noteTabPress(): void {
+  /**
+   * Ein Tab-Wechsel IST eine Bewegung — auch wenn keine Kurve dabei läuft.
+   *
+   * Er tauscht native Ansichten aus, friert die Karte ein oder taut sie auf und
+   * schickt Fokus-Effekte durch mehrere Bildschirme. Gemeldet hat ihn bisher
+   * niemand: `isTransitionBusy()` stand dabei auf falsch, und damit war der
+   * Tab-Wechsel das einzige Zeitfenster der App, in das aufgeschobene Arbeit
+   * ungehindert fallen durfte — die Persistenz des Speichers mit ihrer 10 bis
+   * 30ms langen Serialisierung, das Aufräumen verlassener Bildschirme, sämtliche
+   * Wiederversuche.
+   *
+   * Schlimmer als im Wechsel selbst wirkt sich das DANACH aus: Wer gleich im
+   * Anschluss Bo öffnet, bekommt genau diese Arbeit in die ersten Bilder der
+   * Einfahrt. Bos Fahrt meldet sich seit Kurzem schon ab dem Tipp an; die Lücke
+   * davor bleibt aber offen, solange der Wechsel selbst stumm ist. Beide Fenster
+   * überlappen sich mit dieser Zeile, und dazwischen passt nichts mehr.
+   *
+   * 180ms sind bewusst knapp — es geht um das Überbrücken, nicht um eine
+   * Sperre. Der Zeitstempel verfällt von selbst.
+   */
+  markTransitionBusy(180);
   const now = Date.now();
   rapidNav = lastTabPressAt !== 0 && now - lastTabPressAt < RAPID_NAV_MS;
   lastTabPressAt = now;
@@ -262,10 +284,6 @@ function isRapidNav(): boolean {
  * Commits (z.B. das Einfrieren der Karte) sich aus dem Wechsel-Frame
  * heraushalten, statt blind auf einen festen Timer zu setzen.
  */
-export function msSinceTabPress(): number {
-  return lastTabPressAt === 0 ? Number.POSITIVE_INFINITY : Date.now() - lastTabPressAt;
-}
-
 interface Entrance {
   /**
    * true = Inhalt SOFORT vollständig zeigen, ohne Welle.

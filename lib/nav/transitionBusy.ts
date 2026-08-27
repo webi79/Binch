@@ -1,8 +1,8 @@
 /**
  * „Gerade fährt etwas" — als schlichter Zeitstempel.
  *
- * WOZU: Die Persistenz des Speichers serialisiert über 50 KB und braucht dafür
- * 10 bis 30 Millisekunden auf dem JS-Strang. Sie wartet deshalb auf eine
+ * WOZU: Die Persistenz des Speichers serialisiert den Zustand und wartet dafür
+ * auf eine
  * Leerlauf-Lücke (`requestIdleCallback`). Nur misst die die Ruhe des
  * JS-STRANGS — und jede Bewegung dieser App läuft als Worklet auf dem
  * UI-STRANG. Während einer Slide ist der JS-Strang also genau ruhig, die

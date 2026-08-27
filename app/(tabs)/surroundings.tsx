@@ -8,7 +8,6 @@ import { useQuery } from "@tanstack/react-query";
 import { router } from "expo-router";
 import { useIsFocused } from "@react-navigation/native";
 import { Freeze } from "react-freeze";
-import { msSinceTabPress } from "@/lib/motion";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import {
   MapSurface,
@@ -56,7 +55,6 @@ const DEFAULT_VIEWPORT_DISTANCE = 2000;
 const DEFAULT_ZOOM = 13;
 
 /** Ruhe-Fenster, das ein Tab-Tipp braucht, bevor die Karte einfrieren darf. */
-const FREEZE_QUIET_MS = 500;
 
 /** Berechnet eine großzügige BBox aus Viewport-Center + Distanz. Faktor 2.5
  *  damit Marker am Rand schon gerendert sind wenn der User wischt — kein
@@ -168,52 +166,34 @@ export default function SurroundingsScreen() {
   //     durchklickt, bekam den Freeze-Commit mitten in den ZWEITEN oder DRITTEN
   //     Wechsel geschoben — der Ruckler war damit vom eigenen Tipp entkoppelt
   //     und wirkte wie zufälliger Lag. Jetzt wird weiter aufgeschoben, solange
-  //     der letzte Tab-Tipp noch frisch ist (msSinceTabPress), der Commit landet
+  //     der letzte Tab-Tipp noch frisch war, der Commit landet
   //     also garantiert in einer ruhigen Phase.
   //  2. Aufgetaut wurde per State im Effekt: Der Screen rendete beim Zurück-
   //     kommen erst NOCH eingefroren, und erst der Effekt danach taute den
   //     kompletten Kartenbaum in einem zweiten Commit auf — beide im Wechsel-
   //     Frame. `frozen` ist jetzt abgeleitet, das Auftauen passiert im ersten
   //     Render, und es bleibt bei EINEM Commit.
-  const [freezeArmed, setFreezeArmed] = useState(false);
-  useEffect(() => {
-    if (isFocused) {
-      // Auftauen erledigt `frozen` unten schon. Gleicher Wert ⇒ React bailt raus.
-      setFreezeArmed((armed) => (armed ? false : armed));
-      return;
-    }
-    let id: ReturnType<typeof setTimeout>;
-    const schedule = (delay: number) => {
-      id = setTimeout(() => {
-        /**
-         * Auch WARTEN, solange etwas fährt — hier fehlte die zweite Bedingung.
-         *
-         * Der Aufschub fragt bisher nur, ob der letzte TAB-TIPP frisch ist. Das
-         * deckt schnelles Durchklicken ab, aber nicht den häufigsten Fall
-         * danach: Man kommt von der Karte zurück in den Landingscreen und
-         * öffnet dort etwas — Bo, die Suche, eine Karte. Der Freeze-Commit
-         * hängt den kompletten Kartenbaum ab, und er fiel dann genau in DEREN
-         * Einfahrt.
-         *
-         * Das erklärt auch, warum es nur BEIM ERSTEN MAL nach einem Tab-Wechsel
-         * auffällt: Der Freeze ist pro Karten-Besuch ein einziges Ereignis. Ist
-         * er durch, sind alle weiteren Fahrten sauber — bis man wieder auf die
-         * Karte geht.
-         *
-         * Dieselbe Prüfung wie überall sonst, mit Wiederversuch statt Verzicht:
-         * Eingefroren werden MUSS am Ende, sonst läuft der GL-Strang der Karte
-         * unsichtbar weiter.
-         */
-        if (msSinceTabPress() < FREEZE_QUIET_MS || isTransitionBusy()) {
-          schedule(FREEZE_QUIET_MS);
-          return;
-        }
-        setFreezeArmed(true);
-      }, delay);
-    };
-    schedule(FREEZE_QUIET_MS);
-    return () => clearTimeout(id);
-  }, [isFocused]);
+  /**
+   * SOFORT einfrieren, sobald der Tab den Fokus verliert.
+   *
+   * Hier stand ein Aufschub von 500ms plus eine Prüfung auf laufende
+   * Bewegungen. Beides war gut gemeint — der Freeze-Commit sollte nicht in den
+   * Tab-Wechsel und nicht in eine fremde Fahrt fallen. Nur hatte es eine Folge,
+   * die schwerer wiegt als der Commit selbst: In diesem Fenster ist die Karte
+   * NICHT eingefroren. Sie zeichnet weiter, und man sieht sie — als schwarzen
+   * Balken am oberen Rand, dort wo sie unter die Statusleiste reicht.
+   *
+   * Genau das ist der gemeldete Befund: Löst man die Fahrt aus, WÄHREND der
+   * Balken zu sehen ist, ruckelt sie; wartet man, bis er weg ist, läuft sie
+   * glatt. Der Balken ist die noch lebende Karte, und der Aufschub hat sein
+   * Fenster verlängert — beim Öffnen von Bo sogar über die ganze Fahrt, weil
+   * die Prüfung dann jedes Mal erneut vertagt.
+   *
+   * Der Commit fällt jetzt in den Tab-Wechsel. Dort ist er am besten
+   * aufgehoben: Der Wechsel blendet nicht über (`disablePageAnimations`), es
+   * läuft also keine Bewegung, die er stören könnte.
+   */
+  const freezeArmed = !isFocused;
   /**
    * Auch einfrieren, wenn ein WÄHLER darüber liegt — nicht nur beim Tab-Wechsel.
    *

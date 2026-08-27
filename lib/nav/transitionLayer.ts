@@ -33,7 +33,18 @@ import { isSheetMoving } from "./searchHandoff";
  * Modul `searchHandoff`. Bleibt vorerst stehen, damit die Aufzählung nicht in
  * einer unbeteiligten Runde wandert; `settings` ist neu.
  */
-export type LayerKey = "home" | "saved" | "searchHero" | "results" | "settings" | "pickerLocation" | "pickerDate";
+/**
+ * KEIN "home" mehr. Der Landingscreen hatte als einziger Abonnent eine Textur
+ * für die Dauer eines Übergangs — gestützt auf die Annahme, sein Baum werde
+ * beim Zur-Seite-Wandern in jedem Bild neu gezeichnet. Die Annahme war falsch
+ * (Android hält je Ansicht eine aufgezeichnete Zeichenliste; eine Verschiebung
+ * ist eine Eigenschaft davon), und die Zustandsgröße, an der sie hing, saß in
+ * der Parallax-Komponente: Jedes Anfordern und Freigeben schickte einen
+ * Fabric-Commit auf genau die Ansicht, die Reanimated Bild für Bild beschreibt.
+ * Die Selbstverfall-Wecker schoben einen Teil davon bis in ein späteres
+ * Scrollen. Wieder aufnehmen nur mit Messung am Gerät.
+ */
+export type LayerKey = "saved" | "searchHero" | "results" | "settings" | "pickerLocation" | "pickerDate";
 
 type Listener = (on: boolean) => void;
 

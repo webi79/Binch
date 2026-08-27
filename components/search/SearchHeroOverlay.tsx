@@ -25,7 +25,8 @@ import { TAB_BAR_H } from "@/components/ui/BinchTabBar";
 import type { TravelMode } from "@/types/search";
 import { SearchHero } from "@/components/search/SearchHero";
 import { subscribeHandoffLayer, warmHandoffLayer, setSearchScreenOpenProbe, setSheetMoving, subscribeSheetMoving } from "@/lib/nav/searchHandoff";
-import { holdLayer, layerGeneration, rearmLayer, releaseLayer, subscribeLayer } from "@/lib/nav/transitionLayer";
+import { subscribeLayer } from "@/lib/nav/transitionLayer";
+import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import { resultsPush, heroClipPush, searchHeroPush, startSearchHeroPush, isSearchHeroPushStarted, endSearchHeroPush, searchHeroSettled, setSearchHeroArrivedHandler, overlayCover as parallaxCover, pushProgress, UNDERLAY_TRAVEL_FRAC, SCREEN_CORNER_RADIUS, PUSH_SPRING, POP_SPRING, COVER_IN_SPRING, SHEET_IN, SHEET_OUT, markSheetMoving,
   warmPushCurves,
 } from "@/lib/nav/overlayCover";
@@ -258,6 +259,8 @@ export function SearchHeroOverlay() {
    * frisch geöffneten Bildschirm hinein. Siehe die Begründung dort.
    */
   const finishRafRef = useRef<number | null>(null);
+  /** Der aufgeschobene Teil desselben Aufräumens — muss mit abbrechbar sein. */
+  const finishTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /** 0 = Content unsichtbar (Splash deckt), 1 = Content sichtbar. Harter
    *  Schalter, KEIN Fade — der Wechsel passiert, während der Splash vollflächig
@@ -506,6 +509,10 @@ export function SearchHeroOverlay() {
         cancelAnimationFrame(finishRafRef.current);
         finishRafRef.current = null;
       }
+      if (finishTimerRef.current !== null) {
+        clearTimeout(finishTimerRef.current);
+        finishTimerRef.current = null;
+      }
       /**
        * KEIN Zurücksetzen des Fortschritts mehr.
        *
@@ -538,16 +545,6 @@ export function SearchHeroOverlay() {
       // Abonnenten weiter unten). Bleibt hier als Notausgang für die Wege, die
       // keinen Berührungs-Moment haben (Sprachbefehl, Wiederherstellung).
       useSearchStore.getState().setSearchContentVisible(true);
-      /**
-       * Die Textur des Landingscreens halten, solange das Blatt darüber liegt.
-       *
-       * Angefordert wird sie beim Aufsetzen des Fingers und verfällt nach 1,4
-       * Sekunden. Wer länger sucht — also immer —, fuhr die Rückfahrt ohne
-       * Ebene, und der Landingscreen wird dabei mit seinen vier bildschirmhohen
-       * Bildkarten jedes Bild neu gezeichnet. Detail-, Ticket-Blatt und
-       * Ergebnisliste machen es seit Längerem richtig.
-       */
-      holdLayer("home");
       /**
        * SOFORT setzen — nicht erst im rAF darunter.
        *
@@ -642,8 +639,6 @@ export function SearchHeroOverlay() {
         // 50ms kürzer (so macht es der Auth-Screen).
         setMoving(true);
         setSheetMoving(true);
-        // Und die Ebene der Unterlage für die Rückfahrt scharf stellen.
-        rearmLayer("home");
         /**
          * Den Merker JETZT zurücknehmen, nicht erst am Ende der Kurve.
          *
@@ -658,26 +653,6 @@ export function SearchHeroOverlay() {
          */
         endSearchHeroPush();
         markSheetMoving(SLIDE_OUT.duration);
-        // Und die Unterlagen-Textur am Ende der Rückfahrt freigeben statt sie
-        // 1,4 Sekunden später von selbst verfallen zu lassen — siehe Bo.
-        {
-          const gen = layerGeneration("home");
-          /**
-           * Mit ABSTAND, nicht 40ms hinter der Kurve.
-           *
-           * Das Abreißen einer Textur ist kein Buchhaltungs-Schritt: Die
-           * bildschirmfüllende Ebene des Landingscreens wird verworfen, und die
-           * Fläche darunter muss einmal komplett neu gezeichnet werden — mit ihren
-           * vier fast bildschirmhohen Bildkarten. 40ms nach dem Ende hieß: genau im
-           * Nachklang der Bewegung, wo der Parallax gerade ausläuft und das Auge
-           * noch daran hängt. Das ist der Teil von „der Parallax ruckelt", der gar
-           * nicht mehr in der Fahrt liegt.
-           *
-           * Weit genug weg vom Ende, weit genug vor der 1,4-Sekunden-Frist, gegen
-           * die diese Freigabe überhaupt eingebaut wurde.
-           */
-          setTimeout(() => releaseLayer("home", gen), SLIDE_OUT.duration + 260);
-        }
         requestAnimationFrame(() => {
         searchHeroPush.value = withTiming(0, SLIDE_OUT, (finished) => {
           if (finished) {
@@ -782,10 +757,43 @@ export function SearchHeroOverlay() {
         // Die Textur der Fahrt — siehe den Abschluss-Rückruf. Wurde inzwischen
         // wieder geöffnet, greift der Ausstieg darüber, und sie bleibt stehen:
         // Dann FÄHRT der Bildschirm ja auch wieder.
-        setMoving(false);
-        setActive(null);
-        setLaunchActive(false);
-        hideSearchContent();
+        /**
+         * Und erst, wenn nichts mehr fährt.
+         *
+         * Das sind vier Commits am Stück — drei Zustände plus ein Schreibvorgang
+         * in den Speicher, der jeden Selektor der App weckt —, und `setMoving`
+         * reißt zusätzlich eine bildschirmfüllende GPU-Ebene ab, worauf die
+         * Fläche darunter einmal komplett neu gezeichnet wird.
+         *
+         * Sie lagen zwei Bilder hinter dem Kurvenende, also noch im Nachklang
+         * der eigenen Ausfahrt, in dem der Parallax des Landingscreens gerade
+         * ausläuft. Und wer von hier direkt weiterspringt — Blatt zu, sofort auf
+         * die Suchleiste für Bo —, bekam sie mitten in DESSEN Einfahrt. Bos
+         * Schließ-Abschluss wartet aus genau diesem Grund längst auf eine Lücke;
+         * hier fehlte es.
+         *
+         * Sichtbar ändert sich nichts: Das Blatt ist zu diesem Zeitpunkt bereits
+         * geparkt (`searchHeroPush` und `overlayVisible` stehen auf null), es
+         * bleibt nur ein paar Bilder länger gemountet.
+         */
+        const commit = () => {
+          // Zwischen Aufschub und Ausführung kann wieder geöffnet worden sein —
+          // dieselbe Lebend-Prüfung wie oben, sie gilt auch hier.
+          if (useSearchStore.getState().searchOverlayMode != null) {
+            finishTimerRef.current = null;
+            return;
+          }
+          if (isTransitionBusy()) {
+            finishTimerRef.current = setTimeout(commit, 120);
+            return;
+          }
+          finishTimerRef.current = null;
+          setMoving(false);
+          setActive(null);
+          setLaunchActive(false);
+          hideSearchContent();
+        };
+        commit();
       });
     });
   };

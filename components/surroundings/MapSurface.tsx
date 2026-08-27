@@ -213,6 +213,28 @@ const MapSurfaceInner = forwardRef<MapSurfaceHandle, Props>(function MapSurface(
   return (
     <Map
       style={StyleSheet.absoluteFill}
+      /**
+       * TEXTUR statt eigener Oberfläche — das ist der schwarze Balken.
+       *
+       * MapLibre rendert auf Android standardmäßig in eine `GLSurfaceView`.
+       * Die ist keine gewöhnliche Ansicht: Sie stanzt ein Loch in das Fenster
+       * und wird vom System getrennt komponiert. Beim Tab-Wechsel bleibt dieses
+       * Loch stehen, bis die Fläche wirklich zerstört ist — sichtbar als
+       * schwarzes Rechteck am oberen Rand, dort wo die Karte unter die
+       * Statusleiste reicht. Und solange es steht, hat der Compositor eine
+       * zusätzliche Ebene zu verwalten.
+       *
+       * Genau das deckt sich mit dem Befund: Löst man die Fahrt aus, WÄHREND
+       * der Balken zu sehen ist, ruckelt sie; wartet man, bis er weg ist, läuft
+       * sie glatt. Der Balken war also nie ein zweiter Fehler, sondern das
+       * sichtbare Zeichen dafür, dass die Karten-Oberfläche noch lebt.
+       *
+       * Als `TextureView` ist die Karte eine ganz normale Ansicht im Baum: kein
+       * Loch, keine eigene Ebene, und sie verschwindet mit dem Tab-Wechsel
+       * sofort. Der Preis ist eine zusätzliche Kopie beim Zeichnen — für eine
+       * Karte, die die meiste Zeit stillsteht, ist das der günstigere Tausch.
+       */
+      androidView="texture"
       mapStyle={DARK_MAP_STYLE}
       compass={false}
       attribution

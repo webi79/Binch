@@ -19,7 +19,6 @@ import { TravelMode } from "@/types/search";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { haptic } from "@/lib/haptics";
-import { prepareLayer, releaseLayer } from "@/lib/nav/transitionLayer";
 import { startResultsPush } from "@/lib/nav/overlayCover";
 import { scaledStyles } from "@/lib/ui/compact";
 
@@ -158,22 +157,6 @@ function RecentCardInner({ search, bordered = false }: { search: RecentSearch; b
   // wenn die Lücke schon zu ist; dadurch gibt es keinen Sprung mehr.
   useEffect(() => {
     if (!collapsing) return;
-    /**
-     * Die Textur des Landingscreens MUSS hier weg.
-     *
-     * Angefordert hat sie das Aufsetzen des Fingers auf diese Karte (siehe
-     * `onTouchStart` unten) — gedacht für den Fall, dass daraus ein Tipp auf die
-     * Suche wird. Aus einem Langdruck plus Tipp auf den Mülleimer wird stattdessen
-     * DIESE Animation, und die ist der denkbar schlechteste Inhalt für eine
-     * gehaltene Ebene: Sie fährt `height` und `marginBottom` auf null, also echte
-     * Layout-Werte. Jedes Bild ist damit ein Yoga-Durchgang, der den Inhalt der
-     * Scroll-Fläche verändert — und macht die bildschirmfüllende Textur darüber
-     * jedes Mal ungültig. Sie wird dann in jedem Bild neu gezeichnet UND neu
-     * hochgeladen (14,7ms gegen 8,3ms Budget), statt einmal.
-     *
-     * Ohne Ebene ist es die gewöhnliche Layout-Animation, die sie vorher war.
-     */
-    releaseLayer("home");
     collapse.value = withTiming(0, { duration: 220, easing: EASING_OUT }, (finished) => {
       "worklet";
       if (finished) runOnJS(removeRecentSearch)(search.id);
@@ -286,26 +269,6 @@ function RecentCardInner({ search, bordered = false }: { search: RecentSearch; b
     if (useSearchStore.getState().recentHistoryOverlayOpen) closeRecentHistoryOverlay();
     // Sofort öffnen — ohne Router. Die Route wird nachgezogen, sobald die
     // Bewegung durch ist (siehe pendingResultsRoute im Store).
-      // Textur des Landingscreens anlegen, solange der Finger gerade abhebt.
-      //
-      // Das fehlte, und es ist der ganze Unterschied zum Saved-Tab — dem einzigen
-      // Übergang, den der Nutzer von sich aus „smooth" nennt. Dort steht
-      // `prepareLayer("saved")` genau hier, im bestätigten Tipp (TicketCard).
-      // Hier stand nichts: Der Ergebnis-Bildschirm HÄLT die Textur des
-      // Landingscreens (`holdLayer("home")`) und gibt sie wieder frei — nur
-      // angefordert hat sie nie jemand, und `holdLayer` legt bewusst keine an.
-      // Der Landingscreen wurde also während der ganzen Bewegung jedes Bild neu
-      // gezeichnet: bildschirmfüllend, mit Bildern und Verläufen. Das sind die
-      // Mikro-Ruckler, die aus dem Landingscreen blieben, im Saved-Tab aber nicht.
-      //
-      // Im FINGERDRUCK darf das nicht stehen — dort wird jede Berührung zur
-      // Textur, auch die, die in Wirklichkeit ein Scrollen wird, und das Anlegen
-      // und Abräumen fiel dann in den Scroll-Start. Im bestätigten Tipp gibt es
-      // dieses Problem nicht: Er feuert nur, wenn wirklich getippt wurde.
-      // Angefordert wird sie beim AUFSETZEN (siehe `onTouchStart` am Rahmen
-      // unten). Hier stand sie im bestätigten Tipp, also im Loslassen — damit
-      // fiel der 66ms-Aufbau in den Berührungs-Frame und lief noch, als die
-      // Bewegung schon startete.
     const rp = {
         mode: search.mode,
         origin: search.origin.code,
@@ -388,13 +351,7 @@ function RecentCardInner({ search, bordered = false }: { search: RecentSearch; b
 
       {/* Vordergrund: die eigentliche Card. Pan-Gesture für Swipe-To-Cancel. */}
       <GestureDetector gesture={pan}>
-        {/* Textur des Landingscreens beim AUFSETZEN anfordern — nicht im
-            bestätigten Tipp. Dort fiel der 66ms-Aufbau in den Berührungs-Frame
-            und lief noch, als die Bewegung schon startete. Die Ticket-, Reise-
-            und Ergebnis-Karte machen es längst so. `onTouchStart` und nicht
-            `onPressIn`: In einer Liste wird ein Druck-Beginn oft ein Scrollen,
-            und das reine Berührungs-Ereignis beansprucht die Geste nicht. */}
-        <Animated.View style={cardAnim} onTouchStart={() => prepareLayer("home")}>
+        <Animated.View style={cardAnim}>
           <RippleTouch
             style={[
               styles.recentCard,

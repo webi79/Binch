@@ -18,9 +18,19 @@ export type Locale = "en" | "de" | "fr" | "es";
  * Persist-Adapter, der WEDER serialisiert NOCH schreibt, solange der Nutzer aktiv ist.
  *
  * Problem: Zustands `persist` ruft `setItem` SYNCHRON nach jedem `set()` — also
- * bei jedem Save, jedem Toggle, jedem Öffnen eines Overlays. Die Serialisierung
- * (JSON.stringify über einen >50kB-Zustand) blockiert den JS-Thread 10-30ms.
- * Genau in diesen Fenstern stottern Animationen, und Tipper wirken verschluckt.
+ * bei jedem Save, jedem Toggle, jedem Öffnen eines Overlays. Jedes `set()` zog
+ * damit eine eigene Serialisierung nach sich.
+ *
+ * ACHTUNG, ZAHL KORRIGIERT: Hier stand „blockiert den JS-Thread 10-30ms", und
+ * diese Zahl hat quer durch die Navigations-Schicht Entscheidungen getragen.
+ * Sie war nie gemessen. Am Gerät nachgemessen (Sonde über `logcat`, Marken
+ * unmittelbar vor und nach dem `JSON.stringify`, über zwanzig Flushes) liegt
+ * der Schreibvorgang durchgehend bei UNTER EINER MILLISEKUNDE — Start und Ende
+ * fielen jedes Mal auf denselben Millisekunden-Stempel.
+ *
+ * Das Bündeln bleibt trotzdem richtig: Es spart die WIEDERHOLUNG (eine
+ * Serialisierung statt einer pro `set()`), und der Aufwand wächst mit dem
+ * Zustand. Nur als Begründung für Wartezeiten in Übergängen taugt es nicht.
  *
  * Der vorherige Adapter hat nur den SCHREIBVORGANG gebündelt: `createJSONStorage`
  * lag darüber und hat trotzdem bei jedem einzelnen `set()` serialisiert. Damit
@@ -69,7 +79,8 @@ function createDeferredJSONStorage<S>(
    *
    * Der Flush selbst ist der teure Teil: `JSON.stringify` über den ganzen
    * persistierten Zustand (gespeicherte Reisen, Tickets, Verlauf) blockt den
-   * JS-Thread 10-30ms. Bisher lag er auf einem nackten Timer — und der feuert
+   * den JS-Thread — messbar unter 1ms, siehe oben. Bisher lag er auf einem
+   * nackten Timer, und der feuert
    * 2,5s nach der LETZTEN Änderung, also ausgerechnet oft mittendrin: Man tippt
    * etwas an (Änderung), navigiert kurz darauf weiter, und der Flush landet im
    * laufenden Übergang. Das erklärt Slides, die nur MANCHMAL haken.
@@ -110,7 +121,7 @@ function createDeferredJSONStorage<S>(
    * `requestIdleCallback` misst die Ruhe des JS-Strangs — und genau während
    * einer Slide ist der ruhig, weil die Kurve auf dem UI-Strang rechnet. Die
    * Leerlauf-Bedingung war also ausgerechnet in den Fenstern erfüllt, die sie
-   * ausschließen sollte, und der 10-30ms-Schreibvorgang lief hinein. Kein Bild
+   * ausschließen sollte, und der Schreibvorgang lief hinein. Kein Bild
    * fiel dabei aus, aber alles, was in diesem Fenster über den JS-Strang muss —
    * die Abschluss-Rückrufe der Bewegung, React-Commits, Berührungen — stand
    * dahinter an.
@@ -751,15 +762,21 @@ export const useSearchStore = create<SearchStore>()(
       closeAssistant: () => {
         if (!get().assistantOpen) return;
         /**
-         * Den Vorbereitungs-Merker MIT zurücknehmen.
+         * Den Vorbereitungs-Merker NICHT zurücknehmen.
          *
-         * Sonst bliebe Bo nach dem Schließen gemountet, und der Bildschirm
-         * würde nie abgebaut — sein Aufräumen (Timer, Abos, Strom-Abbruch,
-         * Zurücksetzen der Fahrt) hängt aber genau daran. So bleibt der
-         * Lebenszyklus derselbe wie vorher: aufgebaut beim Berühren,
-         * abgebaut beim Schließen.
+         * Hier stand `assistantPreload: false`, begründet damit, dass Bo sonst
+         * gemountet bliebe und sein Aufräumen nie liefe. Das galt, solange der
+         * Wirt ihn beim Schließen abbaute. Er bleibt inzwischen dauerhaft
+         * stehen (siehe `AssistantHost`), und damit dreht sich die Rechnung um:
+         * Der Merker kippt beim Schließen auf falsch und bei der nächsten
+         * Berührung der Suchleiste wieder auf wahr — ein Schreibvorgang, der
+         * jeden Selektor der App weckt, im Bild direkt vor der Einfahrt, und
+         * der nichts bewirkt, weil der Baum längst gebaut ist.
+         *
+         * Stehen gelassen greift stattdessen der Wächter in `preloadAssistant`:
+         * Ab dem ersten Mal ist jede weitere Vorbereitung ein echtes No-Op.
          */
-        set({ assistantOpen: false, assistantAutoVoice: false, assistantPreload: false });
+        set({ assistantOpen: false, assistantAutoVoice: false });
       },
       settingsSub: null,
       setSettingsSub: (v) => set({ settingsSub: v }),
@@ -883,7 +900,7 @@ export const useSearchStore = create<SearchStore>()(
       openRecentHistoryOverlay: () => set({ recentHistoryOverlayOpen: true }),
       closeRecentHistoryOverlay: () => {
         // Nur schreiben, wenn wirklich offen: Jedes set() serialisiert den
-        // persistierten Store synchron (10-30ms JS-Blockade). Der Tipp auf
+        // persistierten Store synchron. Der Tipp auf
         // eine Reise im Verlauf rief das bedingungslos auf — die Blockade
         // lag damit genau im Touch-Frame.
         if (get().recentHistoryOverlayOpen) set({ recentHistoryOverlayOpen: false });

@@ -19,7 +19,7 @@
  *   - Animated-G-Props bewegen einzelne Gesichtsteile (Augen, Mund, Arm, Tropfen)
  *   - Animationen werden bei state-Wechsel komplett cancelled + neu gestartet
  */
-import React, { memo, useEffect, useRef } from "react";
+import React, { memo, useEffect, useMemo, useRef } from "react";
 import { View, StyleSheet } from "react-native";
 import Svg, {
   Defs,
@@ -544,7 +544,25 @@ function BoInner({ state = "idle", size = 128, paused = false }: Props) {
   const H = size * 1.2; // SVG-Body-Höhe; ViewBox erweitert für Glow-Halo.
   const frameH = boFrameHeight(size); // Platz für Schatten unten
 
-  return (
+  /**
+   * Der SVG-Baum hängt NICHT an `paused` — und das ist der ganze Punkt.
+   *
+   * Gemessen (Sonde über logcat, elf Durchgänge): Bos Entsperren kostete 21ms,
+   * und die lagen vollständig VOR dem Animations-Effekt. Es ist also nicht das
+   * Starten der Werte, sondern der React-Durchgang davor — Bo ist ein großer
+   * SVG-Baum, und `paused` löste ihn komplett neu aus.
+   *
+   * Im JSX kommt `paused` gar nicht vor: Es steuert ausschließlich, ob die
+   * Animationen laufen. Alles Sichtbare hängt an `state`, an `size` und an
+   * geteilten Werten, die sich nie neu erzeugen. Damit lässt sich der Baum
+   * festhalten — ein Pausen-Wechsel führt dann nur noch den Effekt aus, und
+   * gezeichnet wird gar nichts neu.
+   *
+   * Die Abhängigkeiten sind vollständig aufgeführt, auch die stabilen: Sie
+   * kosten nichts und machen nachprüfbar, dass nichts fehlt.
+   */
+  const visual = useMemo(
+    () => (
     <View style={[styles.frame, { width: W, height: frameH }]}>
       {/* Glow ist jetzt INNERHALB der SVG via RadialGradient (siehe unten) —
           ein solid-color View-Kreis hatte immer harte Kanten egal wie niedrig
@@ -779,7 +797,22 @@ function BoInner({ state = "idle", size = 128, paused = false }: Props) {
       {/* Boden-Schatten. */}
       <View style={[styles.shadow, { width: W * 0.62, bottom: size * 0.04 }]} />
     </View>
+    ),
+    [
+      state,
+      size,
+      accent,
+      bodyStyle,
+      eyesProps,
+      armProps,
+      mouthProps,
+      sparkleStyle,
+      sweatProps,
+      glowOp,
+    ],
   );
+
+  return visual;
 }
 
 /** Siehe Begründung an `BoInner`. */

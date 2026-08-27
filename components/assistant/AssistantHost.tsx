@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useSearchStore } from "@/stores/searchStore";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import { AssistantScreen } from "./AssistantScreen";
@@ -101,6 +101,22 @@ export function AssistantHost() {
     return () => clearTimeout(id);
   }, [built, open, preload]);
 
+  /**
+   * Das Element EINMAL bauen und festhalten.
+   *
+   * Dieser Wirt hängt an zwei Store-Feldern und rendert deshalb bei jedem
+   * Öffnen und jedem Schließen neu. `<AssistantScreen />` frisch im `return`
+   * heißt: ein neues Element, also ein erzwungener Neu-Durchlauf des größten
+   * Baums der App — und zwar genau im Berührungs-Bild vor der Einfahrt und im
+   * Nachklang der Ausfahrt. Bo braucht diesen Anstoß von oben nicht: Er hängt
+   * mit eigenen Abonnements am selben Speicher und rendert von sich aus, wenn
+   * sich für ihn etwas ändert.
+   *
+   * Der Aufbau bleibt an `built` gebunden — das Element wird erst gelesen, wenn
+   * es so weit ist, und `useMemo` steht VOR dem Ausstieg (Hook-Reihenfolge).
+   */
+  const screen = useMemo(() => <AssistantScreen />, []);
+
   if (!built) return null;
-  return <AssistantScreen />;
+  return screen;
 }

@@ -34,7 +34,6 @@ import { useAppBg, usePalette } from "@/lib/theme/appBg";
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { keyboardHeight } from "@/lib/nav/keyboardHeight";
-import { holdLayer, layerGeneration, rearmLayer, releaseLayer } from "@/lib/nav/transitionLayer";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import {
   appendStreamText,
@@ -43,6 +42,8 @@ import {
   takeStreamText,
 } from "@/lib/assistant/streamText";
 import Animated, {
+  measure,
+  useAnimatedRef,
   Extrapolation,
   interpolate,
   useAnimatedStyle,
@@ -57,6 +58,7 @@ import Animated, {
   useDerivedValue,
   runOnUI,
   type SharedValue,
+  type AnimatedRef,
 } from "react-native-reanimated";
 import { Send, Mic, AlertTriangle, RotateCw, X } from "lucide-react-native";
 import {
@@ -366,8 +368,6 @@ export function AssistantScreen() {
   /** Das Bild Vorlauf der Ausfahrt — muss beim Abbau mit weg, sonst stellt es
    *  danach noch einen Wecker, der irgendwohin zurücknavigiert. */
   const closeRafRef = useRef<number | null>(null);
-  /** Freigabe der Unterlagen-Textur am Ende der Ausfahrt — muss abbrechbar sein. */
-  const releaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /**
    * Was das Schließen kostet, passiert schon beim BERÜHREN des Knopfes.
    *
@@ -393,10 +393,6 @@ export function AssistantScreen() {
       clearTimeout(disarmTimerRef.current);
       disarmTimerRef.current = null;
     }
-    setClosing(true);
-    // Und die Ebene der Unterlage wieder scharf stellen — sie soll die
-    // Rückfahrt tragen und danach von selbst verfallen (siehe `holdLayer` oben).
-    rearmLayer("home");
     // Bo hält auch schon an. Sonst fällt sein Anhalten — Abbruch von 15 Werten,
     // Neustart von nichts, aber ein Render des ganzen Bildschirms — in genau
     // den Durchgang, in dem die Ausfahrt losläuft.
@@ -405,19 +401,17 @@ export function AssistantScreen() {
   const disarmClose = useCallback(() => {
     if (disarmTimerRef.current) clearTimeout(disarmTimerRef.current);
     // Mit Abstand: Beim echten Tipp läuft `onPressOut` VOR `onPress`, ein
-    // sofortiges Zurücknehmen würde die Textur also genau dem Fall wegnehmen,
-    // für den sie angelegt wurde.
+    // sofortiges Zurücknehmen würde Bo also genau dem Fall wieder anlaufen
+    // lassen, für den er angehalten wurde.
     disarmTimerRef.current = setTimeout(() => {
       disarmTimerRef.current = null;
       if (closingRef.current) return;
-      setClosing(false);
       setSliding(false);
     }, 400);
   }, []);
   useEffect(() => () => {
     if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
     if (disarmTimerRef.current) clearTimeout(disarmTimerRef.current);
-    if (releaseTimerRef.current) clearTimeout(releaseTimerRef.current);
     if (closeRafRef.current !== null) cancelAnimationFrame(closeRafRef.current);
   }, []);
   const closeScreen = useCallback(() => {
@@ -536,37 +530,30 @@ export function AssistantScreen() {
     closeRafRef.current = requestAnimationFrame(() => {
       closeRafRef.current = null;
       endAssistantPush();
-      /**
-       * Die Textur des Landingscreens am Ende der Rückfahrt FREIGEBEN.
-       *
-       * Sie wurde nur wieder scharf gestellt (`rearmLayer` beim Berühren), fiel
-       * also erst 1,4 Sekunden später von selbst weg — und damit mitten hinein,
-       * während der Nutzer im Landingscreen schon wieder scrollt. Ein
-       * Ebenen-Abbau über einer scrollenden Fläche ist genau der Ruckler, der
-       * zeitlich nichts mehr mit dem Blatt zu tun hat und deshalb wie zufällige
-       * Trägheit wirkt. `DetailsOverlay` beschreibt das an seiner Stelle
-       * ausführlich und macht es richtig.
-       */
-      const gen = layerGeneration("home");
-      releaseTimerRef.current = setTimeout(() => {
-        releaseTimerRef.current = null;
-        releaseLayer("home", gen);
-      /**
-       * Mit ABSTAND, nicht 40ms hinter der Kurve.
-       *
-       * Das Abreißen einer Textur ist kein Buchhaltungs-Schritt: Die
-       * bildschirmfüllende Ebene des Landingscreens wird verworfen, und die
-       * Fläche darunter muss einmal komplett neu gezeichnet werden — mit ihren
-       * vier fast bildschirmhohen Bildkarten. 40ms nach dem Ende hieß: genau im
-       * Nachklang der Bewegung, wo der Parallax gerade ausläuft und das Auge
-       * noch daran hängt. Das ist der Teil von „der Parallax ruckelt", der gar
-       * nicht mehr in der Fahrt liegt.
-       *
-       * Weit genug weg vom Ende, weit genug vor der 1,4-Sekunden-Frist, gegen
-       * die diese Freigabe überhaupt eingebaut wurde.
-       */
-      }, ASSISTANT_OUT.duration + 260);
-      closeTimerRef.current = setTimeout(() => {
+      const finish = () => {
+        /**
+         * Auch dieser Schritt wartet auf eine Lücke.
+         *
+         * Er liegt 120ms hinter dem Kurvenende — und die Bewegungs-Meldung
+         * deckt nur 380ms plus 80ms Reserve ab. Er fiel also knapp DANEBEN, in
+         * den Nachklang der Ausfahrt, in dem das Auge noch an der Bewegung
+         * hängt und der Parallax gerade ausläuft.
+         *
+         * Und billig ist er nicht: `closeAssistant()` weckt jeden Selektor der
+         * App, lässt diesen Bildschirm mit seinen viertausend Zeilen komplett
+         * neu durchlaufen und stößt acht Effekte an, die am Vordergrund hängen.
+         * Genau das ist der verbliebene „gelegentliche Ruckler beim
+         * Einfahren" — gelegentlich, weil er nur trifft, wenn die Reserve
+         * gerade nicht mehr greift.
+         *
+         * Sichtbar ändert sich durch das Warten nichts: Bo steht zu diesem
+         * Zeitpunkt längst außerhalb des Bildes.
+         */
+        if (isTransitionBusy()) {
+          closeTimerRef.current = setTimeout(finish, 120);
+          return;
+        }
+        closeTimerRef.current = null;
         // Kein `canGoBack`-Zweig mehr nötig? Doch: Wer über eine Verknüpfung
         // direkt hier landet, hat keine Vorgeschichte zum Zurückgehen.
         useSearchStore.getState().closeAssistant();
@@ -579,7 +566,8 @@ export function AssistantScreen() {
          * derselben Kurve hängt — im letzten Bild springt beides. Und
          * `setTimeout` ist ohnehin nicht bildgenau.
          */
-      }, ASSISTANT_OUT.duration + 120);
+      };
+      closeTimerRef.current = setTimeout(finish, ASSISTANT_OUT.duration + 120);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router, armClose]);
@@ -1018,9 +1006,20 @@ export function AssistantScreen() {
      */
     let id: ReturnType<typeof setTimeout>;
     const attempt = () => {
-      // Beim Schließen gar nicht mehr: Die Scroll-Strecke wird nie wieder
-      // gebraucht, der Bildschirm verschwindet.
-      if (closingRef.current) return;
+      /**
+       * KEIN Ausstieg beim Schließen mehr — der ließ den Wert für immer stehen.
+       *
+       * Hier stand „beim Schließen gar nicht mehr, der Bildschirm verschwindet
+       * ja". Das galt, solange Bo beim Schließen abgebaut wurde. Seit er
+       * dauerhaft gemountet bleibt, ist es falsch: Der Versuch bricht ab, die
+       * Abhängigkeiten des Effekts ändern sich nicht mehr, und die Zahl bleibt
+       * auf dem Stand der OFFENEN Tastatur stehen.
+       *
+       * An ihr hängt der Innenabstand am unteren Ende des Listeninhalts. Er
+       * blieb damit reserviert, obwohl die Tastatur längst zu ist — sichtbar
+       * als leerer Bereich, in den man scrollen kann. Genau das war der
+       * gemeldete Fehler.
+       */
       if (isTransitionBusy()) {
         id = setTimeout(attempt, 200);
         return;
@@ -1507,6 +1506,10 @@ export function AssistantScreen() {
         clearTimeout(welcomeTimerRef.current);
         welcomeTimerRef.current = null;
       }
+      if (barHeightTimerRef.current) {
+        clearTimeout(barHeightTimerRef.current);
+        barHeightTimerRef.current = null;
+      }
       /**
        * Den GEMERKTEN Zustand mit aufräumen, nicht nur den lebenden.
        *
@@ -1844,6 +1847,8 @@ export function AssistantScreen() {
   const gateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Höhe der Eingabeleiste, gemessen während einer Fahrt — siehe dort. */
   const pendingBarHeightRef = useRef<number | null>(null);
+  /** Wiederversuch für die aufgeschobene Leisten-Höhe. */
+  const barHeightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Aufgeschobenes Nachziehen der Tastatur-Zahl. */
   const kbOffsetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Aufgeschobene Begrüßung. */
@@ -2174,7 +2179,26 @@ export function AssistantScreen() {
   const reversedMessages = useMemo(() => [...messages].reverse(), [messages]);
   /** Die fünf neuesten — siehe `data` an der Liste. Eigener Merker, damit die
    *  Schranke der Liste nicht bei jedem Durchgang bricht. */
-  const enteringSlice = useMemo(() => reversedMessages.slice(0, 5), [reversedMessages]);
+  /**
+   * ZWÖLF statt fünf — fünf füllen den Bildschirm nicht.
+   *
+   * Die Begrenzung während der Fahrt hat einen guten Grund (siehe `data` an der
+   * Liste): Sie sperrt den Eil-Pfad der Virtualisierung aus, der sonst mitten in
+   * der Bewegung synchron nachrendert. Die ZAHL war aber falsch gewählt. Fünf
+   * Zeilen decken eine Fläche nur, wenn die Nachrichten hoch sind — bei kurzem
+   * Text, und erst recht ohne ausgefahrene Tastatur, bleibt der obere Teil leer,
+   * bis der Rest 120ms nach der Ankunft nachrückt. Genau das ist als „es sind
+   * noch nicht alle Nachrichten da" aufgefallen.
+   *
+   * Zwölf ist dieselbe Zahl, die die Liste nach der Fahrt ohnehin als
+   * Anfangsbereich benutzt — der Eil-Pfad bleibt damit gesperrt, weil der
+   * gekürzte Datensatz weiterhin vollständig gerendert wird.
+   *
+   * Und teurer wird die Fahrt dadurch nicht: Bo bleibt seit dem Umbau dauerhaft
+   * gemountet, diese zwölf Zeilen stehen also schon, bevor der Finger die
+   * Suchleiste berührt. Gebaut wird während der Bewegung nichts mehr.
+   */
+  const enteringSlice = useMemo(() => reversedMessages.slice(0, 12), [reversedMessages]);
 
 
 
@@ -2484,19 +2508,42 @@ export function AssistantScreen() {
 
 
   // Einmal erzeugen — eine neue Kennung würde jede Zelle neu aufbauen.
+  /**
+   * Der Bezugspunkt für die Tiefen-Messung: die Oberkante der Liste.
+   *
+   * Gemessen wird gegen diese Hülle, nicht gegen das Fenster. Beide — Hülle und
+   * Zeile — hängen an denselben Transformationen (Parkposition des Bildschirms,
+   * Hub über der Tastatur), und in der Differenz kürzen die sich heraus. Ein
+   * Fensterbezug würde dagegen bei jeder Parkbewegung mitwandern.
+   *
+   * Dieselben Auslöser wie in den Zellen, damit der Wert im selben Durchgang
+   * frisch ist, in dem die Zeilen ihn lesen.
+   */
+  const threadWrapRef = useAnimatedRef<View>();
+  const threadTopY = useDerivedValue(() => {
+    threadScrollY.value;
+    threadHeight.value;
+    slideShift.value;
+    const m = safeMeasure(threadWrapRef);
+    // NaN heißt „nicht messbar" — die Zellen fallen dann auf die Rechnung
+    // zurück. Null wäre eine gültige Lage und würde stumm falsch rechnen.
+    return m === null ? NaN : m.pageY;
+  });
+
   const RecedingCell = useMemo(
     () =>
       makeRecedingCell(
         threadScrollY,
         threadHeight,
         slideShift,
+        threadTopY,
         firstY,
         padBottomSV,
         padBottomRef,
         allowEnter,
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [threadScrollY, threadHeight, slideShift, firstY, padBottomSV, allowEnter],
+    [threadScrollY, threadHeight, slideShift, threadTopY, firstY, padBottomSV, allowEnter],
   );
 
   /**
@@ -2686,20 +2733,6 @@ export function AssistantScreen() {
       startRaf = null;
       if (!isAssistantPushStarted()) startAssistantPush();
     });
-    /**
-     * Die Textur des Landingscreens HALTEN, solange Bo darüber liegt.
-     *
-     * Sie wird beim Aufsetzen des Fingers angefordert und verfällt nach 1,4
-     * Sekunden von selbst. Wer länger in Bo bleibt — also praktisch immer —,
-     * fuhr die Rückfahrt damit ohne Ebene: Der Landingscreen wandert 380ms lang
-     * um 30% der Breite und wird dabei jedes Bild neu gezeichnet, mit vier fast
-     * bildschirmhohen Bildkarten darin.
-     *
-     * Detail-Blatt, Ticket-Blatt und Ergebnisliste machen genau das seit
-     * Längerem; Bo war die einzige Überlagerung ohne dieses Paar. Das ist das
-     * perfekte „manchmal ruckelt es": schnell zu = glatt, normal = nicht.
-     */
-    holdLayer("home");
     return () => {
       if (startRaf !== null) {
         cancelAnimationFrame(startRaf);
@@ -2723,7 +2756,39 @@ export function AssistantScreen() {
    * sondern schadet: Er müsste wegen derselben Animation ohnehin jedes Bild neu
    * hochgeladen werden. Also die Ursache anhalten statt das Ergebnis puffern.
    */
-  const [sliding, setSliding] = useState(true);
+  /**
+   * KEINE Zustandsgröße mehr — Begründung samt Messwerten bei `setBoBlocked`.
+   *
+   * Der Wert lebt in einer Ablage und wird über den Verteiler bekanntgegeben.
+   * `isFocused` und `isScrolling` bleiben Zustand (sie haben andere Aufgaben);
+   * ändern sie sich, wird die Sperre unten im Effekt neu berechnet.
+   */
+  const slidingRef = useRef(true);
+  const isScrollingRef = useRef(isScrolling);
+  isScrollingRef.current = isScrolling;
+  /**
+   * Die Sprachleiste hängt an derselben Sperre — abonniert aber NUR, solange
+   * sie sichtbar ist. Im Normalfall (Text-Eingabe) gibt es damit kein
+   * Abonnement und keinen Durchgang.
+   */
+  const [voiceBarPaused, setVoiceBarPaused] = useState(true);
+  useEffect(() => {
+    if (!voiceMode) return;
+    return subscribeBoBlocked(setVoiceBarPaused);
+  }, [voiceMode]);
+  const publishPause = useCallback(() => {
+    const blocked = slidingRef.current || !isFocusedRef.current;
+    setDotsPaused(blocked);
+    setBoBlocked(blocked || isScrollingRef.current);
+  }, []);
+  const setSliding = useCallback(
+    (v: boolean) => {
+      if (slidingRef.current === v) return;
+      slidingRef.current = v;
+      publishPause();
+    },
+    [publishPause],
+  );
   /**
    * Für die Ausfahrt die ganze Fläche einmal in eine GPU-Textur legen.
    *
@@ -2735,7 +2800,6 @@ export function AssistantScreen() {
    * die Textur wäre sofort wieder ungültig und müsste neu hochgeladen werden.
    * Beim Schließen steht der Inhalt fest, und Bo ist ohnehin angehalten.
    */
-  const [closing, setClosing] = useState(false);
   /**
    * Getrennt von `sliding`: nur die EINFAHRT verkleinert die gehaltene Strecke.
    *
@@ -2764,8 +2828,8 @@ export function AssistantScreen() {
    *    während DEREN Bewegungen.
    */
   useEffect(() => {
-    setDotsPaused(sliding || !isFocused);
-  }, [sliding, isFocused]);
+    publishPause();
+  }, [isFocused, isScrolling, publishPause]);
 
   const enterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const windowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2796,6 +2860,7 @@ export function AssistantScreen() {
    * herein — dort gehört es nicht hinein. Eine Fahrtlänge später steht alles,
    * und Bo ist ohnehin verdeckt: Zu sehen ist von der Umstellung nichts.
    */
+
   useEffect(() => {
     if (isFocused) return;
     /**
@@ -2862,8 +2927,6 @@ export function AssistantScreen() {
      *   • den Abbau-Wecker mitten in die Einfahrt (Bo fährt herein und ist
      *     sofort wieder weg — das ist das sichtbar „Buggy"),
      *   • `closingRef` dauerhaft gesetzt, das X und die Zurück-Geste also tot,
-     *   • `closing` dauerhaft gesetzt, die GPU-Textur blieb über der Fläche
-     *     stehen, auf der man gleich wieder scrollt,
      *   • `sliding` dauerhaft gesetzt, Bo blieb also eingefroren,
      *   • und die eingefrorene Tastatur-Zahl, die nie wieder auftaute.
      *
@@ -2879,10 +2942,6 @@ export function AssistantScreen() {
       closeRafRef.current = null;
     }
     closingRef.current = false;
-    if (releaseTimerRef.current) {
-      clearTimeout(releaseTimerRef.current);
-      releaseTimerRef.current = null;
-    }
     /**
      * Auch den Rücknahme-Wecker des Knopfes, sonst greift er MITTEN in die
      * Wieder-Einfahrt.
@@ -2899,16 +2958,6 @@ export function AssistantScreen() {
       clearTimeout(disarmTimerRef.current);
       disarmTimerRef.current = null;
     }
-    /**
-     * Und die Textur der Unterlage wieder festhalten.
-     *
-     * Beim regulären Öffnen erledigt das der Effekt an `isFocused`; der läuft
-     * bei einem unterbrochenen Schließen aber nicht, weil sich `isFocused`
-     * dabei gar nicht ändert. Ohne diese Zeile liefe die Textur 1,4 Sekunden
-     * nach der Berührung von selbst ab — mitten in die Sitzung hinein, und die
-     * nächste Ausfahrt hätte keine mehr.
-     */
-    holdLayer("home");
     /**
      * Die Tastatur-Zahl wieder AUFTAUEN.
      *
@@ -2996,18 +3045,6 @@ export function AssistantScreen() {
       // Öffnen ist das nicht theoretisch.
       if (closingRef.current) return;
       setSliding(false);
-      /**
-       * Und die Ausfahrt-Textur abräumen, falls dieses Öffnen ein Schließen
-       * unterbrochen hat.
-       *
-       * Bei einem normalen Öffnen steht der Merker ohnehin auf falsch, hier
-       * passiert dann nichts. Nach einem abgebrochenen Schließen trägt die
-       * Fläche dagegen noch die GPU-Ebene von damals — und eine dauerhafte
-       * Ebene über einer Fläche, in der gleich gescrollt wird, ist teurer als
-       * keine. Genau hier ist die richtige Stelle: Die Einfahrt ist durch, die
-       * Ebene hat sie noch getragen.
-       */
-      setClosing(false);
       // Ab jetzt ziehen neu eintreffende Zeilen ein — vorher fährt der ganze
       // Bildschirm, da wäre es Bewegung in der Bewegung.
       allowEnter.current = true;
@@ -3045,6 +3082,7 @@ export function AssistantScreen() {
       // einen neuen hinein.
       setAssistantArrivedHandler(null);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isFocused, openSeq]);
 
@@ -3182,7 +3220,15 @@ export function AssistantScreen() {
        * Erst wenn er darüber hinausreicht, greift der Takt.
        *
        */
-      initialNumToRender={entering ? 5 : 12}
+      /**
+       * Zwölf in BEIDEN Fällen — die Zahl muss zum gekürzten Datensatz passen.
+       *
+       * Der Eil-Pfad der Virtualisierung greift genau dann nicht, wenn die
+       * unterste gerenderte Zelle die LETZTE des Datensatzes ist. Stünde hier
+       * eine kleinere Zahl als die Länge des Ausschnitts, wäre er wieder offen
+       * und würde mitten in der Fahrt synchron nachrendern.
+       */
+      initialNumToRender={12}
       maxToRenderPerBatch={6}
       /**
        * Und was danach noch fehlt, rückt erst NACH der Fahrt nach.
@@ -3260,30 +3306,27 @@ export function AssistantScreen() {
        * Baum wirklich weg ist.
        */
       /**
-       * Die Textur gehört auf DIESE Wurzel — der Versuch, sie tiefer zu legen,
-       * ist gescheitert.
+       * KEINE GPU-Ebene für die Ausfahrt — und das ist kein Kompromiss.
        *
-       * Der Gedanke war: Auf Android verliert Text in einer GPU-Ebene seine
-       * Subpixel-Glättung, und weil die Ebene beim Aufsetzen des Fingers
-       * entsteht, änderten der Schriftzug „Binch" und Bo ihr Aussehen, während
-       * der Bildschirm noch stillstand. Also wurde sie auf die Nachrichtenliste
-       * verlegt, damit die Kopfzeile scharf bleibt.
+       * Hier lag eine, mit der Begründung, der Baum werde beim Wandern sonst in
+       * jedem Bild neu gezeichnet. Diese Annahme galt lange als gesetzt und ist
+       * falsch: Android hält je Ansicht eine AUFGEZEICHNETE Zeichenliste, eine
+       * Verschiebung ist eine Eigenschaft davon und löst keine Neuaufzeichnung
+       * aus. Die vermessenen 14,7ms fallen erst an, wenn NACHFAHREN ungültig
+       * werden — und Bos Inhalt steht während der Ausfahrt ausdrücklich still
+       * (`sliding` hält das Maskottchen an, die Tipp-Punkte pausieren, der
+       * Strom wird gestaut). Genau der Fall, in dem eine Ebene nichts einspart.
        *
-       * Am Gerät war die Ausfahrt danach deutlich SCHLECHTER — und zwar
-       * ausgeprägter, je mehr Nachrichten im Verlauf standen. Das ist die
-       * Handschrift von „pro Zeile compositet statt als ein Bild geschoben":
-       * Auf einer inneren Hülle deckt die Ebene den bewegten Knoten nicht mehr
-       * ab, der Rest des Baumes hängt also weiterhin einzeln an der Bewegung.
+       * Gekostet hat sie dagegen sicher: Text verliert in einer GPU-Ebene die
+       * Subpixel-Glättung, weshalb Schriftzug und Maskottchen beim Aufsetzen
+       * des Fingers sichtbar weich wurden. Der Aufbau der Ebene selbst liegt bei
+       * gemessenen 66ms und fiel in dasselbe Berührungs-Bild. Und der Merker
+       * dafür war ein React-Zustand — jedes Setzen und Zurücknehmen ein Commit
+       * auf dem Bildschirm, der gleich fahren soll.
        *
-       * Die weichere Rasterung ist der Preis dafür, und sie ist der kleinere:
-       * Sie ist ein Aussehen, das andere war ein Ruckeln. Wer sie loswerden
-       * will, muss an der ZEIT ansetzen, nicht am Ort — die Ebene erst ein Bild
-       * vor der Kurve anlegen statt beim Aufsetzen. Dann fällt der Wechsel in
-       * die Bewegung und ist nicht mehr zu sehen; dafür liegt ein Teil des
-       * Aufbaus (66ms) wieder in der Fahrt. Das ist eine Abwägung, keine
-       * Verbesserung, und deshalb steht sie hier nur als Notiz.
+       * Dieselbe Falle wie beim Landingscreen, wo dieselbe Annahme dieselbe
+       * Maschinerie getragen hat. Wieder aufnehmen nur mit Messung am Gerät.
        */
-      renderToHardwareTextureAndroid={closing}
     >
         {/* Slim Top-Bar: Binch-Logo links, Close-Button rechts. Da wir die
             FloatingTabBar im Chat verstecken, ist X der einzige Weg zurück
@@ -3359,7 +3402,7 @@ export function AssistantScreen() {
           sichtbare Ausschnitt exakt der von vorher, als jede Zeile sich einzeln
           verschoben hat. */}
       <View style={styles.threadClip}>
-        <Animated.View style={[styles.threadFill, threadShiftStyle]}>
+        <Animated.View ref={threadWrapRef} style={[styles.threadFill, threadShiftStyle]}>
           {thread}
         </Animated.View>
       </View>
@@ -3370,7 +3413,7 @@ export function AssistantScreen() {
           (Schweben, Blinzeln, ggf. Wink/Yap) auf der UI-Thread im Hinter-
           grund weiter — verlangsamt jeden anderen Tab spürbar. */}
       <View style={[styles.hero, { top: insets.top + HERO_TOP }]} pointerEvents="none">
-        <Bo state={mood} size={BO_SIZE} paused={!isFocused || isScrolling || sliding} />
+        <BoGate state={mood} size={BO_SIZE} />
       </View>
 
       {/* Input-Bar Wrapper — absolut bei bottom:0, die Hochbewegung kommt
@@ -3397,8 +3440,28 @@ export function AssistantScreen() {
            * (siehe dort) — die Abweichung ist im Regelfall null.
            */
           if (Math.abs(h - inputbarHeight) <= 1) return;
+          /**
+           * Aufschieben heißt NACHHOLEN, nicht verwerfen.
+           *
+           * Der Wert wurde hier nur in eine Ablage geschrieben und nie wieder
+           * angewandt — die Leisten-Höhe blieb also auf ihrem gerechneten
+           * Startwert stehen, wenn die Messung zufällig in eine Fahrt fiel. An
+           * ihr hängt der Abstand zwischen letzter Blase und Eingabeleiste.
+           */
           if (isTransitionBusy()) {
             pendingBarHeightRef.current = h;
+            if (barHeightTimerRef.current) return;
+            const apply = () => {
+              if (isTransitionBusy()) {
+                barHeightTimerRef.current = setTimeout(apply, 200);
+                return;
+              }
+              barHeightTimerRef.current = null;
+              const pending = pendingBarHeightRef.current;
+              pendingBarHeightRef.current = null;
+              if (pending !== null) setInputbarHeight(pending);
+            };
+            barHeightTimerRef.current = setTimeout(apply, 200);
             return;
           }
           pendingBarHeightRef.current = null;
@@ -3418,7 +3481,7 @@ export function AssistantScreen() {
            * während FREMDER Bewegungen. Die Aufnahme selbst läuft weiter;
            * angehalten wird nur ihre Darstellung.
            */
-          paused={sliding || !isFocused}
+          paused={voiceBarPaused}
           onPauseToggle={() => {
             if (listening) stopVoice();
             else void startVoice();
@@ -3642,10 +3705,30 @@ interface CellProps {
   cellKey?: string;
 }
 
+/**
+ * `measure`, das nicht in die Luft geht.
+ *
+ * Die Bibliothek verspricht `null`, wenn nicht gemessen werden kann — der
+ * native Teil darunter WIRFT aber, wenn die Ansicht noch gar nicht im Baum
+ * steht („Value is null, expected an Object"). Beim App-Start läuft dieser Wert
+ * genau einmal, bevor die Hülle hängt, und riss die App mit. Ein abgeleiteter
+ * Wert darf niemals werfen: Er läuft auf dem UI-Strang, und dort gibt es
+ * niemanden, der den Fehler auffängt.
+ */
+function safeMeasure(ref: AnimatedRef<View>) {
+  "worklet";
+  try {
+    return measure(ref);
+  } catch {
+    return null;
+  }
+}
+
 function makeRecedingCell(
   scrollY: SharedValue<number>,
   listH: SharedValue<number>,
   slide: SharedValue<number>,
+  listTop: SharedValue<number>,
   firstY: SharedValue<number>,
   padBottomSV: SharedValue<number>,
   padBottomRef: { current: number },
@@ -3683,6 +3766,7 @@ function makeRecedingCell(
     ...rest
   }: CellProps) {
     const key = cellKey ?? `#${index}`;
+    const cellRef = useAnimatedRef<View>();
     const seen = known.get(key);
     /**
      * Neu im Verlauf — oder nur wieder aufgebaut, weil sie ins Bild zurückkommt?
@@ -3800,56 +3884,69 @@ function makeRecedingCell(
      * geschrieben, und der Stil-Auswerter läuft gar nicht erst. Gerundet, damit
      * ein Zittern in der sechsten Nachkommastelle nicht als Änderung durchgeht.
      */
+    /**
+     * DIE ZEILE WIRD GEFRAGT, NICHT GERECHNET.
+     *
+     * Vorher entstand ihre Bildschirmlage aus `listH - (y + h) + scrollY +
+     * slide` — vier Werte aus DREI verschiedenen Quellen: `y` und `h` aus der
+     * Layout-Meldung dieser Zelle, `listH` aus der der Liste (beide JS-Strang),
+     * `scrollY` aus dem Scroll-Ereignis (UI-Strang). Die Rechnung stimmt nur,
+     * solange alle vier denselben Augenblick beschreiben.
+     *
+     * Bleibt für EINE Zelle eine Layout-Meldung aus, rechnet ab da genau diese
+     * eine falsch — und zwar beliebig weit daneben. Sichtbar wurde das als
+     * einzelne Nachricht, die mitten im Bild auf 12% Deckkraft und 66% Größe
+     * steht, während die darüber und darunter normal aussehen. Ein
+     * positionsabhängiger Effekt kann das gar nicht erzeugen; genau daran war
+     * zu erkennen, dass nicht die Position schuld ist, sondern die Buchhaltung
+     * darüber.
+     *
+     * `measure` liest die Lage direkt aus dem Schattenbaum, auf dem UI-Strang,
+     * im selben Bild, in dem sie gebraucht wird. Es gibt dann nichts mehr, was
+     * auseinanderlaufen könnte — weder zwischen zwei Zellen noch zwischen Zelle
+     * und Liste. Gemessen wird gegen die Liste (`listTop`), nicht gegen das
+     * Fenster: Beide hängen an denselben Transformationen (Parkposition, Hub
+     * über der Tastatur), und die Differenz kürzt sie damit heraus.
+     *
+     * Die vier alten Werte bleiben als AUSLÖSER stehen. Ein abgeleiteter Wert
+     * rechnet nur neu, wenn sich eine seiner gelesenen Größen ändert — ohne sie
+     * würde einmal gemessen und nie wieder.
+     *
+     * Fällt die Messung aus (Zeile noch nicht im Baum), gilt null: volle
+     * Deckkraft. Im Zweifel sichtbar, nie fälschlich weggeblendet.
+     */
     const progress = useDerivedValue(() => {
-      if (listH.value === 0 || h.value === 0) return 0;
+      scrollY.value;
+      listH.value;
+      slide.value;
+      y.value;
+      const hv = h.value;
+      if (hv === 0) return 0;
       /**
-       * Sichtbare Oberkante der Zeile.
+       * Gemessen, wenn möglich — gerechnet, wenn nicht.
        *
-       * Die Liste ist gespiegelt: Ein Inhaltspunkt `p` landet auf der Höhe
-       * `listH - (p - scrollY)`. Für die Zeile [y, y+h] ist die sichtbar OBERE
-       * Kante damit die des unteren Inhaltsrandes.
-       */
-      /**
-       * Die Nachhol-Strecke gehört HIER hinein.
+       * Die Messung ist der bessere Weg: Sie liest die Lage im selben Bild aus
+       * dem Schattenbaum, es kann also nichts auseinanderlaufen. Sie kann aber
+       * ausfallen — eine Zeile, die noch nicht im Baum hängt, eine Ansicht, die
+       * Android flachgelegt hat. Wer dann einfach null meldet, schaltet den
+       * Effekt stillschweigend ab; genau das ist passiert.
        *
-       * Gerechnet werden muss die Stelle, an der die Zeile GERADE ZU SEHEN ist
-       * — nicht die, an der das Layout sie schon führt. Ohne sie wäre die Zeile
-       * bereits klein, während sie noch unten steht: genau das Aufblitzen beim
-       * Öffnen der Tastatur. So folgt die Größe der Bewegung, statt ihr
-       * vorauszulaufen, und beide hängen an derselben Zahl.
+       * Also: Rückfall auf die alte Rechnung. Die kann in seltenen Fällen
+       * danebenliegen (dafür steht die Sicherung darunter), aber sie ist immer
+       * da. Nie ist beides gleichzeitig weg.
        */
-      /**
-       * Die Verschiebung gehört HIER hinein.
-       *
-       * Gerechnet werden muss die Stelle, an der die Zeile GERADE ZU SEHEN ist
-       * — nicht die, an der das Layout sie schon führt. Ohne sie wäre die Zeile
-       * bereits klein, während sie noch unten steht. So folgt die Größe der
-       * Bewegung, statt ihr vorauszulaufen, und beide hängen an derselben Zahl.
-       */
+      const lt = listTop.value;
+      const m = lt === lt ? safeMeasure(cellRef) : null;
       const visualTop =
-        listH.value - (y.value + h.value) + scrollY.value + slide.value;
-      /**
-       * Gemessen wird die MITTE, und über eine mit der Höhe wachsende Strecke.
-       *
-       * An der Oberkante begänne eine hohe Karte zu schrumpfen, während sie noch
-       * vollständig im Bild steht; mit fester Strecke kippte sie zudem auf einen
-       * Schlag weg. Über die Mitte kippt Großes von selbst später und langsamer.
-       */
-      const center = visualTop + h.value / 2;
-      const len = Math.max(RECEDE_LENGTH, h.value * 0.6);
+        m === null ? listH.value - (y.value + hv) + scrollY.value + slide.value : m.pageY - lt;
+      const height = m === null ? hv : m.height;
+      // Was rechnerisch KOMPLETT über dem Rand liegt, wird nicht verblasst:
+      // Stimmen die Werte, ist die Zeile dann ohnehin außerhalb des Bildes;
+      // stimmen sie nicht, wird sie lieber gezeigt als fälschlich ausgeblendet.
+      if (visualTop + height < 0) return 0;
+      const center = visualTop + height / 2;
+      const len = Math.max(RECEDE_LENGTH, height * 0.6);
       const t = Math.min(1, Math.max(0, (RECEDE_START_Y - center) / len));
-      /**
-       * Sanfter Anlauf, aber er muss auch ANKOMMEN.
-       *
-       * Vorher quadratisch. Der Anlauf war damit richtig weich, nur blieb der
-       * Effekt danach zu klein: Eine Zeile hinter Bo steht typischerweise bei
-       * knapp der halben Strecke, und quadratisch sind das 22% — 7% kleiner,
-       * 81% Deckkraft. Sichtbar ist das kaum, obwohl sie schon halb verdeckt
-       * ist.
-       *
-       * Eine S-Kurve läuft am Anfang genauso weich an (Steigung null bei null),
-       * kommt in der Mitte aber auf 45% und läuft am Ende ebenso weich aus.
-       */
       return Math.round(t * t * (3 - 2 * t) * 512) / 512;
     });
 
@@ -3890,7 +3987,16 @@ function makeRecedingCell(
     });
 
     return (
-      <View {...rest} style={style} onLayout={handleLayout}>
+      <View
+        ref={cellRef}
+        {...rest}
+        // NACH `rest`, damit nichts es überschreibt: Ohne das legt Android die
+        // Ansicht flach, und `measure` liefert dann NaN — die Bibliothek warnt
+        // wörtlich davor.
+        collapsable={false}
+        style={style}
+        onLayout={handleLayout}
+      >
         <Animated.View style={depth}>{children}</Animated.View>
       </View>
     );
@@ -4192,6 +4298,50 @@ function RichText({ text, accent }: { text: string; accent: string }) {
  * die drei Punkte und sonst niemanden; `lib/assistant/streamText.ts` begründet
  * dasselbe Vorgehen ausführlicher.
  */
+/**
+ * Dieselbe Bauart für BO — und der Grund ist gemessen, nicht vermutet.
+ *
+ * `sliding` war eine Zustandsgröße, die AUSSCHLIESSLICH zwei `paused`-Props
+ * gespeist hat. Ihr Umlegen rendert dafür diesen Bildschirm komplett neu, und
+ * das kostet auf dem Gerät 28ms — bei 120Hz drei bis vier verlorene Bilder.
+ *
+ * Gemessen wurde es so (Sonde über `logcat`, acht Durchgänge, ausnahmslos):
+ *
+ *     bo-laeuft-an    +774      Zustand kippt
+ *     STALL 28ms      +802
+ *     bo-effekt-start +802      Bo baut JETZT ERST seine Animationen auf
+ *
+ * Die 28ms liegen vollständig ZWISCHEN dem Zustandswechsel und Bos Effekt. Es
+ * ist also nicht der Animations-Neustart, es ist der Neu-Durchlauf davor. Über
+ * einen Verteiler weckt das Entsperren nur noch Bo und sonst niemanden.
+ *
+ * Der Zeitpunkt liegt 200ms hinter dem Kurvenende — die Fahrt selbst ist davon
+ * nicht betroffen. Sichtbar ist es als Haken in Bos ERSTER Bewegung.
+ */
+let boBlocked = true;
+const boBlockedListeners = new Set<(blocked: boolean) => void>();
+
+function setBoBlocked(blocked: boolean): void {
+  if (boBlocked === blocked) return;
+  boBlocked = blocked;
+  for (const fn of boBlockedListeners) fn(blocked);
+}
+
+function subscribeBoBlocked(fn: (blocked: boolean) => void): () => void {
+  boBlockedListeners.add(fn);
+  fn(boBlocked);
+  return () => {
+    boBlockedListeners.delete(fn);
+  };
+}
+
+/** Bo hinter dem Verteiler — nur DIESER Knoten rendert beim Entsperren neu. */
+const BoGate = memo(function BoGate({ state, size }: { state: BoMood; size: number }) {
+  const [paused, setPaused] = useState(true);
+  useEffect(() => subscribeBoBlocked(setPaused), []);
+  return <Bo state={state} size={size} paused={paused} />;
+});
+
 let dotsPaused = false;
 const dotsListeners = new Set<(paused: boolean) => void>();
 

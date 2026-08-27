@@ -7,7 +7,6 @@ import {
   StyleSheet,
   ImageBackground,
   useWindowDimensions,
-  Platform,
   type GestureResponderEvent,
   type StyleProp,
   type ViewStyle,
@@ -31,6 +30,7 @@ import { OnFocusLost } from "@/lib/nav/FocusSentinel";
 import {
   resultsPush,
   assistantPush,
+  armAssistantPush,
   startAssistantPush,
   searchHeroPush,
   startSearchHeroPush,
@@ -55,7 +55,6 @@ import { haptic } from "@/lib/haptics";
 import { GUTTER, SPACE, HEADING_TOP, HEADING_GAP, useNavbarSpace } from "@/lib/theme/spacing";
 import { ScreenHeading, HEADING_LINE_HEIGHT } from "@/components/ui/ScreenHeading";
 import { MOTION } from "@/lib/motion";
-import { subscribeLayer, prepareLayer, releaseLayer } from "@/lib/nav/transitionLayer";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { RecentCard } from "@/components/home/RecentCard";
@@ -271,32 +270,27 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
 };
 
 /**
- * Die Scroll-Fläche des Landingscreens — und für die Dauer eines Übergangs eine
- * GPU-Textur.
+ * Die Scroll-Fläche des Landingscreens.
  *
- * Ohne sie zeichnet Android diesen Baum in JEDEM Bild der Bewegung neu, während
- * er per Parallax zur Seite wandert. Am Ticket-Blatt ist das mit ~14,7ms gegen
- * ein 8,3ms-Budget vermessen — jedes zweite Bild fällt aus. Als Textur ist ein
- * Bild nur noch ein Kopiervorgang.
+ * EIGENE KOMPONENTE, damit der Parallax-Stil nur diesen Knoten betrifft und
+ * nicht den ganzen Baum des Landingscreens.
  *
- * NUR während des Übergangs: Eine dauernde Textur über einer scrollenden Fläche
- * müsste bei jedem Scroll-Bild neu entstehen und wäre schlimmer als keine.
+ * KEINE GPU-TEXTUR MEHR. Sie lag hier für die Dauer eines Übergangs, gestützt
+ * auf die Annahme, dieser Baum werde beim Zur-Seite-Wandern in jedem Bild neu
+ * gezeichnet. Die Annahme war falsch: Android hält je Ansicht eine
+ * aufgezeichnete Zeichenliste, eine Verschiebung ist eine Eigenschaft davon und
+ * zeichnet nichts neu. Der Landingscreen steht während der Fahrt vollständig
+ * still — keine Dauerläufer, keine Zeitgeber.
  *
- * EIGENE KOMPONENTE, damit der Zustandswechsel beim Fingerdruck nur diesen
- * Knoten trifft. Läge er im Landingscreen selbst, rendete dessen ganzer Baum im
- * Berührungs-Frame neu.
+ * Gekostet hat sie dagegen sicher: einen bildschirmgroßen GPU-Puffer je Zyklus,
+ * eine Rasterung des Inhalts (die als „verzerrte Reiseziel-Karten" auffiel), und
+ * ihr leerer Puffer war der schwarze Balken. Vor allem aber hing an ihr eine
+ * Zustandsgröße in DIESER Komponente: Jedes Anfordern und Freigeben schickte
+ * einen Fabric-Commit auf genau die Ansicht, die Reanimated Bild für Bild
+ * beschreibt. Die Selbstverfall-Wecker (1,4s) schoben einen Teil davon weit
+ * hinter die Bewegung — bis mitten in ein späteres Scrollen. Genau das war das
+ * „nach schnellem Auf und Zu ruckelt das Scrollen".
  */
-/**
- * Als MODUL-Funktion, nicht als frische Schließung im JSX.
- *
- * Der Handler sitzt auf einem animierten Knoten. Eine neue Funktions-Kennung
- * pro Durchgang ist dort dasselbe wie ein neues Stil-Objekt: ein Fabric-Commit
- * auf genau der Ansicht, die Reanimated Bild für Bild beschreibt. `releaseLayer`
- * braucht nur einen festen Schlüssel — die Funktion kann also einmal existieren.
- */
-function releaseHomeLayer(): void {
-  releaseLayer("home");
-}
 
 function ParallaxScroll({
   style,
@@ -307,22 +301,6 @@ function ParallaxScroll({
   contentContainerStyle: StyleProp<ViewStyle>;
   children: ReactNode;
 }) {
-  const [layered, setLayered] = useState(false);
-  useEffect(() => subscribeLayer("home", setLayered), []);
-
-  /**
-   * Beim Zurückkommen wird die Textur NICHT vorab angefordert — ausprobiert und
-   * verworfen.
-   *
-   * Sie zu früh anzulegen brachte einen schwarzen Balken am oberen Rand: Der
-   * Puffer einer GPU-Ebene entsteht leer, und wird sie angefordert, bevor die
-   * Seite nach dem Tab-Wechsel gezeichnet ist, sieht man ihn. Den gemeldeten
-   * Ruckler hat es dabei nicht behoben.
-   *
-   * Angefordert wird sie deshalb weiterhin beim Aufsetzen des Fingers — dann
-   * steht die Seite längst, und der Aufbau fällt in die 80 bis 150ms, die
-   * ohnehin verstreichen.
-   */
 
   /**
    * Der Parallax liegt HIER, nicht im Landingscreen — und er läuft nur, wenn
@@ -339,8 +317,7 @@ function ParallaxScroll({
    *
    * 2. Er steht in DIESER kleinen Komponente. Im Landingscreen selbst hätte das
    *    Abonnement auf den Zustand des Blattes dessen kompletten Baum bei jedem
-   *    Öffnen und Schließen neu gerendert — genau im Bild des Übergangs. Das ist
-   *    derselbe Grund, aus dem der Textur-Schalter hier liegt und nicht dort.
+   *    Öffnen und Schließen neu gerendert — genau im Bild des Übergangs.
    */
   const { width: screenW } = useWindowDimensions();
   /**
@@ -373,76 +350,40 @@ function ParallaxScroll({
     if (p === 0) return NO_HOME_PARALLAX;
     return { transform: [{ translateX: p * screenW * UNDERLAY_TRAVEL_FRAC }] };
   }, [screenW]);
+  /**
+   * Transform UND Textur sitzen wieder auf der SCROLL-FLÄCHE.
+   *
+   * Sie lagen kurzzeitig auf einer schlichten Hülle darum — mit der
+   * Begründung, eine ScrollView sei der komplizierteste Knoten, den man
+   * dafür wählen kann (Fling-Maschinerie, Überzieh-Effekt,
+   * Scroll-Buchhaltung), und die Wähler machten es an anderer Stelle bereits
+   * so.
+   *
+   * Am Gerät kam dabei ein sichtbarer Fehler heraus: Die Reiseziel-Karten
+   * und besonders ihre Knöpfe wirkten während der Fahrt verzerrt. Eine
+   * GPU-Ebene rastert den Inhalt einmal und schiebt danach das Ergebnis —
+   * auf einer eigenen Hülle traf das offenbar andere Kanten als vorher.
+   * Gewonnen war dabei nichts: Der gemeldete Ruckler blieb unverändert.
+   *
+   * Ein Umbau, der ein sichtbares Problem einbringt und die Ursache nicht
+   * trifft, gehört zurückgenommen.
+   */
   return (
-    /**
-     * TRANSFORM UND TEXTUR AUF EINER SCHLICHTEN HÜLLE — nicht auf der ScrollView.
-     *
-     * Beides saß bis eben direkt auf der Scroll-Fläche. Eine ScrollView ist aber
-     * der komplizierteste Knoten, den man dafür wählen kann: eine ViewGroup mit
-     * eigener Ungültigkeits-Logik — Fling-Maschinerie, Überzieh-Effekt,
-     * Scroll-Buchhaltung. Eine schlichte `View` hat davon nichts; sie wird
-     * gerastert und verschoben, mehr nicht.
-     *
-     * Das Projekt macht es an anderer Stelle bereits so: Beide Wähler tragen
-     * ihre Textur auf einer inneren Hülle, ausdrücklich mit dieser Begründung,
-     * und ihre Fahrten sind sauber.
-     *
-     * Der Inhalt bleibt unverändert: Die Hülle nimmt sich die volle Fläche
-     * (`flex: 1`), die Scroll-Fläche darin behält ihren Stil vom Aufrufer —
-     * dort steht ohnehin nur `flex: 1`. Layout-seitig ändert sich also nichts.
-     *
-     * ZURÜCKDREHEN: Hülle entfernen, `parallaxStyle` und den Textur-Schalter
-     * zurück auf die Scroll-Fläche, und aus `ScrollView` wieder
-     * `Animated.ScrollView` machen.
-     */
-    <Animated.View
-      style={[FILL, parallaxStyle]}
-      collapsable={false}
-      renderToHardwareTextureAndroid={Platform.OS === "android" && layered}
-    >
-    <ScrollView
-      // KEIN `scrollEventThrottle` mehr nötig: Der Wert stand hier, weil
-      // Reanimated auf SEINEN Scroll-Flächen ungefragt 1 setzt — ein Ereignis
-      // pro Bild zum JS-Strang, für eine Fläche ohne `onScroll`-Handler. Eine
-      // gewöhnliche `ScrollView` schickt ohne Handler gar keine.
-      /**
-       * WER SCROLLT, BEKOMMT KEINE TEXTUR — sie sofort wieder abgeben.
-       *
-       * Die Textur dieser Fläche wird beim AUFSETZEN des Fingers angefordert
-       * (Kacheln, Reiseziel-Karten, Suchleiste, Verlaufs-Karten — überall
-       * `onTouchStart`), weil ihr Aufbau 66ms dauert und deshalb nicht in den
-       * Start einer Bewegung fallen darf. Das ist für einen TIPP richtig.
-       *
-       * Nur wird aus einem Aufsetzen in einer Liste sehr oft ein SCROLLEN. Dann
-       * lag hier bis zu 1,4 Sekunden lang eine bildschirmfüllende GPU-Ebene auf
-       * genau der Fläche, die gerade gescrollt wird — und eine Ebene über einer
-       * bewegten Fläche ist teurer als gar keine: Sie wird in jedem Bild
-       * ungültig und muss neu hochgeladen werden. Der Landingscreen trägt vier
-       * fast bildschirmhohe Bildkarten, das Neuzeichnen ist mit 14,7ms gegen ein
-       * Budget von 8,3ms vermessen.
-       *
-       * Genau davor warnen die Kommentare in `transitionLayer.ts` und im
-       * Ortswähler wörtlich — der hat dafür `unstable_pressDelay`. Ein rohes
-       * Berührungs-Ereignis kennt diese Verzögerung nicht, also wird hier
-       * andersherum aufgeräumt: Sobald der Griff wirklich ein Scrollen ist, ist
-       * die Ebene falsch und geht weg. Ein Tipp erreicht diese Zeile nie.
-       *
-       * Deckt alle Anforderer auf einen Schlag ab, weil sie sich dieselbe Fläche
-       * teilen.
-       */
-      onScrollBeginDrag={releaseHomeLayer}
-      style={style}
+    <Animated.ScrollView
+      // Reanimated setzt auf seinen Scroll-Flächen ungefragt
+      // `scrollEventThrottle: 1` — ein Ereignis pro Bild zum JS-Strang, bei
+      // 120Hz also 120 pro Sekunde. Diese Fläche hat gar keinen
+      // `onScroll`-Handler (der Parallax hängt an geteilten Werten auf dem
+      // UI-Strang), die Ereignisse sind also restlos Abfall.
+      scrollEventThrottle={16}
+      style={[style, parallaxStyle]}
       contentContainerStyle={contentContainerStyle}
       showsVerticalScrollIndicator={false}
     >
       {children}
-    </ScrollView>
-    </Animated.View>
+    </Animated.ScrollView>
   );
 }
-
-/** Volle Fläche für die Parallax-Hülle — als Konstante, nicht pro Durchgang neu. */
-const FILL = { flex: 1 } as const;
 
 /** Ruhestellung des Parallax — als Konstante, kein neues Objekt pro Auswertung. */
 const NO_HOME_PARALLAX = { transform: [{ translateX: 0 }] } as const;
@@ -534,19 +475,6 @@ function TransportTile({
   const launchRect = useRef<SearchOverlayLaunch | null>(null);
 
   const capture = (e: GestureResponderEvent) => {
-    /**
-     * Die Textur für die Unterlage JETZT anfordern, beim Aufsetzen.
-     *
-     * Dieser Bildschirm wandert beim Öffnen der Suche 430ms lang um 30% der
-     * Breite — mit vier fast bildschirmhohen Bildkarten darin. Ohne Ebene wird
-     * das jedes Bild neu gezeichnet (im Projekt mit 14,7ms gegen 8,3ms Budget
-     * vermessen). Der Weg zu Bo und der zur Ergebnisliste machen es längst so;
-     * ausgerechnet der häufigste Weg — der Tipp auf eine Kachel — nicht.
-     *
-     * Der Aufbau kostet gemessene 66ms und gehört deshalb zwischen Aufsetzen
-     * und Loslassen, nicht in den Start der Bewegung.
-     */
-    prepareLayer("home");
     // Den schweren Himmel-SVG des Such-Blattes jetzt schon zeichnen lassen —
     // Begründung dort beim Abonnenten. Ohne das fällt seine Erstzeichnung in
     // die ersten Bilder der Fahrt.
@@ -791,10 +719,7 @@ const DestinationCard = memo(function DestinationCard({ d }: { d: Destination })
     <Animated.View style={[CARD_ENTER_FROM, cardAnim]}>
       <RippleTouch
         style={[styles.card, { backgroundColor: palette.s2 }]}
-        // Textur der Unterlage beim Aufsetzen — siehe `capture` bei den
-        // Kacheln. Dieser Weg hatte sie als einziger nicht.
         onTouchStart={() => {
-          prepareLayer("home");
           useSearchStore.getState().setSearchContentVisible(true);
         }}
         onPress={() => {
@@ -846,7 +771,6 @@ const DestinationCard = memo(function DestinationCard({ d }: { d: Destination })
             <RippleTouch
               style={styles.cta}
               onTouchStart={() => {
-                prepareLayer("home");
                 useSearchStore.getState().setSearchContentVisible(true);
               }}
               onPress={(e) => {
@@ -956,17 +880,7 @@ export default function HomeScreen() {
 
             <SearchBar
               style={[styles.searchBarSpacing, { borderWidth: 1.5, borderColor: "rgba(255,255,255,0.14)" }]}
-              /**
-               * Die Textur für den Landingscreen beim AUFSETZEN anlegen.
-               *
-               * Bo liegt als durchsichtiges Blatt über dem Stapel, dieser
-               * Bildschirm bleibt darunter also sichtbar UND wird in jedem Bild
-               * seiner Einfahrt neu gezeichnet. Der Weg zur Ergebnisliste macht
-               * das seit Längerem (`RecentCard`), der zu Bo nicht — dabei ist
-               * hier mehr zu zeichnen.
-               */
               onTouchStart={() => {
-                prepareLayer("home");
                 /**
                  * KEINE Textur für Bos EINfahrt — ausprobiert und verworfen.
                  *
@@ -1033,10 +947,12 @@ export default function HomeScreen() {
                * Bild mehr Zeit, fertig zu werden.
                */
               onPress={() => {
+                armAssistantPush();
                 useSearchStore.getState().openAssistant();
                 requestAnimationFrame(startAssistantPush);
               }}
               onMicPress={() => {
+                armAssistantPush();
                 useSearchStore.getState().openAssistant(true);
                 requestAnimationFrame(() => startAssistantPush());
               }}

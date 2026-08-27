@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef } from "react";
 import { Image, Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import Animated, { useAnimatedStyle } from "react-native-reanimated";
+import Animated from "react-native-reanimated";
 import { router, usePathname } from "expo-router";
 
 import { noteTabPress, usePressBounce } from "@/lib/motion";

@@ -1,12 +1,11 @@
 import { useEffect, useRef } from "react";
-import { Text, TextInput, StyleSheet, View, type StyleProp, type ViewStyle } from "react-native";
+import { Text, TextInput, StyleSheet, View, type StyleProp, type ViewStyle, Pressable } from "react-native";
 import { useRouter } from "expo-router";
 import { Search as SearchIcon } from "lucide-react-native";
 import Svg, { Path, Circle } from "react-native-svg";
 import { useT } from "@/lib/i18n/useT";
 import { usePalette } from "@/lib/theme/appBg";
 import { useSearchStore } from "@/stores/searchStore";
-import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { scaledStyles } from "@/lib/ui/compact";
 
@@ -150,10 +149,10 @@ export function SearchBar(props: Props) {
   const placeholder = t(placeholderKey);
 
   const mic = showMic ? (
-    <RippleTouch
+    // Auch hier keine Welle: Der Mikrofon-Knopf öffnet Bo genauso — siehe unten.
+    <Pressable
       style={styles.micButton}
       hitSlop={6}
-      borderless
       onPress={(e) => {
         e.stopPropagation?.();
         if (onMicPress) onMicPress();
@@ -168,7 +167,7 @@ export function SearchBar(props: Props) {
           gefüllte Silhouette mit Zipfelsaum und großen Augen, also erkennbar
           dieselbe Figur, die im Chat antwortet. */}
       <BoMark />
-    </RippleTouch>
+    </Pressable>
   ) : null;
 
   if (isInput) {
@@ -193,8 +192,39 @@ export function SearchBar(props: Props) {
     );
   }
 
+  /**
+   * Schlichtes `Pressable` statt `RippleTouch` — wie die vier Launch-Kacheln
+   * im Landingscreen, und aus einem verwandten Grund.
+   *
+   * Diese Leiste ist der Weg zu Bo. Beim Loslassen startet die Fahrt, und die
+   * Material-Welle läuft danach noch rund 300ms weiter — auf einer Fläche,
+   * die in genau diesen Bildern nach links wandert. Eine Ansicht, die sich
+   * währenddessen selbst ändert, macht die Unterlage in jedem Bild ungültig;
+   * das ist der Mikro-Ruckler im Parallax.
+   *
+   * Und es erklärt, warum das Such-Blatt sich besser anfühlt: Die vier
+   * Kacheln, über die man es meistens öffnet, tragen längst keine Welle mehr.
+   * Nur der Weg zu Bo hatte noch eine.
+   *
+   * Die Rückmeldung bleibt — als Abdunkeln beim Drücken statt als laufende
+   * Welle. Sie steht sofort und ändert sich danach nicht mehr.
+   */
   return (
-    <RippleTouch
+    <Pressable
+      /**
+       * ARRAY, keine Funktion.
+       *
+       * Mit `style={({pressed}) => [...]}` kam hier gar kein Stil an: Die Leiste
+       * verlor Pillenform, Hintergrund und Zeilen-Anordnung, der
+       * Mikrofon-Knopf zog sich über die volle Breite. Diese Datei geht durch
+       * NativeWinds JSX-Umschreibung, und die verträgt sich an dieser Stelle
+       * nicht mit der Funktions-Form.
+       *
+       * Die Druck-Rückmeldung entfällt damit — wie bei den vier Launch-Kacheln
+       * im Landingscreen, die aus demselben Grund ohne Welle auskommen. Sichtbar
+       * ist sie ohnehin kaum: Der Bildschirm fährt im selben Moment los, und
+       * DAS ist die Rückmeldung.
+       */
       style={[styles.bar, { backgroundColor: palette.s2 }, style]}
       onPress={props.onPress ?? (() => router.navigate("/search"))}
       onTouchStart={"onTouchStart" in props ? props.onTouchStart : undefined}
@@ -205,7 +235,7 @@ export function SearchBar(props: Props) {
         {placeholder}
       </Text>
       {mic}
-    </RippleTouch>
+    </Pressable>
   );
 }
 
