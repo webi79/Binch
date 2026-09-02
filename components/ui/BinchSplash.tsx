@@ -26,7 +26,7 @@ import Animated, {
 import { useAccent } from "@/lib/theme/accent";
 import { scaledStyles } from "@/lib/ui/compact";
 
-const WHITE = "#FFFFFF";
+const WHITE = "#F4F4F5";
 
 interface Props {
   onFinish?: () => void;

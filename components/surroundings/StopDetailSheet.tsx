@@ -62,13 +62,13 @@ import { scaledStyles } from "@/lib/ui/compact";
 // rahmt Hero-Card subtil ein. Gleiche Werte wie in ClearSearchHistoryAlert
 // + RecentHistoryOverlay damit das Material konsistent ist.
 const C = {
-  bg: "#1F1F20",
-  surface2: "#242425",
-  surface3: "#2A2A2C",
-  border: "#2E2E30",
-  white: "#FFFFFF",
+  bg: "#171719",
+  surface2: "#171719",
+  surface3: "#212123",
+  border: "#212123",
+  white: "#F4F4F5",
   g1: "#C4C4C8",
-  g2: "#8A8A90",
+  g2: "#8E8E93",
   g3: "#56565C",
 };
 // Akzent-Tokens kommen jetzt aus useAccent() — die Hard-Coded LIME-/SUBTLE-/

@@ -2185,7 +2185,11 @@ export async function runChatTurn(
         // Append assistant response zum Verlauf (volle Content-Blocks, nicht
         // nur Text — Tool-Use-Blöcke müssen mit zurück damit Claude die IDs
         // matcht).
-        messages.push({ role: "assistant", content: finalMessage.content });
+        // Leere Antwort-Inhalte gar nicht erst anhängen: Auch die weist die
+        // API beim nächsten Aufruf zurück, mit derselben Art Fehler.
+        if (finalMessage.content.length > 0) {
+          messages.push({ role: "assistant", content: finalMessage.content });
+        }
 
         const toolUseBlocks = finalMessage.content.filter(
           (b): b is Anthropic.Messages.ToolUseBlock => b.type === "tool_use",
@@ -2296,9 +2300,57 @@ export async function runChatTurn(
         const byId = new Map(
           [...producerResults, ...consumerResults].map((r) => [r.tool_use_id, r]),
         );
-        const toolResults = toolUseBlocks
-          .map((b) => byId.get(b.id))
-          .filter((r): r is NonNullable<typeof r> => r !== undefined);
+        /**
+         * Für JEDEN tool_use-Block ein Ergebnis — notfalls ein erfundenes.
+         *
+         * Vorher wurden fehlende Einträge herausgefiltert. Das ist genau die
+         * falsche Richtung: Die Messages-API verlangt zu jedem `tool_use` ein
+         * `tool_result` mit passender ID, ein Loch darin ist ein 400. Fehlt
+         * eines, ist ein Fehler-Ergebnis allemal besser als keines — Claude
+         * kann darauf antworten, die API kann es annehmen.
+         */
+        const toolResults = toolUseBlocks.map(
+          (b) =>
+            byId.get(b.id) ?? {
+              type: "tool_result" as const,
+              tool_use_id: b.id,
+              content: JSON.stringify({ error: "Tool result missing" }),
+              is_error: true,
+            },
+        );
+
+        /**
+         * Und wenn es GAR KEINE Blöcke gab, wird nichts angehängt.
+         *
+         * `stop_reason: "tool_use"` ohne einen einzigen `tool_use`-Block sollte
+         * es nicht geben — aber genau das ist passiert, und die Folge war ein
+         * Nutzer-Turn mit leerem Inhalt. Der fliegt erst beim NÄCHSTEN Aufruf
+         * auf, als „messages.N: user messages must have non-empty content", und
+         * landete roh als Fehlermeldung im Chat.
+         *
+         * Statt weiterzuschleifen: den Turn hier sauber beenden. Text, den
+         * Claude in derselben Antwort geschrieben hat, ist oben schon gesendet
+         * worden — was fehlt, ist nur die Fortsetzung.
+         */
+        if (toolResults.length === 0) {
+          flushAttachments();
+          if (textBlocks.length === 0) {
+            setMood("error");
+            onEvent({
+              type: "error",
+              message:
+                input.locale === "de"
+                  ? "Da ist mir gerade etwas dazwischengekommen — frag mich das nochmal."
+                  : input.locale === "fr"
+                    ? "Quelque chose s'est mal passé — repose-moi la question."
+                    : input.locale === "es"
+                      ? "Algo salió mal — vuelve a preguntármelo."
+                      : "Something got in the way there — ask me again.",
+            });
+          }
+          onEvent({ type: "done" });
+          return;
+        }
 
         // User-Turn mit allen Tool-Results auf einmal — Multi-Tool im
         // selben Turn.

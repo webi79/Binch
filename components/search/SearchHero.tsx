@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { prepareLayer } from "@/lib/nav/transitionLayer";
 import { armHeroClip, startResultsPush } from "@/lib/nav/overlayCover";
 import Animated, {
@@ -10,13 +10,19 @@ import Animated, {
 import {
   View,
   Text,
-  Pressable,
   ScrollView,
   StyleSheet,
   type ViewStyle,
 } from "react-native";
 import { BinchHero, pickTimeOfDay, type HeroCategory } from "./BinchHero";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import {
+  ClassSheet,
+  DEFAULT_PAX,
+  TravelersSheet,
+  paxTotal,
+  type PaxCounts,
+} from "@/components/search/TravelOptionsSheets";
 import { SegmentedToggle } from "@/components/ui/SegmentedToggle";
 import { Reveal, ScreenEntrance, usePressBounce } from "@/lib/motion";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -31,6 +37,9 @@ import {
   MapPin,
   CalendarDays,
   ArrowUpDown,
+  Users,
+  Armchair,
+  ChevronDown,
   type LucideIcon,
 } from "lucide-react-native";
 import { format } from "date-fns";
@@ -95,16 +104,16 @@ import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import { PICKER_OUT } from "@/lib/nav/overlayCover";
 
 const C = {
-  bg: "#1A1A1A",
-  surface1: "#1F1F20",
-  surface2: "#242425",
-  surface3: "#2A2A2C",
-  border: "#2E2E30",
+  bg: "#0D0D0D",
+  surface1: "#171719",
+  surface2: "#171719",
+  surface3: "#212123",
+  border: "#212123",
   green: "#7FEA4D",
   greenSubtle: "#1A3D26",
-  white: "#FFFFFF",
+  white: "#F4F4F5",
   gray1: "#C8C8CC",
-  gray2: "#8A8A90",
+  gray2: "#8E8E93",
   gray3: "#56565C",
   red: "#FF3B5C",
   black: "#000000",
@@ -224,8 +233,10 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
   const [destination, setDestination] = useState<Location | null>(null);
   const [departDate, setDepartDate] = useState<Date | null>(null);
   const [returnDate, setReturnDate] = useState<Date | null>(null);
-  const [pax, setPax] = useState(1);
+  const [pax, setPax] = useState<PaxCounts>(DEFAULT_PAX);
   const [extraOpt, setExtraOpt] = useState(0);
+  /** Welches der beiden Options-Blätter offen ist — keines, Reisende, Klasse. */
+  const [sheet, setSheet] = useState<"pax" | "class" | null>(null);
   // LocationPicker läuft jetzt am Root-Level via LocationPickerHost.
   // Store-getriebene Open/Result-Flow, keine lokale pickerField-State mehr.
   // Picker läuft am Root-Level via DatePickerHost. Wir lesen das Result
@@ -273,8 +284,11 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
     setDestination(null);
     setDepartDate(null);
     setReturnDate(null);
-    setPax(1);
+    setPax(DEFAULT_PAX);
     setExtraOpt(0);
+    // Sicherheitsnetz: Der Bildschirm bleibt dauerhaft gemountet, ein offen
+    // gebliebenes Blatt stünde beim nächsten Öffnen wieder da.
+    setSheet(null);
     setTripType("roundtrip");
     setErrors(new Set());
   }, [resetTrigger]);
@@ -703,7 +717,7 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
           departTime: departTimeIso,
           returnDate: returnIso,
           tripType,
-          passengers: String(pax),
+          passengers: String(paxTotal(pax)),
           currency,
           travelClass,
         } as Record<string, string>;
@@ -737,6 +751,17 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
   // „Do, 3 Sep · 14:30" bräche darin um oder würde beschnitten. Die Uhrzeit
   // wählt man weiterhin im Kalender, sie geht auch weiterhin in die Suche.
   const formatDate = (d: Date) => format(d, "EEE, d MMM", { locale: dateLocale });
+
+  /** „1 Reisender" / „3 Reisende" — die Summe aus Erwachsenen, Kindern, Babys. */
+  const paxCount = paxTotal(pax);
+  const paxLabel = `${paxCount} ${t(paxCount === 1 ? "search.pax.one" : "search.pax.many")}`;
+  /** Die gewählte Klasse. Der Rückfall auf die erste greift beim Wechsel des
+   *  Verkehrsmittels: Die Listen sind unterschiedlich lang, und ein Index aus
+   *  der längeren zeigte sonst ins Leere. */
+  const classLabel = t(extraOpts[extraOpt] ?? extraOpts[0] ?? "");
+  /** Feste Kennung: Beide Blätter bekommen sie als Prop, ein Literal wäre bei
+   *  jedem Render eine neue und würde sie durch `memo` hindurch neu rendern. */
+  const closeSheet = useCallback(() => setSheet(null), []);
 
   // wave={false}: Der Inhalt ist sofort vollständig da und fährt als EIN Körper
   // mit dem Blatt herein — genau wie im Anmelde-Screen. Die gestaffelte
@@ -776,7 +801,7 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
             Vorher war hier ein 60%-Schwarz mitten im Bild — das hat die
             Sky-Farben der Animation matschig gemacht. */}
         <LinearGradient
-          colors={["transparent", "transparent", "rgba(26,26,26,0.45)"]}
+          colors={["transparent", "transparent", "rgba(13,13,13,0.45)"]}
           locations={[0, 0.7, 1]}
           style={StyleSheet.absoluteFill}
           pointerEvents="none"
@@ -915,59 +940,45 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
         </Reveal>
 
         <Reveal index={3}>
-        <View style={styles.dateRow}>
-          <View style={[styles.fieldBox, { backgroundColor: palette.s2 }, styles.flex1]}>
-            <Text style={styles.fieldLabel}>{t("search.persons").toUpperCase()}</Text>
-            <View style={styles.paxRow}>
-              <RippleTouch
-                onPress={() => {
-                  haptic("button");
-                  finishAnim();
-                  setPax((p) => Math.max(1, p - 1));
-                }}
-                borderless
-                style={[styles.paxBtn, { backgroundColor: palette.s3 }]}
-              >
-                <Text style={styles.paxBtnText}>−</Text>
-              </RippleTouch>
-              <Text style={styles.paxCount}>{pax}</Text>
-              <RippleTouch
-                onPress={() => {
-                  haptic("button");
-                  finishAnim();
-                  setPax((p) => Math.min(9, p + 1));
-                }}
-                borderless
-                style={[styles.paxBtn, styles.paxBtnPlus, { backgroundColor: accent.solid }]}
-              >
-                <Text style={[styles.paxBtnText, styles.paxBtnTextDark]}>+</Text>
-              </RippleTouch>
-            </View>
-          </View>
+        {/* Reisende und Klasse als zwei Auswahl-Knöpfe.
 
-          <View style={[styles.fieldBox, { backgroundColor: palette.s2 }, styles.flex1]}>
-            <Text style={styles.fieldLabel}>{extraLabel.toUpperCase()}</Text>
-            <View style={styles.pillRow}>
-              {extraOpts.map((opt, i) => {
-                const active = i === extraOpt;
-                return (
-                  <Pressable
-                    key={opt}
-                    onPress={() => {
-                      haptic("button");
-                      finishAnim();
-                      setExtraOpt(i);
-                    }}
-                    style={[styles.pill, active && [styles.pillActive, { backgroundColor: accent.subtle, borderColor: accent.solid }]]}
-                  >
-                    <Text style={[styles.pillText, active && [styles.pillTextActive, { color: accent.solid }]]}>
-                      {t(opt)}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-            </View>
-          </View>
+            Hier standen zwei Kästen: links ein Zähler mit Plus und Minus, rechts
+            eine Reihe Pillen für die Klasse. Beides nebeneinander auf halber
+            Breite — die Pillen brachen bei vier Kabinen-Arten um, und für Kinder
+            und Babys wäre daneben gar kein Platz mehr gewesen. Eingestellt wird
+            deshalb in je einem Blatt von unten (TravelOptionsSheets), hier steht
+            nur noch, was gewählt ist. */}
+        <View style={styles.chipRow}>
+          <RippleTouch
+            onPress={() => {
+              haptic("button");
+              finishAnim();
+              setSheet("pax");
+            }}
+            style={[styles.chip, { backgroundColor: palette.s2 }]}
+          >
+            <Users size={16} color={C.gray1} strokeWidth={2} />
+            <Text style={styles.chipText} numberOfLines={1}>
+              {paxLabel}
+            </Text>
+            <ChevronDown size={16} color={C.gray2} strokeWidth={2.2} />
+          </RippleTouch>
+
+          <RippleTouch
+            onPress={() => {
+              haptic("button");
+              finishAnim();
+              setSheet("class");
+            }}
+            accessibilityLabel={`${extraLabel}: ${classLabel}`}
+            style={[styles.chip, { backgroundColor: palette.s2 }]}
+          >
+            <Armchair size={16} color={C.gray1} strokeWidth={2} />
+            <Text style={styles.chipText} numberOfLines={1}>
+              {classLabel}
+            </Text>
+            <ChevronDown size={16} color={C.gray2} strokeWidth={2.2} />
+          </RippleTouch>
         </View>
         </Reveal>
 
@@ -1024,6 +1035,28 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
           </View>
         </Reveal>
       </ScrollView>
+
+      {/* Reisende und Klasse — Blätter von unten, mit derselben Bewegung wie
+          das Ticket-Blatt im Saved-Tab (gemeinsame Hülle: `SheetModal`).
+
+          Anders als Ort- und Datumswähler liegen sie NICHT am Wurzel-Layout und
+          bleiben auch nicht gemountet: Ihr Inhalt sind ein paar Zeilen Text und
+          Knöpfe, der Aufbau ist also nicht der teure Fall, den die beiden
+          großen Wähler mit ihrem Vorlauf umgehen müssen. */}
+      <TravelersSheet
+        visible={sheet === "pax"}
+        value={pax}
+        onClose={closeSheet}
+        onApply={setPax}
+      />
+      <ClassSheet
+        visible={sheet === "class"}
+        title={extraLabel}
+        options={extraOpts}
+        value={extraOpt}
+        onClose={closeSheet}
+        onApply={setExtraOpt}
+      />
 
       {/* LocationPicker liegt am Root-Layout via LocationPickerHost.
           Trigger via openLocationPicker. */}
@@ -1118,26 +1151,10 @@ const styles = scaledStyles({
     justifyContent: "center",
   },
 
-  fieldBox: {
-    backgroundColor: C.surface1,
-    borderRadius: 16,
-    padding: 14,
-    // Rahmen bewusst unsichtbar: Die Breite bleibt reserviert, damit der rote
-    // Fehler-Zustand keinen Layout-Sprung auslöst — die Box behält in jedem Fall
-    // dieselbe Größe. Sichtbar abgegrenzt sind die Felder allein über die
-    // Flächenfarbe (s2 auf dem s1-Fenster).
-    borderWidth: 1,
-    borderColor: "transparent",
-  },
+  /** Roter Rahmen für ein fehlendes Pflichtfeld. Die Breite ist an den Feldern
+   *  selbst schon reserviert (`borderColor: "transparent"`), damit das Auftauchen
+   *  keinen Layout-Sprung auslöst. */
   fieldBoxError: { borderColor: C.red },
-  flex1: { flex: 1 },
-  fieldLabel: {
-    fontSize: 11,
-    fontWeight: "600",
-    color: C.gray3,
-    letterSpacing: 0.6,
-    marginBottom: 6,
-  },
   fieldInput: { fontSize: 22, fontWeight: "700", color: C.white, padding: 0 },
 
   dateRow: { flexDirection: "row", gap: 8 },
@@ -1146,26 +1163,28 @@ const styles = scaledStyles({
   dateField: { flex: 1, paddingLeft: 14, paddingRight: 12, gap: 10 },
   dateText: { fontSize: 15 },
 
-  paxRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 4 },
-  paxBtn: {
-    width: 30,
-    height: 30,
+  /**
+   * Zwei Knöpfe auf einer Zeile, halbe Breite — dieselbe Teilung wie die
+   * Datumsfelder darüber.
+   *
+   * `gap` und `flex: 1` sind exakt die Werte aus `dateRow`; damit stehen die
+   * vier Kanten (links, Fuge, rechts) über beide Zeilen hinweg auf derselben
+   * Linie. Vorher war jeder Knopf so breit wie seine Beschriftung — bei
+   * „1 Reisender" und „Economy" also zwei verschieden breite Pillen, die mit
+   * nichts darüber oder darunter fluchteten.
+   */
+  chipRow: { flexDirection: "row", gap: 8 },
+  chip: {
+    flex: 1,
+    height: 42,
     borderRadius: 9999,
-    backgroundColor: C.surface3,
+    paddingHorizontal: 14,
+    flexDirection: "row",
     alignItems: "center",
-    justifyContent: "center",
+    gap: 8,
+    minWidth: 0,
   },
-  paxBtnPlus: {},
-  paxBtnText: { fontSize: 18, color: C.white, lineHeight: 22 },
-  paxBtnTextDark: { color: "#000" },
-  paxCount: { fontSize: 20, fontWeight: "700", color: C.white },
-
-  pillRow: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 4 },
-  pill: { paddingVertical: 5, paddingHorizontal: 10, borderRadius: 9999, backgroundColor: C.surface3 },
-  // backgroundColor + borderColor inline mit accent.subtle / accent.solid.
-  pillActive: { borderWidth: 1 },
-  pillText: { fontSize: 11, fontWeight: "600", color: C.gray2 },
-  pillTextActive: {},
+  chipText: { fontSize: 14, fontWeight: "600", color: C.white, flexShrink: 1 },
 
   cta: {
     // EXAKT die Feldhöhe — das war der Wunsch: Felder so groß wie dieser Knopf.

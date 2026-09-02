@@ -91,12 +91,12 @@ function withDisplayRatePin(config) {
       if (!appTheme.item.some((i) => i.$?.name === NAME)) {
         appTheme.item.push({ _: "false", $: { name: NAME } });
       }
-      // Fenster-Hintergrund explizit auf die App-Farbe #1A1A1A. Ohne das fällt er
+      // Fenster-Hintergrund explizit auf die App-Farbe #0D0D0D. Ohne das fällt er
       // auf den Material3-DayNight-Default zurück (hell #FEF7FF / dunkel #141218)
       // und blitzt bei kurzen Lücken (Tab-Crossfade, Freeze-Commit) durch.
       const BG = "android:windowBackground";
       if (!appTheme.item.some((i) => i.$?.name === BG)) {
-        appTheme.item.push({ _: "#1A1A1A", $: { name: BG } });
+        appTheme.item.push({ _: "#0D0D0D", $: { name: BG } });
       }
     }
     return config;

@@ -102,6 +102,12 @@ module.exports = {
       // Scroll-Judder-Fix: pinnt die Display-Rate am App-Window (Details im
       // Plugin). MUSS als Config-Plugin laufen — android/ ist gitignored
       // (CNG), direkte Edits dort erreichen EAS-Builds nie.
+      /**
+       * Wiedergabe der Sprachnachrichten im Chat. Aufgenommen wird weiterhin
+       * über `expo-speech-recognition` — dort entsteht die Datei zusammen mit
+       * der Erkennung, aus EINER Mikrofon-Aufnahme.
+       */
+      "expo-audio",
       "./plugins/withDisplayRatePin",
       "@react-native-community/datetimepicker",
       [

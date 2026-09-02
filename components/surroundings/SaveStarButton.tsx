@@ -311,7 +311,7 @@ export function SaveStarButton({ size = 46, starSize = 30, saved: savedProp, onC
         <Path
           d={STAR_PATH}
           fill="none"
-          stroke="#FFFFFF"
+          stroke="#F4F4F5"
           strokeWidth={1.7}
           strokeLinejoin="round"
           strokeLinecap="round"

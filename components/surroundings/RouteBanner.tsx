@@ -28,7 +28,7 @@ export function RouteBanner({ title, waypointCount, onBack, topInset }: Props) {
   return (
     <View style={[styles.wrap, { top: topInset + 8 }]} pointerEvents="box-none">
       <RippleTouch onPress={onBack} hitSlop={8} style={styles.backBtn}>
-        <ArrowLeft color="#FFFFFF" size={20} strokeWidth={2.2} />
+        <ArrowLeft color="#F4F4F5" size={20} strokeWidth={2.2} />
       </RippleTouch>
       <View style={styles.titleBox}>
         <Text style={styles.title} numberOfLines={1}>
@@ -56,8 +56,8 @@ const styles = scaledStyles({
     width: 44,
     height: 44,
     borderRadius: 22,
-    backgroundColor: "rgba(36,36,37,0.95)",
-    borderColor: "#2E2E30",
+    backgroundColor: "rgba(27,27,27,0.95)",
+    borderColor: "#212123",
     borderWidth: 1,
     alignItems: "center",
     justifyContent: "center",
@@ -69,8 +69,8 @@ const styles = scaledStyles({
   },
   titleBox: {
     flex: 1,
-    backgroundColor: "rgba(36,36,37,0.95)",
-    borderColor: "#2E2E30",
+    backgroundColor: "rgba(27,27,27,0.95)",
+    borderColor: "#212123",
     borderWidth: 1,
     borderRadius: 9999,
     paddingHorizontal: 16,
@@ -85,12 +85,12 @@ const styles = scaledStyles({
   title: {
     fontSize: 14,
     fontWeight: "700",
-    color: "#FFFFFF",
+    color: "#F4F4F5",
     letterSpacing: -0.2,
   },
   subtitle: {
     fontSize: 11,
-    color: "#8A8A90",
+    color: "#8E8E93",
     fontWeight: "500",
   },
 });

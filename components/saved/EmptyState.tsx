@@ -229,7 +229,7 @@ export function EmptyState({ tab, active = true }: Props) {
         <Text className="text-base font-semibold text-white mb-2 text-center">
           {t(titleKey)}
         </Text>
-        <Text className="text-[13px] text-[#8A8A90] text-center leading-5">
+        <Text className="text-[13px] text-[#8E8E93] text-center leading-5">
           {t(bodyKey)}
         </Text>
       </View>
@@ -245,7 +245,7 @@ export function EmptyState({ tab, active = true }: Props) {
       <Text className="text-base font-semibold text-white mb-2 text-center">
         {t(titleKey)}
       </Text>
-      <Text className="text-[13px] text-[#8A8A90] text-center leading-5">
+      <Text className="text-[13px] text-[#8E8E93] text-center leading-5">
         {t(bodyKey)}
       </Text>
     </View>

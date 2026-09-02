@@ -24,7 +24,7 @@ import { RouteLayer } from "@/components/surroundings/RouteLayer";
 import { RouteBanner } from "@/components/surroundings/RouteBanner";
 import { scaledStyles } from "@/lib/ui/compact";
 
-const C = { bg: "#1A1A1A" };
+const C = { bg: "#0D0D0D" };
 
 export default function RouteMapScreen() {
   const appBg = useAppBg();

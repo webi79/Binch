@@ -10,11 +10,11 @@ import { GradientFill } from "@/components/ui/GradientFill";
 import { scaledStyles } from "@/lib/ui/compact";
 
 const COLORS = {
-  surface: "#242425",
+  surface: "#171719",
   // lime entfernt — GradientFill liest den User-Akzent via useAccent().
   black: "#000000",
-  white: "#FFFFFF",
-  gray2: "#8A8A90",
+  white: "#F4F4F5",
+  gray2: "#8E8E93",
   gray3: "#56565C",
 };
 
@@ -93,8 +93,8 @@ function BoMark() {
         fill={COLORS.black}
       />
       {/* Augen: an Bos Position (cx 76/124), rund statt hoch-oval. */}
-      <Circle cx="76" cy="120" r="15" fill="#FFFFFF" />
-      <Circle cx="124" cy="120" r="15" fill="#FFFFFF" />
+      <Circle cx="76" cy="120" r="15" fill="#F4F4F5" />
+      <Circle cx="124" cy="120" r="15" fill="#F4F4F5" />
       {/* Die kleinen Glanzpunkte machen den Blick weich — dieselbe Idee wie bei
           der großen Figur, nur größer im Verhältnis, damit sie hier trägt. */}
       <Circle cx="82" cy="113" r="5" fill={COLORS.black} opacity={0.55} />
@@ -248,6 +248,17 @@ const styles = scaledStyles({
     flexDirection: "row",
     alignItems: "center",
     gap: 10,
+    /**
+     * Die Umrandung steht HIER, nicht an der Aufrufstelle.
+     *
+     * Sie hing vorher als Inline-Stil am Landingscreen; die Leiste auf der
+     * Karte und die im Ortswähler hatten sie deshalb nicht — dieselbe
+     * Komponente, drei verschiedene Erscheinungen. Auf der dunklen Karte fehlte
+     * damit genau das, was die Leiste vom Grund abhebt, und sie wirkte tiefer
+     * als die auf dem Landingscreen, obwohl beide dieselbe Fläche tragen.
+     */
+    borderWidth: 1.5,
+    borderColor: "rgba(255,255,255,0.14)",
   },
   leadingLabel: { fontSize: 14, color: COLORS.white, fontWeight: "500" },
   placeholder: { flex: 1, fontSize: 14, color: COLORS.gray2, fontWeight: "400", paddingVertical: 10 },

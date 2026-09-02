@@ -32,7 +32,7 @@ import { scaledStyles } from "@/lib/ui/compact";
 /**
  * Bottom-sheet overlay showing the full recent-search history.
  * Visual styling mirrors AddTicketModal: dimmed backdrop, dark sheet
- * (#1F1F20) with 28px top radius, drag-handle indicator, tap backdrop
+ * (#171719) with 28px top radius, drag-handle indicator, tap backdrop
  * to dismiss. Sheet height locked to width:height = 1:1.168 aspect ratio.
  */
 export function RecentHistoryOverlay() {
@@ -255,7 +255,7 @@ const styles = scaledStyles({
   title: {
     fontSize: 18,
     fontWeight: "700",
-    color: "#FFFFFF",
+    color: "#F4F4F5",
     flex: 1,
   },
   trashBtn: {
@@ -264,11 +264,11 @@ const styles = scaledStyles({
     borderRadius: 22,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#131313",
+    backgroundColor: "#171719",
   },
   subtitle: {
     fontSize: 13,
-    color: "#8A8A90",
+    color: "#8E8E93",
     marginBottom: 18,
     lineHeight: 18,
     paddingHorizontal: 20,

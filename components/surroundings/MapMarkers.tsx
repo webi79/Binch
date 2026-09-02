@@ -28,9 +28,9 @@ const MARKER_ICON: Record<MarkerKind, LucideIcon> = {
 function markerColors(type: MarkerKind, accentSolid: string, accentTextOn: string): { bg: string; fg: string } {
   if (type === "train" || type === "airport") return { bg: accentSolid, fg: accentTextOn };
   if (type === "subway") return { bg: "#1F3A8A", fg: "#FFFFFF" }; // Dunkelblau
-  if (type === "tram") return { bg: "#2A2A2C", fg: "#FFFFFF" };
+  if (type === "tram") return { bg: "#212123", fg: "#FFFFFF" };
   if (type === "cruise") return { bg: "#6B95B5", fg: "#FFFFFF" };
-  return { bg: "#FFFFFF", fg: "#1A1A1A" };
+  return { bg: "#FFFFFF", fg: "#0D0D0D" };
 }
 
 /** MapLibre erwartet Koordinaten als [longitude, latitude] (GeoJSON-Order). */
@@ -129,7 +129,7 @@ const styles = scaledStyles({
     position: "absolute",
     top: -6,
     right: -6,
-    backgroundColor: "#1A1A1A",
+    backgroundColor: "#0D0D0D",
 
     borderWidth: 1.5,
     paddingHorizontal: 4,
@@ -172,6 +172,6 @@ const styles = scaledStyles({
     borderRadius: 10,
 
     borderWidth: 3,
-    borderColor: "#1A1A1A",
+    borderColor: "#0D0D0D",
   },
 });

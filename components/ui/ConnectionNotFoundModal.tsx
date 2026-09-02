@@ -21,18 +21,18 @@ import { usePalette } from "@/lib/theme/appBg";
 import { scaledStyles } from "@/lib/ui/compact";
 
 // Binch v2 Design-Tokens — sind aus app-internem Theme abgeleitet (tailwind
-// brand.lime = #7FEA4D, brand.dark = #1A1A1A). Wir halten sie hier lokal
+// brand.lime = #7FEA4D, brand.dark = #0D0D0D). Wir halten sie hier lokal
 // damit das Modal self-contained bleibt.
 const tokens = {
-  surface2: "#242425",
+  surface2: "#171719",
   borderSoft: "rgba(255,255,255,0.08)",
   scrim: "rgba(0,0,0,0.55)",
   lime: "#7FEA4D",
   limePressed: "#3ED35A",
   limeSubtle: "rgba(127,234,77,0.18)",
-  textPrimary: "#FFFFFF",
+  textPrimary: "#F4F4F5",
   textSecondary: "#C8C8CC",
-  bg: "#1A1A1A",
+  bg: "#0D0D0D",
 } as const;
 
 /** Papierflieger mit Akzent-Farbe + gestrichelter Flugbahn. SVG damit's auf
@@ -63,7 +63,7 @@ const PaperPlaneIllustration: React.FC<{ size?: number; color: string }> = ({ si
       </G>
       <Circle cx={22} cy={36} r={2} fill={color} opacity={0.5} />
       <Circle cx={142} cy={22} r={1.6} fill={color} opacity={0.4} />
-      <Circle cx={60} cy={22} r={1.4} fill="#FFFFFF" opacity={0.3} />
+      <Circle cx={60} cy={22} r={1.4} fill="#F4F4F5" opacity={0.3} />
     </Svg>
   );
 };

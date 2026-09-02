@@ -1,0 +1,432 @@
+diff --git a/node_modules/expo-speech-recognition/android/src/main/java/expo/modules/speechrecognition/ExpoAudioRecorder.kt b/node_modules/expo-speech-recognition/android/src/main/java/expo/modules/speechrecognition/ExpoAudioRecorder.kt
+index aaa462a..f244619 100644
+--- a/node_modules/expo-speech-recognition/android/src/main/java/expo/modules/speechrecognition/ExpoAudioRecorder.kt
++++ b/node_modules/expo-speech-recognition/android/src/main/java/expo/modules/speechrecognition/ExpoAudioRecorder.kt
+@@ -33,6 +33,16 @@ class ExpoAudioRecorder(
+     private val context: Context,
+     // Optional output file path
+     private val outputFilePath: String?,
++    /**
++     * Lautstärke des gerade gelesenen Blocks, 0..1.
++     *
++     * Ohne diesen Rückruf gibt es beim Aufnehmen ins Dateisystem gar keinen
++     * Pegel: `onRmsChanged` kommt vom Erkennungs-DIENST, und der bekommt hier
++     * nur noch einen Datenstrom statt des Mikrofons — viele Dienste melden dann
++     * nichts mehr. Die Zahl aus dem eigenen PCM ist ohnehin die ehrlichere: Es
++     * ist derselbe Ton, der auch in der Datei landet.
++     */
++    private val onLevel: ((Float) -> Unit)? = null,
+ ) : AudioRecorder {
+     private var audioRecorder: AudioRecord? = null
+ 
+@@ -65,6 +75,26 @@ class ExpoAudioRecorder(
+     private var recordingThread: Thread? = null
+     private var isRecordingAudio = false
+ 
++    /**
++     * Die Leitung zum Erkenner bekommt einen EIGENEN Schreiber — und eine
++     * Warteschlange, die notfalls etwas fallen lässt.
++     *
++     * Vorher schrieb die Aufnahme-Schleife direkt in die Leitung. Eine Pipe
++     * fasst rund 64 KB, das sind hier zwei Sekunden Ton. Hört der Erkenner auf
++     * zu lesen — und das tut er, sobald er eine Äußerung für beendet hält —,
++     * läuft sie voll, und der nächste `write` BLOCKIERT. Damit steht die
++     * Aufnahme-Schleife, `AudioRecord` läuft über, und dieser Ton ist weg.
++     *
++     * Genau das ist „mittendrin fehlen Wörter": nicht am Anfang, nicht am Ende,
++     * sondern dort, wo der Erkenner gerade nachdenkt.
++     *
++     * Jetzt schreibt die Schleife nur noch in die DATEI und legt eine Kopie in
++     * die Warteschlange. Läuft die voll, wird der älteste Block verworfen — der
++     * Erkenner verliert dann etwas, die Aufnahme nie.
++     */
++    private val pipeQueue = java.util.concurrent.LinkedBlockingQueue<ByteArray>(96)
++    private var pipeThread: Thread? = null
++
+     companion object {
+         private const val TAG = "ExpoAudioRecorder"
+ 
+@@ -79,7 +109,23 @@ class ExpoAudioRecorder(
+             sampleRateInHz: Int,
+         ): File {
+             val outputFile = File(outputFilePath)
+-            val audioDataLength = pcmFile.length()
++            /**
++             * Die Daten ZUERST lesen — die Länge kommt aus ihnen.
++             *
++             * Vorher stand hier `pcmFile.length()`, und gelesen wurde die Datei
++             * erst dreißig Zeilen später. Schreibt der Aufnahme-Thread in dieser
++             * Spanne noch (etwa weil das Warten auf ihn in seine Frist gelaufen
++             * ist), passt das Längenfeld im Kopf nicht zu dem, was dahinter
++             * steht — und Abspieler brechen genau am Kopfwert ab.
++             */
++            val pcmData =
++                try {
++                    pcmFile.readBytes()
++                } catch (e: IOException) {
++                    Log.e(TAG, "Failed to read PCM file", e)
++                    ByteArray(0)
++                }
++            val audioDataLength = pcmData.size.toLong()
+             val numChannels = 1
+             val bitsPerSample = 16
+ 
+@@ -105,14 +151,8 @@ class ExpoAudioRecorder(
+                 out.writeBytes("data")
+                 out.writeInt(Integer.reverseBytes(audioDataLength.toInt()))
+ 
+-                try {
+-                    val pcmData = pcmFile.readBytes()
+-                    out.write(pcmData)
+-                    pcmFile.delete()
+-                } catch (e: IOException) {
+-                    Log.e(TAG, "Failed to read PCM file", e)
+-                    e.printStackTrace()
+-                }
++                out.write(pcmData)
++                pcmFile.delete()
+             }
+ 
+             return outputFile
+@@ -147,12 +187,34 @@ class ExpoAudioRecorder(
+ 
+             // First check whether the above object actually initialized
+             if (this.state != AudioRecord.STATE_INITIALIZED) {
++                // Und dann auch nicht als Aufnehmer stehenlassen: Was hier
++                // liegenbleibt, wird beim Abräumen angehalten — und das wirft.
++                Log.w(TAG, "AudioRecord did not initialize (microphone busy?)")
++                audioRecorder = null
++                release()
+                 return
+             }
+ 
+             this.startRecording()
+             isRecordingAudio = true
+ 
++            // Der Schreiber zur Leitung — er darf blockieren, die Aufnahme nicht.
++            pipeThread =
++                thread {
++                    while (isRecordingAudio || pipeQueue.isNotEmpty()) {
++                        val block =
++                            pipeQueue.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS)
++                                ?: continue
++                        try {
++                            outputStream?.write(block)
++                            outputStream?.flush()
++                        } catch (e: IOException) {
++                            // Leitung zu (Erkenner fertig) — die Aufnahme läuft weiter.
++                            break
++                        }
++                    }
++                }
++
+             // Start thread
+             recordingThread =
+                 thread {
+@@ -163,10 +225,46 @@ class ExpoAudioRecorder(
+ 
+     override fun stop() {
+         isRecordingAudio = false
+-        audioRecorder?.stop()
++        /**
++         * Auch das Anhalten kann werfen.
++         *
++         * Ist die Aufnahme nie zustande gekommen (Mikrofon belegt, Telefonat),
++         * steht hier ein nicht initialisiertes `AudioRecord` — und `stop()`
++         * darauf wirft. Die Ausnahme flöge aus dem Abräumen heraus, also VOR
++         * dem „end"-Ereignis: Die App bliebe im Aufnahme-Zustand hängen und
++         * würde nichts absenden.
++         */
++        try {
++            audioRecorder?.stop()
++        } catch (e: IllegalStateException) {
++            Log.w(TAG, "AudioRecord was not recording", e)
++        }
+         audioRecorder?.release()
+         audioRecorder = null
++        /**
++         * AUF DEN AUFNAHME-THREAD WARTEN, bevor die Datei gelesen wird.
++         *
++         * Hier stand nur `recordingThread = null` — das lässt die Referenz
++         * fallen, hält aber nichts an. Der Thread steckt in diesem Moment noch
++         * in `streamAudioToPipe`: Er schreibt seinen letzten Block in die
++         * PCM-Datei und schließt sie erst danach. `appendWavHeader` liest
++         * gleich darauf `pcmFile.length()` und den Inhalt — und bekommt damit
++         * eine Datei, deren Ende noch fehlt.
++         *
++         * Genau das ist die abgeschnittene Sprachnachricht, und sie hängt an
++         * keinem Gerät: Es ist ein Wettlauf, den mal der eine und mal der
++         * andere gewinnt. Die Grenze ist großzügig — die Schleife endet, sobald
++         * `read()` nach dem `stop()` oben zurückkommt.
++         */
++        try {
++            recordingThread?.join(1000)
++            pipeThread?.join(200)
++        } catch (e: InterruptedException) {
++            Log.w(TAG, "Interrupted while waiting for the recording thread", e)
++        }
+         recordingThread = null
++        pipeThread = null
++        pipeQueue.clear()
+         if (outputFilePath != null) {
+             try {
+                 outputFile =
+@@ -195,6 +293,39 @@ class ExpoAudioRecorder(
+         }
+     }
+ 
++    /** Zeitpunkt der letzten gemeldeten Lautstärke — höchstens alle 100ms. */
++    private var lastLevelAt = 0L
++
++    /**
++     * Effektivwert des Blocks, auf 0..1 gebracht.
++     *
++     * 16-Bit-Mono, little endian — genau das, was `createRecorder` einstellt.
++     * Gemeldet wird höchstens zehnmal je Sekunde; öfter braucht es für eine
++     * Anzeige nicht, und die Schleife hier läuft im Aufnahme-Thread.
++     */
++    private fun emitLevel(
++        data: ByteArray,
++        read: Int,
++    ) {
++        val cb = onLevel ?: return
++        val now = System.currentTimeMillis()
++        if (now - lastLevelAt < 100) return
++        lastLevelAt = now
++
++        var sum = 0.0
++        var i = 0
++        var count = 0
++        while (i + 1 < read) {
++            val sample = (((data[i + 1].toInt() and 0xFF) shl 8) or (data[i].toInt() and 0xFF)).toShort().toInt()
++            sum += (sample.toDouble() * sample.toDouble())
++            i += 2
++            count++
++        }
++        if (count == 0) return
++        val rms = kotlin.math.sqrt(sum / count) / 32768.0
++        cb(rms.toFloat())
++    }
++
+     private fun streamAudioToPipe() {
+         val tempFileOutputStream = FileOutputStream(tempPcmFile)
+         val data = ByteArray(bufferSizeInBytes)
+@@ -212,18 +343,22 @@ class ExpoAudioRecorder(
+ 
+             when {
+                 read > 0 -> {
+-                    try {
+-                        outputStream?.write(data, 0, read)
+-                        outputStream?.flush()
+-
+-                        // Write to the temp PCM file
+-                        if (outputFilePath != null) {
++                    emitLevel(data, read)
++                    // ZUERST die Datei: Sie ist das, was der Nutzer später hört,
++                    // und sie darf von der Leitung zum Erkenner nicht abhängen.
++                    if (outputFilePath != null) {
++                        try {
+                             tempFileOutputStream.write(data, 0, read)
+                             tempFileOutputStream.flush()
++                        } catch (e: IOException) {
++                            Log.e(TAG, "Failed to write to PCM file", e)
+                         }
+-                    } catch (e: IOException) {
+-                        Log.e(TAG, "Failed to write to output stream", e)
+-                        e.printStackTrace()
++                    }
++                    // Und dann eine Kopie für den Erkenner — ohne zu warten.
++                    val copy = data.copyOf(read)
++                    if (!pipeQueue.offer(copy)) {
++                        pipeQueue.poll()
++                        pipeQueue.offer(copy)
+                     }
+                 }
+ 
+diff --git a/node_modules/expo-speech-recognition/android/src/main/java/expo/modules/speechrecognition/ExpoSpeechRecognitionOptions.kt b/node_modules/expo-speech-recognition/android/src/main/java/expo/modules/speechrecognition/ExpoSpeechRecognitionOptions.kt
+index e8b8064..2224a90 100644
+--- a/node_modules/expo-speech-recognition/android/src/main/java/expo/modules/speechrecognition/ExpoSpeechRecognitionOptions.kt
++++ b/node_modules/expo-speech-recognition/android/src/main/java/expo/modules/speechrecognition/ExpoSpeechRecognitionOptions.kt
+@@ -39,6 +39,21 @@ class SpeechRecognitionOptions : Record {
+     @Field
+     val audioSource: AudioSourceOptions? = null
+ 
++    /**
++     * NUR AUFNEHMEN, nicht erkennen.
++     *
++     * Auf Geräten ohne brauchbaren Erkennungsdienst (siehe die Xiaomi-Geräte,
++     * die nur ihren eigenen mitbringen und die Sprachvorgabe ignorieren) ist der
++     * Erkenner nicht nur nutzlos, sondern schädlich: Er meldet Netzfehler, reißt
++     * dabei die laufende Sitzung ab — und damit die Aufnahme mit.
++     *
++     * Mit dieser Vorgabe läuft nur der eigene Aufnehmer: Datei und Pegel wie
++     * gehabt, kein `SpeechRecognizer`, keine fremden Fehler. Die Abschrift macht
++     * die App danach selbst.
++     */
++    @Field
++    val recordOnly: Boolean? = false
++
+     @Field
+     val recordingOptions: RecordingOptions? = null
+ 
+diff --git a/node_modules/expo-speech-recognition/android/src/main/java/expo/modules/speechrecognition/ExpoSpeechService.kt b/node_modules/expo-speech-recognition/android/src/main/java/expo/modules/speechrecognition/ExpoSpeechService.kt
+index 06ff2e0..a687b74 100644
+--- a/node_modules/expo-speech-recognition/android/src/main/java/expo/modules/speechrecognition/ExpoSpeechService.kt
++++ b/node_modules/expo-speech-recognition/android/src/main/java/expo/modules/speechrecognition/ExpoSpeechService.kt
+@@ -131,6 +131,37 @@ class ExpoSpeechService(
+             lastVolumeChangeEventTime = 0L
+             try {
+                 val intent = createSpeechIntent(options)
++                // `createSpeechIntent` richtet nebenbei den Aufnehmer ein — nur
++                // deshalb steht der Aufruf auch im Nur-Aufnehmen-Fall hier oben.
++                if (options.recordOnly == true) {
++                    /**
++                     * Ohne Aufnehmer gibt es nichts aufzunehmen — und das MUSS
++                     * ein Fehler sein.
++                     *
++                     * `createSpeechIntent` legt ihn nur ab Android 13 an (siehe
++                     * dort). Darunter stand hier vorher trotzdem „audiostart"
++                     * und der Zustand ACTIVE: Die App zeigte eine laufende
++                     * Aufnahme, die es nicht gab, und beim Absenden kam nichts.
++                     * Lieber eine ehrliche Meldung als ein Knopf, der lügt.
++                     */
++                    val recorder = audioRecorder
++                    if (recorder == null) {
++                        sendEvent(
++                            "error",
++                            mapOf(
++                                "error" to "audio-capture",
++                                "message" to "Recording requires Android 13 or newer",
++                                "code" to -1,
++                            ),
++                        )
++                        teardownAndEnd()
++                        return@post
++                    }
++                    recorder.start()
++                    recognitionState = RecognitionState.ACTIVE
++                    sendEvent("audiostart", mapOf("uri" to recorder.outputFileUri))
++                    return@post
++                }
+                 speech = createSpeechRecognizer(options)
+ 
+                 // Start the audio recorder
+@@ -167,24 +198,32 @@ class ExpoSpeechService(
+      * Stops the audio recorder and sends the recorded audio file path to the app.
+      */
+     private fun stopRecording() {
+-        audioRecorder?.stop()
+-        if (audioRecorder?.outputFile != null) {
+-            val uri = audioRecorder?.outputFile?.absolutePath?.let { "file://$it" }
+-            sendEvent(
+-                "audioend",
+-                mapOf(
+-                    "uri" to uri,
+-                ),
+-            )
+-        } else {
+-            sendEvent(
+-                "audioend",
+-                mapOf(
+-                    "uri" to null,
+-                ),
+-            )
+-        }
++        val recorder = audioRecorder
+         audioRecorder = null
++        if (recorder == null) {
++            sendEvent("audioend", mapOf("uri" to null))
++            return
++        }
++        /**
++         * NICHT auf dem Hauptstrang abräumen.
++         *
++         * `stop()` wartet erst auf den Aufnahme-Thread (bis zu einer Sekunde,
++         * damit die Datei vollständig ist) und schreibt danach die ganze
++         * Aufnahme mit WAV-Kopf neu — bei einer Minute Ton sind das zwei
++         * Megabyte Lesen und Schreiben. Aufgerufen wird das aus
++         * `teardownAndEnd`, und das läuft im Haupt-Handler: Die Oberfläche
++         * stand für diese Zeit, und bei längeren Aufnahmen ist das der Bereich,
++         * in dem Android „reagiert nicht" anbietet.
++         *
++         * Auf einem eigenen Strang kostet es niemanden etwas. Das „audioend"
++         * kommt dann NACH dem „end" — die JS-Seite wartet ohnehin ausdrücklich
++         * darauf, bevor sie die Datei anfasst (`finishVoiceRecording`).
++         */
++        Thread {
++            recorder.stop()
++            val uri = recorder.outputFile?.absolutePath?.let { "file://$it" }
++            sendEvent("audioend", mapOf("uri" to uri))
++        }.start()
+     }
+ 
+     /**
+@@ -192,6 +231,13 @@ class ExpoSpeechService(
+      * Attempts to emit a final result if the speech recognizer is still running.
+      */
+     fun stop() {
++        // Ohne Erkenner gibt es niemanden, der `onResults`/`onError` meldet —
++        // das Ende müssen wir hier selbst herbeiführen, sonst bliebe die Datei
++        // offen und die App wartete auf ein „audioend", das nie kommt.
++        if (this::options.isInitialized && options.recordOnly == true) {
++            teardownAndEnd()
++            return
++        }
+         mainHandler.post {
+             recognitionState = RecognitionState.STOPPING
+             try {
+@@ -272,11 +318,15 @@ class ExpoSpeechService(
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && options.audioSource == null) {
+             // Feature: Stream microphone input to SpeechRecognition so the user can access the audio blob
+             if (options.recordingOptions?.persist == true) {
+-                audioRecorder = ExpoAudioRecorder(reactContext, resolveFilePathFromConfig(options.recordingOptions))
++                audioRecorder =
++                    ExpoAudioRecorder(
++                        reactContext,
++                        resolveFilePathFromConfig(options.recordingOptions),
++                    ) { level -> emitRecorderLevel(level) }
+             } else if (options.continuous == true) {
+                 // Feature: Continuous transcription from microphone using `RecognizerIntent.EXTRA_AUDIO_SOURCE`
+                 // This also has the side effect of not playing the "beep" sound when starting and stopping recognition
+-                audioRecorder = ExpoAudioRecorder(reactContext, null)
++                audioRecorder = ExpoAudioRecorder(reactContext, null) { level -> emitRecorderLevel(level) }
+             }
+ 
+             // Set common intent extras if audioRecorder is initialized
+@@ -463,6 +513,36 @@ class ExpoSpeechService(
+         sendEvent("speechstart", null)
+     }
+ 
++    /**
++     * Pegel aus dem EIGENEN Aufnahme-Puffer (siehe ExpoAudioRecorder).
++     *
++     * Kommt in derselben Form heraus wie `onRmsChanged`, damit die JS-Seite nur
++     * eine Quelle kennt: 0..1 aus dem PCM, auf denselben Bereich gestreckt, den
++     * Android für `rmsdB` benutzt (etwa 0..10).
++     */
++    private fun emitRecorderLevel(level: Float) {
++        if (options.volumeChangeEventOptions?.enabled != true) {
++            return
++        }
++        // Der Effektivwert kommt LINEAR herein (0..1) — und linear ist für eine
++        // Anzeige unbrauchbar: Normale Sprechlautstärke liegt bei 0.02 bis 0.2,
++        // alles Sichtbare drängt sich also im untersten Zehntel der Skala. Das
++        // war der Grund, warum die Balken kaum zuckten, obwohl Ton ankam.
++        //
++        // Also erst in Dezibel (das Ohr hört so), dann auf denselben Bereich
++        // strecken, den Android für `onRmsChanged` benutzt (etwa -2 bis 10) —
++        // damit die JS-Seite nur EINE Skala kennt, egal welche Quelle liefert.
++        // -50 dBFS ist Zimmerstille, -5 dBFS die Grenze zur Übersteuerung.
++        val db =
++            if (level <= 0.00001f) {
++                -60.0
++            } else {
++                20.0 * kotlin.math.log10(level.toDouble())
++            }
++        val scaled = -2.0 + ((db + 50.0) / 45.0) * 12.0
++        sendEvent("volumechange", mapOf("value" to scaled.coerceIn(-2.0, 10.0).toFloat()))
++    }
++
+     override fun onRmsChanged(rmsdB: Float) {
+         if (options.volumeChangeEventOptions?.enabled != true) {
+             return

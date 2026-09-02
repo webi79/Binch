@@ -189,5 +189,5 @@ const styles = scaledStyles({
   segment: { flex: 1, alignItems: "center", justifyContent: "center" },
   text: { fontSize: 13, fontWeight: "600" },
   activeText: { color: "#000000", fontWeight: "700" },
-  inactiveText: { color: "#8A8A90" },
+  inactiveText: { color: "#8E8E93" },
 });

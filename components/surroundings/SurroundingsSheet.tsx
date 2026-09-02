@@ -50,15 +50,15 @@ const KIND_CHIP_STYLE: Record<string, { bg: string; fg: string }> = {
   bus: { bg: BUS_PURPLE_SUB, fg: BUS_PURPLE },
 };
 const C = {
-  bg: "#1F1F20",
-  border: "#2E2E30",
-  white: "#FFFFFF",
+  bg: "#171719",
+  border: "#212123",
+  white: "#F4F4F5",
   g1: "#C4C4C8",
-  g2: "#8A8A90",
+  g2: "#8E8E93",
   g3: "#56565C",
-  s2: "#1F1F20",
-  s3: "#2A2A2C",
-  s4: "#3A3A3D",
+  s2: "#171719",
+  s3: "#212123",
+  s4: "#2D2D31",
 };
 
 const KIND_ICON: Record<MarkerKind, LucideIcon> = {

@@ -42,10 +42,10 @@ const RING_DURATION = 420;
 const CHECK_DURATION = 280;
 const CHECK_LEN = 26;
 
-const SURFACE = "#2A2A2C";
+const SURFACE = "#171719";
 const BORDER = "rgba(255,255,255,0.08)";
-const TEXT_PRIMARY = "#FFFFFF";
-const TEXT_TERTIARY = "#8A8A90";
+const TEXT_PRIMARY = "#F4F4F5";
+const TEXT_TERTIARY = "#8E8E93";
 const ICON_INK = "#123007";
 
 /**
@@ -245,7 +245,10 @@ function Toast() {
       <Animated.View
         style={[styles.layer, { top: (insets.top || 0) + 10 }, toastStyle]}
       >
-        <View style={[styles.toast, { backgroundColor: palette.s3 }]}>
+        {/* Box-Ton, nicht die Stufe darüber: Eine Meldung ist eine Box, die
+            über dem Bildschirm schwebt — ihr Rand und ihr Schatten heben sie
+            ab, nicht ein hellerer Grauton. */}
+        <View style={[styles.toast, { backgroundColor: palette.s2 }]}>
             <View style={styles.iconWrap}>
               <Animated.View
                 style={[

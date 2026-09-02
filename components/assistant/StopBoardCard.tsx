@@ -37,11 +37,11 @@ import {
 import { scaledStyles } from "@/lib/ui/compact";
 
 const C = {
-  card: "#1F1F20",
-  cardAlt: "#242425",
-  border: "#2E2E30",
-  text: "#FFFFFF",
-  sub: "#8A8A90",
+  card: "#171719",
+  cardAlt: "#171719",
+  border: "#212123",
+  text: "#F4F4F5",
+  sub: "#8E8E93",
   subDim: "#56565C",
   delay: "#FF7A6B",
 };
@@ -151,7 +151,7 @@ function StopBoardCardInner({ stop, initialBoard, initialData }: Props) {
     kind === "departures" ? t("stop.tab.departures") : t("stop.tab.arrivals");
 
   return (
-    <View style={[styles.card, { backgroundColor: palette.s1, borderColor: palette.border }]}>
+    <View style={[styles.card, { backgroundColor: palette.s2, borderColor: palette.border }]}>
       {/**
         * Kopfzeile ÖFFNET das Halt-Blatt — das war das einzige Element im Chat,
         * das auf einen Tipp nicht reagiert hat.
@@ -189,7 +189,9 @@ function StopBoardCardInner({ stop, initialBoard, initialData }: Props) {
               onPress={() => setBoard(kind)}
               style={[
                 styles.tab,
-                { backgroundColor: palette.s2, borderColor: palette.border },
+                // Die Umschalter liegen AUF der Karte, also `s3`. Auf `s2` trugen
+                // sie denselben Ton wie die Karte darunter.
+                { backgroundColor: palette.s3, borderColor: palette.border },
                 on && { backgroundColor: accent.subtle, borderColor: accent.border },
               ]}
             >
@@ -296,7 +298,7 @@ function Hero({
       : `${realTime}${item.platform ? ` · ${item.platform}` : ""}`;
 
   return (
-    <View style={[styles.hero, { backgroundColor: palette.s2 }]}>
+    <View style={[styles.hero, { backgroundColor: palette.s3 }]}>
       <View style={styles.heroRing}>
         <Svg width={70} height={70} viewBox="0 0 70 70">
           <Circle cx={35} cy={35} r={RING_R} fill="none" stroke={C.border} strokeWidth={5} />

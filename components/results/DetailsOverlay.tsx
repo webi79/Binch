@@ -90,14 +90,14 @@ import { scaledStyles } from "@/lib/ui/compact";
 
 // Brand-Palette (App-Colors statt der neonigen Mockup-Lime).
 const C = {
-  bg: "#1A1A1A",
-  card: "#242425",
-  surface: "#1F1F20",
-  surface3: "#2A2A2C",
-  border: "#2E2E30",
+  bg: "#0D0D0D",
+  card: "#171719",
+  surface: "#171719",
+  surface3: "#212123",
+  border: "#212123",
   borderSoft: "rgba(255,255,255,0.06)",
-  text: "#FFFFFF",
-  sub: "#8A8A90",
+  text: "#F4F4F5",
+  sub: "#8E8E93",
   subDim: "#56565C",
   lime: "#7FEA4D",
   limePressed: "#6DCC3F",

@@ -70,17 +70,17 @@ import { RippleTouch } from "@/components/ui/RippleTouch";
 import { scaledStyles } from "@/lib/ui/compact";
 
 const C = {
-  bg: "#1A1A1A",
-  s1: "#1F1F20",
-  s2: "#242425",
-  s3: "#2A2A2C",
-  border: "#2E2E30",
+  bg: "#0D0D0D",
+  s1: "#171719",
+  s2: "#171719",
+  s3: "#212123",
+  border: "#212123",
   green: "#7FEA4D",
   greenDark: "#2BB857",
   greenSubtle: "#1A3D26",
-  white: "#FFFFFF",
+  white: "#F4F4F5",
   g1: "#C8C8CC",
-  g2: "#8A8A90",
+  g2: "#8E8E93",
   g3: "#56565C",
   red: "#FF453A",
 };
@@ -336,7 +336,7 @@ function ProfileCard() {
   };
 
   return (
-    <View style={[styles.profileCard, { backgroundColor: palette.s1 }]}>
+    <View style={[styles.profileCard, { backgroundColor: palette.s2 }]}>
       <View style={styles.profileTopRow}>
         <View style={{ flex: 1, paddingRight: 12 }}>
           <Text style={styles.eyebrow}>{t("settings.account").toUpperCase()}</Text>
@@ -369,7 +369,7 @@ function ProfileCard() {
               <Text style={styles.avatarText}>{initials}</Text>
             </View>
           ) : (
-            <View style={[styles.avatar, { backgroundColor: palette.s2, borderWidth: 1, borderColor: palette.border }]}>
+            <View style={[styles.avatar, { backgroundColor: palette.s3, borderWidth: 1, borderColor: palette.border }]}>
               <User size={26} color={C.g2} strokeWidth={2} />
             </View>
           )}
@@ -425,7 +425,7 @@ function SectionCard({
       }}
       style={({ pressed }) => [
         styles.sectionCard,
-        { backgroundColor: palette.s1 },
+        { backgroundColor: palette.s2 },
         pressed && { backgroundColor: palette.s3, transform: [{ scale: 0.982 }] },
       ]}
     >
@@ -533,7 +533,7 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
               <Text style={styles.avatarLargeText}>{initials}</Text>
             </View>
           ) : (
-            <View style={[styles.avatarLarge, { backgroundColor: palette.s2, borderWidth: 1, borderColor: palette.border }]}>
+            <View style={[styles.avatarLarge, { backgroundColor: palette.s3, borderWidth: 1, borderColor: palette.border }]}>
               <User size={36} color={C.g2} strokeWidth={2} />
             </View>
           )}
@@ -608,9 +608,12 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
 
 /* ─────────────────────── SETTINGS SUB ─────────────────────── */
 const THEMES: { id: "dark" | "light" | "gray"; bg: string; surface: string }[] = [
-  { id: "dark", bg: "#000000", surface: "#1A1A1A" },
+  { id: "dark", bg: "#000000", surface: "#171719" },
   { id: "light", bg: "#F2F2F5", surface: "#FFFFFF" },
-  { id: "gray", bg: "#1C1C1E", surface: "#2C2C2E" },
+  // Die Tupfer zeigen, was das Theme WIRKLICH setzt (lib/theme/appBg.ts).
+  // Für Grau standen hier #1C1C1E/#2C2C2E — beides Werte, die es in der App
+  // nirgends gab; der Tupfer war heller als der Bildschirm, den er ankündigt.
+  { id: "gray", bg: "#0D0D0D", surface: "#171719" },
 ];
 
 const LANGS: { id: Locale; label: string; flag: string }[] = [
@@ -835,7 +838,7 @@ function SettingsSubScreen({ onBack }: { onBack: () => void }) {
       <StripeLabel text={t("settings.toast.section")} />
       <View style={{ paddingHorizontal: GUTTER }}>
         <Text style={styles.toastDesc}>{t("settings.toast.desc")}</Text>
-        <View style={[styles.toastSegment, { backgroundColor: palette.s3 }]}>
+        <View style={[styles.toastSegment, { backgroundColor: palette.s2 }]}>
           {(["top", "bottom"] as const).map((pos) => {
             const active = savedToastPosition === pos;
             return (
@@ -1060,7 +1063,7 @@ function ToggleRow({
   const accent = useAccent();
   return (
     <View style={[styles.row, !isLast && styles.rowDivider]}>
-      <View style={[styles.rowIcon, { backgroundColor: palette.s2 }]}>{icon}</View>
+      <View style={[styles.rowIcon, { backgroundColor: palette.s3 }]}>{icon}</View>
       <View style={{ flex: 1 }}>
         <Text style={[styles.rowLabel, { fontWeight: "500" }]}>{label}</Text>
         {desc ? <Text style={styles.rowSub}>{desc}</Text> : null}
@@ -1112,20 +1115,20 @@ function IlluDetails() {
   return (
     <Svg width={80} height={72} viewBox="0 0 80 72">
       <Circle cx={32} cy={18} r={10} fill="#C8C8CC" />
-      <Path d="M22 16 Q22 8 32 7 Q42 8 42 16 L42 13 Q39 5 32 5 Q25 5 22 13Z" fill="#2E2E30" />
+      <Path d="M22 16 Q22 8 32 7 Q42 8 42 16 L42 13 Q39 5 32 5 Q25 5 22 13Z" fill="#212123" />
       <Rect x={23} y={27} width={18} height={20} rx={6} fill={accent.solid} />
       <Rect x={14} y={28} width={10} height={6} rx={3} fill={accent.solid} />
       <Rect x={41} y={28} width={10} height={6} rx={3} fill={accent.solid} />
-      <Rect x={25} y={45} width={6} height={14} rx={3} fill="#242425" />
-      <Rect x={33} y={45} width={6} height={14} rx={3} fill="#242425" />
-      <Rect x={46} y={22} width={28} height={20} rx={4} fill="#1F1F20" stroke={accent.solid} strokeWidth={1.2} />
+      <Rect x={25} y={45} width={6} height={14} rx={3} fill="#171719" />
+      <Rect x={33} y={45} width={6} height={14} rx={3} fill="#171719" />
+      <Rect x={46} y={22} width={28} height={20} rx={4} fill="#171719" stroke={accent.solid} strokeWidth={1.2} />
       <Rect x={46} y={22} width={28} height={6} rx={3} fill={accent.solid} fillOpacity={0.35} />
       <Circle cx={53} cy={35} r={3.5} fill={accent.solid} fillOpacity={0.6} />
       <Rect x={58} y={33} width={10} height={1.5} rx={0.75} fill={accent.solid} fillOpacity={0.5} />
       <Rect x={58} y={36.5} width={7} height={1.5} rx={0.75} fill={accent.solid} fillOpacity={0.3} />
-      <Circle cx={28} cy={17} r={1.2} fill="#2E2E30" />
-      <Circle cx={36} cy={17} r={1.2} fill="#2E2E30" />
-      <Path d="M28 22 Q32 25 36 22" stroke="#2E2E30" strokeWidth={1.2} strokeLinecap="round" fill="none" />
+      <Circle cx={28} cy={17} r={1.2} fill="#212123" />
+      <Circle cx={36} cy={17} r={1.2} fill="#212123" />
+      <Path d="M28 22 Q32 25 36 22" stroke="#212123" strokeWidth={1.2} strokeLinecap="round" fill="none" />
     </Svg>
   );
 }
@@ -1134,24 +1137,24 @@ function IlluSettings() {
   const accent = useAccent();
   return (
     <Svg width={80} height={72} viewBox="0 0 80 72">
-      <Rect x={4} y={56} width={72} height={5} rx={2.5} fill="#242425" />
-      <Rect x={14} y={46} width={48} height={10} rx={2} fill="#242425" />
-      <Rect x={16} y={18} width={44} height={30} rx={3} fill="#1F1F20" stroke={accent.solid} strokeWidth={1} strokeOpacity={0.4} />
-      <Rect x={21} y={26} width={22} height={2.5} rx={1.25} fill="#2E2E30" />
+      <Rect x={4} y={56} width={72} height={5} rx={2.5} fill="#171719" />
+      <Rect x={14} y={46} width={48} height={10} rx={2} fill="#171719" />
+      <Rect x={16} y={18} width={44} height={30} rx={3} fill="#171719" stroke={accent.solid} strokeWidth={1} strokeOpacity={0.4} />
+      <Rect x={21} y={26} width={22} height={2.5} rx={1.25} fill="#212123" />
       <Rect x={21} y={26} width={13} height={2.5} rx={1.25} fill={accent.solid} fillOpacity={0.7} />
       <Circle cx={34} cy={27.25} r={3} fill={accent.solid} />
-      <Rect x={21} y={33} width={22} height={2.5} rx={1.25} fill="#2E2E30" />
+      <Rect x={21} y={33} width={22} height={2.5} rx={1.25} fill="#212123" />
       <Rect x={21} y={33} width={16} height={2.5} rx={1.25} fill={accent.solid} fillOpacity={0.5} />
       <Circle cx={37} cy={34.25} r={3} fill={accent.solid} fillOpacity={0.8} />
-      <Rect x={21} y={40} width={22} height={2.5} rx={1.25} fill="#2E2E30" />
+      <Rect x={21} y={40} width={22} height={2.5} rx={1.25} fill="#212123" />
       <Rect x={21} y={40} width={8} height={2.5} rx={1.25} fill={accent.solid} fillOpacity={0.4} />
       <Circle cx={29} cy={41.25} r={3} fill={accent.solid} fillOpacity={0.6} />
       <Circle cx={64} cy={34} r={9} fill="#C8C8CC" />
-      <Path d="M55 32 Q55 25 64 24 Q73 25 73 32 L73 29 Q70 22 64 22 Q58 22 55 29Z" fill="#2E2E30" />
+      <Path d="M55 32 Q55 25 64 24 Q73 25 73 32 L73 29 Q70 22 64 22 Q58 22 55 29Z" fill="#212123" />
       <Path d="M56 42 Q56 39 64 39 Q72 39 72 42 L74 56 L54 56Z" fill={accent.solid} fillOpacity={0.7} />
-      <Circle cx={60} cy={33} r={1.2} fill="#2E2E30" />
-      <Circle cx={68} cy={33} r={1.2} fill="#2E2E30" />
-      <Path d="M60 38 Q64 41 68 38" stroke="#2E2E30" strokeWidth={1.2} strokeLinecap="round" fill="none" />
+      <Circle cx={60} cy={33} r={1.2} fill="#212123" />
+      <Circle cx={68} cy={33} r={1.2} fill="#212123" />
+      <Path d="M60 38 Q64 41 68 38" stroke="#212123" strokeWidth={1.2} strokeLinecap="round" fill="none" />
     </Svg>
   );
 }
@@ -1161,7 +1164,7 @@ function IlluSupport() {
   return (
     <Svg width={80} height={72} viewBox="0 0 80 72">
       <Circle cx={34} cy={22} r={11} fill="#C8C8CC" />
-      <Path d="M23 20 Q23 11 34 10 Q45 11 45 20 L45 16 Q42 8 34 8 Q26 8 23 16Z" fill="#242425" />
+      <Path d="M23 20 Q23 11 34 10 Q45 11 45 20 L45 16 Q42 8 34 8 Q26 8 23 16Z" fill="#171719" />
       <Path d="M23 19 Q23 10 34 10 Q45 10 45 19" stroke={accent.solid} strokeWidth={2.5} fill="none" strokeLinecap="round" />
       <Rect x={20} y={18} width={6} height={8} rx={2.5} fill={accent.solid} />
       <Rect x={42} y={18} width={6} height={8} rx={2.5} fill={accent.solid} />
@@ -1169,13 +1172,13 @@ function IlluSupport() {
       <Circle cx={15} cy={35} r={2.5} fill={accent.solid} />
       <Rect x={25} y={31} width={18} height={20} rx={6} fill={accent.solid} fillOpacity={0.8} />
       <Rect x={15} y={32} width={11} height={6} rx={3} fill={accent.solid} fillOpacity={0.8} />
-      <Rect x={27} y={49} width={6} height={14} rx={3} fill="#242425" />
-      <Rect x={35} y={49} width={6} height={14} rx={3} fill="#242425" />
-      <Circle cx={29} cy={21} r={1.2} fill="#2E2E30" />
-      <Circle cx={39} cy={21} r={1.2} fill="#2E2E30" />
-      <Path d="M29 26 Q34 29 39 26" stroke="#2E2E30" strokeWidth={1.2} strokeLinecap="round" fill="none" />
-      <Rect x={50} y={6} width={26} height={20} rx={6} fill="#1F1F20" stroke={accent.solid} strokeWidth={1} />
-      <Path d="M54 26 L51 32 L60 26" fill="#1F1F20" stroke={accent.solid} strokeWidth={1} />
+      <Rect x={27} y={49} width={6} height={14} rx={3} fill="#171719" />
+      <Rect x={35} y={49} width={6} height={14} rx={3} fill="#171719" />
+      <Circle cx={29} cy={21} r={1.2} fill="#212123" />
+      <Circle cx={39} cy={21} r={1.2} fill="#212123" />
+      <Path d="M29 26 Q34 29 39 26" stroke="#212123" strokeWidth={1.2} strokeLinecap="round" fill="none" />
+      <Rect x={50} y={6} width={26} height={20} rx={6} fill="#171719" stroke={accent.solid} strokeWidth={1} />
+      <Path d="M54 26 L51 32 L60 26" fill="#171719" stroke={accent.solid} strokeWidth={1} />
       <Circle cx={58} cy={16} r={2} fill={accent.solid} fillOpacity={0.8} />
       <Circle cx={63} cy={16} r={2} fill={accent.solid} fillOpacity={0.8} />
       <Circle cx={68} cy={16} r={2} fill={accent.solid} fillOpacity={0.8} />

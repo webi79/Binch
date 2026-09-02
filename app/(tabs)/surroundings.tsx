@@ -1,6 +1,7 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { prepareLayer } from "@/lib/nav/transitionLayer";
 import { preloadLocationPicker } from "@/lib/nav/pickerPreload";
+import { PICKER_IN } from "@/lib/nav/overlayCover";
 import { View, StyleSheet, type LayoutChangeEvent } from "react-native";
 import Animated, { FadeOut } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -195,18 +196,35 @@ export default function SurroundingsScreen() {
    */
   const freezeArmed = !isFocused;
   /**
-   * Auch einfrieren, wenn ein WÄHLER darüber liegt — nicht nur beim Tab-Wechsel.
+   * Auch einfrieren, wenn ein WÄHLER darüber liegt — aber erst, wenn er WIRKLICH
+   * darüber liegt.
    *
-   * Der Ortswähler wird aus dieser Karte heraus geöffnet, also bei FOKUSSIERTEM
-   * Tab. Der Riegel griff dort nie: Während der 250ms Einfahrt und der 220ms
-   * Ausfahrt liefen der GL-Strang der Karte, die Marker-Ebene und die
-   * Ausschnitts-Abfrage einfach weiter — unter einem deckenden Blatt, das man
-   * ohnehin nicht durchschauen kann.
+   * Der Gedanke stimmt: Der Ortswähler wird aus dieser Karte heraus geöffnet,
+   * also bei fokussiertem Tab, und unter einem deckenden Blatt braucht der
+   * GL-Strang der Karte nicht weiterzulaufen.
    *
-   * Derselbe Wähler über dem Such-Bildschirm hat diesen Nachbarn nicht. Das ist
-   * einer der Gründe, warum es sich hier schlechter anfühlt als dort.
+   * Nur deckt das Blatt beim Antippen noch gar nichts. Es fährt erst herein, und
+   * das dauert `PICKER_IN` — und über diese ganze Strecke ist die Karte dahinter
+   * zu sehen. Eingefroren verliert die GL-Fläche ihren Kontext (die SurfaceView
+   * geht auf `INVISIBLE`), und genau das sah man: Die Karte wurde in dem Moment
+   * schwarz, in dem das Blatt losfuhr.
+   *
+   * Also erst anhalten, wenn die Einfahrt durch ist. Der Zuschlag deckt das
+   * Bild ab, in dem die Kurve endet.
    */
-  const pickerOverMap = useSearchStore((st) => st.locationPickerRequest !== null);
+  const pickerOpen = useSearchStore((st) => st.locationPickerRequest !== null);
+  const [pickerCoversMap, setPickerCoversMap] = useState(false);
+  useEffect(() => {
+    // Beim Schließen SOFORT freigeben — dort ist es umgekehrt: Das Blatt fährt
+    // hinaus und die Karte soll schon wieder da sein, wenn es den Blick freigibt.
+    if (!pickerOpen) {
+      setPickerCoversMap(false);
+      return;
+    }
+    const id = setTimeout(() => setPickerCoversMap(true), PICKER_IN.duration + 40);
+    return () => clearTimeout(id);
+  }, [pickerOpen]);
+  const pickerOverMap = pickerCoversMap;
   /** Liegt die Suche darüber? Dann ist die Karte sicher nicht zu sehen. */
   const searchOverMap = useSearchStore((st) => st.searchOverlayMode != null);
   /**
@@ -690,6 +708,36 @@ export default function SurroundingsScreen() {
     setMapTilesRendered(true);
   }, []);
 
+  /**
+   * Ein Flugziel, das gerade nicht ausgeführt werden kann, geht nicht verloren.
+   *
+   * Die Auswahl aus dem Wähler kommt an, WÄHREND die Karte noch angehalten ist:
+   * `confirmLocationPicker` ruft den Rückruf, bevor es den Auftrag räumt, und
+   * eine angehaltene Karte hat keine Fläche, auf der sie fliegen könnte. Der
+   * Aufruf lief damit ins Leere — man wählte einen Bahnhof und es passierte
+   * nichts.
+   *
+   * Also merken und nachholen, sobald die Karte wieder läuft UND gemeldet hat,
+   * dass sie fertig gezeichnet ist. Ist sie ohnehin wach (schnelle Auswahl,
+   * bevor der Riegel greift), fliegt sie sofort.
+   */
+  const pendingFlyRef = useRef<{ lat: number; lng: number; zoom: number } | null>(null);
+  const flyToOrRemember = useCallback((lat: number, lng: number, zoom: number) => {
+    if (!frozenRef.current) {
+      pendingFlyRef.current = null;
+      mapRef.current?.flyTo(lat, lng, zoom);
+      return;
+    }
+    pendingFlyRef.current = { lat, lng, zoom };
+  }, []);
+  useEffect(() => {
+    if (frozen || !mapTilesRendered) return;
+    const target = pendingFlyRef.current;
+    if (!target) return;
+    pendingFlyRef.current = null;
+    mapRef.current?.flyTo(target.lat, target.lng, target.zoom);
+  }, [frozen, mapTilesRendered]);
+
   // Beim ersten GPS-Fix auf den Standort fliegen — Zoom je nach Modus.
   // Wird übersprungen wenn eine Route aktiv ist (dann fitten wir auf die Route).
   // Wichtig: NICHT fliegen solange `locationStatus === "loading"`. Sonst
@@ -1049,7 +1097,7 @@ export default function SurroundingsScreen() {
                   // Bushaltestelle näher dran (Stadt-Detail), bei Häfen mittel.
                   const zoom =
                     loc.type === "FLIGHT" ? 11 : loc.type === "CRUISE" ? 12 : 14;
-                  mapRef.current?.flyTo(coord.latitude, coord.longitude, zoom);
+                  flyToOrRemember(coord.latitude, coord.longitude, zoom);
                 },
               })
             }

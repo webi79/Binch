@@ -23,11 +23,11 @@ import { usePalette } from "@/lib/theme/appBg";
 import { scaledStyles } from "@/lib/ui/compact";
 
 const tokens = {
-  surface2: "#242425",
+  surface2: "#171719",
   border: "rgba(255,255,255,0.08)",
-  white: "#FFFFFF",
+  white: "#F4F4F5",
   gray200: "#C8C8CC",
-  gray300: "#8A8A90",
+  gray300: "#8E8E93",
   // Brand-Lime aus dem App-Theme (tailwind.config.js brand.lime).
   lime: "#7FEA4D",
   textOnLime: "#000000",

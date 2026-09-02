@@ -38,12 +38,12 @@ export function useLoaderPaused(): boolean {
 }
 
 const C = {
-  surface2: "#242425",
-  surface4: "#323234",
-  border: "#2E2E30",
-  text: "#FFFFFF",
-  textTertiary: "#8A8A90",
-  ink: "#1A1A1A",
+  surface2: "#171719",
+  surface4: "#212123",
+  border: "#212123",
+  text: "#F4F4F5",
+  textTertiary: "#8E8E93",
+  ink: "#0D0D0D",
   ghostBodyBottom: "#E9ECEC",
 };
 

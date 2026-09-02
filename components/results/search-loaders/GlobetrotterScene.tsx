@@ -37,7 +37,7 @@ export function GlobetrotterScene({ originCode = "—", destCode = "—" }: Prop
       </View>
 
       <Svg width={SCENE_W} height={SCENE_H} style={StyleSheet.absoluteFill}>
-        <Path d="M30,170 Q150,40 270,170" stroke="#2E2E30" strokeWidth={3} fill="none" />
+        <Path d="M30,170 Q150,40 270,170" stroke="#212123" strokeWidth={3} fill="none" />
         <Path
           d="M30,170 Q150,40 270,170"
           stroke={accent.solid}
@@ -49,12 +49,12 @@ export function GlobetrotterScene({ originCode = "—", destCode = "—" }: Prop
       </Svg>
 
       <View style={{ position: "absolute", left: 18, top: 156 }}>
-        <MapPin size={26} color="#8A8A90" />
+        <MapPin size={26} color="#8E8E93" />
       </View>
       <View style={{ position: "absolute", left: 256, top: 156 }}>
         <MapPin size={26} color={accent.solid} />
       </View>
-      <Text style={[styles.code, { left: 8, top: 186, color: "#8A8A90" }]}>
+      <Text style={[styles.code, { left: 8, top: 186, color: "#8E8E93" }]}>
         {originCode}
       </Text>
       <Text style={[styles.code, { left: 250, top: 186, color: accent.solid }]}>

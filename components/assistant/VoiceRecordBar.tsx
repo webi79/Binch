@@ -13,7 +13,7 @@
  *  - Bei recording=false friert der Sampler ein — Balken halten ihre
  *    letzten Werte.
  */
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import Animated, {
   cancelAnimation,
@@ -57,22 +57,42 @@ interface Props {
 }
 
 const C = {
-  panel: "#1F1F20",
-  border: "#2E2E30",
+  panel: "#171719",
+  border: "#212123",
   red: "#FF3B30",
-  white: "#FFFFFF",
-  gray: "#8A8A90",
-  surface3: "#323234",
+  white: "#F4F4F5",
+  gray: "#8E8E93",
+  surface3: "#212123",
 };
 
-const PITCH = 6;
-const BAR_W = 3;
-/** Halbe Höhe — Balken extendieren von -HALF_H bis +HALF_H um die Mittellinie. */
-const HALF_H = 17;
-/** Minimaler Stub auch bei Stille, damit Wellenform nicht komplett verschwindet. */
-const MIN_AMP = 0.06;
-/** Sample-Cadence: einmal pro TICK_MS schreiben wir die aktuelle Volume in den Buffer. */
-const TICK_MS = 80;
+/**
+ * Maße der Balken — nach Vorlage.
+ *
+ * Vorher 3 Punkt breit im 6er-Raster: Das ergab eine feine Schraffur, in der
+ * die einzelnen Balken kaum als solche zu lesen waren. 4 im 8er-Raster heißt
+ * gleich viel Balken wie Lücke — dadurch wird jeder einzelne als Strich
+ * erkennbar, so wie in der Vorlage.
+ */
+const PITCH = 8;
+const BAR_W = 4;
+/** Halbe Höhe — Balken reichen von -HALF_H bis +HALF_H um die Mitte. */
+const HALF_H = 20;
+/**
+ * Auch bei Stille bleibt ein Stummel stehen. Höher als zuvor (0.06): Bei einem
+ * kräftigeren Balken liest sich ein zu kurzer Stummel als Punkt, nicht als
+ * Strich — und die Spur soll durchgehend als Spur erkennbar bleiben.
+ */
+const MIN_AMP = 0.14;
+/**
+ * Wie lange ein Balken lebt — und damit, wie schnell die Spur läuft.
+ *
+ * Ein Balken je `TICK_MS`, und die Spur wandert in derselben Zeit um eine
+ * Rasterbreite. Von 80 auf 160 heißt also: halbes Tempo, und jeder Balken deckt
+ * die doppelte Zeit ab. Weil in dieser Zeit die LAUTESTE Stelle festgehalten
+ * wird (siehe `peak`), geht dabei keine Silbe verloren.
+ */
+const TICK_MS = 160;
+
 
 /* ──── Bar — symmetrisch um die Mittellinie, scaleY = amp ────────── */
 
@@ -107,7 +127,22 @@ function Bar({ index, total, bufSV, color }: BarProps) {
     const head = buf.length - 1;
     const sampleIdx = head - (total - 1 - index);
     const raw = sampleIdx >= 0 ? buf[sampleIdx] ?? 0 : 0;
-    const amp = Math.max(MIN_AMP, Math.min(1, raw));
+    /**
+     * Der Nachbar zieht mit — ein Balken springt nicht aus dem Nichts.
+     *
+     * Jeder Wert ist die lauteste Stelle seines Zeitfensters, und zwischen zwei
+     * Fenstern kann das weit auseinanderliegen. Gemittelt mit dem vorherigen
+     * bleibt der Ausschlag erhalten, die Spur liest sich aber als Kurve statt
+     * als Zaun.
+     */
+    const prev = sampleIdx - 1 >= 0 ? buf[sampleIdx - 1] ?? raw : raw;
+    const amp = Math.max(MIN_AMP, Math.min(1, raw * 0.7 + prev * 0.3));
+    /**
+     * `scaleY` um die MITTE — der Balken füllt die volle Höhe des Ausschnitts
+     * und wird von seinem Mittelpunkt aus gestaucht. Er wächst dadurch von
+     * selbst gleich weit nach oben wie nach unten; eine Mittellinie oder zwei
+     * getrennte Hälften braucht es dafür nicht.
+     */
     return { transform: [{ scaleY: amp }] };
   });
 
@@ -131,7 +166,12 @@ function Bar({ index, total, bufSV, color }: BarProps) {
 
 /* ──── Waveform — Sampler + Bars ─────────────────────────────────── */
 
-function Waveform({
+/**
+ * Wird auch vom neuen Mikrofon-Kasten benutzt (`MicBox`) — deshalb ausgeführt.
+ * Es gibt bewusst nur EINE Wellenform in der App; diese Datei ist ihr Ort,
+ * auch wenn der Rest darin gerade nicht eingebaut ist.
+ */
+export const Waveform = memo(function Waveform({
   recording,
   paused,
   micVolumeSV,
@@ -148,8 +188,20 @@ function Waveform({
   );
 
   const bufSV = useSharedValue<number[]>([]);
+  /**
+   * Lautester Wert SEIT dem letzten Balken — nicht der Wert im Augenblick des
+   * Abtastens.
+   *
+   * Das Mikrofon meldet etwa alle 100ms, abgetastet wird alle 80ms: Ein
+   * Momentwert verpasst damit regelmäßig genau die Spitze einer Silbe, und die
+   * Spur wirkt teilnahmslos. Über das Maximum zwischen zwei Balken landet jede
+   * Silbe in der Spur — das ist der Unterschied zwischen „zappelt zufällig" und
+   * „reagiert auf die Stimme".
+   */
+  const peak = useSharedValue(0);
   const phase = useSharedValue(0);
-  const lastSampleTs = useSharedValue(0);
+  /** Bei welchem ganzen Schritt der letzte Balken entstanden ist. */
+  const lastStep = useSharedValue(0);
   const lastFrameTs = useSharedValue(0);
 
   // Recording-State auf UI-Thread spiegeln damit die Frame-Callback (worklet)
@@ -164,7 +216,6 @@ function Waveform({
     const ts = info.timestamp;
     if (lastFrameTs.value === 0) {
       lastFrameTs.value = ts;
-      lastSampleTs.value = ts;
       return;
     }
     const dt = ts - lastFrameTs.value;
@@ -174,10 +225,27 @@ function Waveform({
     // Phase wächst kontinuierlich → smoothes sub-Pitch Scrolling.
     phase.value = phase.value + dt / TICK_MS;
 
-    // Sample alle TICK_MS einen neuen Volume-Wert in den Buffer schreiben.
-    if (ts - lastSampleTs.value >= TICK_MS) {
-      lastSampleTs.value = ts;
-      const v = micVolumeSV.value;
+    // Zwischen zwei Balken die lauteste Stelle festhalten.
+    if (micVolumeSV.value > peak.value) peak.value = micVolumeSV.value;
+
+    /**
+     * Ein neuer Balken entsteht GENAU dann, wenn die Phase einen ganzen Schritt
+     * weiter ist — nicht nach einer eigenen Stoppuhr.
+     *
+     * Das war das Zittern: Die Verschiebung lief über `phase`, der neue Balken
+     * über einen Zeitvergleich. Zwei Uhren für dieselbe Sache, und zwischen
+     * ihnen sammelte sich ein Bruchteil an. Der Streifen sprang beim Weiterzählen
+     * mal etwas zu früh, mal etwas zu spät zurück — sichtbar als Ruckeln, obwohl
+     * beide für sich gleichmäßig liefen.
+     *
+     * Ein Schritt, eine Quelle: Jetzt fällt der Rücksprung der Verschiebung
+     * exakt auf den neuen Balken.
+     */
+    const step = Math.floor(phase.value);
+    if (step > lastStep.value) {
+      lastStep.value = step;
+      const v = peak.value;
+      peak.value = micVolumeSV.value;
       const next = [...bufSV.value, v];
       // Buffer-Cap: nur die letzten ~maxBars Samples behalten.
       const cap = total + 2;
@@ -195,19 +263,35 @@ function Waveform({
     // `paused` hält ihn auch für die Dauer einer Fahrt an — siehe dort. Die
     // Balken behalten dabei ihre letzten Werte, genau wie beim Pausieren der
     // Aufnahme.
-    frameCb.setActive(recording && !paused);
-  }, [frameCb, recording, paused]);
+    const active = recording && !paused;
+    /**
+     * Beim Anhalten den Zeitstempel löschen.
+     *
+     * Ohne das rechnet der erste Bild-Rückruf nach dem Fortsetzen die GANZE
+     * Pause in `dt` — die Spur springt dann um so viele Balken weiter, wie die
+     * Pause lang war, und der Ton dazu fehlt. Bei zehn Sekunden Pause ist die
+     * sichtbare Historie damit in einem Bild weg.
+     */
+    if (!active) lastFrameTs.value = 0;
+    frameCb.setActive(active);
+  }, [frameCb, recording, paused, lastFrameTs]);
 
   const scrollStyle = useAnimatedStyle(() => {
     "worklet";
     const sub = phase.value - Math.floor(phase.value);
+    /**
+     * Bewusst NICHT auf ganze Pixel gerundet.
+     *
+     * Beim Kartenstapel war das Runden richtig — dort ruht die Fläche am Ende.
+     * Hier rollt sie dauerhaft, und zwar langsam: rund ein Achtel Pixel je Bild.
+     * Gerundet stünde der Streifen sechs Bilder still und spränge dann um ein
+     * ganzes — das wäre erst recht ein Ruckeln.
+     */
     return { transform: [{ translateX: -sub * PITCH }] };
   });
 
   return (
     <View style={styles.waveClip} onLayout={(e) => setWidth(e.nativeEvent.layout.width)}>
-      {/* Mittellinie (subtil) als Referenz für die +/- Auslenkung */}
-      <View style={[styles.centerLine, { backgroundColor: accent.solid, opacity: 0.15 }]} />
       {/* Der gemeinsame Rahmen trägt die Verschiebung — siehe Begründung an `Bar`. */}
       <Animated.View style={[StyleSheet.absoluteFill, scrollStyle]} pointerEvents="none">
         {total > 0
@@ -224,7 +308,7 @@ function Waveform({
       </Animated.View>
     </View>
   );
-}
+});
 
 /* ──── Pulsierender Aufnahme-Dot ─────────────────────────────────── */
 
@@ -380,13 +464,6 @@ const styles = scaledStyles({
     height: HALF_H * 2,
     overflow: "hidden",
     justifyContent: "center",
-  },
-  centerLine: {
-    position: "absolute",
-    left: 0,
-    right: 0,
-    top: HALF_H - 0.5,
-    height: 1,
   },
   barBase: {
     position: "absolute",

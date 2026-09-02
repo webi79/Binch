@@ -7,14 +7,14 @@ import { usePalette } from "@/lib/theme/appBg";
 import { scaledStyles } from "@/lib/ui/compact";
 
 const C = {
-  sheet: "#1F1F20",
-  border: "#2E2E30",
-  white: "#FFFFFF",
+  sheet: "#171719",
+  border: "#212123",
+  white: "#F4F4F5",
   gray1: "#C8C8CC",
-  gray2: "#8A8A90",
+  gray2: "#8E8E93",
   black: "#000000",
   red: "#FF3B5C",
-  surface3: "#2A2A2C",
+  surface3: "#212123",
 };
 
 /** Mounted once at the app root. Renders styled alerts triggered via `showAlert(...)`. */
@@ -48,7 +48,9 @@ export function AppAlertHost() {
         <Animated.View
           entering={ZoomIn.duration(200)}
           exiting={ZoomOut.duration(150)}
-          style={[styles.dialog, { backgroundColor: palette.s1 }]}
+          // Ein Dialog ist eine BOX auf der Verdunkelung, kein Blatt —
+          // dieselbe Stufe wie die beiden anderen Alerts der App.
+          style={[styles.dialog, { backgroundColor: palette.s2 }]}
         >
           {title ? <Text style={styles.title}>{title}</Text> : null}
           {body ? <Text style={styles.body}>{body}</Text> : null}

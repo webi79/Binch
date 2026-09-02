@@ -261,9 +261,9 @@ export default function RootLayout() {
                 }}
               />
             </Stack>
-            {/* KEIN Dim mehr: Der Home ist von sich aus #1A1A1A = exakt die
+            {/* KEIN Dim mehr: Der Home ist von sich aus #0D0D0D = exakt die
                 Box-Endfarbe. Ein Dim (schwarz → Farb-Stufe; oder deckend
-                #1A1A1A → Bildschirm „ploppt" vor Expand-Ende in die Endfarbe)
+                #0D0D0D → Bildschirm „ploppt" vor Expand-Ende in die Endfarbe)
                 zerstört beides Mal den Expand. Die Box wächst jetzt sichtbar
                 über den echten (farbgleichen) Home. */}
             {/* StopDetailSheet wird hier registriert (nicht in den Tabs)

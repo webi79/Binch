@@ -440,7 +440,7 @@ function AddTicketSheet({
                         { opacity: pressed ? 0.85 : 1 },
                       ]}
                     >
-                      <Icon size={22} color="#FFFFFF" strokeWidth={1.8} />
+                      <Icon size={22} color="#F4F4F5" strokeWidth={1.8} />
                       <Text style={styles.tileLabel}>{t(m.labelKey)}</Text>
                     </RippleTouch>
                   );
@@ -464,7 +464,7 @@ const styles = scaledStyles({
   // gewandert, weil diese Ebene das Blatt nicht mehr enthält.
   backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.6)" },
   sheet: {
-    backgroundColor: "#1F1F20",
+    backgroundColor: "#171719",
     borderTopLeftRadius: 28,
     borderTopRightRadius: 28,
     paddingHorizontal: 20,
@@ -473,8 +473,8 @@ const styles = scaledStyles({
   root: { flex: 1 },
   handleWrap: { alignItems: "center", paddingTop: 12, paddingBottom: 16 },
   handle: { width: 40, height: 4, borderRadius: 9999, backgroundColor: "#FFFFFF" },
-  title: { fontSize: 18, fontWeight: "700", color: "#FFFFFF", marginBottom: 6 },
-  subtitle: { fontSize: 13, color: "#8A8A90", marginBottom: 18, lineHeight: 18 },
+  title: { fontSize: 18, fontWeight: "700", color: "#F4F4F5", marginBottom: 6 },
+  subtitle: { fontSize: 13, color: "#8E8E93", marginBottom: 18, lineHeight: 18 },
   tilesRow: {
     flexDirection: "row",
     flexWrap: "wrap",
@@ -486,13 +486,13 @@ const styles = scaledStyles({
     flexGrow: 1,
     paddingVertical: 18,
     borderRadius: 14,
-    backgroundColor: "#1F1F20",
+    backgroundColor: "#171719",
     borderWidth: 1,
-    borderColor: "#2E2E30",
+    borderColor: "#212123",
     alignItems: "center",
     gap: 8,
   },
-  tileLabel: { fontSize: 13, fontWeight: "600", color: "#FFFFFF" },
+  tileLabel: { fontSize: 13, fontWeight: "600", color: "#F4F4F5" },
   hint: { fontSize: 12, color: "#56565C", textAlign: "center", lineHeight: 18, paddingHorizontal: 6, marginTop: 6 },
   busyWrap: { alignItems: "center", justifyContent: "center", paddingVertical: 50, gap: 14 },
   busyText: { fontSize: 14, color: "#C8C8CC" },

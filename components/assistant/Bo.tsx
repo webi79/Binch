@@ -55,7 +55,7 @@ const EASE = Easing.inOut(Easing.ease);
 const ERROR_COLOR = "#FF7A6B";
 const GHOST_TOP = "#FFFFFF";
 const GHOST_BOTTOM = "#E9ECEC";
-const INK = "#1A1A1A";
+const INK = "#0D0D0D";
 const SWEAT = "#7FD4FF";
 
 interface Props {
@@ -679,10 +679,10 @@ function BoInner({ state = "idle", size = 128, paused = false }: Props) {
             <AG animatedProps={eyesProps}>
               <Ellipse cx={76} cy={120} rx={16} ry={21} fill={INK} />
               <Ellipse cx={124} cy={120} rx={16} ry={21} fill={INK} />
-              <Circle cx={82} cy={112} r={5.5} fill="#FFFFFF" />
-              <Circle cx={130} cy={112} r={5.5} fill="#FFFFFF" />
-              <Circle cx={71} cy={126} r={2.6} fill="#FFFFFF" opacity={0.7} />
-              <Circle cx={119} cy={126} r={2.6} fill="#FFFFFF" opacity={0.7} />
+              <Circle cx={82} cy={112} r={5.5} fill="#F4F4F5" />
+              <Circle cx={130} cy={112} r={5.5} fill="#F4F4F5" />
+              <Circle cx={71} cy={126} r={2.6} fill="#F4F4F5" opacity={0.7} />
+              <Circle cx={119} cy={126} r={2.6} fill="#F4F4F5" opacity={0.7} />
             </AG>
           </G>
 

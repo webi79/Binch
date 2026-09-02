@@ -42,5 +42,5 @@ export function VoiceOverlay() {
 }
 
 const styles = scaledStyles({
-  sheet: { backgroundColor: "#1A1A1A" },
+  sheet: { backgroundColor: "#0D0D0D" },
 });

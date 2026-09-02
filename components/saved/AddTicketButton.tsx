@@ -8,7 +8,7 @@ import { ms, scaledStyles } from "@/lib/ui/compact";
 
 // App-Farben (Akzent kommt live aus useAccent(), Flächen aus usePalette()):
 const META = "#7E7E86";
-const BARCODE = "#3A3A3D";
+const BARCODE = "#2D2D31";
 
 /**
  * Auch diese beiden über `ms`.
@@ -152,7 +152,7 @@ const styles = scaledStyles({
   title: {
     fontSize: 17,
     fontWeight: "700",
-    color: "#FFFFFF",
+    color: "#F4F4F5",
     letterSpacing: -0.2,
   },
   meta: {

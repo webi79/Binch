@@ -25,14 +25,14 @@ import { intlLocale } from "@/lib/i18n/intl";
 import { scaledStyles } from "@/lib/ui/compact";
 
 const C = {
-  bg: "#1A1A1A",
-  surface: "#242425",
-  surface3: "#2A2A2C",
-  border: "#2E2E30",
-  dashed: "#3A3A3E",
-  white: "#FFFFFF",
+  bg: "#0D0D0D",
+  surface: "#171719",
+  surface3: "#212123",
+  border: "#212123",
+  dashed: "#2D2D31",
+  white: "#F4F4F5",
   gray200: "#C8C8CC",
-  gray300: "#8A8A90",
+  gray300: "#8E8E93",
   gray400: "#56565C",
 };
 

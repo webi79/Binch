@@ -62,6 +62,7 @@ export function SaveToast({
       pointerEvents="box-none"
       style={[styles.wrap, { top: topOffset, opacity: anim, transform: [{ translateY }] }]}
     >
+      {/* Schwebende Meldung — derselbe Ton wie der gespeicherte-Trip-Toast. */}
       <View style={[styles.card, { backgroundColor: palette.s2 }]}>
         <View style={[styles.check, { backgroundColor: accent.solid }]}>
           <Svg width={22} height={22} viewBox="0 0 24 24">
@@ -106,7 +107,7 @@ const styles = scaledStyles({
     paddingVertical: 12,
     paddingHorizontal: 15,
     borderRadius: 20,
-    backgroundColor: "#242425",
+    backgroundColor: "#171719",
     shadowColor: "#000",
     shadowOpacity: 0.6,
     shadowRadius: 22,
@@ -121,7 +122,7 @@ const styles = scaledStyles({
     justifyContent: "center",
   },
   textCol: { flex: 1, minWidth: 0 },
-  title: { color: "#FFFFFF", fontSize: 15, fontWeight: "700", lineHeight: 18 },
-  subtitle: { color: "#8A8A90", fontSize: 11, fontWeight: "600", letterSpacing: 0.6, marginTop: 3 },
-  action: { color: "#FFFFFF", fontSize: 14, fontWeight: "600", textDecorationLine: "underline" },
+  title: { color: "#F4F4F5", fontSize: 15, fontWeight: "700", lineHeight: 18 },
+  subtitle: { color: "#8E8E93", fontSize: 11, fontWeight: "600", letterSpacing: 0.6, marginTop: 3 },
+  action: { color: "#F4F4F5", fontSize: 14, fontWeight: "600", textDecorationLine: "underline" },
 });

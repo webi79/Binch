@@ -22,8 +22,8 @@ import { useAccent } from "@/lib/theme/accent";
 // und innerhalb der MarkerLayer-Komponente als lokale Konstante geschadowed.
 const TRAIN_YELLOW = "#FFD60A";
 const BUS_PURPLE = "#9D5FE0";
-const WHITE = "#FFFFFF";
-const DARK = "#2A2A2C";
+const WHITE = "#F4F4F5";
+const DARK = "#212123";
 const CRUISE_BLUE = "#6B95B5";
 // Dunkelblau für U-Bahn — klar vom dunkelgrauen Tram und blauen Cruise
 // unterscheidbar.
@@ -170,7 +170,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
   }, [geojsonMain]);
   const clusterTextColorMain =
     clusterColorMain === DARK || clusterColorMain === SUBWAY_BLUE || clusterColorMain === BUS_PURPLE
-      ? "#FFFFFF"
+      ? "#F4F4F5"
       : "#14181A";
 
   // Cluster-Farbe für Airport/Cruise-Source.
@@ -178,7 +178,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
     const sample = geojsonAircr.features[0]?.properties?.kind;
     return sample === "cruise" ? CRUISE_BLUE : LIME;
   }, [geojsonAircr]);
-  const clusterTextColorAircr = clusterColorAircr === CRUISE_BLUE ? "#FFFFFF" : "#14181A";
+  const clusterTextColorAircr = clusterColorAircr === CRUISE_BLUE ? "#F4F4F5" : "#14181A";
 
   return (
     <>

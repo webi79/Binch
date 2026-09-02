@@ -23,7 +23,6 @@ import { setSheetMoving } from "@/lib/nav/searchHandoff";
 import {
   Dimensions,
   BackHandler,
-  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -42,22 +41,26 @@ import { X, Clock } from "lucide-react-native";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
 import { SlidingPanels } from "@/components/ui/SlidingPanels";
+import {
+  TimeSheetGate,
+  DEFAULT_TIME,
+  openTimeSheet,
+  closeTimeSheet,
+} from "./TimeSheet";
 import { scaledStyles } from "@/lib/ui/compact";
 import { useSearchStore } from "@/stores/searchStore";
 
 const C = {
-  bg: "#1A1A1A",
-  surface1: "#1F1F20",
-  surface2: "#242425",
-  surface3: "#2A2A2C",
-  popup: "#222223",
-  border: "#2E2E30",
-  white: "#FFFFFF",
+  bg: "#0D0D0D",
+  surface1: "#171719",
+  surface2: "#171719",
+  surface3: "#212123",
+  border: "#212123",
+  white: "#F4F4F5",
   gray200: "#C8C8CC",
-  gray300: "#8A8A90",
+  gray300: "#8E8E93",
   gray500: "#56565C",
-  gray700: "#3A3A3E",
-  wheelBg: "#161617",
+  gray700: "#2D2D31",
 };
 
 const MONTHS = [
@@ -68,7 +71,6 @@ const WD_MON = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"];
 const WD_SUN = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
 const WD_FULL = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
 
-const ITEM = 44;
 const CHEAP_DAY = 80;
 const CHEAP_MONTH = 70;
 // Wir bieten — wie die großen Apps — ein rollierendes 12-Monats-Fenster ab dem
@@ -120,7 +122,6 @@ const PARK_Y = Dimensions.get("window").height;
  */
 const PAD_BOTTOM_120 = { paddingBottom: 120 } as const;
 const PAD_H20_B120 = { paddingHorizontal: 20, paddingBottom: 120 } as const;
-const PAD_V70 = { paddingVertical: 70 } as const;
 
 type Mode = "specific" | "flexible";
 
@@ -636,9 +637,8 @@ const DatePickerContent = memo(function DatePickerContent({
     if (!initialDate) return null;
     return { y: initialDate.getFullYear(), m: initialDate.getMonth(), d: initialDate.getDate() };
   });
-  const [hour, setHour] = useState(initialDate?.getHours() ?? 9);
-  const [minute, setMinute] = useState(initialDate?.getMinutes() ?? 30);
-  const [timeOpen, setTimeOpen] = useState(false);
+  const [hour, setHour] = useState(initialDate?.getHours() ?? DEFAULT_TIME.hour);
+  const [minute, setMinute] = useState(initialDate?.getMinutes() ?? DEFAULT_TIME.minute);
   /**
    * Stabil — sonst ist das `memo()` um `ModeTabs` wirkungslos.
    *
@@ -650,7 +650,6 @@ const DatePickerContent = memo(function DatePickerContent({
     haptic("button");
     setMode(m);
   }, []);
-  const confirmBounce = usePressBounce();
   const weiterBounce = usePressBounce();
   const [selMonthKey, setSelMonthKey] = useState<string | null>(null);
   // Infinite Scroll — startet bei INITIAL_MONTHS, lädt LOAD_MORE_MONTHS
@@ -753,12 +752,12 @@ const DatePickerContent = memo(function DatePickerContent({
        * Block als Zweck angibt.
        */
       setSel(null);
-      setHour(9);
-      setMinute(30);
+      setHour(DEFAULT_TIME.hour);
+      setMinute(DEFAULT_TIME.minute);
       // Gehörte nie in diese Liste: Wer die Uhrzeit-Auswahl offen hatte und den
       // Wähler über die Zurück-Geste verließ, bekam sie beim nächsten Öffnen
       // sofort wieder vorgesetzt.
-      setTimeOpen(false);
+      closeTimeSheet();
       setMode(initialMode);
       setLoadedMonths(INITIAL_MONTHS);
       setSelMonthKey(null);
@@ -785,14 +784,6 @@ const DatePickerContent = memo(function DatePickerContent({
 
   const weekdays = startMonday ? WD_MON : WD_SUN;
   const todayVal = today.y * 372 + today.m * 31 + today.d;
-
-  const minuteValues = useMemo(() => {
-    const arr: number[] = [];
-    for (let m = 0; m < 60; m += minuteStep) arr.push(m);
-    return arr;
-  }, [minuteStep]);
-
-  const hourValues = useMemo(() => Array.from({ length: 24 }, (_, i) => i), []);
 
   // Monate werden lazy berechnet — nur die `loadedMonths` ersten kommen
   // tatsächlich in die FlatList. Beim Scrollen kommt mehr dazu.
@@ -854,11 +845,26 @@ const DatePickerContent = memo(function DatePickerContent({
     bottomTitle = hasDate ? `${selFull} · ${selTime} Uhr` : "Abreisedatum wählen";
   }
 
+  /**
+   * Das Öffnen läuft NICHT über den Zustand dieses Bauteils.
+   *
+   * Ein `setState` hier baut den gesamten Kalender neu auf — zwölf Monate, die
+   * Reiter, die Schiebe-Ebenen —, und dieser Durchgang läge unmittelbar vor der
+   * Einfahrt des Blattes. Zu sehen ist von alledem nichts; hinter der
+   * Verdunkelung ändert sich nichts. Der Merker liegt deshalb in `TimeSheet`,
+   * und daran hängt dort nur ein einziger, winziger Knoten.
+   */
   const openTime = useCallback(() => {
     if (sel == null) return;
     haptic("button");
-    setTimeOpen(true);
+    openTimeSheet();
   }, [sel]);
+
+  /** Fest — sonst baut das Blatt bei jedem Durchgang seine Rückmeldung neu ein. */
+  const applyTime = useCallback((h: number, m: number) => {
+    setHour(h);
+    setMinute(m);
+  }, []);
 
   // Stabiler onDayPress damit DayCell-memo greift.
   const onDayPress = useCallback((y: number, m: number, d: number) => {
@@ -1143,67 +1149,13 @@ const DatePickerContent = memo(function DatePickerContent({
         )}
       </View>
 
-      {/* Time Popup */}
-      <Modal visible={timeOpen} transparent animationType="fade" onRequestClose={() => setTimeOpen(false)}>
-        <Pressable style={s.backdrop} onPress={() => setTimeOpen(false)} />
-        <View style={s.popupWrap} pointerEvents="box-none">
-          <View style={[s.popup, { backgroundColor: palette.s2 }]}>
-            <View style={s.grabber} />
-            <Text style={s.popupLabel}>ABFAHRTSZEIT</Text>
-            <View style={s.bigTimeRow}>
-              <Text style={[s.bigTime, { color: accentSolid }]}>{selTime}</Text>
-              <Text style={s.bigTimeUnit}>Uhr</Text>
-            </View>
-
-            <View style={s.wheelBox}>
-              <View
-                pointerEvents="none"
-                style={[
-                  s.wheelBand,
-                  { backgroundColor: accentSubtle, borderColor: accentBorder },
-                ]}
-              />
-              <View style={s.wheelRow}>
-                <Wheel data={hourValues} value={hour} onChange={setHour} />
-                <Text style={[s.wheelColon, { color: accentSolid }]}>:</Text>
-                <Wheel data={minuteValues} value={minute} onChange={setMinute} />
-              </View>
-            </View>
-            <View style={s.wheelLabels}>
-              <Text style={s.wheelLabel}>Stunde</Text>
-              <Text style={s.wheelLabel}>Minute</Text>
-            </View>
-
-            <View style={s.popupBtns}>
-              <Pressable
-                style={[s.popupBtn, s.popupBtnGhost, { backgroundColor: palette.s3 }]}
-                onPress={() => setTimeOpen(false)}
-              >
-                <Text style={s.popupBtnGhostTxt}>Abbrechen</Text>
-              </Pressable>
-              {/* Druck-Effekt wie an den Kategorie-Kacheln im Landingscreen —
-                  derselbe Baustein, also dieselben Federwerte. */}
-              {/* Die Breitenverteilung (flex 1.4 gegen 1) gehört an DIESEN
-                  Rahmen, nicht an den Knopf darin: In einer Zeile teilt der
-                  äußerste Knoten den Platz auf. Am Knopf gelassen hätte er in
-                  seinem eigenen, senkrechten Rahmen gestreckt statt in der
-                  Zeile — die beiden Knöpfe wären gleich breit geworden. */}
-              <Animated.View style={[confirmBounce.style, s.popupBtnPrimaryWrap]}>
-                <Pressable
-                  style={[s.popupBtn, s.popupBtnPrimary, { backgroundColor: accentSolid }]}
-                  onPress={() => setTimeOpen(false)}
-                  onPressIn={confirmBounce.onPressIn}
-                  onPressOut={confirmBounce.onPressOut}
-                >
-                  <Text style={[s.popupBtnPrimaryTxt, { color: accentTextOnSolid }]}>
-                    Bestätigen
-                  </Text>
-                </Pressable>
-              </Animated.View>
-            </View>
-          </View>
-        </View>
-      </Modal>
+      {/* Uhrzeit — dasselbe Blatt von unten wie Reisende und Klasse. */}
+      <TimeSheetGate
+        hour={hour}
+        minute={minute}
+        minuteStep={minuteStep}
+        onApply={applyTime}
+      />
     </View>
   );
 });
@@ -1368,41 +1320,6 @@ const DayCell = memo(function DayCell({
   );
 });
 
-function Wheel({
-  data,
-  value,
-  onChange,
-}: {
-  data: number[];
-  value: number;
-  onChange: (v: number) => void;
-}) {
-  const idx = Math.max(0, data.indexOf(value));
-  return (
-    <ScrollView
-      style={s.wheel}
-      showsVerticalScrollIndicator={false}
-      snapToInterval={ITEM}
-      decelerationRate="fast"
-      contentContainerStyle={PAD_V70}
-      contentOffset={{ x: 0, y: idx * ITEM }}
-      onMomentumScrollEnd={(e) => {
-        const i = Math.round(e.nativeEvent.contentOffset.y / ITEM);
-        const v = data[Math.max(0, Math.min(data.length - 1, i))];
-        if (v !== value) onChange(v);
-      }}
-    >
-      {data.map((v) => (
-        <View key={v} style={s.wheelItem}>
-          <Text style={[s.wheelTxt, v === value ? s.wheelTxtActive : s.wheelTxtIdle]}>
-            {pad(v)}
-          </Text>
-        </View>
-      ))}
-    </ScrollView>
-  );
-}
-
 const s = scaledStyles({
   root: { flex: 1, backgroundColor: C.bg },
 
@@ -1551,57 +1468,4 @@ const s = scaledStyles({
   weiter: { paddingVertical: 15, paddingHorizontal: 30, borderRadius: 9999 },
   weiterTxt: { fontSize: 15, fontWeight: "700" },
 
-  // Popup
-  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(8,8,9,0.72)" },
-  popupWrap: { ...StyleSheet.absoluteFillObject, alignItems: "center", justifyContent: "center", padding: 22 },
-  popup: {
-    width: "100%",
-    maxWidth: 320,
-    backgroundColor: C.popup,
-    borderRadius: 34,
-    paddingHorizontal: 22,
-    paddingVertical: 22,
-  },
-  grabber: {
-    width: 38,
-    height: 5,
-    borderRadius: 9999,
-    backgroundColor: "#3C3C42",
-    alignSelf: "center",
-    marginBottom: 16,
-    marginTop: 2,
-  },
-  popupLabel: { fontSize: 11, color: C.gray300, letterSpacing: 1.3, fontWeight: "700", textAlign: "center" },
-  bigTimeRow: { flexDirection: "row", alignItems: "baseline", justifyContent: "center", gap: 8, marginTop: 6 },
-  bigTime: { fontSize: 46, fontWeight: "800", letterSpacing: -1.4 },
-  bigTimeUnit: { fontSize: 16, fontWeight: "600", color: C.gray300 },
-
-  wheelBox: { position: "relative", marginTop: 20, backgroundColor: C.wheelBg, borderRadius: 24, overflow: "hidden" },
-  wheelBand: {
-    position: "absolute",
-    left: 14,
-    right: 14,
-    top: "50%",
-    marginTop: -23,
-    height: 46,
-    borderWidth: 1,
-    borderRadius: 15,
-  },
-  wheelRow: { flexDirection: "row", height: 184, alignItems: "stretch" },
-  wheel: { flex: 1, height: 184 },
-  wheelItem: { height: ITEM, alignItems: "center", justifyContent: "center" },
-  wheelTxt: { fontVariant: ["tabular-nums"] },
-  wheelTxtActive: { fontSize: 24, fontWeight: "800", color: C.white },
-  wheelTxtIdle: { fontSize: 19, fontWeight: "600", color: C.gray500 },
-  wheelColon: { width: 16, textAlign: "center", fontSize: 22, fontWeight: "800", alignSelf: "center" },
-  wheelLabels: { flexDirection: "row", justifyContent: "space-around", marginTop: 8 },
-  wheelLabel: { fontSize: 10, color: C.gray500, letterSpacing: 1, fontWeight: "600" },
-
-  popupBtns: { flexDirection: "row", gap: 10, marginTop: 18 },
-  popupBtn: { paddingVertical: 15, borderRadius: 9999, alignItems: "center" },
-  popupBtnGhost: { flex: 1, backgroundColor: C.surface3 },
-  popupBtnGhostTxt: { color: C.gray200, fontSize: 15, fontWeight: "600" },
-  popupBtnPrimaryWrap: { flex: 1.4 },
-  popupBtnPrimary: {},
-  popupBtnPrimaryTxt: { fontSize: 15, fontWeight: "700" },
 });

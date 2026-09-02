@@ -81,8 +81,8 @@ const TABS = [
 const HIDE_ON = ["/search/route-map", "/search/voice"] as const;
 
 
-const ACTIVE = "#FFFFFF";
-const INACTIVE = "#8A8A90";
+const ACTIVE = "#F4F4F5";
+const INACTIVE = "#8E8E93";
 
 /**
  * Höhe der Leiste OHNE die sichere Fläche darunter.
@@ -171,9 +171,9 @@ const BADGE_RING = BADGE + 6;
  * darunter kleiner als eine Stufe im Farbwert.
  */
 const BAR_SOLID: Record<string, string> = {
-  dark: "#070708",
-  gray: "#1F1F20",
-  light: "#1F1F20",
+  dark: "#171719",
+  gray: "#171719",
+  light: "#171719",
 };
 const GLYPH_CX = ((BADGE_ICON_LEFT + BADGE_ICON_RIGHT) / 2) * PX;
 const GLYPH_CY = ((BADGE_ICON_TOP + BADGE_ICON_BOTTOM) / 2) * PX;
@@ -320,7 +320,7 @@ const TabItem = memo(function TabItem({
  *
  * EINE Farbe für beide Themen geht nicht auf: `rgba(7,7,8,0.93)` sitzt im
  * Dark-Theme richtig (Hintergrund ist dort echtes Schwarz, die Leiste hebt sich
- * gerade eben ab). Über dem Grau-Theme mit seinem #1A1A1A wirkt dieselbe Farbe
+ * gerade eben ab). Über dem Grau-Theme mit seinem #0D0D0D wirkt dieselbe Farbe
  * wie ein dunkles Loch — dort muss die Leiste HELLER sein als der Untergrund,
  * nicht dunkler, sonst liest sie sich nicht als eigene Fläche.
  *
@@ -328,15 +328,18 @@ const TabItem = memo(function TabItem({
  * durch.
  */
 const BAR_TINT: Record<string, string> = {
-  dark: "rgba(7,7,8,0.93)",
-  // Vorher rgba(32,32,34) — das war der Ton der Karten und Knöpfe (s2, #242425)
-  // und hob sich damit deutlich vom Hintergrund #1A1A1A ab; die Leiste wirkte
-  // wie ein aufgesetzter Balken. Jetzt liegt sie auf der Stufe der
-  // Eingabeflächen (s1, #1F1F20): über dem Hintergrund gemischt ergibt das rund
-  // #1E1E1F — gerade genug Abstand, um als eigene Fläche gelesen zu werden,
-  // ohne heller zu wirken als der Bildschirm darunter.
-  gray: "rgba(31,31,32,0.92)",
-  light: "rgba(31,31,32,0.92)",
+  // Dark bekommt DENSELBEN Ton wie Grau: Zwischen den Themes wechselt nur der
+  // Bildschirm, nicht die Flächen darauf (siehe lib/theme/appBg.ts).
+  dark: "rgba(23,23,25,0.92)",
+  // Die Leiste liegt auf der Stufe der Eingabeflächen (s1, #171719), nicht auf
+  // der der Karten und Knöpfe (s2): Über dem Hintergrund gemischt ergibt das
+  // rund #161618 — gerade genug Abstand, um als eigene Fläche gelesen zu
+  // werden, ohne wie ein aufgesetzter Balken zu wirken.
+  //
+  // Die Zahlen sind mit der Palette gewandert (früher rgba(31,31,32) auf
+  // #1A1A1A); das Verhältnis ist dasselbe geblieben.
+  gray: "rgba(23,23,25,0.92)",
+  light: "rgba(23,23,25,0.92)",
 };
 
 export function BinchTabBar() {
@@ -521,6 +524,7 @@ export function BinchTabBar() {
     ],
     [insets.bottom, theme],
   );
+
 
   if (hidden) return null;
 

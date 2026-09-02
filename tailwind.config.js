@@ -10,7 +10,7 @@ module.exports = {
           lime: "#7FEA4D",
           limePressed: "#3ED35A",
           green: "#7FEA4D",
-          dark: "#1A1A1A",
+          dark: "#0D0D0D",
           gray: "#5E5E5E",
         },
       },

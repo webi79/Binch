@@ -47,10 +47,10 @@ interface Props {
 }
 
 const C = {
-  card: "#242425",
-  border: "#2E2E30",
-  text: "#FFFFFF",
-  sub: "#8A8A90",
+  card: "#171719",
+  border: "#212123",
+  text: "#F4F4F5",
+  sub: "#8E8E93",
   subDim: "#56565C",
   lime: "#7FEA4D",
   black: "#000000",

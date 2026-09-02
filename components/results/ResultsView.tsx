@@ -74,13 +74,13 @@ import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 type SortKey = "cheapest" | "fastest" | "direct";
 
 const C = {
-  bg: "#1A1A1A",
-  card: "#1F1F20",
-  border: "#2E2E30",
-  surface3: "#2A2A2C",
-  text: "#FFFFFF",
+  bg: "#0D0D0D",
+  card: "#171719",
+  border: "#212123",
+  surface3: "#212123",
+  text: "#F4F4F5",
   gray200: "#C8C8CC",
-  sub: "#8A8A90",
+  sub: "#8E8E93",
   subDim: "#56565C",
   lime: "#7FEA4D",
   black: "#000000",
@@ -2205,7 +2205,7 @@ const styles = scaledStyles({
   dirToggleWrap: { paddingHorizontal: GUTTER, paddingTop: 12 },
   dirToggle: {
     flexDirection: "row",
-    backgroundColor: "#242425",
+    backgroundColor: "#171719",
     borderRadius: 16,
     padding: 4,
   },
@@ -2217,7 +2217,7 @@ const styles = scaledStyles({
     justifyContent: "center",
   },
   dirSegActive: {},
-  dirSegText: { color: "#8A8A90", fontSize: 13, fontWeight: "500" },
+  dirSegText: { color: "#8E8E93", fontSize: 13, fontWeight: "500" },
   dirSegTextActive: { color: "#000000", fontSize: 13, fontWeight: "700" },
 
   tabsRow: {

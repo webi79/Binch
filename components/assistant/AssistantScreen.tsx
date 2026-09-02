@@ -72,10 +72,11 @@ import {
   ASSISTANT_OUT,
   SCREEN_CORNER_RADIUS,
   resetAssistantPush,
+  SHEET_IN,
+  SHEET_OUT,
 } from "@/lib/nav/overlayCover";
 import { loadAuthToken } from "@/lib/auth/tokenStorage";
 import { Bo, boBodyHeight, type BoMood } from "@/components/assistant/Bo";
-import { VoiceRecordBar } from "@/components/assistant/VoiceRecordBar";
 import { ResultCard } from "@/components/results/ResultCard";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
@@ -84,6 +85,18 @@ import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
 import { ScreenHeading, HEADING_LINE_HEIGHT } from "@/components/ui/ScreenHeading";
 import { GUTTER, HEADING_TOP } from "@/lib/theme/spacing";
+import { MicBox } from "@/components/assistant/MicBox";
+import { useAudioRecorder, RecordingPresets } from "expo-audio";
+import { joinWavFiles } from "@/lib/assistant/wavJoin";
+import {
+  ensureModel,
+  isModelReady,
+  lastWhisperIssue,
+  releaseWhisper,
+  transcribeVoice,
+} from "@/lib/assistant/whisper";
+import { VoiceBubble } from "@/components/assistant/VoiceBubble";
+import * as FileSystem from "expo-file-system/legacy";
 import { useSearchStore } from "@/stores/searchStore";
 import { type StopBoardResponse } from "@/lib/api/client";
 import { streamChat, todayLocal, ChatApiError, type ChatStreamEvent, type LastSearchParams } from "@/lib/api/chat";
@@ -104,13 +117,13 @@ try {
 }
 
 const C = {
-  bg: "#1A1A1A",
-  surface2: "#242425",
-  surface3: "#2A2A2C",
-  surface4: "#323234",
-  border: "#2E2E30",
-  white: "#FFFFFF",
-  textTertiary: "#8A8A90",
+  bg: "#0D0D0D",
+  surface2: "#171719",
+  surface3: "#212123",
+  surface4: "#212123",
+  border: "#212123",
+  white: "#F4F4F5",
+  textTertiary: "#8E8E93",
   textDim: "#56565C",
   error: "#FF7A6B",
 };
@@ -153,7 +166,14 @@ type Msg =
    * Nachliefern des Textes und zum Aussortieren doppelter Treffer.
    */
   | { id: string; kind: "result"; result: SearchResult; botId: string }
-  | { id: string; kind: "user"; text: string }
+  /**
+   * Die Nachricht des Nutzers — mit Text UND, wenn gesprochen, mit Ton.
+   *
+   * Beides gehört zusammen: Angezeigt wird die Sprachnachricht, geschickt hat
+   * Bo den Text. Zwei getrennte Nachrichten wären zwei Blasen für eine Äußerung,
+   * und der Verlauf, den Bo bekommt, hängt an genau diesem `text`.
+   */
+  | { id: string; kind: "user"; text: string; audioUri?: string; audioSec?: number }
   | { id: string; kind: "error"; message: string }
   | { id: string; kind: "typing" };
 
@@ -211,6 +231,140 @@ const SLIDE_LIFT = 0;
 const SHELL_OVERFLOW: "hidden" | "visible" = SLIDE_LIFT > 0 ? "hidden" : "visible";
 
 const PARK_X = Dimensions.get("window").width;
+
+/**
+ * Höhe des Mikrofon-Kastens — ein Viertel des Bildschirms.
+ *
+ * Einmal beim Laden gelesen, aus demselben Grund wie `PARK_X` direkt darüber:
+ * Laufend gelesen wäre es ein Maß-Ereignis, das den ganzen Bildschirm samt
+ * aller gemounteten Zeilen neu rendert, und unter `adjustResize` wanderte der
+ * Wert mit der Tastatur.
+ */
+const MIC_BOX_H = Math.round(Dimensions.get("window").height * 0.25);
+
+/**
+ * Der seitliche Rand DIESES Bildschirms.
+ *
+ * Nicht `GUTTER` (20): Der Verlauf und die Eingabezeile stehen hier auf 16, und
+ * der Kasten gehört zu ihnen. Als Konstante, damit die drei nicht wieder
+ * auseinanderlaufen — vier Punkte Unterschied sieht man sofort, wenn zwei
+ * Kanten übereinander liegen.
+ */
+const CHAT_EDGE = 16;
+
+/**
+ * Läuft die Spracherkennung MIT, während aufgenommen wird?
+ *
+ * Auf diesem Gerät nicht, und das ist gemessen, nicht vermutet. Die Messzeile
+ * im Kasten zeigte drei Dinge auf einmal:
+ *
+ *   `de-DE · std · FEHLER network · P:tot(-160)`
+ *
+ *   • `std` — es war KEIN Dienst gewählt. Googles Erkenner steht auf diesem
+ *     Gerät gar nicht zur Verfügung (`getSpeechRecognitionServices()` führt ihn
+ *     nicht), also entschied das System: der Erkenner des Herstellers.
+ *   • `FEHLER network` — und der scheitert. Vorher lieferte er englisches
+ *     Kauderwelsch auf deutsche Sprache.
+ *   • `P:tot(-160)` — der Pegel unserer eigenen Aufnahme ist tot. Genau der
+ *     Wert, den `MediaRecorder.getMaxAmplitude()` liefert, wenn ein ZWEITER
+ *     Zugriff auf das Mikrofon läuft: Die Datei wird weiter geschrieben, der
+ *     Zähler bleibt stehen.
+ *
+ * Der Erkenner richtet hier also nur Schaden an: Er nimmt uns die Pegel, meldet
+ * Netzfehler und erkennt in der falschen Sprache. Ohne ihn bekommt die Aufnahme
+ * das Mikrofon für sich — und damit schlagen die Balken wieder aus.
+ *
+ * Dass die Tastatur trotzdem Deutsch versteht, ist kein Widerspruch: Sie
+ * benutzt Googles Erkennung nicht über diese Android-Schnittstelle, sondern
+ * spricht direkt mit deren Servern. Diesen Weg gibt es für Apps nicht.
+ *
+ * Die Abschrift für Bo muss deshalb woanders entstehen — siehe die Frage im
+ * Chat. Diese Zeile ist der Schalter dafür.
+ */
+/**
+ * Die Abschrift macht die App selbst — whisper.cpp auf dem Gerät.
+ *
+ * Der Grund steht ausführlich in `lib/assistant/whisper.ts`: Dieses Gerät hat
+ * genau einen Erkennungsdienst, Xiaomis eigenen, und der ignoriert die
+ * Sprachvorgabe. Alles, was wir an ihm eingestellt haben, war deshalb
+ * wirkungslos — er antwortet englisch, egal was gesprochen wurde.
+ *
+ * Mit Whisper hängt die Erkennung nicht mehr daran, was ein Hersteller
+ * mitliefert. Der Erkenner von Android läuft dann GAR NICHT mehr mit: Er wäre
+ * nicht nur nutzlos, sondern schädlich — seine Netzfehler rissen die Sitzung
+ * ab und damit die laufende Aufnahme (`recordOnly`, siehe den Patch).
+ */
+/**
+ * ABER: Der Aufnehmer des Moduls gibt es erst ab Android 13 (API 33).
+ *
+ * `ExpoSpeechService` legt ihn nur unter `SDK_INT >= TIRAMISU` an
+ * (ExpoSpeechService.kt:292) — darunter ist er schlicht `null`. Ohne ihn gibt es
+ * keine WAV-Datei, keinen Pegel und für Whisper nichts zu lesen; „nur aufnehmen"
+ * wäre auf solchen Geräten ein Knopf, der nichts tut.
+ *
+ * Deshalb hängt der ganze Weg an dieser einen Zahl. Darunter läuft die alte
+ * Aufstellung weiter: eigener Aufnehmer für die Sprachnachricht (die Blase
+ * spielt auch eine m4a-Datei) und Androids Erkenner für den Text. Auf Geräten
+ * mit einem brauchbaren Erkenner — also überall außer bei diesem Xiaomi — ist
+ * das eine ordentliche Notlösung statt einer toten Funktion.
+ *
+ * Whisper braucht ausdrücklich WAV: Sein Leser kennt nur RIFF. Was der eigene
+ * Aufnehmer schreibt, ist auf Android eine m4a — Android kann mit `MediaRecorder`
+ * gar kein WAV. Die beiden Wege lassen sich deshalb nicht mischen.
+ */
+const MODULE_RECORDS_AUDIO_SUPPORTED =
+  Platform.OS === "android" && Number(Platform.Version) >= 33;
+const USE_WHISPER = MODULE_RECORDS_AUDIO_SUPPORTED;
+const RECOGNITION_DURING_RECORDING = !USE_WHISPER;
+
+/**
+ * WER hält das Mikrofon — und warum es nur einer sein darf.
+ *
+ * Die Messzeile hat es gezeigt: `FEHLER audio-capture` und gleichzeitig
+ * `P:tot(-160)`. Beides sind Folgen desselben Streits.
+ *
+ *   • `audio-capture` ist `SpeechRecognizer.ERROR_AUDIO` — der Erkenner kam
+ *     nicht ans Mikrofon, weil unsere eigene Aufnahme es schon hielt.
+ *   • `-160 dB` ist die Null-Kennung von `MediaRecorder.getMaxAmplitude()`. Auf
+ *     diesem Gerät liefert der Zähler nichts Brauchbares, auch wenn die Datei
+ *     einwandfrei geschrieben wird.
+ *
+ * Also nur noch EIN Nehmer: das Modul selbst (`recordingOptions.persist`). Es
+ * schreibt die WAV-Datei für die Sprachnachricht UND reicht den Ton an den
+ * Erkenner weiter — und aus demselben PCM rechnet der Patch den Pegel
+ * (`patches/expo-speech-recognition+3.1.3.patch`). Damit sind Aufnahme, Pegel
+ * und Erkennung wieder aus einer Quelle, und genau in dieser Aufstellung haben
+ * die Balken zuletzt nachweislich ausgeschlagen.
+ *
+ * Der eigene Aufnehmer bleibt im Code — für das ABSPIELEN im Chat wird
+ * expo-audio weiterhin gebraucht.
+ */
+const MODULE_RECORDS_AUDIO = MODULE_RECORDS_AUDIO_SUPPORTED;
+
+/**
+ * Und zwar ausschließlich über den Erkenner AUF dem Gerät.
+ *
+ * `requiresOnDeviceRecognition: true` lässt das Modul
+ * `SpeechRecognizer.createOnDeviceSpeechRecognizer` benutzen
+ * (ExpoSpeechService.kt:94-97). Das ist ein ANDERER Weg als der über die
+ * Dienstliste: Android nimmt dafür den Erkenner, der in
+ * `config_defaultOnDeviceSpeechRecognitionService` steht — üblicherweise
+ * „Android System Intelligence", nicht der des Herstellers.
+ *
+ * Genau deshalb ist es einen Versuch wert: Über die Dienstliste kommen wir auf
+ * diesem Gerät nur an Xiaomis Erkenner, und der ignoriert die Sprache. Der
+ * Erkenner auf dem Gerät braucht dafür allerdings das deutsche Sprachpaket —
+ * fehlt es, stoßen wir den Download an (siehe `ensureOfflineModel`).
+ */
+const ON_DEVICE_ONLY = false;
+
+/** App-Sprache → Erkennungssprache. */
+const SPEECH_LANG: Record<string, string> = {
+  de: "de-DE",
+  fr: "fr-FR",
+  es: "es-ES",
+  en: "en-US",
+};
 
 /**
  * Takt des Text-Puffers — 100ms statt 50.
@@ -653,6 +807,28 @@ export function AssistantScreen() {
   // weil bei „Pause" der User die VoiceRecordBar sehen WILL, aber listening
   // dann false ist.
   const [voiceMode, setVoiceMode] = useState(false);
+  /**
+   * Solange der Mikrofon-Kasten steht, fährt die EINGABEZEILE nach unten aus
+   * dem Bild — Textfeld, Mikrofon und Senden.
+   *
+   * 0 = an ihrem Platz, 1 = um ihre eigene Höhe nach unten. Die Höhe kommt aus
+   * der Vermessung der Zeile (siehe `onLayout` unten), damit der Weg exakt
+   * stimmt: zu wenig, und ein Streifen bliebe stehen; zu viel, und sie fährt
+   * sinnlos weit.
+   *
+   * Der Rückweg hängt am Aufräumen des Effekts, nicht an den beiden Knöpfen im
+   * Kasten: So kommt die Zeile auch dann zurück, wenn der Kasten auf einem
+   * anderen Weg verschwindet — etwa weil Bo geschlossen wird, während er steht.
+   */
+  const barHide = useSharedValue(0);
+  const barTravel = useSharedValue(0);
+  useEffect(() => {
+    if (!voiceMode) return;
+    barHide.value = withTiming(1, SHEET_IN);
+    return () => {
+      barHide.value = withTiming(0, SHEET_OUT);
+    };
+  }, [voiceMode, barHide]);
   const [mood, setMood] = useState<BoMood>(() => persistedMood);
   const [listening, setListening] = useState(false);
 
@@ -1100,7 +1276,10 @@ export function AssistantScreen() {
     return kbHeight + lift;
   });
   const barAnimStyle = useAnimatedStyle(() => ({
-    transform: [{ translateY: -kbShift.value }],
+    // Zwei Wege auf derselben Achse: Die Tastatur hebt die Zeile an, der
+    // Mikrofon-Kasten schiebt sie hinunter. Sie addieren sich — offen ist immer
+    // nur einer, die Tastatur wird beim Öffnen des Kastens geschlossen.
+    transform: [{ translateY: -kbShift.value + barHide.value * barTravel.value }],
   }));
 
 
@@ -1151,33 +1330,116 @@ export function AssistantScreen() {
   // warten auf das finale Result-Event (mit isFinal=true) und schicken DANN
   // den finalen Transkript an Bo. Sonst würden wir mit dem letzten interim
   // result senden — der manchmal mid-word abgeschnitten ist.
+  /**
+   * Der Text ABGESCHLOSSENER Erkennungs-Abschnitte — und der vollständige Stand.
+   *
+   * Eine Aufnahme läuft in Abschnitten: Hält die Erkennung eine Äußerung für
+   * beendet, meldet sie ihr Ergebnis und wird neu gestartet. Der neue Abschnitt
+   * fängt mit einem LEEREN Transkript an.
+   *
+   * Genau daran ging der Text kaputt: Jedes Ergebnis überschrieb das
+   * Eingabefeld vollständig. Von „Fahr mich morgen früh nach Köln, aber
+   * möglichst günstig" kam bei Bo nur das letzte Bruchstück an — und war der
+   * letzte Abschnitt leer, kam GAR NICHTS an, obwohl gesprochen wurde.
+   *
+   * Deshalb zwei Stände: was fertig ist, und was daraus zusammen mit dem
+   * laufenden Abschnitt gerade gilt. Der zweite ist die Wahrheit für Anzeige
+   * und Versand — und als Ablage, nicht als Zustand, weil die Ereignis-Handler
+   * sonst mit dem Stand von damals arbeiten.
+   */
+  const transcriptBaseRef = useRef("");
+  const transcriptLiveRef = useRef("");
   const pendingSendRef = useRef(false);
+  /** Frist, nach der auch ohne Schluss-Ergebnis abgeschickt wird. */
+  const sendGuardRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearSendGuard = () => {
+    if (sendGuardRef.current) {
+      clearTimeout(sendGuardRef.current);
+      sendGuardRef.current = null;
+    }
+  };
+  /**
+   * Die fertige Sprachnachricht, die an der NÄCHSTEN Nutzer-Nachricht hängt.
+   *
+   * Der Weg dorthin ist zwangsläufig zweigeteilt: Der Ton steht, sobald die
+   * Aufnahme endet, der Text erst, wenn das Schluss-Ergebnis der Erkennung da
+   * ist — und erst der löst das Senden aus. Die Ablage überbrückt genau diese
+   * Lücke.
+   */
+  const pendingVoiceRef = useRef<{ uri: string; sec: number } | null>(null);
+  /** Die nächste Nachricht ist eine gesprochene — gesetzt beim Antippen von
+   *  „Senden" im Mikrofon-Kasten. */
+  const voiceSendRef = useRef(false);
   // sendRef wird unten initialisiert, hier nur deklariert damit der Result-
   // Listener Zugriff hat auch wenn `send` per Closure-Capture an alten
   // Stand kommt.
   const sendRef = useRef<((text: string) => void) | null>(null);
   const setVoiceModeRef = useRef<((on: boolean) => void) | null>(null);
 
+  /** Fehlschläge in Folge, ohne dass dazwischen etwas erkannt wurde. */
+  const errorStreakRef = useRef(0);
+  /** Einmaliger zweiter Versuch mit dem anderen Erkenner. */
+  const recognitionRetryRef = useRef(false);
+  /** Nach einem Fehlschlag: den Erkenner auf dem Gerät überspringen. */
+  const forceNetworkRef = useRef(false);
+  /** Zeiger auf `startVoice` — die Funktion steht weiter unten. */
+  const startVoiceRef = useRef<(() => Promise<void>) | null>(null);
   useSpeechRecognitionEvent("result", (e) => {
-    const text = e.results?.[0]?.transcript ?? "";
-    if (text) setInput(text);
+    const segment = e.results?.[0]?.transcript ?? "";
+    if (segment) {
+      errorStreakRef.current = 0;
+      recognitionRetryRef.current = false;
+    }
+    const base = transcriptBaseRef.current;
+    const merged = base && segment ? `${base} ${segment}` : base || segment;
+    transcriptLiveRef.current = merged;
+    if (segment) setInput(merged);
+    /**
+     * JEDES Schluss-Ergebnis wird zur Basis — nicht erst das Ende der Sitzung.
+     *
+     * Das war der eigentliche Bruch: Mit `EXTRA_SEGMENTED_SESSION` meldet
+     * Android mehrfach PRO Sitzung ein fertiges Ergebnis (`onSegmentResults`),
+     * jedes nur mit dem Text SEINES Abschnitts — und dazwischen kommt kein
+     * „end". Wurde die Basis nur dort fortgeschrieben, warf der nächste
+     * Abschnitt alles Vorherige weg. Google segmentiert bei ein bis zwei
+     * Sekunden Stille; in einem gesprochenen Satz passiert das mehrmals.
+     *
+     * Nur Schluss-Ergebnisse taugen dafür: Zwischenstände nimmt der Erkenner
+     * zurück und schreibt sie um.
+     */
+    if (e.isFinal) transcriptBaseRef.current = merged;
     // Final-Result UND pending Send → jetzt an Bo schicken.
     if (e.isFinal && pendingSendRef.current) {
       pendingSendRef.current = false;
+      clearSendGuard();
       setVoiceModeRef.current?.(false);
-      const trimmed = text.trim();
-      if (trimmed) sendRef.current?.(trimmed);
+      /**
+       * IMMER weiterreichen, auch ohne Text.
+       *
+       * Hier stand `if (trimmed)`. War nichts erkannt worden, wurde der Merker
+       * verbraucht, das Fenster geschlossen — und der Sprach-Sendeweg nie
+       * betreten. Damit blieb die Aufnahme unversendet UND ihre Tonstücke in
+       * der Liste liegen, wo sie sich an die nächste Nachricht hängten. Der
+       * Weg selbst kennt den leeren Fall längst und stellt die Aufnahme dann
+       * ohne Bo-Anfrage in den Verlauf.
+       */
+      sendRef.current?.(merged.trim());
     }
   });
   useSpeechRecognitionEvent("end", () => {
+    // Zuerst: Wer auf das Ende dieser Sitzung wartet, darf jetzt starten.
+    flushEndWaiters();
     // Pending Send → finalen Transkript schicken (oder den letzten Interim
     // wenn kein isFinal-Result kam).
     if (pendingSendRef.current) {
       setListening(false);
       pendingSendRef.current = false;
+      clearSendGuard();
       setVoiceModeRef.current?.(false);
-      const trimmed = input.trim();
-      if (trimmed) sendRef.current?.(trimmed);
+      // Aus der Ablage, NICHT aus `input`: Dieser Rückruf trägt den Stand aus
+      // dem Durchgang, in dem er angelegt wurde — bei laufender Erkennung ist
+      // das regelmäßig ein alter.
+      sendRef.current?.(transcriptLiveRef.current.trim());
       explicitStopRef.current = false;
       return;
     }
@@ -1193,7 +1455,11 @@ export function AssistantScreen() {
     // Vorher: setListening(false) + ~80ms später startVoice → Pause-Button
     // blinkte kurz auf Play (sah wie ein zufälliger Pause-State aus). Jetzt
     // bleibt listening durchgehend true → UI keine Flicker.
-    if (voiceModeRef.current) {
+    if (voiceModeRef.current && !userPausedRef.current) {
+      // Die Basis steht schon (jedes Schluss-Ergebnis schreibt sie fort). Der
+      // laufende Stand darf hier NICHT hinein: Er kann ein Zwischenstand sein,
+      // und den nimmt der Erkenner unter Umständen zurück.
+      transcriptLiveRef.current = transcriptBaseRef.current;
       autoRestartingRef.current = true;
       // Zeitgeber merken UND auf Fokus prüfen. Wechselt der Nutzer in diesen 80ms
       // den Tab, stoppt der Blur-Effekt zwar die Aufnahme, setzt aber `voiceMode`
@@ -1209,22 +1475,101 @@ export function AssistantScreen() {
     setListening(false);
   });
   useSpeechRecognitionEvent("error", (e) => {
+    // Auch ein Fehler beendet die Sitzung — sonst wartete ein Neustart
+    // vergeblich auf ein „end", das nicht mehr kommt.
+    flushEndWaiters();
     // Bei fatalen Fehlern (Permission, Audio-Capture, Network etc.) voice
     // mode sofort verlassen — Recovery nicht sinnvoll. Bei recoverable
     // Errors ("no-speech" = Silence-Timeout, kommt bei jeder Pause) NICHTS
     // tun → der end-Handler kümmert sich um Auto-Restart ohne dass
     // listening kurz auf false flackert (= sah aus wie ein zufälliger
     // Pause-Toggle in der UI).
+    /**
+     * „too-many-requests" gehört dazu, „busy" und „network" nicht.
+     *
+     * Jeder Fehler zieht ein „end" nach sich, und der dortige Zweig startet nach
+     * 80ms neu — bei einer Fehlerlage, die anhält, ist das eine enge Schleife:
+     * jedes Mal eine neue, leere Tonaufnahme in der Liste, und am Ende kein
+     * Text. Deshalb zusätzlich ein Zähler: Drei Fehlschläge hintereinander ohne
+     * ein einziges Ergebnis, und die Aufnahme wird beendet statt weiterzudrehen.
+     */
+    /**
+     * Stille zählt NICHT als Fehlschlag.
+     *
+     * Am Mikrofon meldet der Erkenner nach ein paar Sekunden ohne Sprache
+     * „no-speech" — das ist der Normalfall einer Denkpause, kein Problem. Mein
+     * Zähler nahm es als solches, und nach drei Pausen war die Aufnahme aus:
+     * „bricht random von selber ab". Gezählt wird nur, was wirklich schiefgeht.
+     */
+    const harmless = e.error === "no-speech" || e.error === "speech-timeout";
+    if (!harmless) errorStreakRef.current += 1;
+    // VORÜBERGEHEND sichtbar: Ohne den Grund ist „kein Wort verstanden" nicht
+    // von „Erkennung nie gestartet" zu unterscheiden.
+    if (!harmless) lastVoiceErrorRef.current = String(e.error ?? "?");
     const fatal =
       e.error === "not-allowed" ||
       e.error === "service-not-allowed" ||
       e.error === "audio-capture" ||
-      e.error === "language-not-supported";
+      e.error === "too-many-requests" ||
+      e.error === "language-not-supported" ||
+      errorStreakRef.current >= 3;
+    /**
+     * Fehlt das Sprachpaket, ist das der reparierbarste Fall von allen.
+     *
+     * Der Erkenner sagt damit ausdrücklich: „Diese Sprache kenne ich, sie ist
+     * nur nicht geladen." Dann hat die Dienstwahl daneben gegriffen — merken
+     * verwerfen, damit der nächste Start neu sucht und beim Netz-Erkenner
+     * landet.
+     */
+    if (e.error === "language-not-supported") recognitionPkgRef.current = null;
     if (fatal) {
+      /**
+       * Ein Fehler der ERKENNUNG beendet nicht die AUFNAHME.
+       *
+       * Genau daran ist es zuletzt gescheitert: Der Kasten ging auf und sofort
+       * wieder zu, weil ein Fehler des Erkenners den ganzen Sprachmodus
+       * abgeräumt hat. Seit Ton und Erkennung getrennt laufen, ist das falsch —
+       * die Aufnahme läuft, der Nutzer spricht, und ob nebenbei eine Abschrift
+       * entsteht, ist eine andere Frage.
+       *
+       * Also nur die Erkennung anhalten. Und einmal mit dem ANDEREN Erkenner
+       * versuchen: Der auf dem Gerät wird zuerst genommen (die Tastatur benutzt
+       * ihn), aber wenn er in dieser Zusammenstellung nicht will, gibt es noch
+       * den über das Netz.
+       */
       setListening(false);
-      setVoiceModeRef.current?.(false);
-      pendingSendRef.current = false;
+      /**
+       * Lief gerade ein Absenden, wird es JETZT zu Ende gebracht.
+       *
+       * Hier stand nur `pendingSendRef.current = false`. Traf ein Fehler in die
+       * 700ms zwischen „Senden gedrückt" und dem Schluss-Ergebnis, war der
+       * Merker damit verbraucht: Die Frist fand nichts mehr vor, das folgende
+       * „end" sah den Merker auf false — und die Sprachnachricht verschwand
+       * ersatzlos. Genau das „manchmal wird nichts abgesendet".
+       */
+      if (pendingSendRef.current) {
+        pendingSendRef.current = false;
+        clearSendGuard();
+        setVoiceModeRef.current?.(false);
+        sendRef.current?.(transcriptLiveRef.current.trim());
+      }
       explicitStopRef.current = false;
+      errorStreakRef.current = 0;
+      // Auf dem Gerät gibt es keinen zweiten Kandidaten: Der Weg über die
+      // Dienstliste führt hier nur zu Xiaomis Erkenner, und der ist der Grund
+      // für Kauderwelsch und Netzfehler. Dann lieber ohne Abschrift als mit
+      // einer falschen — die Aufnahme läuft ohnehin weiter.
+      if (!ON_DEVICE_ONLY && !recognitionRetryRef.current && voiceModeRef.current) {
+        recognitionRetryRef.current = true;
+        // Beim zweiten Versuch GAR KEINEN Dienst vorgeben: Lässt sich der
+        // gewählte nicht binden („Bind to system recognition service failed"),
+        // ist der Standard des Systems die einzige verbleibende Möglichkeit.
+        recognitionPkgRef.current = { lang: SPEECH_LANG[locale] ?? "en-US", pkg: "" };
+        forceNetworkRef.current = true;
+        setTimeout(() => {
+          if (voiceModeRef.current && !userPausedRef.current) void startVoiceRef.current?.();
+        }, 200);
+      }
     }
   });
 
@@ -1234,43 +1579,808 @@ export function AssistantScreen() {
    *  was bei linearer /10 Normalisierung zu fast unsichtbaren Balken führt.
    *  Daher: Math.pow(_, 0.5) als kompressive Kurve — pusht leise Sprache in
    *  den sichtbaren Bereich, sättigt bei lauten Spitzen. */
-  const micVolumeSV = useSharedValue(0);
-  useSpeechRecognitionEvent("volumechange", (e) => {
-    const raw = Math.max(0, e.value);
-    const norm = Math.min(1, Math.pow(raw / 5, 0.5));
-    micVolumeSV.value = norm;
+  /**
+   * Die Tonstücke der laufenden Aufnahme.
+   *
+   * Mehrere, weil eine Aufnahme in Stücken entstehen kann: Die Erkennung endet
+   * bei Stille von selbst und läuft neu an, und wer pausiert und fortsetzt,
+   * beginnt ohnehin ein neues. Beim Senden werden sie zu einer Datei
+   * zusammengefügt (`joinWavFiles`).
+   */
+  /**
+   * Der Ton wird SELBST aufgenommen — getrennt von der Erkennung.
+   *
+   * Das ist der Kern des Umbaus, und der Anstoß war die Beobachtung, dass die
+   * Spracheingabe der Tastatur einwandfrei Deutsch versteht: Sie lässt den
+   * Erkenner ans MIKROFON. Wir haben ihm stattdessen einen Datenstrom
+   * hingeschoben (`EXTRA_AUDIO_SOURCE`) — nötig, weil das Modul nur so nebenbei
+   * eine Datei schreibt. In diesem Modus liefert derselbe Erkenner auf demselben
+   * Gerät Unsinn: englische Brocken auf deutsche Sprache.
+   *
+   * Also getrennt. Der Erkenner bekommt das Mikrofon wie bei der Tastatur; die
+   * Aufnahme läuft daneben und DURCHGEHEND — sie hat mit den Abschnitten der
+   * Erkennung nichts mehr zu tun. Damit entfällt alles, was hier vorher stand:
+   * Stückliste, Generationen, Warten auf `audioend`, Zusammenfügen.
+   */
+  const recorder = useAudioRecorder({
+    ...RecordingPresets.HIGH_QUALITY,
+    isMeteringEnabled: true,
   });
+  const recordingRef = useRef(false);
+  /** Sichtbarer Zustand der Tonaufnahme — treibt Tonspur und Uhr im Kasten. */
+  const [micRecording, setMicRecording] = useState(false);
+  /** Läuft gerade eine Abschrift? (Whisper braucht ein paar Sekunden.) */
+  const [transcribing, setTranscribing] = useState(false);
+  /** Warum die letzte Abschrift leer blieb — entscheidet über die Meldung. */
+  const transcribeReasonRef = useRef("");
+  /** Ladefortschritt des Sprachmodells (0..1), -1 = kein Laden nötig/aktiv. */
+  const [modelProgress, setModelProgress] = useState(-1);
+
+
+  /**
+   * Das Sprachmodell holen, sobald jemand aufnimmt.
+   *
+   * Nicht beim Start der App: 60 MB ungefragt zu laden, weil jemand die App
+   * öffnet, wäre über Mobilfunk eine Unverschämtheit. Wer den Mikrofon-Knopf
+   * drückt, will dagegen sprechen — und die AUFNAHME läuft sofort, unabhängig
+   * davon, wie weit das Modell ist. Gebraucht wird es erst beim Absenden.
+   */
+  useEffect(() => {
+    if (!USE_WHISPER || !voiceMode) return;
+    let alive = true;
+    void (async () => {
+      if (await isModelReady()) return;
+      if (!alive) return;
+      setModelProgress(0);
+      const ok = await ensureModel((p) => {
+        if (alive) setModelProgress(p);
+      });
+      if (alive) setModelProgress(ok ? -1 : -1);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [voiceMode]);
+
+  /**
+   * Eine Zeile, zwei Wartezeiten — die jeweils zutreffende gewinnt.
+   */
+  const voiceStatus = transcribing
+    ? t("assistant.voice.transcribing")
+    : modelProgress >= 0
+      ? `${t("assistant.voice.loadingmodel")} ${Math.round(modelProgress * 100)}%`
+      : "";
+  /** Spiegel von `listening` für die Ereignis-Rückrufe — die laufen außerhalb
+   *  von React und sähen sonst den Stand ihres Durchgangs. */
+  const listeningRef = useRef(false);
+
+  const micVolumeSV = useSharedValue(0);
+  /**
+   * Fester Maßstab — der mitlaufende war der Fehler.
+   *
+   * Vorher richtete sich der Ausschlag nach dem lautesten Wert der letzten
+   * Sekunden, und dieser Bezugspunkt sank danach langsam ab. Dadurch zeigte
+   * DIESELBE Stimme mal hohe, mal niedrige Balken, je nachdem was kurz vorher
+   * passiert war — genau die „komischen Ausschläge".
+   *
+   * Seit der Pegel aus unserem eigenen PCM kommt (siehe Patch), ist der Bereich
+   * auch bekannt und muss nicht mehr geschätzt werden: Der Effektivwert liegt
+   * bei Sprache typisch zwischen 0,2 und 3. Ein fester Nenner darauf ist
+   * vorhersehbar — gleich laut heißt gleich hoch, immer.
+   */
+  /**
+   * Der Pegel kommt aus der eigenen Aufnahme, nicht mehr vom Erkenner.
+   *
+   * Zwei Gründe: Der Erkenner meldet ihn nur, wenn er selbst am Mikrofon hängt —
+   * und selbst dann ist der Wertebereich von Gerät zu Gerät verschieden. Der
+   * Aufnehmer liefert Dezibel (etwa -60 bis 0), also eine bekannte Skala.
+   *
+   * Abgefragt statt abonniert, und ohne React: Ein Zustandswechsel zehnmal je
+   * Sekunde würde den ganzen Bildschirm neu rendern. So schreibt der Takt nur
+   * in den geteilten Wert, den die Balken lesen.
+   */
+  /**
+   * Der Pegel kommt vom ERKENNER — und das war zuletzt genau der Fehler.
+   *
+   * Als das Modul noch selbst aufnahm, meldete der Erkenner keinen Pegel; ich
+   * habe deshalb auf den eigenen Aufnehmer umgestellt. Seit er wieder direkt am
+   * Mikrofon hängt, meldet er ihn — nur hatte ich den Zuhörer beim Umbau
+   * entfernt. Die Meldungen liefen also die ganze Zeit ins Leere.
+   *
+   * Der Weg über den Aufnehmer scheidet ohnehin aus: `getMaxAmplitude()` bleibt
+   * bei doppeltem Mikrofon-Zugriff auf 0, und daraus macht expo-audio hart
+   * -160 dB — ein Wert, aus dem kein Ausschlag mehr wird.
+   */
+  /**
+   * Die Tonstücke aus der Aufnahme des Moduls.
+   *
+   * Mehrere, weil die Erkennung bei Stille endet und neu anläuft — jedes Mal
+   * beginnt eine neue Datei. Beim Senden werden sie zu einer zusammengefügt
+   * (`joinWavFiles`); die Lücke dazwischen ist die einzige, die bleibt.
+   */
+  const audioPartsRef = useRef<string[]>([]);
+  const audioStartedAtRef = useRef(0);
+  const audioSecRef = useRef(0);
+  const audioEndWaitersRef = useRef<(() => void)[]>([]);
+  useSpeechRecognitionEvent("audiostart", (e) => {
+    if (e.uri && !audioPartsRef.current.includes(e.uri)) audioPartsRef.current.push(e.uri);
+    audioStartedAtRef.current = Date.now();
+  });
+  useSpeechRecognitionEvent("audioend", (e) => {
+    if (e.uri && !audioPartsRef.current.includes(e.uri)) audioPartsRef.current.push(e.uri);
+    if (audioStartedAtRef.current > 0) {
+      audioSecRef.current += (Date.now() - audioStartedAtRef.current) / 1000;
+      audioStartedAtRef.current = 0;
+    }
+    const waiting = audioEndWaitersRef.current;
+    audioEndWaitersRef.current = [];
+    for (const done of waiting) done();
+  });
+
+  const lastVolumeAtRef = useRef(0);
+  useSpeechRecognitionEvent("volumechange", (e) => {
+    // Android meldet `rmsdB`, laut Modul etwa -2 bis 10.
+    const raw = typeof e?.value === "number" ? e.value : -2;
+    const norm = Math.max(0, Math.min(1, (raw + 2) / 12));
+    // Kleiner Exponent hebt normale Sprechlautstärke (etwa 1 bis 4) sichtbar an.
+    micVolumeSV.value = Math.pow(norm, 0.6);
+    lastVolumeAtRef.current = Date.now();
+  });
+
+  /**
+   * ZWEITE Quelle: der eigene Aufnehmer.
+   *
+   * Der Pegel des Erkenners ist freiwillig — ob ein Dienst ihn meldet, steht
+   * nirgends geschrieben, und der Hersteller-Dienst auf diesem Gerät tut es
+   * offenbar nicht. Der Aufnehmer läuft dagegen immer.
+   *
+   * Er greift nur, wenn vom Erkenner seit einer Viertelsekunde nichts kam, und
+   * nur mit einem brauchbaren Wert: expo-audio meldet bei Amplitude null hart
+   * -160 dB, und das heißt „keine Messung", nicht „Stille".
+   *
+   */
+  useEffect(() => {
+    if (!micRecording) return;
+    const id = setInterval(() => {
+      if (Date.now() - lastVolumeAtRef.current < 250) return;
+      if (MODULE_RECORDS_AUDIO) {
+        // Der eigene Aufnehmer läuft in dieser Aufstellung gar nicht — ihn zu
+        // fragen ergäbe nur die -160, mit denen sein Zähler „keine Messung"
+        // meldet. Also einfach abklingen lassen.
+        micVolumeSV.value = micVolumeSV.value * 0.7;
+        return;
+      }
+      let db: number | undefined;
+      try {
+        db = recorder.getStatus?.().metering;
+      } catch {
+        db = undefined;
+      }
+      if (typeof db === "number" && db > -159) {
+        const norm = Math.max(0, Math.min(1, (db + 55) / 55));
+        micVolumeSV.value = Math.pow(norm, 1.2);
+        return;
+      }
+      // Keine Quelle: abklingen lassen statt einfrieren.
+      micVolumeSV.value = micVolumeSV.value * 0.7;
+    }, 100);
+    return () => clearInterval(id);
+  }, [micRecording, recorder, micVolumeSV]);
+
+
+
+  /**
+   * VORÜBERGEHEND: In welcher Sprache wird wirklich erkannt?
+   *
+   * Das Ereignis kommt nur, wenn `EXTRA_ENABLE_LANGUAGE_DETECTION` gesetzt ist
+   * (siehe `startVoice`). Es beantwortet die eine Frage, die von hier aus nicht
+   * zu klären war: Schickt der Dienst deutsch los und antwortet englisch, liegt
+   * es an ihm — nicht an unserem Code.
+   */
+  const lastVoiceErrorRef = useRef("");
+  /** Zustand des deutschen Sprachpakets (nur auf dem Weg über Androids
+   *  Erkenner, siehe `USE_WHISPER`). */
+  const offlineModelRef = useRef("?");
+  /**
+   * VORÜBERGEHEND: Was die Erkennung gerade tut.
+   *
+   * Die Zeile lief zuletzt über das `languagedetection`-Ereignis — und weil die
+   * Erkennung gar nicht erst startete, kam sie nie. Jetzt steht sie unabhängig
+   * davon: Sprache, gewählter Dienst, und ob Wörter ankommen oder ein Fehler.
+   */
+
+
+  /**
+   * Läuft gerade ein Beenden, auf das noch kein „end" gefolgt ist?
+   *
+   * DAS war der Grund, warum „Fortsetzen" erst beim ZWEITEN Druck ging:
+   * `stop()` wirkt nicht sofort. Die native Erkennung räumt ihre Sitzung ab und
+   * meldet erst danach „end". Ein `start()` in diesem Fenster fällt bei Android
+   * auf den beschäftigten Erkenner und wird verworfen — sichtbar passiert
+   * nichts. Beim zweiten Druck war das Abräumen durch, und es lief.
+   *
+   * Also: Wer starten will, wartet auf das „end" der vorigen Sitzung. Nicht auf
+   * eine feste Zeit — die wäre auf schnellen Geräten Verschwendung und auf
+   * langsamen zu kurz —, sondern auf die Meldung selbst, mit einer halben
+   * Sekunde als Notausstieg, falls sie ausbleibt.
+   */
+  const sessionEndingRef = useRef(false);
+  const endWaitersRef = useRef<(() => void)[]>([]);
+  const flushEndWaiters = useCallback(() => {
+    sessionEndingRef.current = false;
+    const waiting = endWaitersRef.current;
+    endWaitersRef.current = [];
+    for (const done of waiting) done();
+  }, []);
+
+  /**
+   * WELCHER Dienst erkennt — und zwar einer, der unsere Sprache WIRKLICH kann.
+   *
+   * Android hat nicht einen Spracherkenner, sondern so viele wie installiert
+   * sind, und sie verhalten sich verschieden:
+   *
+   *   • `com.google.android.googlequicksearchbox` — über das Netz, kennt
+   *     praktisch jede Sprache. Der Wunschkandidat.
+   *   • `com.google.android.as` — läuft AUF DEM GERÄT und kennt nur, was dort
+   *     heruntergeladen ist. Bewusst ausgeschlossen: Er meldet Sprachen auch
+   *     dann als „unterstützt", wenn das Modell fehlt, und erkennt dann in dem,
+   *     was da ist — meist Englisch. Genau das war „deutsch gesprochen,
+   *     englisch geschrieben".
+   *   • Herstellereigene (Bixby & Co.) — letzte Wahl; viele ignorieren die
+   *     Sprachvorgabe.
+   *
+   * Gefragt wird mit `getSupportedLocales`, und zwar nach der BASISsprache:
+   * Ein Erkenner, der `de-AT` führt, versteht auch Deutsch.
+   */
+  const recognitionPkgRef = useRef<{ lang: string; pkg: string } | null>(null);
+  const resolveRecognitionService = useCallback(
+    async (lang: string): Promise<string | undefined> => {
+      if (Platform.OS !== "android") return undefined;
+      const cached = recognitionPkgRef.current;
+      // Ein LEERES Ergebnis wird nicht gemerkt: Es bedeutet „gerade nicht
+      // feststellbar", nicht „gibt es nicht". Sonst bliebe die App für den Rest
+      // des Laufs beim Standard-Erkenner des Systems — und der ist auf manchen
+      // Geräten genau der, der die Sprache ignoriert.
+      if (cached && cached.lang === lang && cached.pkg) return cached.pkg;
+
+      const base = lang.split("-")[0].toLowerCase();
+      const speaks = (list: string[] | undefined) =>
+        (list ?? []).some((l) => l.replace(/_/g, "-").toLowerCase().split("-")[0] === base);
+
+      let chosen = "";
+      try {
+        const services: string[] =
+          ExpoSpeechRecognitionModule?.getSpeechRecognitionServices?.() ?? [];
+        const GSB = "com.google.android.googlequicksearchbox";
+        const ON_DEVICE = "com.google.android.as";
+        /**
+         * ZUERST der Erkenner auf dem Gerät — aber nur mit INSTALLIERTEM Modell.
+         *
+         * Ich hatte ihn ganz ausgeschlossen, weil er Sprachen auch dann als
+         * „unterstützt" meldet, wenn das Modell fehlt. Das war zu grob: Die
+         * Spracheingabe der Tastatur, die auf demselben Gerät einwandfrei
+         * Deutsch versteht, benutzt genau diesen Erkenner. Ist das Modell
+         * geladen, ist er der beste — er hört auf die Sprachvorgabe und braucht
+         * kein Netz.
+         *
+         * Die harte Zusage dafür ist `installedLocales`: Was dort steht, liegt
+         * wirklich auf dem Gerät. Für den Netz-Erkenner reicht `locales`.
+         */
+        /**
+         * Der Erkenner auf dem Gerät bleibt vorerst außen vor.
+         *
+         * Er lässt sich nicht gezielt ansprechen, ohne dass das Modul auf
+         * `createOnDeviceSpeechRecognizer` umschaltet — und dann bestimmt das
+         * System, welcher es wird. Solange `languagedetection` nicht bestätigt,
+         * dass er wirklich deutsch erkennt, ist der Netz-Erkenner die sichere
+         * Wahl: Er kennt jede Sprache und braucht kein geladenes Modell.
+         */
+        const onDevice = "";
+        if (onDevice) {
+          try {
+            const res = await ExpoSpeechRecognitionModule.getSupportedLocales({
+              androidRecognitionServicePackage: onDevice,
+            });
+            if (speaks(res.installedLocales)) chosen = onDevice;
+          } catch {
+            // Antwortet nicht — dann eben der Netz-Erkenner.
+          }
+        }
+        /**
+         * IST Googles Netz-Erkenner installiert, wird er genommen — ohne Probe.
+         *
+         * Das war der Fehler, und die Messzeile hat ihn verraten: Dort stand
+         * `speech`, also `com.xiaomi.mibrain.speech` — der Erkenner des
+         * Herstellers. Der ignoriert die Sprachvorgabe und erkennt in seiner
+         * eigenen (englisch), und bei englischer Sprache meldet er einen
+         * Netzfehler.
+         *
+         * Hineingeraten ist er über meine Prüfung: Ich habe jeden Dienst gefragt,
+         * welche Sprachen er kann, und den ersten genommen, der Deutsch nannte.
+         * Googles Dienst beantwortet diese Frage aber oft gar nicht — das Modul
+         * warnt ausdrücklich davor („may not be able to return any results") —,
+         * also fiel er durch, und der Hersteller-Dienst gewann.
+         *
+         * Die Probe taugt damit nicht als Ausschlusskriterium. Googles
+         * Netz-Erkenner kann jede Sprache; ist er da, ist die Frage beantwortet.
+         * Erst wenn er fehlt, lohnt es sich, die anderen zu fragen.
+         */
+        if (!chosen && services.includes(GSB)) {
+          chosen = GSB;
+        }
+        if (!chosen) {
+          for (const pkg of services.filter((p: string) => p !== ON_DEVICE)) {
+            try {
+              const res = await ExpoSpeechRecognitionModule.getSupportedLocales({
+                // Kein Paket, wenn wir auf dem Gerät erkennen: Das Modul würde es ohnehin
+      // nicht lesen (siehe unten), und die Dienstliste führt hier nur Xiaomi.
+      androidRecognitionServicePackage: ON_DEVICE_ONLY ? undefined : pkg,
+              });
+              if (speaks(res.locales) || speaks(res.installedLocales)) {
+                chosen = pkg;
+                break;
+              }
+            } catch {
+              // Antwortet nicht — weiter.
+            }
+          }
+        }
+        if (!chosen && services.includes(GSB)) {
+          // Nichts konnte antworten (auf Android 12 und älter liefert die
+          // Abfrage grundsätzlich leere Listen). Dann lieber der Netz-Erkenner
+          // von Google als der Standard des Systems.
+          chosen = GSB;
+        }
+        if (!chosen) {
+          // Bewusst NICHT mehr auf den Standard des Systems ausweichen: Auf
+          // diesem Gerät ist genau der der Hersteller-Dienst, der die Sprache
+          // ignoriert. Lieber gar keine Vorgabe — dann entscheidet das Modul.
+          chosen = "";
+        }
+      } catch {
+        chosen = "";
+      }
+      recognitionPkgRef.current = { lang, pkg: chosen };
+      return chosen || undefined;
+    },
+    [],
+  );
+
+  /**
+   * Aufnahme abschließen: Stücke zusammenfügen und für die Nachricht vormerken.
+   *
+   * Läuft NEBEN dem Senden, nicht davor: Das Zusammenfügen liest Dateien und
+   * kostet Zeit, das Absenden hängt aber am Schluss-Ergebnis der Erkennung, das
+   * ohnehin noch aussteht. Wer schneller fertig ist, wartet auf den anderen —
+   * `pendingVoiceRef` ist der Treffpunkt.
+   */
+  const startRecording = useCallback(async () => {
+    if (recordingRef.current) return;
+    recordingRef.current = true;
+    setMicRecording(true);
+    /**
+     * Ein zweiter Versuch, falls das Mikrofon gerade noch belegt ist.
+     *
+     * Erkenner und Aufnahme greifen beide darauf zu. Android erlaubt das für
+     * diese Paarung, aber im Umschaltmoment kann der erste Griff danebengehen —
+     * und ein stiller Fehlschlag heißt: Kasten steht, nichts wird aufgenommen.
+     */
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await recorder.prepareToRecordAsync();
+        recorder.record();
+        return;
+      } catch {
+        if (attempt === 0) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 300));
+          continue;
+        }
+        setMicRecording(false);
+        recordingRef.current = false;
+      }
+    }
+  }, [recorder]);
+
+  /** Beendet die Aufnahme und legt die Datei dauerhaft ab. */
+  const stopRecording = useCallback(async (): Promise<{ uri: string; sec: number } | null> => {
+    if (!recordingRef.current) return null;
+    recordingRef.current = false;
+    setMicRecording(false);
+    try {
+      const status = recorder.getStatus?.();
+      const sec = status?.durationMillis ? status.durationMillis / 1000 : 0;
+      await recorder.stop();
+      const from = recorder.uri;
+      if (!from || sec < 0.3) return null;
+      // In den dauerhaften Bereich: Der Aufnehmer schreibt in den
+      // Zwischenspeicher, und den räumt Android, wann es will.
+      const dir = FileSystem.documentDirectory ?? "";
+      await FileSystem.makeDirectoryAsync(`${dir}voice`, { intermediates: true });
+      const to = `${dir}voice/${Date.now()}-${Math.random().toString(36).slice(2, 7)}.m4a`;
+      await FileSystem.copyAsync({ from, to });
+      return { uri: to, sec };
+    } catch {
+      return null;
+    }
+  }, [recorder]);
+
+  const finishVoiceRecording = useCallback(async (): Promise<{
+    uri: string;
+    sec: number;
+  } | null> => {
+    setMicRecording(false);
+    if (!MODULE_RECORDS_AUDIO) return stopRecording();
+
+    // Läuft die Aufnahme des Moduls noch, erst ihr Ende abwarten: Die WAV-Datei
+    // bekommt ihren Kopf beim Schließen, vorher ist sie unbrauchbar.
+    if (audioStartedAtRef.current > 0) {
+      const arrived = await new Promise<boolean>((resolve) => {
+        const waiter = () => {
+          clearTimeout(bail);
+          resolve(true);
+        };
+        const bail = setTimeout(() => {
+          /**
+           * Den eigenen Rückruf wieder ABMELDEN.
+           *
+           * Er blieb sonst in der Liste stehen und wurde beim nächsten
+           * „audioend" mit aufgerufen — ein `resolve` auf ein längst
+           * abgelaufenes Versprechen. Harmlos im Ergebnis, aber die Liste wuchs
+           * mit jeder Zeitüberschreitung weiter.
+           */
+          audioEndWaitersRef.current = audioEndWaitersRef.current.filter((w) => w !== waiter);
+          resolve(false);
+        }, 3000);
+        audioEndWaitersRef.current.push(waiter);
+      });
+      if (!arrived && audioStartedAtRef.current > 0) {
+        // Und die Stücke gehören trotzdem weg: Sie hingen sich sonst vorne an
+        // die nächste Sprachnachricht.
+        audioPartsRef.current = [];
+        audioSecRef.current = 0;
+        return null;
+      }
+    }
+    const parts = audioPartsRef.current;
+    audioPartsRef.current = [];
+    const sec = audioSecRef.current;
+    audioSecRef.current = 0;
+    if (parts.length === 0) return null;
+    try {
+      const dir = FileSystem.documentDirectory ?? "";
+      await FileSystem.makeDirectoryAsync(`${dir}voice`, { intermediates: true });
+      const out = `${dir}voice/${Date.now()}-${Math.random().toString(36).slice(2, 7)}.wav`;
+      const uri = await joinWavFiles(parts, out);
+      const info = await FileSystem.getInfoAsync(uri);
+      const size = info.exists && "size" in info ? ((info as { size?: number }).size ?? 0) : 0;
+      // Ein WAV-Kopf sind 44 Byte; kommt nichts dahinter, hat die Aufnahme nie
+      // Daten bekommen — als Blase wäre das ein Abspieler ohne Inhalt.
+      if (size <= 64) return null;
+      /**
+       * Die Länge kommt aus der DATEI, nicht von der Uhr.
+       *
+       * Gestoppt hatte ich bisher die Zeit zwischen Start und Ende der Aufnahme
+       * — die zählt aber auch das mit, was der Aufnehmer beim Anlaufen und
+       * Schließen braucht, und bei mehreren Stücken die Lücken dazwischen. In
+       * der Blase stand dann eine Dauer, die nicht zu dem passte, was man hört.
+       *
+       * 16 kHz, mono, 16 Bit — das sind 32000 Byte je Sekunde (ExpoAudioRecorder
+       * stellt das fest ein), abzüglich des Kopfes.
+       */
+      const fromBytes = (size - 44) / 32000;
+      return { uri, sec: fromBytes > 0.2 ? fromBytes : sec };
+    } catch {
+      const last = parts[parts.length - 1];
+      return last ? { uri: last, sec } : null;
+    }
+  }, [stopRecording]);
+
+  /** Verworfen heißt verworfen — auch die Dateien. */
+  const discardVoiceRecording = useCallback(async () => {
+    transcriptBaseRef.current = "";
+    transcriptLiveRef.current = "";
+    pendingVoiceRef.current = null;
+    setMicRecording(false);
+    if (MODULE_RECORDS_AUDIO) {
+      const parts = audioPartsRef.current;
+      audioPartsRef.current = [];
+      audioStartedAtRef.current = 0;
+      audioSecRef.current = 0;
+      for (const uri of parts) {
+        try {
+          await FileSystem.deleteAsync(uri, { idempotent: true });
+        } catch {
+          // Zwischenspeicher — kein Grund für einen Fehler.
+        }
+      }
+      return;
+    }
+    const dropped = await stopRecording();
+    if (dropped) {
+      try {
+        await FileSystem.deleteAsync(dropped.uri, { idempotent: true });
+      } catch {
+        // Eine Datei, die sich nicht löschen lässt, ist kein Grund für einen
+        // Fehler.
+      }
+    }
+  }, [stopRecording]);
+
+  /**
+   * Läuft gerade ein Start? Zwei überlappende Aufrufe erreichen sonst beide den
+   * nativen Aufruf — und der räumt den vorigen Erkenner ohne Meldung ab.
+   */
+  const startingRef = useRef(false);
+  /** Fortsetzen nach Pause — siehe die Räum-Entscheidung in `startVoice`. */
+  const resumingRef = useRef(false);
+
+  /**
+   * Ist das Sprachpaket für die Erkennung ohne Netz da? Sonst anstoßen.
+   *
+   * Auf Android 13 öffnet das einen Dialog, ab 14 lädt es im Hintergrund. Läuft
+   * höchstens EINMAL je Sprache und Sitzung — der Aufruf bindet einen
+   * Systemdienst und gehört nicht in jeden Start.
+   */
+  const modelCheckedRef = useRef("");
+  const ensureOfflineModel = useCallback(async (lang: string) => {
+    if (Platform.OS !== "android" || modelCheckedRef.current === lang) return;
+    modelCheckedRef.current = lang;
+    try {
+      const res = await ExpoSpeechRecognitionModule.getSupportedLocales({
+        androidRecognitionServicePackage: "com.google.android.as",
+      });
+      const base = lang.split("-")[0].toLowerCase();
+      const installed = (res.installedLocales ?? []).some(
+        (l: string) => l.replace(/_/g, "-").toLowerCase().split("-")[0] === base,
+      );
+      if (installed) {
+        offlineModelRef.current = "da";
+        return;
+      }
+      const dl = await ExpoSpeechRecognitionModule.androidTriggerOfflineModelDownload({
+        locale: lang,
+      });
+      offlineModelRef.current = dl.status;
+    } catch (err) {
+      offlineModelRef.current = `? ${String(err).slice(0, 24)}`;
+    }
+  }, []);
+
+  /**
+   * Aufnahme-Kasten schließen, wenn der Start scheitert.
+   *
+   * Der Mikrofon-Knopf öffnet ihn im Voraus — das ist richtig, sonst hinge die
+   * Oberfläche an der Berechtigungsabfrage. Kommt der Start dann aber nicht
+   * zustande, muss das Vorgeschossene auch wieder zurückgenommen werden.
+   */
+  const abortVoiceMode = useCallback(
+    (reason: "permission" | "focus") => {
+      setListening(false);
+      setMicRecording(false);
+      setVoiceMode(false);
+      voiceSendRef.current = false;
+      if (reason === "permission") {
+        setMessages((prev) => [
+          ...prev,
+          { id: idGen(), kind: "error", message: t("assistant.voice.nopermission") },
+        ]);
+      }
+    },
+    [t],
+  );
 
   const startVoice = useCallback(async () => {
     if (!ExpoSpeechRecognitionModule) return;
+    if (startingRef.current) return;
+    startingRef.current = true;
+    // Wer startet, will aufnehmen — damit ist die Pause aufgehoben. Muss VOR
+    // die Wartepunkte, sonst prüft die Gegenprobe unten gegen den alten Stand.
+    userPausedRef.current = false;
+    // Reste einer abgebrochenen Sitzung: Bleiben sie stehen, schickt das erste
+    // Ergebnis der NEUEN Aufnahme sofort ab oder der Räum-Zweig wird übersprungen.
+    pendingSendRef.current = false;
+    explicitStopRef.current = false;
+    try {
     const perm = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
-    if (!perm.granted) return;
+    if (!perm.granted) {
+      /**
+       * Ohne Erlaubnis wird der Kasten wieder zugemacht.
+       *
+       * Vorher stand hier nur `return`: Der Mikrofon-Knopf hatte den Kasten
+       * schon geöffnet und die Tonspur gestartet, und die lief dann über einer
+       * Aufnahme, die es nicht gibt. Erst beim Absenden kam heraus, dass nichts
+       * da war — und auch das nur als „nicht verstanden".
+       */
+      abortVoiceMode("permission");
+      return;
+    }
+    if (sessionEndingRef.current) {
+      await new Promise<void>((resolve) => {
+        const bail = setTimeout(resolve, 500);
+        endWaitersRef.current.push(() => {
+          clearTimeout(bail);
+          resolve();
+        });
+      });
+    }
     // Nur beim ALLER-ersten Start input clearen — bei Auto-Restarts (nach
     // Android-Silence-Timeout) wollen wir den bisherigen Transkript behalten.
-    if (!autoRestartingRef.current) setInput("");
+    /**
+     * Geräumt wird nur bei einer WIRKLICH neuen Aufnahme.
+     *
+     * „Fortsetzen" nach einer Pause ist keine: Dort gehören Text und Tonstücke
+     * von vor der Pause zur selben Nachricht. Ohne diese Unterscheidung war
+     * nach jedem Pausieren alles Gesagte weg — Text und Ton.
+     */
+    if (!autoRestartingRef.current && !resumingRef.current) {
+      setInput("");
+      /**
+       * Und die Tonstücke der VORIGEN Aufnahme wegräumen.
+       *
+       * Genau hier lag der Fehler hinter „in der Aufnahme ist das, was ich
+       * vorher gesagt habe": Blieb ein Versuch ohne Ergebnis — etwa weil die
+       * Erkennung nichts verstanden hat und deshalb nichts abgeschickt wurde —,
+       * lagen seine Stücke weiter in der Liste. Der nächste Versuch hängte sich
+       * hinten an, und zusammengefügt wurde beides.
+       *
+       * Nur beim NEUSTART aus einer laufenden Sitzung heraus nicht: Da gehören
+       * die bisherigen Stücke ja zur selben Nachricht.
+       */
+      // NUR den Text zurücksetzen. Die Tonaufnahme gehört dem Mikrofon-Knopf
+      // und läuft an dieser Stelle gerade erst an — sie hier zu beenden hieße,
+      // sie im selben Atemzug wieder abzuwürgen.
+      transcriptBaseRef.current = "";
+      transcriptLiveRef.current = "";
+      recognitionRetryRef.current = false;
+      forceNetworkRef.current = false;
+      lastVoiceErrorRef.current = "";
+      /**
+       * Und die Tonstücke einer NICHT abgeschlossenen Aufnahme.
+       *
+       * Abschicken und Verwerfen räumen selbst auf. Was dazwischenliegt, tut es
+       * nicht: Wer den Tab wechselt oder die App wegdrückt, lässt seine Stücke
+       * liegen — und die nächste Sprachnachricht hätte sie vorne dran.
+       */
+      audioPartsRef.current = [];
+      audioStartedAtRef.current = 0;
+      audioSecRef.current = 0;
+    }
     autoRestartingRef.current = false;
+    /**
+     * Und der Fortsetzen-Merker.
+     *
+     * Er stand hier NIE auf false zurück. Nach dem ersten Pausieren galt damit
+     * jede weitere Aufnahme für den Rest des App-Laufs als „Fortsetzung": Der
+     * Räum-Zweig oben wurde nie wieder betreten, alter Text und alte Tonstücke
+     * blieben stehen und hängten sich an die nächste Nachricht.
+     */
+    resumingRef.current = false;
+    /**
+     * Nach den Wartepunkten noch einmal fragen, ob das hier noch gewollt ist.
+     *
+     * Zwischen Berechtigung, dem Ende der vorigen Sitzung und der Dienstwahl
+     * liegen mehrere Wartepunkte. Wer in dieser Zeit verwirft, pausiert oder den
+     * Tab wechselt, hat bereits gestoppt — ein `start()` danach nähme die
+     * Aufnahme trotzdem wieder auf, und der Ton der verworfenen Sitzung liefe in
+     * die nächste Nachricht.
+     */
+    if (!voiceModeRef.current || userPausedRef.current || !isFocusedRef.current) {
+      // Hier ist der Ausstieg richtig und still: Wer in der Zwischenzeit
+      // verworfen, pausiert oder den Tab gewechselt hat, hat den Kasten
+      // ohnehin schon zu — nur ein hängengebliebener Kasten wird zugemacht.
+      if (voiceModeRef.current && !userPausedRef.current) abortVoiceMode("focus");
+      return;
+    }
     setListening(true);
+    const lang = SPEECH_LANG[locale] ?? "en-US";
+    // Ohne Erkenner ist die Dienstwahl überflüssig — sie kostet nur Abfragen
+    // an den Paketverwalter, deren Ergebnis niemand mehr liest.
+    const pkg = USE_WHISPER ? undefined : await resolveRecognitionService(lang);
+    const androidApi = Platform.OS === "android" ? Number(Platform.Version) : 0;
+    if (ON_DEVICE_ONLY) await ensureOfflineModel(lang);
     ExpoSpeechRecognitionModule.start({
-      lang:
-        locale === "de"
-          ? "de-DE"
-          : locale === "fr"
-            ? "fr-FR"
-            : locale === "es"
-              ? "es-ES"
-              : "en-US",
+      lang,
+      // Siehe `resolveRecognitionService`: Die Sprache hängt daran, WER erkennt.
+      androidRecognitionServicePackage: pkg,
+      // Und ausdrücklich über das Netz, nicht vom Gerät: Die Sprachpakete für
+      // die Erkennung ohne Netz sind oft nicht installiert, und fehlt das
+      // passende, weicht der Erkenner auf das aus, was da ist.
+      /**
+       * BEWUSST falsch — und das ist der Fehler, den ich letzte Runde gebaut habe.
+       *
+       * `true` schaltet das Modul auf `createOnDeviceSpeechRecognizer` um
+       * (ExpoSpeechService.kt:94-97) und liest `androidRecognitionServicePackage`
+       * dann GAR NICHT MEHR. Die ganze geprüfte Dienstwahl war damit wirkungslos;
+       * gebunden wurde der System-Standard für Erkennung ohne Netz.
+       *
+       * Dazu setzt es `EXTRA_PREFER_OFFLINE` (ebd. 385-387). Fehlt das deutsche
+       * Modell auf dem Gerät, meldet Googles Erkenner das oft NICHT als Fehler,
+       * sondern erkennt still mit dem weiter, was geladen ist — meist Englisch.
+       * Genau das Symptom.
+       *
+       * Und meine Begründung dafür war ohnehin unbelegt: Dass die Tastatur
+       * Deutsch versteht, heißt nicht, dass sie den Erkenner auf dem Gerät
+       * benutzt — sie verwaltet ihr Sprachpaket selbst und weicht sonst still
+       * aufs Netz aus.
+       */
+      requiresOnDeviceRecognition: ON_DEVICE_ONLY,
+      /**
+       * Die Sprache doppelt und ausdrücklich.
+       *
+       * Das Modul setzt nur `EXTRA_LANGUAGE`. Zwei weitere Angaben kennt Android
+       * seit Jahren, und sie sind genau für diesen Fall gedacht:
+       *
+       *   • `EXTRA_LANGUAGE_PREFERENCE` — die Sprache, die viele Erkenner
+       *     tatsächlich heranziehen.
+       *   • `EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE` — verbietet das Ausweichen
+       *     auf eine andere Sprache. Der direkte Riegel gegen „deutsch
+       *     gesprochen, englisch geschrieben".
+       *
+       * Bewusst KEINE neueren Felder (Sprachwechsel-Listen aus API 33/34): Die
+       * Extras gehen per Reflexion an `RecognizerIntent`, ein auf dem Gerät
+       * unbekanntes Feld wirft — und landet in dieser App als Abbruch der
+       * Aufnahme. Diese beiden gibt es seit API 3 bzw. 8.
+       */
+      // Das Modul nimmt auf: eine Datei für die Nachricht, ein Datenstrom für den
+      // Erkenner, ein Pegel für die Balken — alles aus derselben Aufnahme.
+      ...(MODULE_RECORDS_AUDIO
+        ? {
+            recordingOptions: { persist: true },
+            /**
+             * Nur aufnehmen, nicht erkennen (siehe den Patch am Modul).
+             *
+             * Und weil kein Erkenner mitläuft, endet die Sitzung auch nicht mehr
+             * bei jeder Sprechpause von selbst: EIN durchgehendes Stück statt
+             * mehrerer, die zusammengefügt werden müssen.
+             */
+            ...(USE_WHISPER ? { recordOnly: true } : { continuous: true }),
+          }
+        : {}),
+      /**
+       * KEINE zusätzlichen Intent-Extras mehr.
+       *
+       * Sie gehen per Reflexion an `RecognizerIntent` (ExpoSpeechService.kt:402).
+       * Kennt das Gerät ein Feld nicht ODER passt der Werttyp nicht, wirft der
+       * Aufruf — gefangen wird das im Modul als `error: "audio-capture"`, und
+       * die Erkennung ist tot, bevor sie begonnen hat. Genau das war zu sehen:
+       * Aufnahme da, kein Wort erkannt, keine Pegel, keine Messwerte.
+       *
+       * Die Sprache braucht sie ohnehin nicht: `EXTRA_LANGUAGE` setzt das Modul
+       * selbst aus `lang` (ebd. 393-394). Was hier stand, war Zusatz auf
+       * Verdacht — und der hat mehr gekostet als gebracht.
+       */
       interimResults: true,
-      continuous: true,
+      /**
+       * KEIN `recordingOptions` und KEIN `continuous` — beides zwingt das Modul
+       * dazu, selbst aufzunehmen und dem Erkenner einen Datenstrom zu schicken
+       * (`EXTRA_AUDIO_SOURCE`, ExpoSpeechService.kt:274-291). Genau dieser Modus
+       * liefert auf demselben Gerät Unsinn, während die Tastatur einwandfrei
+       * versteht. Ohne beides bekommt der Erkenner das Mikrofon — wie sie.
+       *
+       * Dass die Erkennung dadurch bei Stille endet, ist verkraftbar: Der
+       * „end"-Zweig startet sie neu, und der TON läuft ohnehin getrennt weiter.
+       */
       volumeChangeEventOptions: {
         enabled: true,
         intervalMillis: 100,
       },
     });
-  }, [locale]);
+    } finally {
+      startingRef.current = false;
+    }
+  }, [locale, resolveRecognitionService, ensureOfflineModel]);
 
   /** True wenn der User explizit gestoppt hat (Pause/Delete/Send). Steuert
    *  ob das "end"-Event in einen Auto-Restart führen soll. */
   const explicitStopRef = useRef(false);
+  /**
+   * Hat der Nutzer angehalten? Dann bleibt es dabei, bis er selbst fortsetzt.
+   *
+   * `explicitStopRef` reicht dafür nicht: Es gilt nur für die EINE Meldung
+   * direkt nach dem Stoppen und wird dabei verbraucht. Dieser Merker hier gilt
+   * für den ganzen Pausen-Zustand.
+   */
+  const userPausedRef = useRef(false);
   /** True während einer Auto-Restart-Phase damit startVoice den bisherigen
    *  Input nicht clearet. */
   const autoRestartingRef = useRef(false);
@@ -1283,6 +2393,24 @@ export function AssistantScreen() {
     // triggern. Wird vom Pause/Delete/Send-Pfad gesetzt. Auto-End (Android-
     // Silence-Timeout) lässt das Flag false → Restart greift.
     explicitStopRef.current = true;
+    /**
+     * Und ab jetzt startet NICHTS mehr von selbst.
+     *
+     * Das war der Grund, warum die Aufnahme nach einer Pause von allein wieder
+     * anlief: Android beendet die Erkennung bei Stille selbst, und darauf
+     * antwortet der „end"-Zweig mit einem Neustart nach 80ms. Fiel die Pause in
+     * dieses Fenster — oder kam danach noch eine späte Meldung —, griff der
+     * Neustart, obwohl der Nutzer ausdrücklich angehalten hatte. Der Zweig
+     * fragte nur, ob der Kasten noch offen ist, und das ist er beim Pausieren
+     * ja gerade.
+     */
+    userPausedRef.current = true;
+    if (restartRef.current) {
+      clearTimeout(restartRef.current);
+      restartRef.current = null;
+    }
+    // Ab hier gilt die Sitzung als „im Abbau" — siehe `sessionEndingRef`.
+    sessionEndingRef.current = true;
     ExpoSpeechRecognitionModule?.stop?.();
     setListening(false);
   }, []);
@@ -1345,8 +2473,37 @@ export function AssistantScreen() {
       if (restartRef.current) {
         clearTimeout(restartRef.current);
         restartRef.current = null;
+        // Sonst hält sich das Merkmal „Neustart läuft" bis in die nächste
+        // Aufnahme und lässt sie den Räum-Zweig überspringen.
+        autoRestartingRef.current = false;
       }
       if (listening) stopVoice();
+      // Und der Kasten geht mit. Vorher blieb er stehen: Die Aufnahme war zwar
+      // aus, das Fenster stand aber weiter über dem Chat, wenn man zurückkam.
+      setVoiceMode(false);
+      /**
+       * Und die AUFNAHME-Anzeige auch — daran hängt mehr als der Kasten.
+       *
+       * `micRecording` steuert den Zeitgeber, der zehnmal je Sekunde nach dem
+       * Pegel sieht. Er blieb beim Tab-Wechsel stehen und lief für den Rest der
+       * Sitzung weiter, obwohl längst nichts mehr aufgenommen wurde.
+       */
+      setMicRecording(false);
+      /**
+       * Das Sprachmodell aus dem Speicher nehmen, wenn Bo den Vordergrund
+       * verliert.
+       *
+       * Das stand vorher im Abbau-Rückruf der Komponente — und der läuft NIE:
+       * `AssistantHost` baut den Bildschirm einmal auf (`useMemo`, `built` wird
+       * nie zurückgesetzt) und lässt ihn stehen. Das Modell blieb damit für die
+       * gesamte Laufzeit der App im Speicher liegen, also genau das, was der
+       * Rückbau verhindern sollte.
+       *
+       * Der Preis ist die knappe Sekunde fürs erneute Aufsetzen bei der
+       * nächsten Sprachnachricht — und die fällt nur an, wenn wirklich wieder
+       * gesprochen wird.
+       */
+      void releaseWhisper();
       Keyboard.dismiss();
       /**
        * Das Tor und die Zahl NICHT im selben Bild — hier startet gerade eine
@@ -1566,6 +2723,9 @@ export function AssistantScreen() {
       if (restartRef.current) {
         clearTimeout(restartRef.current);
         restartRef.current = null;
+        // Sonst hält sich das Merkmal „Neustart läuft" bis in die nächste
+        // Aufnahme und lässt sie den Räum-Zweig überspringen.
+        autoRestartingRef.current = false;
       }
       // Die beiden anderen ebenso: Der eine hält sonst über eine Minute die
       // ganze `send`-Umgebung fest, der andere schreibt nach dem Abbau noch am
@@ -1626,9 +2786,19 @@ export function AssistantScreen() {
   }, []);
 
   const send = useCallback(
-    async (text: string) => {
+    /**
+     * @param existingUserMsgId Wenn die Blase des Nutzers schon im Verlauf
+     *   steht — bei Sprachnachrichten. Sie wird gepostet, sobald die Aufnahme
+     *   fertig ist, und nicht erst wenn die Abschrift vorliegt: Sonst starrte
+     *   man nach dem Absenden ein paar Sekunden auf einen unveränderten Chat.
+     *   Sie wird dann hier weder ein zweites Mal angehängt noch doppelt in den
+     *   Verlauf für den Server geschrieben.
+     */
+    async (text: string, existingUserMsgId?: string): Promise<boolean> => {
       const trimmed = text.trim();
-      if (!trimmed || busyRef.current) return;
+      // Der Rückgabewert ist nicht Zierde: Der Sprachweg hat seine Blase da
+      // schon gepostet und muss wissen, ob eine Antwort kommt (siehe dort).
+      if (!trimmed || busyRef.current) return false;
       busyRef.current = true;
       /**
        * Notbremse für die Sperre.
@@ -1651,7 +2821,11 @@ export function AssistantScreen() {
       // zwischen Messages.
       haptic("button");
 
-      const userMsg: Msg = { id: idGen(), kind: "user", text: trimmed };
+      const voice = pendingVoiceRef.current;
+      pendingVoiceRef.current = null;
+      const userMsg: Msg = voice
+        ? { id: idGen(), kind: "user", text: trimmed, audioUri: voice.uri, audioSec: voice.sec }
+        : { id: idGen(), kind: "user", text: trimmed };
       const typingMsg: Msg = { id: idGen(), kind: "typing" };
       const botId = idGen();
       streamingBotIdRef.current = botId;
@@ -1664,6 +2838,9 @@ export function AssistantScreen() {
       // Das war die Haupt-Ursache fürs Scroll-Ruckeln bei langen Chats.
       const history = [
         ...messagesRef.current
+          // Die schon gepostete Sprach-Blase NICHT mitzählen: Ihr Text wird
+          // unten als neueste Nachricht angehängt, sie stünde sonst doppelt.
+          .filter((m) => m.id !== existingUserMsgId)
           .filter((m): m is Extract<Msg, { kind: "user" | "bot" }> =>
             m.kind === "user" || m.kind === "bot",
           )
@@ -1684,7 +2861,13 @@ export function AssistantScreen() {
 
       // Inverted FlatList rendert neueste Bubble strukturell am Bottom —
       // kein manuelles Scroll-Management nötig.
-      setMessages((prev) => [...prev, userMsg, typingMsg]);
+      setMessages((prev) =>
+        existingUserMsgId
+          ? // Nur den Text nachtragen (für den Verlauf) und Bo antworten lassen
+            // — die Blase selbst steht schon da.
+            [...prev.map((m) => (m.id === existingUserMsgId ? { ...m, text: trimmed } : m)), typingMsg]
+          : [...prev, userMsg, typingMsg],
+      );
       setInput("");
       setBusy(true);
 
@@ -1728,13 +2911,16 @@ export function AssistantScreen() {
            * setzte die Stimmung auf ruhig, während der noch lief. Wer abgelöst
            * wurde, fasst nichts mehr an; die Anzeige gehört dem laufenden Turn.
            */
-          if (streamingBotIdRef.current !== botId) return;
+          // `true`: Abgeschickt WURDE es — die Blase steht, die Antwort ist
+          // nur nicht zustande gekommen. Der Sprachweg braucht die Unterscheidung
+          // (siehe `sendMaybeVoice`): `false` heißt „gar nicht erst gelaufen".
+          if (streamingBotIdRef.current !== botId) return true;
           setMessages((prev) => [
             ...prev.filter((m) => m.kind !== "typing"),
             { id: idGen(), kind: "error", message: t("assistant.error.generic") },
           ]);
           setMood("idle");
-          return;
+          return true;
         }
         // Bo ist kontogebunden: 401 = nicht eingeloggt → Login-Screen öffnen,
         // 429 = Stunden-Kontingent des Kontos aufgebraucht. Beide bekommen
@@ -1814,6 +3000,7 @@ export function AssistantScreen() {
           streamingBotIdRef.current = null;
         }
       }
+      return true;
     },
     // KEIN `busy`: Gelesen wird `busyRef`, weil zwei Aufrufe im selben
     // Durchgang sonst beide durchkämen. Als Abhängigkeit stehengeblieben, hätte
@@ -2130,7 +3317,192 @@ export function AssistantScreen() {
   // Sync send + setVoiceMode + voiceMode in Refs damit die Speech-
   // Recognition-Event-Handler (oben definiert) auf die jeweils aktuelle
   // Function-Instanz und den aktuellen voiceMode-State zugreifen.
-  sendRef.current = send;
+  /**
+   * Absenden, wenn die Nachricht gesprochen war.
+   *
+   * Der Text kommt aus dem Schluss-Ergebnis der Erkennung, der Ton aus der
+   * geschlossenen Datei — beides zu verschiedenen Zeitpunkten. Hier laufen sie
+   * zusammen: erst den Ton abholen (das wartet, falls die Aufnahme noch
+   * schließt), dann senden.
+   *
+   * Wichtig ist die Reihenfolge gegenüber `stopVoice`: Gestoppt wird ZUERST,
+   * eingesammelt danach. Andersherum lag die Datei unfertig da.
+   */
+  /**
+   * Warten, bis Bo mit der vorigen Antwort durch ist.
+   *
+   * `send` steigt aus, solange gestreamt wird (`busyRef`) — für getippte
+   * Nachrichten ist das richtig, der Knopf ist dann ohnehin gesperrt. Eine
+   * SPRACHnachricht kann man aber jederzeit aufnehmen und abschicken, und
+   * traf sie in eine laufende Antwort, verschwand sie ersatzlos: kein Eintrag,
+   * keine Meldung. Das ist eines der „manchmal wird nichts abgesendet".
+   */
+  const waitUntilIdle = useCallback(async () => {
+    for (let i = 0; i < 200 && busyRef.current; i++) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    }
+  }, []);
+
+  const sendMaybeVoice = useCallback(
+    async (text: string) => {
+      if (!voiceSendRef.current) {
+        send(text);
+        return;
+      }
+      voiceSendRef.current = false;
+      const voice = await finishVoiceRecording();
+      if (!voice) {
+        pendingVoiceRef.current = null;
+        // Ohne Whisper trägt der Erkenner den Text — der geht auch ohne Ton raus.
+        if (!USE_WHISPER) {
+          if (text.trim()) void send(text.trim());
+          return;
+        }
+        /**
+         * Mit Whisper ist die Aufnahme ALLES, was die Nachricht ausmacht — ohne
+         * sie gibt es weder Blase noch Abschrift. Vorher endete der Zweig hier
+         * wortlos: Man drückte Senden, und es passierte schlicht nichts.
+         *
+         * Das trifft den Fall, in dem die Datei nicht rechtzeitig geschlossen
+         * wurde oder gar nichts aufgezeichnet war (Mikrofon belegt, sofort
+         * wieder abgesendet).
+         */
+        setMessages((prev) => [
+          ...prev,
+          { id: idGen(), kind: "error" as const, message: t("assistant.voice.lost") },
+        ]);
+        return;
+      }
+
+      /**
+       * Die Blase geht SOFORT raus, die Abschrift kommt nach.
+       *
+       * Androids Erkenner lieferte den Text schon während des Sprechens —
+       * Whisper bekommt die fertige Datei und braucht ein paar Sekunden. Würde
+       * erst danach gepostet, starrte man nach dem Absenden auf einen Chat, in
+       * dem nichts passiert. Also erst die Sprachnachricht zeigen (sie ist ja
+       * fertig), dann abschreiben, dann Bo fragen.
+       */
+      const msgId = idGen();
+      if (USE_WHISPER) {
+        setMessages((prev) => [
+          ...prev,
+          { id: msgId, kind: "user", text: "", audioUri: voice.uri, audioSec: voice.sec },
+        ]);
+      }
+
+      let spoken = text.trim();
+      if (USE_WHISPER) {
+        /**
+         * Fehlt das Modell noch, wird darauf GEWARTET.
+         *
+         * Die Aufnahme ist ja schon zu sehen, und der Ladebalken steht über der
+         * Eingabezeile — wer beim allerersten Mal spricht, bevor die 60 MB
+         * durch sind, bekommt seine Abschrift eben ein paar Sekunden später
+         * statt gar nicht.
+         */
+        if (!(await isModelReady())) {
+          setModelProgress(0);
+          await ensureModel(setModelProgress);
+          setModelProgress(-1);
+        }
+        setTranscribing(true);
+        try {
+          const out = await transcribeVoice(voice.uri, locale, voice.sec);
+          spoken = out.text;
+          transcribeReasonRef.current = out.reason ?? "";
+        } finally {
+          setTranscribing(false);
+        }
+      }
+
+      if (spoken) {
+        await waitUntilIdle();
+        if (USE_WHISPER) {
+          // Der Ton hängt schon an der Blase — `send` trägt nur den Text nach
+          // und lässt Bo antworten.
+          const sent = await send(spoken, msgId);
+          if (!sent) {
+            /**
+             * `send` steigt aus, wenn nach zwanzig Sekunden Warten IMMER NOCH
+             * gestreamt wird. Die Blase steht dann schon im Chat — ohne diesen
+             * Zweig bliebe sie mit leerem Text liegen, ohne Antwort und ohne
+             * Hinweis, und im Verlauf für Bo wäre sie unsichtbar.
+             *
+             * Also wenigstens den Text nachtragen (dann trägt der Verlauf ihn
+             * beim nächsten Mal mit) und sagen, was los ist.
+             */
+            setMessages((prev) => [
+              ...prev.map((m) => (m.id === msgId ? { ...m, text: spoken } : m)),
+              { id: idGen(), kind: "error" as const, message: t("assistant.voice.busy") },
+            ]);
+          }
+          return;
+        }
+        // ERST nach dem Warten setzen: Der Merker wird beim Absenden
+        // verbraucht, und in der Wartezeit könnte eine andere Nachricht ihn
+        // sonst mitnehmen.
+        pendingVoiceRef.current = voice;
+        send(spoken);
+        /**
+         * Und wieder abräumen, falls `send` nicht durchkam.
+         *
+         * Es steigt aus, wenn gerade doch wieder gestreamt wird — der Merker
+         * bliebe dann stehen und würde an der NÄCHSTEN Nachricht hängen, auch
+         * an einer getippten. Ein Bild später ist er entweder verbraucht oder
+         * gehört niemandem mehr.
+         */
+        setTimeout(() => {
+          pendingVoiceRef.current = null;
+        }, 0);
+        return;
+      }
+
+      /**
+       * Nichts verstanden — die Aufnahme bleibt trotzdem stehen.
+       *
+       * Vorher verschwand sie hier lautlos: `send` steigt bei leerem Text
+       * sofort aus, und damit war die Sprachnachricht weg, obwohl sie
+       * aufgenommen wurde. Für den Nutzer sah es aus, als sei nichts passiert.
+       *
+       * Bo wird dabei NICHT gefragt — es gibt ja keinen Text, auf den er
+       * antworten könnte. Stattdessen steht der Grund darunter.
+       */
+      pendingVoiceRef.current = null;
+      setMessages((prev) => [
+        // Ohne Whisper steht die Blase noch nicht — dann jetzt.
+        ...(USE_WHISPER
+          ? prev
+          : [
+              ...prev,
+              {
+                id: msgId,
+                kind: "user" as const,
+                text: "",
+                audioUri: voice.uri,
+                audioSec: voice.sec,
+              },
+            ]),
+        {
+          id: idGen(),
+          kind: "error" as const,
+          message:
+            transcribeReasonRef.current === "no-model"
+              ? // VORÜBERGEHEND mit Grund: „konnte nicht geladen werden" allein
+                // sagt nicht, ob die Datei fehlt, das Laden abbrach oder der
+                // native Teil sie nicht annimmt — und genau das brauchen wir.
+                `${t("assistant.voice.modelmissing")}${
+                  lastWhisperIssue() ? ` (${lastWhisperIssue()})` : ""
+                }`
+              : t("assistant.voice.notunderstood"),
+        },
+      ]);
+    },
+    [send, finishVoiceRecording, waitUntilIdle, locale, t],
+  );
+  sendRef.current = sendMaybeVoice;
+  startVoiceRef.current = startVoice;
+  listeningRef.current = listening;
   setVoiceModeRef.current = setVoiceMode;
   voiceModeRef.current = voiceMode;
 
@@ -2767,15 +4139,17 @@ export function AssistantScreen() {
   const isScrollingRef = useRef(isScrolling);
   isScrollingRef.current = isScrolling;
   /**
-   * Die Sprachleiste hängt an derselben Sperre — abonniert aber NUR, solange
-   * sie sichtbar ist. Im Normalfall (Text-Eingabe) gibt es damit kein
-   * Abonnement und keinen Durchgang.
+   * Das Abonnement der Sprachleiste auf Bos Sperre ist WEG — mitsamt seinem
+   * Zustand.
+   *
+   * Es speiste `paused` der Tonspur. Die bekommt inzwischen fest `false`, weil
+   * die Sperre auch bei Scrollen und Fokuswechseln anschlug und die Spur dann
+   * mitten in der Aufnahme einfror (Begründung am Kasten). Zurückgeblieben war
+   * ein Abonnement, das während JEDER Aufnahme bei jedem Scrollen, jeder Fahrt
+   * und jedem Fokuswechsel einen kompletten Durchgang dieses Bildschirms
+   * auslöste — für einen Wert, den niemand mehr liest. Genau die Art Commit,
+   * die Reanimateds Bewegungen anhält.
    */
-  const [voiceBarPaused, setVoiceBarPaused] = useState(true);
-  useEffect(() => {
-    if (!voiceMode) return;
-    return subscribeBoBlocked(setVoiceBarPaused);
-  }, [voiceMode]);
   const publishPause = useCallback(() => {
     const blocked = slidingRef.current || !isFocusedRef.current;
     setDotsPaused(blocked);
@@ -3421,9 +4795,12 @@ export function AssistantScreen() {
           UI-Thread). onLayout misst die echte Bar-Höhe für die
           contentPaddingBottom-Berechnung. */}
       <Animated.View
-        style={[styles.inputbarWrap, inputbarWrapStyle, barAnimStyle]}
+        style={[styles.inputbarWrap, { backgroundColor: palette.bg }, inputbarWrapStyle, barAnimStyle]}
         onLayout={(e) => {
           const h = e.nativeEvent.layout.height;
+          // Ohne Umweg über React: Diesen Wert braucht nur der UI-Strang (der
+          // Fahrweg der Zeile), er kostet damit keinen Durchgang.
+          barTravel.value = h;
           /**
            * NICHT während der Fahrt — jeder Commit hält die Kurve an.
            *
@@ -3468,43 +4845,23 @@ export function AssistantScreen() {
           setInputbarHeight(h);
         }}
       >
-      {voiceMode ? (
-        <VoiceRecordBar
-          recording={listening}
-          /**
-           * Still, während etwas fährt — UND solange Bo nicht zu sehen ist.
-           *
-           * Hier stand nur `sliding`. Verliert Bo den Vordergrund, ohne
-           * abgebaut zu werden — er öffnet die Ergebnisliste selbst, oder er
-           * steht nach dem Schließen noch geparkt da —, lief der
-           * Wellenform-Sampler im Bild-Takt weiter, unsichtbar, und damit auch
-           * während FREMDER Bewegungen. Die Aufnahme selbst läuft weiter;
-           * angehalten wird nur ihre Darstellung.
-           */
-          paused={voiceBarPaused}
-          onPauseToggle={() => {
-            if (listening) stopVoice();
-            else void startVoice();
-          }}
-          onDelete={() => {
-            if (listening) stopVoice();
-            setInput("");
-            setVoiceMode(false);
-          }}
-          onSend={() => {
-            if (listening) {
-              pendingSendRef.current = true;
-              stopVoice();
-            } else {
-              const text = input.trim();
-              setVoiceMode(false);
-              if (text) send(text);
-            }
-          }}
-          bottomInset={inputbarPadBottom}
-          micVolumeSV={micVolumeSV}
-        />
-      ) : (
+      {/**
+        * Was gerade mit der Sprachnachricht passiert.
+        *
+        * Zwei Wartezeiten, die der Nutzer sonst nicht einordnen kann: das
+        * einmalige Laden des Sprachmodells (rund 60 MB) und das Abschreiben
+        * einer Aufnahme. Beides passiert, während die Aufnahme-Box schon zu ist
+        * — ohne diese Zeile sähe es aus, als hinge die App.
+        */}
+      {voiceStatus ? (
+        <View style={styles.voiceStatusRow} pointerEvents="none">
+          <Text style={[styles.voiceStatusText, { backgroundColor: palette.s3 }]}>{voiceStatus}</Text>
+        </View>
+      ) : null}
+      {/* Der Sprachbalken (Wellenform, Aufnahmepunkt, Zeitanzeige) ist hier
+          ausgebaut — die Mikrofon-Funktion wird neu gebaut. Die Komponente
+          liegt unangetastet unter `components/assistant/VoiceRecordBar.tsx`,
+          falls Teile davon wieder gebraucht werden. */}
       <View style={[styles.inputbar, { backgroundColor: palette.s2, paddingBottom: inputbarPadBottom }]}>
         <View style={[styles.field, { backgroundColor: palette.s3 }]}>
           <TextInput
@@ -3539,12 +4896,29 @@ export function AssistantScreen() {
           disabled={!voiceAvailable}
           onPress={() => {
             haptic("button");
-            // Keyboard zuerst dismissen — slidet runter, dann erscheint die
-            // VoiceRecordBar an dessen Stelle. Ohne dismiss bliebe das
-            // Keyboard offen und überlagerte die Bar.
+            // Tastatur zuerst schließen: Der Kasten sitzt über der Eingabezeile,
+            // und die wandert mit der Tastatur.
+            /**
+             * Erst die Tastatur wegräumen, DANN den Kasten zeigen.
+             *
+             * Beides im selben Bild sah aus, als spränge der Kasten aus dem
+             * Nichts über die noch fahrende Tastatur. Mit dem kurzen Abstand
+             * fährt zuerst die Tastatur hinunter, die Eingabezeile geht mit —
+             * und erst auf den freien Platz kommt der Kasten.
+             *
+             * Ohne offene Tastatur gibt es nichts zu warten: dann sofort.
+             */
+            const hadKeyboard = Keyboard.isVisible();
             Keyboard.dismiss();
-            setVoiceMode(true);
-            void startVoice();
+            const begin = () => {
+              setVoiceMode(true);
+              if (!MODULE_RECORDS_AUDIO) void startRecording();
+              setMicRecording(true);
+              // Immer: Diese Sitzung IST die Aufnahme, auch ohne Erkenner.
+              void startVoice();
+            };
+            if (hadKeyboard) setTimeout(begin, 220);
+            else begin();
           }}
           accessibilityLabel="Voice"
         >
@@ -3570,8 +4944,126 @@ export function AssistantScreen() {
           )}
         </Pressable>
       </View>
-      )}
       </Animated.View>
+
+      {/**
+        * Der Mikrofon-Kasten.
+        *
+        * Unterkante GENAU auf der Unterkante des Mikrofon-Knopfes: Der sitzt in
+        * der Eingabezeile, deren unterer Innenabstand `inputbarPadBottom` ist —
+        * also derselbe Abstand vom Bildschirmrand.
+        *
+        * Er liegt NEBEN der Eingabezeile im Baum, nicht darin: Deren Hülle ist
+        * nur so hoch wie die Zeile selbst, und was darüber hinausragt, läge
+        * außerhalb seines Elternteils — auf Android damit weder sichtbar noch
+        * berührbar.
+        *
+        * `pointerEvents="none"`, solange er leer ist: So bleibt die Zeile
+        * darunter bedienbar, und ein zweiter Druck auf das Mikrofon nimmt ihn
+        * wieder weg.
+        */}
+      {voiceMode ? (
+        <MicBox
+          /**
+           * An der AUFNAHME, nicht an der Erkennung.
+           *
+           * `listening` gehört dem Erkenner, und der endet bei jeder Sprechpause
+           * und läuft neu an. Die Tonspur fror dabei ein — „auf einmal passiert
+           * gar nichts mehr" —, obwohl weiter aufgenommen wurde. Der Ton läuft
+           * durch, also läuft auch die Spur durch.
+           */
+          recording={micRecording}
+          /**
+           * NICHT an Bos Sperre hängen — das war der Grund für die toten Balken.
+           *
+           * `voiceBarPaused` folgt `boBlocked`, und das ist wahr, sobald Bo
+           * gerade fährt, den Fokus nicht hat ODER die Liste gescrollt wird
+           * (siehe `publishPause`). Der Anfangswert ist ebenfalls wahr. Steht
+           * einer dieser drei Fälle beim Öffnen des Kastens an — oder bleibt er
+           * hängen —, wird der Bild-Rückruf der Tonspur nie eingeschaltet: Es
+           * kommt Pegel an, aber niemand tastet ihn ab.
+           *
+           * Diese Sperre ist für Bos Dauer-Animationen gedacht, die im
+           * Hintergrund weiterliefen. Die Tonspur ist etwas anderes: Sie läuft
+           * nur, solange der Kasten offen ist — also genau dann, wenn der
+           * Nutzer hinsieht.
+           */
+          paused={false}
+          micVolumeSV={micVolumeSV}
+          style={[styles.micBox, { height: MIC_BOX_H, bottom: inputbarPadBottom }]}
+          onToggle={() => {
+            if (listening) {
+              stopVoice();
+              // Der Ton hält mit an — sonst liefe die Pause als Stille mit in
+              // die Aufnahme.
+              setMicRecording(false);
+              try {
+                if (!MODULE_RECORDS_AUDIO) recorder.pause();
+              } catch {
+                // Aufnehmer nicht in einem Zustand, in dem sich pausieren
+                // lässt — dann bleibt es beim Weiterlaufen.
+              }
+            } else {
+              // Fortsetzen, nicht neu anfangen: Text und Ton von vor der Pause
+              // bleiben stehen.
+              resumingRef.current = true;
+              setMicRecording(true);
+              try {
+                if (!MODULE_RECORDS_AUDIO) recorder.record();
+              } catch {
+                // siehe oben
+              }
+              void startVoice();
+            }
+          }}
+          onDelete={() => {
+            voiceSendRef.current = false;
+            if (listening) stopVoice();
+            void discardVoiceRecording();
+            setInput("");
+            setVoiceMode(false);
+          }}
+          onSend={() => {
+            /**
+             * Direkt aus der laufenden Aufnahme heraus — kein Umweg über Pause.
+             *
+             * Gestoppt wird hier, eingesammelt wird erst, wenn die Datei
+             * geschlossen ist (siehe `sendMaybeVoice`). Vorher wurde beides in
+             * dieser Reihenfolge verkehrt gemacht, und genau daher kamen die
+             * abgehackten und die ausbleibenden Nachrichten.
+             */
+            voiceSendRef.current = true;
+            if (listening) {
+              /**
+               * Abgeschickt wird JETZT, nicht wenn der Erkenner soweit ist.
+               *
+               * Vorher wurde nur gestoppt und auf das Schluss-Ergebnis gewartet
+               * — kam keines (weil nichts verstanden wurde oder der Dienst sich
+               * Zeit ließ), sah es aus, als hätte man bloß angehalten.
+               *
+               * Jetzt läuft eine kurze Frist mit: Kommt das Schluss-Ergebnis in
+               * dieser Zeit, geht es damit raus; kommt keines, eben mit dem
+               * bisherigen Stand. Die Aufnahme selbst ist davon ohnehin
+               * unabhängig.
+               */
+              pendingSendRef.current = true;
+              stopVoice();
+              setVoiceMode(false);
+              const guard = setTimeout(() => {
+                if (!pendingSendRef.current) return;
+                pendingSendRef.current = false;
+                void sendMaybeVoice(transcriptLiveRef.current.trim());
+              }, 700);
+              sendGuardRef.current = guard;
+            } else {
+              // Aus der Ablage, nicht aus `input` — siehe Begründung am
+              // „end"-Zweig: Der Zustand hier stammt aus einem alten Durchgang.
+              setVoiceMode(false);
+              void sendMaybeVoice(transcriptLiveRef.current.trim());
+            }
+          }}
+        />
+      ) : null}
     </Animated.View>
   );
 }
@@ -4171,7 +5663,13 @@ function BubbleInner({ msg, accent, onRetry, onOpenResults, t }: BubbleProps) {
   if (msg.kind === "user") {
     return (
       <View style={[styles.bubble, styles.userBubble, { backgroundColor: accent }]}>
-        <Text style={[styles.userText, { color: "#000000" }]}>{msg.text}</Text>
+        {msg.audioUri ? (
+          // Gesprochen: Im Chat steht der TON, nicht seine Abschrift. Die geht
+          // an Bo — sichtbar ist sie hier bewusst nicht.
+          <VoiceBubble uri={msg.audioUri} durationSec={msg.audioSec ?? 0} ink="#000000" />
+        ) : (
+          <Text style={[styles.userText, { color: "#000000" }]}>{msg.text}</Text>
+        )}
       </View>
     );
   }
@@ -4584,7 +6082,7 @@ const styles = scaledStyles({
   threadContent: {
     flexGrow: 1,
     justifyContent: "flex-end",
-    paddingHorizontal: 16,
+    paddingHorizontal: CHAT_EDGE,
     gap: 10,
   },
 
@@ -4660,22 +6158,67 @@ const styles = scaledStyles({
   // Absolute Container der die Inputbar/VoiceRecordBar über der FlatList
   // schwebend hält. Bottom:0 (Screen-Bottom), die Hochbewegung kommt via
   // Reanimated translateY (siehe barAnimStyle) — smooth mit dem Keyboard.
+  /**
+   * Halbdurchsichtiger Kasten über der Eingabezeile. Seitenabstand ist
+   * `CHAT_EDGE` — dieselbe Kante wie die Nachrichten und die Eingabezeile.
+   */
+  /**
+   * Nur die LAGE — Fläche, Kante und Innenabstand stehen in `MicBox`.
+   *
+   * Die Höhe steht bewusst nicht hier, sondern am Element: Dieses Stilblatt
+   * läuft durch `scaledStyles`, und `MIC_BOX_H` ist bereits aus der echten
+   * Fensterhöhe gerechnet. Hier bekäme es den Faktor ein zweites Mal — aus
+   * einem Viertel würde auf einem kurzen Gerät ein Fünftel.
+   */
+  micBox: {
+    position: "absolute",
+    left: CHAT_EDGE,
+    right: CHAT_EDGE,
+  },
   inputbarWrap: {
     position: "absolute",
     left: 0,
     right: 0,
     bottom: 0,
-    backgroundColor: "#1A1A1A",
+    backgroundColor: "#0D0D0D",
+  },
+  /**
+   * Statuszeile über der Eingabeleiste (Modell laden / abschreiben).
+   *
+   * SCHWEBEND, nicht in der Spalte. In der Spalte machte sie die Leiste für
+   * ihre Lebensdauer höher — und an der Leistenhöhe hängt der untere
+   * Innenabstand der Liste. Der ganze Chat rutschte beim Erscheinen hoch und
+   * beim Verschwinden ruckartig zurück, für eine Zeile, die nur zwei Sekunden
+   * da ist. Über der Leiste geparkt (`bottom: "100%"`) ändert sie keine Höhe
+   * und die Liste bleibt, wo sie ist.
+   */
+  voiceStatusRow: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: "100%",
+    alignItems: "center",
+    paddingHorizontal: CHAT_EDGE,
+    paddingBottom: 6,
+  },
+  voiceStatusText: {
+    color: C.textDim,
+    fontSize: 12,
+    fontWeight: "600",
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    borderRadius: 9999,
+    overflow: "hidden",
   },
   inputbar: {
     flexDirection: "row",
     alignItems: "flex-end",
     gap: 10,
-    paddingHorizontal: 16,
+    paddingHorizontal: CHAT_EDGE,
     paddingTop: 10,
     borderTopWidth: 1,
     borderTopColor: C.border,
-    backgroundColor: "#1A1A1A",
+    backgroundColor: "#0D0D0D",
   },
   field: {
     flex: 1,

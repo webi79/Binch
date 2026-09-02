@@ -48,5 +48,5 @@ const s = scaledStyles({
   center: { left: 0, right: 0, textAlign: "center" },
   // Durchgestrichene Fahrplanzeit: ausgegraut (NICHT rot) — nur die neue Zeit
   // sticht rot heraus.
-  struck: { color: "#8A8A90", textDecorationLine: "line-through" },
+  struck: { color: "#8E8E93", textDecorationLine: "line-through" },
 });

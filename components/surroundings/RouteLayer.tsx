@@ -219,7 +219,7 @@ export const RouteLayer = memo(function RouteLayer({ waypoints, legs, mode }: Pr
             12,
             8, // transfer
           ],
-          "circle-color": "#FFFFFF",
+          "circle-color": "#F4F4F5",
           "circle-stroke-color": "#14181A",
           "circle-stroke-width": 2,
         }}
@@ -263,7 +263,7 @@ export const RouteLayer = memo(function RouteLayer({ waypoints, legs, mode }: Pr
           "text-optional": true,
         }}
         paint={{
-          "text-color": "#FFFFFF",
+          "text-color": "#F4F4F5",
           "text-halo-color": "#14181A",
           "text-halo-width": 1.5,
         }}

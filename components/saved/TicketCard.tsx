@@ -30,10 +30,10 @@ import {
 import { scaledStyles } from "@/lib/ui/compact";
 
 const C = {
-  bg: "#1A1A1A",
-  surface: "#242425",
-  white: "#FFFFFF",
-  gray300: "#8A8A90",
+  bg: "#0D0D0D",
+  surface: "#171719",
+  white: "#F4F4F5",
+  gray300: "#8E8E93",
   gray400: "#56565C",
   // Farbe der ausgestanzten Perforationskerben. NICHT der reine Hintergrund:
   // Die Karte schwebt jetzt (Schatten), und in ein Loch einer schwebenden Karte
@@ -41,11 +41,15 @@ const C = {
   // sonst wirkt sie als flacher heller Kreis, der den Schatten am Rand
   // unterbricht.
   //
-  // #111111 (≈35 % Schatten) war zu schwarz: Der dunkelste Schatten-Layer ist
-  // zwar rgba(0,0,0,0.42) — voll deckend ergäbe das #0F0F0F —, aber so dunkel
-  // wird er NIE sichtbar, weil der Blur ihn verteilt. Die dunkelste tatsächlich
-  // sichtbare Stelle liegt bei ~15 % Schatten: #1A1A1A → #161616.
-  notchShadow: "#161616",
+  // Die Zahl ist gerechnet, nicht gegriffen: Der dunkelste Schatten-Layer ist
+  // rgba(0,0,0,0.42), voll deckend also 58 % des Grundes — so dunkel wird er
+  // aber NIE sichtbar, weil der Weichzeichner ihn verteilt. Die dunkelste
+  // tatsächlich sichtbare Stelle liegt bei rund 15 % Schatten, und 85 % des
+  // Hintergrunds #0D0D0D sind #0B0B0B.
+  //
+  // (Vor der neuen Palette stand hier #161616 — dieselbe Rechnung auf dem
+  // damaligen Grund #1A1A1A.)
+  notchShadow: "#0B0B0B",
 };
 
 const DATE_LOCALES = { en: enGB, de, fr, es } as const;

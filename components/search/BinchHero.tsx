@@ -207,7 +207,7 @@ interface Props {
 function BinchHeroComponent({
   category,
   time = "tag",
-  melt = "#1A1A1A",
+  melt = "#0D0D0D",
   style,
   paused = false,
   riseKey = 0,

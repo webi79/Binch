@@ -27,6 +27,6 @@ const styles = scaledStyles({
     fontWeight: "900",
     letterSpacing: -0.6,
     lineHeight: HEADING_LINE_HEIGHT,
-    color: "#FFFFFF",
+    color: "#F4F4F5",
   },
 });

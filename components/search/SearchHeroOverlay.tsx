@@ -57,7 +57,7 @@ import { scaledStyles } from "@/lib/ui/compact";
 
 const { width: SW, height: SH } = Dimensions.get("window");
 // Die durchgängige App-Hintergrundfarbe (Home-Root, Root-Layout, Stack-Content
-// = alle #1A1A1A). Der Splash endet genau darauf → nahtloser Content-Swap.
+// = alle #0D0D0D). Der Splash endet genau darauf → nahtloser Content-Swap.
 /** Fallback für Modul-Konstanten. Die LEBENDE Farbe kommt aus useAppBg() —
  *  die Launch-Box muss exakt den aktuellen Screen-Hintergrund treffen, sonst
  *  zeigt der Übergang eine sichtbare Stufe. */
@@ -1136,7 +1136,7 @@ export function SearchHeroOverlay() {
             accessibilityRole="button"
             style={styles.backBtn}
           >
-            <ArrowLeft size={22} color="#FFFFFF" strokeWidth={2} />
+            <ArrowLeft size={22} color="#F4F4F5" strokeWidth={2} />
           </Pressable>
         </Animated.View>
       ) : null}

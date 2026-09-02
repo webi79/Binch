@@ -111,7 +111,7 @@ export function GreetingScene({ name, destLabel }: Props) {
 
       <View style={styles.route}>
         <View style={styles.routeLine} />
-        <Text style={[styles.code, { left: 0, color: "#8A8A90" }]}>{t("loader.from")}</Text>
+        <Text style={[styles.code, { left: 0, color: "#8E8E93" }]}>{t("loader.from")}</Text>
         <Text style={[styles.code, { right: 0, color: accent.solid }]}>{t("loader.to")}</Text>
         <MiniPlane
           light={accent.gradient[0]}
@@ -136,7 +136,7 @@ const styles = scaledStyles({
     gap: 6,
   },
   bubbleTxt: {
-    color: "#FFFFFF",
+    color: "#F4F4F5",
     fontSize: 14.5,
     lineHeight: 20,
     fontWeight: "500",
@@ -158,7 +158,7 @@ const styles = scaledStyles({
     right: 8,
     height: 2,
     borderRadius: 2,
-    backgroundColor: "#323234",
+    backgroundColor: "#212123",
   },
   code: { position: "absolute", top: 5, fontSize: 11, fontWeight: "700" },
 });

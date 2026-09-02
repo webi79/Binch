@@ -86,14 +86,14 @@ const WINDOW_H = Dimensions.get("window").height;
 
 
 const C = {
-  bg: "#1A1A1A",
-  surface2: "#242425",
-  surface3: "#2A2A2C",
-  surface4: "#323234",
-  border: "#2E2E30",
-  white: "#FFFFFF",
+  bg: "#0D0D0D",
+  surface2: "#171719",
+  surface3: "#212123",
+  surface4: "#212123",
+  border: "#212123",
+  white: "#F4F4F5",
   textSecondary: "#C8C8CC",
-  textTertiary: "#8A8A90",
+  textTertiary: "#8E8E93",
   error: "#FF7A6B",
   goodOrange: "#FFC65C",
 };
@@ -697,7 +697,7 @@ function Sheet() {
         <View style={[styles.hill, styles.hill2]} />
         <View style={[styles.hill, styles.hill1]} />
         <LinearGradient
-          colors={["transparent", "rgba(26,26,26,0.35)", C.bg]}
+          colors={["transparent", "rgba(13,13,13,0.35)", C.bg]}
           locations={[0.4, 0.8, 1]}
           style={StyleSheet.absoluteFill}
         />
@@ -1316,8 +1316,8 @@ const styles = scaledStyles({
     width: 44,
     height: 44,
     borderRadius: 22,
-    backgroundColor: "rgba(36,36,37,0.95)",
-    borderColor: "#2E2E30",
+    backgroundColor: "rgba(27,27,27,0.95)",
+    borderColor: "#212123",
     borderWidth: 1,
     alignItems: "center",
     justifyContent: "center",

@@ -38,13 +38,13 @@ import { scaledStyles } from "@/lib/ui/compact";
 // auf unsere Brand-Lime gedimmt (#7FEA4D), Card/Surface-Stufen matchen
 // DetailsOverlay damit die beiden Slides visuell zusammen wirken.
 const C = {
-  bg: "#1A1A1A",
-  sheet: "#1F1F20",
-  card: "#242425",
-  cardSoft: "#2A2A2C",
-  border: "#2E2E30",
-  text: "#FFFFFF",
-  sub: "#8A8A90",
+  bg: "#0D0D0D",
+  sheet: "#171719",
+  card: "#171719",
+  cardSoft: "#212123",
+  border: "#212123",
+  text: "#F4F4F5",
+  sub: "#8E8E93",
   subDim: "#56565C",
   lime: "#7FEA4D",
   limeSoft: "rgba(127,234,77,0.14)",
@@ -124,7 +124,7 @@ function productColor(product?: string): string {
     case "flight":
       return "#1F2A57";
     default:
-      return "#3a3a3e";
+      return "#2D2D31";
   }
 }
 
@@ -882,7 +882,7 @@ const styles = scaledStyles({
   // Timeline-Punkt (row alignItems:center) verrutscht NICHT bei Verspätung.
   timeLabelCol: { width: TIME_COL_W },
   // Verspätung: Fahrplanzeit ausgegraut durchgestrichen, Ist-Zeit rot darunter.
-  timeLabelStruck: { color: "#8A8A90", textDecorationLine: "line-through" },
+  timeLabelStruck: { color: "#8E8E93", textDecorationLine: "line-through" },
   timeLabelDelayed: {
     position: "absolute",
     top: "100%", // direkt UNTER die Fahrplanzeit, ohne Zellenhöhe zu ändern

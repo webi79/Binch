@@ -49,12 +49,12 @@ function unlockOpen(): void {
 }
 
 const C = {
-  surface1: "#1F1F20",
-  surface2: "#242425",
+  surface1: "#171719",
+  surface2: "#171719",
   // green entfernt — Akzent kommt via useAccent() bzw. GradientFill.
-  white: "#FFFFFF",
+  white: "#F4F4F5",
   gray1: "#C8C8CC",
-  gray2: "#8A8A90",
+  gray2: "#8E8E93",
   gray3: "#56565C",
   delete: "#E5484D",
 };
@@ -343,7 +343,7 @@ function RecentCardInner({ search, bordered = false }: { search: RecentSearch; b
             accessibilityRole="button"
             style={styles.deleteBtn}
           >
-            <Trash2 size={20} color="#FFFFFF" strokeWidth={2.2} />
+            <Trash2 size={20} color="#F4F4F5" strokeWidth={2.2} />
             <Text style={styles.deleteBtnText}>{t("history.delete")}</Text>
           </Pressable>
         </View>
@@ -355,13 +355,18 @@ function RecentCardInner({ search, bordered = false }: { search: RecentSearch; b
           <RippleTouch
             style={[
               styles.recentCard,
-              { backgroundColor: palette.s1 },
+              // Eine Karte auf dem Bildschirm ist eine BOX, kein Blatt —
+              // deshalb `s2`. Der Ton bleibt derselbe wie bisher; er ist jetzt
+              // nur an der richtigen Stufe angemeldet und wandert mit ihr.
+              { backgroundColor: palette.s2 },
               bordered && [styles.recentCardBordered, { borderColor: palette.border }],
             ]}
             onPress={onCardPress}
             onLongPress={enterDeleteMode}
           >
-            <View style={[styles.recentIconWrap, { backgroundColor: palette.s2 }]}>
+            {/* Liegt AUF der Karte, also `s3`. Stand hier auf `s2` — demselben
+                Ton wie die Karte — und war dadurch unsichtbar. */}
+            <View style={[styles.recentIconWrap, { backgroundColor: palette.s3 }]}>
               <Icon size={20} color={C.gray1} />
             </View>
             <View style={styles.recentText}>
@@ -420,7 +425,7 @@ const styles = scaledStyles({
     gap: 4,
   },
   deleteBtnText: {
-    color: "#FFFFFF",
+    color: "#F4F4F5",
     fontSize: 11,
     fontWeight: "800",
     letterSpacing: 0.6,
@@ -437,7 +442,7 @@ const styles = scaledStyles({
   },
   recentCardBordered: {
     borderWidth: 1,
-    borderColor: "#2E2E30",
+    borderColor: "#212123",
   },
   recentIconWrap: {
     width: 44,

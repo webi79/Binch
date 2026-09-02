@@ -50,12 +50,12 @@ import { TicketHead, Perforation, bookingRefFor } from "./TicketParts";
 import { scaledStyles } from "@/lib/ui/compact";
 
 const C = {
-  bg: "#1A1A1A",
-  surface: "#242425",
-  surface3: "#2A2A2C",
-  white: "#FFFFFF",
+  bg: "#0D0D0D",
+  surface: "#171719",
+  surface3: "#212123",
+  white: "#F4F4F5",
   gray200: "#C8C8CC",
-  gray300: "#8A8A90",
+  gray300: "#8E8E93",
   gray400: "#56565C",
   codeBg: "#FFFFFF",
   codeLabel: "#56565C",
@@ -322,7 +322,7 @@ function TicketDetailSheet({
                 // Echter QR/Barcode aus dem PDF — pixel-genau gecroppt vom
                 // Server, KEIN Re-Encoding → bleibt scanbar. Aspect-Ratio
                 // je nach Typ: QR/Aztec/DataMatrix square, 1D-Barcode breit.
-                <View style={[styles.codePanel, { backgroundColor: palette.s1 }]}>
+                <View style={[styles.codePanel, { backgroundColor: palette.s3 }]}>
                   <Text style={styles.codeLabel}>
                     {t("saved.ticket.code")} · {ticketCode}
                   </Text>
@@ -420,7 +420,7 @@ function NativePdfModal({
         hitSlop={12}
         style={[styles.pdfClose, { backgroundColor: palette.s2 }]}
       >
-        <X size={20} color="#FFFFFF" />
+        <X size={20} color="#F4F4F5" />
       </Pressable>
       {pdfUri ? (
         <Pdf
@@ -527,7 +527,7 @@ const styles = scaledStyles({
   codeFallback: {
     backgroundColor: C.surface3,
     borderWidth: 1,
-    borderColor: "#3A3A3E",
+    borderColor: "#2D2D31",
     borderStyle: "dashed",
     borderRadius: 16,
     paddingHorizontal: 18,

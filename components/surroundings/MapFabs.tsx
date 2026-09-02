@@ -4,7 +4,7 @@ import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useAccent } from "@/lib/theme/accent";
 import { scaledStyles } from "@/lib/ui/compact";
 
-const WHITE = "#FFFFFF";
+const WHITE = "#F4F4F5";
 
 interface Props {
   topInset: number;
@@ -81,8 +81,8 @@ const styles = scaledStyles({
     width: 44,
     height: 44,
     borderRadius: 22,
-    backgroundColor: "rgba(26,26,26,0.92)",
-    borderColor: "#2E2E30",
+    backgroundColor: "rgba(13,13,13,0.92)",
+    borderColor: "#212123",
     borderWidth: 1,
     alignItems: "center",
     justifyContent: "center",

@@ -37,7 +37,7 @@ interface Props {
   color?: string;
 }
 
-export function Barcode({ value, height = 66, color = "#1A1A1A" }: Props) {
+export function Barcode({ value, height = 66, color = "#0D0D0D" }: Props) {
   const { bars, total } = useMemo(() => generateBars(hashCode(value)), [value]);
   return (
     <Svg
