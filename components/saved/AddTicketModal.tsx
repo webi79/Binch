@@ -5,7 +5,6 @@ import {
   Text,
   Modal,
   Pressable,
-  ScrollView,
   StyleSheet,
   ActivityIndicator,
   type LayoutChangeEvent,
@@ -13,21 +12,15 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
-  Easing,
   FadeIn,
   FadeOut,
-  runOnJS,
   useAnimatedStyle,
   useSharedValue,
-  withSpring,
   withTiming,
 } from "react-native-reanimated";
-import {
-  Gesture,
-  GestureDetector,
-  GestureHandlerRootView,
-} from "react-native-gesture-handler";
+import { GestureDetector, GestureHandlerRootView } from "react-native-gesture-handler";
 import { showAlert } from "@/lib/alert";
+import { SHEET_SUBTITLE, SHEET_TITLE } from "@/components/ui/SheetModal";
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import { Plane, TrainFront, Bus, Ship } from "lucide-react-native";
@@ -40,6 +33,7 @@ import { persistTicketImages } from "@/lib/saved/ticketImages";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useAccent } from "@/lib/theme/accent";
 import { scaledStyles } from "@/lib/ui/compact";
+import { useSheetScrollGate, useSheetSwipe } from "@/lib/ui/sheetSwipe";
 
 interface Props {
   visible: boolean;
@@ -158,8 +152,6 @@ function AddTicketSheet({
    * Wisch-Geste schreibt — es gibt nur EINE Position, und damit keine zwei
    * Bewegungen, die sich gegenseitig überschreiben können.
    */
-  /** Wisch-Abwurf: kürzer, die Geste hat den Weg schon halb zurückgelegt. */
-  const SWIPE_OUT = { duration: 220, easing: Easing.out(Easing.quad) } as const;
   const translateY = useSharedValue(900);
   /**
    * Geteilter Wert, keine React-Ablage.
@@ -244,33 +236,23 @@ function AddTicketSheet({
   useEffect(() => registerClose(requestClose), [registerClose, requestClose]);
 
   /**
-   * In `useMemo` — die Geste entstand bei JEDEM Render neu.
+   * Gezogen wird am ganzen Blatt, nicht mehr nur am Strich oben.
    *
-   * Und dieses Blatt rendert währenddessen: Es fährt gerade herein, und beim
-   * Auswählen einer Datei wechselt zusätzlich `busy`. Jedes neue
-   * `Gesture.Pan()`-Objekt muss der Erkenner gegen seinen nativen Gegenpart
-   * abgleichen und neu einrichten — genau in den Bildern, in denen die Bewegung
-   * läuft.
+   * Der Torhüter gehört dazu, obwohl die vier Kacheln fast immer hineinpassen:
+   * Auf einem kurzen Bildschirm mit großer Schrift scrollt die Fläche eben doch
+   * — und dann muss die Liste scrollen und nicht das Blatt wandern.
+   *
+   * `enabled(!busy)`: Während eine Datei gelesen wird, ist das Blatt gesperrt;
+   * das galt schon für den Tipper daneben.
    */
-  const panGesture = useMemo(() =>
-    Gesture.Pan()
-    .activeOffsetY(8)
-    .failOffsetY(-8)
-    .enabled(!busy)
-    .onUpdate((e) => {
-      translateY.value = Math.max(0, e.translationY);
-    })
-    .onEnd((e) => {
-      if (e.translationY > 110 || e.velocityY > 700) {
-        // Bewegung SOFORT von hier, auf dem UI-Strang — der Finger ist gerade
-        // erst weg. Abgemeldet wird erst danach; siehe scheduleClose.
-        translateY.value = withTiming(sheetH.value || 900, SWIPE_OUT);
-        runOnJS(scheduleClose)(SWIPE_OUT.duration);
-      } else {
-        translateY.value = withSpring(0, { damping: 22, stiffness: 220 });
-      }
-    }),
-  [busy, translateY, sheetH, scheduleClose]);
+  const gate = useSheetScrollGate();
+  const panGesture = useSheetSwipe({
+    y: translateY,
+    travel: sheetH,
+    onDismiss: scheduleClose,
+    enabled: !busy,
+    gate,
+  });
 
   const pickAndParse = async (fallbackMode: TravelMode) => {
     // Sperre SOFORT setzen, nicht erst nach dem Dateiauswahl-Dialog: `busy` wurde
@@ -403,54 +385,68 @@ function AddTicketSheet({
         <Pressable style={StyleSheet.absoluteFill} onPress={busy ? undefined : requestClose} />
       </Animated.View>
       <View style={styles.sheetWrap} pointerEvents="box-none">
-        <Animated.View
-          onLayout={onSheetLayout}
-          style={[
-            styles.sheet,
-            { backgroundColor: palette.s1, paddingBottom: bottomPad },
-            sheetAnim,
-          ]}
-        >
-          <GestureDetector gesture={panGesture}>
+        <GestureDetector gesture={panGesture}>
+          <Animated.View
+            onLayout={onSheetLayout}
+            style={[
+              styles.sheet,
+              { backgroundColor: palette.s1, paddingBottom: bottomPad },
+              sheetAnim,
+            ]}
+          >
+            {/* Nur noch Zeichen, nicht mehr Griff — gezogen wird überall. */}
             <View style={styles.handleWrap}>
               <View style={styles.handle} />
             </View>
-          </GestureDetector>
 
-          <Text style={styles.title}>{t("saved.modal.title")}</Text>
-          <Text style={styles.subtitle}>{t("saved.modal.subtitle")}</Text>
+            <Text style={styles.title}>{t("saved.modal.title")}</Text>
+            <Text style={styles.subtitle}>{t("saved.modal.subtitle")}</Text>
 
-          {busy ? (
-            <View style={styles.busyWrap}>
-              <ActivityIndicator size="large" color={accent.solid} />
-              <Text style={styles.busyText}>{t("saved.modal.parsing")}</Text>
-            </View>
-          ) : (
-            <ScrollView showsVerticalScrollIndicator={false}>
-              <View style={styles.tilesRow}>
-                {MODES.map((m) => {
-                  const Icon = m.icon;
-                  return (
-                    <RippleTouch
-                      key={m.id}
-                      onPress={() => pickAndParse(m.id)}
-                      style={({ pressed }) => [
-                        styles.tile,
-                        { backgroundColor: palette.s2, borderColor: palette.border },
-                        { opacity: pressed ? 0.85 : 1 },
-                      ]}
-                    >
-                      <Icon size={22} color="#F4F4F5" strokeWidth={1.8} />
-                      <Text style={styles.tileLabel}>{t(m.labelKey)}</Text>
-                    </RippleTouch>
-                  );
-                })}
+            {busy ? (
+              <View style={styles.busyWrap}>
+                <ActivityIndicator size="large" color={accent.solid} />
+                <Text style={styles.busyText}>{t("saved.modal.parsing")}</Text>
               </View>
+            ) : (
+              /* Eigener nativer Erkenner um die Liste, damit das Ziehen am Blatt
+                 sie nicht abwürgt — siehe `useSheetScrollGate`. */
+              <GestureDetector gesture={gate.native}>
+                <Animated.ScrollView
+                  ref={gate.ref}
+                  showsVerticalScrollIndicator={false}
+                  onScroll={gate.onScroll}
+                  scrollEventThrottle={16}
+                  // Kein Überzieh-Schimmer an der Oberkante: Dort zieht ab
+                  // sofort das Blatt, und der Schimmer liefe dagegen an.
+                  overScrollMode="never"
+                  bounces={false}
+                >
+                  <View style={styles.tilesRow}>
+                    {MODES.map((m) => {
+                      const Icon = m.icon;
+                      return (
+                        <RippleTouch
+                          key={m.id}
+                          onPress={() => pickAndParse(m.id)}
+                          style={({ pressed }) => [
+                            styles.tile,
+                            { backgroundColor: palette.s2, borderColor: palette.border },
+                            { opacity: pressed ? 0.85 : 1 },
+                          ]}
+                        >
+                          <Icon size={22} color="#F4F4F5" strokeWidth={1.8} />
+                          <Text style={styles.tileLabel}>{t(m.labelKey)}</Text>
+                        </RippleTouch>
+                      );
+                    })}
+                  </View>
 
-              <Text style={styles.hint}>{t("saved.modal.hint")}</Text>
-            </ScrollView>
-          )}
-        </Animated.View>
+                  <Text style={styles.hint}>{t("saved.modal.hint")}</Text>
+                </Animated.ScrollView>
+              </GestureDetector>
+            )}
+          </Animated.View>
+        </GestureDetector>
       </View>
     </GestureHandlerRootView>
   );
@@ -473,8 +469,8 @@ const styles = scaledStyles({
   root: { flex: 1 },
   handleWrap: { alignItems: "center", paddingTop: 12, paddingBottom: 16 },
   handle: { width: 40, height: 4, borderRadius: 9999, backgroundColor: "#FFFFFF" },
-  title: { fontSize: 18, fontWeight: "700", color: "#F4F4F5", marginBottom: 6 },
-  subtitle: { fontSize: 13, color: "#8E8E93", marginBottom: 18, lineHeight: 18 },
+  title: { ...SHEET_TITLE, marginBottom: 8 },
+  subtitle: { ...SHEET_SUBTITLE, marginBottom: 16 },
   tilesRow: {
     flexDirection: "row",
     flexWrap: "wrap",

@@ -1,17 +1,17 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useState, useRef } from "react";
-import { SHEET_IN, SHEET_OUT } from "@/lib/nav/overlayCover";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useState, useRef } from "react";
+import { SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import {
   View,
   Text,
   Pressable,
-  ScrollView,
   ActivityIndicator,
   StyleSheet,
   useWindowDimensions,
 } from "react-native";
 import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
+  scrollTo,
   useAnimatedStyle,
   useSharedValue,
   withTiming,
@@ -43,6 +43,7 @@ import type { SearchResult, TravelMode } from "@/types/search";
 import { useAccent } from "@/lib/theme/accent";
 import { SaveStarButton } from "@/components/surroundings/SaveStarButton";
 import { scaledStyles } from "@/lib/ui/compact";
+import { SWIPE_OUT, useSheetScrollGate } from "@/lib/ui/sheetSwipe";
 
 /**
  * Slide-Up-Sheet mit Abfahrten/Ankünften zur ausgewählten Haltestelle.
@@ -895,6 +896,16 @@ function StopDetailSheetInner() {
 
   // Start: off-screen unten. Beim Selectstop animieren wir zu mid.
   const translateY = useSharedValue(snap.sheetHeight);
+  /**
+   * Zeigt dem Effekt unten an, dass die Ausfahrt schon läuft.
+   *
+   * Sie gehört der Wisch-Geste, sobald man das Blatt hinunterzieht: Die stößt
+   * sie im Bild des Loslassens an, auf dem UI-Strang. Ginge sie stattdessen wie
+   * bisher über den Store und den Effekt, lägen ein Sprung auf den JS-Strang
+   * und ein React-Durchgang dazwischen — das Blatt bliebe genau dann stehen,
+   * wenn der Finger das Glas verlässt.
+   */
+  const settlingRef = useRef(false);
   const sheetAnim = useAnimatedStyle(() => ({
     transform: [{ translateY: translateY.value }],
   }));
@@ -941,6 +952,13 @@ function StopDetailSheetInner() {
       return () => clearTimeout(id);
     } else {
       setBodyReady(false);
+      // Fährt die Wisch-Geste schon, wird hier NICHT neu angesetzt: Eine zweite
+      // Kurve auf demselben Wert setzte von der erreichten Stelle mit voller
+      // Dauer an — sichtbar als Tempo-Wechsel mitten in der Ausfahrt.
+      if (settlingRef.current) {
+        settlingRef.current = false;
+        return undefined;
+      }
       translateY.value = withTiming(
         snap.sheetHeight,
         SHEET_OUT,
@@ -961,21 +979,85 @@ function StopDetailSheetInner() {
    * Durchlauf entstand bisher ein neues `Gesture.Pan()`-Objekt, das der Erkenner
    * gegen seinen nativen Gegenpart abgleichen und neu einrichten muss.
    */
+  /**
+   * Der Torhüter für die Abfahrtsliste — siehe `lib/ui/sheetSwipe.ts`.
+   *
+   * Das Blatt lässt sich seit dieser Runde überall anfassen, nicht mehr nur am
+   * Strich oben. Über der Liste heißt das: Sie scrollt wie bisher, und erst
+   * wenn sie oben steht, übernimmt das Blatt. `base` zieht dabei den Weg ab,
+   * den der Finger fürs Scrollen gebraucht hat — sonst spränge das Blatt in dem
+   * Moment, in dem die Liste oben ankommt, um die ganze Scroll-Strecke.
+   */
+  const gate = useSheetScrollGate();
+  const base = useSharedValue(0);
+  /** Buchhaltung zum Wisch-Abwurf — die Bewegung selbst läuft schon. */
+  const closeBySwipe = useCallback(() => {
+    settlingRef.current = true;
+    markSheetMoving(SWIPE_OUT.duration);
+    clearSelectedStop();
+  }, [clearSelectedStop]);
   const pan = useMemo(() =>
     Gesture.Pan()
-    .onStart(() => {
+    /**
+     * Erst ab acht Punkten Weg ist es ein Ziehen.
+     *
+     * Ohne die Schwelle nähme das Blatt jedem Knopf darunter die Berührung ab —
+     * am Griff allein war das egal, auf der ganzen Fläche ist es der
+     * Unterschied zwischen „Abfahrt antippen" und „Blatt verschieben". Beide
+     * Richtungen, denn hier wird auch nach OBEN gezogen (auf `full`).
+     */
+    .activeOffsetY([-8, 8])
+    .failOffsetX([-20, 20])
+    .simultaneousWithExternalGesture(gate.native)
+    .onStart((e) => {
       startY.value = translateY.value;
+      base.value = e.translationY;
     })
     .onUpdate((e) => {
-      const next = startY.value + e.translationY;
+      if (gate.scrollY.value > 0.5) {
+        // Die Liste scrollt noch — das Blatt bleibt stehen, der Nullpunkt geht mit.
+        startY.value = translateY.value;
+        base.value = e.translationY;
+        return;
+      }
+      const next = startY.value + (e.translationY - base.value);
       translateY.value = Math.max(snap.full, next);
+      /**
+       * Liste festhalten, solange sich das Blatt WIRKLICH bewegt.
+       *
+       * Sie bekommt dieselbe Berührung ab (beide Erkenner sind als gleichzeitig
+       * angemeldet) und scrollte sonst unter dem wandernden Blatt mit. Die
+       * Bedingung ist wichtig: Steht das Blatt schon ganz oben und der Finger
+       * geht weiter hoch, bewegt es sich nicht — dann gehört die Bewegung der
+       * Liste, und festhalten dürfte man sie nicht.
+       */
+      if (Math.abs(translateY.value - startY.value) > 0.5 && gate.ref()) {
+        // Der Test auf die Verknüpfung gehört dazu: Ohne Abfahrten zeigt dieses
+        // Blatt gar keine Liste, und Reanimated schriebe pro Bild eine Warnung.
+        scrollTo(gate.ref, 0, 0, false);
+      }
     })
     .onEnd((e) => {
-      const final = startY.value + e.translationY;
+      const final = startY.value + (e.translationY - base.value);
       const closeThreshold = snap.mid + (snap.sheetHeight - snap.mid) * 0.35;
-      if (final > closeThreshold || e.velocityY > 800) {
-        // Schließen → Store leeren, useEffect oben kümmert sich um Animation.
-        runOnJS(clearSelectedStop)();
+      /**
+       * Der Schwung allein schließt nur ein Blatt, das sich auch bewegt hat.
+       *
+       * Sonst schlösse ein kräftiger Wisch IN der Abfahrtsliste das Blatt: Der
+       * Erkenner läuft dabei mit (beide sind als gleichzeitig angemeldet),
+       * bewegt nichts — und läse am Ende trotzdem die Geschwindigkeit des
+       * Listen-Wischs.
+       */
+      const moved = Math.abs(translateY.value - startY.value) > 0.5;
+      if (final > closeThreshold || (moved && e.velocityY > 800)) {
+        // Ausfahrt SOFORT von hier, auf dem UI-Strang — der Finger ist gerade
+        // erst weg. Der Store wird daneben geleert; der Effekt oben hält sich
+        // über `settlingRef` heraus.
+        translateY.value = withTiming(snap.sheetHeight, SWIPE_OUT, (finished) => {
+          "worklet";
+          if (finished) runOnJS(setDisplayStop)(null);
+        });
+        runOnJS(closeBySwipe)();
         return;
       }
       const points = [snap.full, snap.mid];
@@ -992,7 +1074,7 @@ function StopDetailSheetInner() {
       else if (e.velocityY > 200 && final > snap.mid * 0.6) closest = snap.mid;
       translateY.value = withTiming(closest, { duration: 180, easing: Easing.out(Easing.quad) });
     }),
-  [snap, startY, translateY]);
+  [snap, startY, translateY, base, gate, closeBySwipe]);
 
   // Sheet bleibt PERMANENT gemountet — auch wenn nichts ausgewählt ist
   // (translateY = sheetHeight = off-screen). Dadurch entfällt der React-
@@ -1013,6 +1095,7 @@ function StopDetailSheetInner() {
           accessibilityLabel="Close stop details"
         />
       )}
+      <GestureDetector gesture={pan}>
       <Animated.View
         pointerEvents={selectedStop ? "auto" : "none"}
         style={[
@@ -1028,11 +1111,12 @@ function StopDetailSheetInner() {
       >
         {stop && (
           <>
-            <GestureDetector gesture={pan}>
-              <View style={styles.handleZone}>
-                <View style={styles.handle} />
-              </View>
-            </GestureDetector>
+            {/* Nur noch Zeichen, nicht mehr Griff: Der Erkenner sitzt am ganzen
+                Blatt (siehe `pan`). Der Strich bleibt, weil er ansagt, DASS
+                gezogen werden kann. */}
+            <View style={styles.handleZone}>
+              <View style={styles.handle} />
+            </View>
 
             {/* Header: Name, Distanz + Venue-Typ, Favoriten-Stern.
                 Subtitle-Format: „163 m entfernt · Bahnhof" — Venue-Typ kommt
@@ -1175,9 +1259,16 @@ function StopDetailSheetInner() {
                   </Text>
                 </View>
               ) : (
-                <ScrollView
+                <GestureDetector gesture={gate.native}>
+                <Animated.ScrollView
+                  ref={gate.ref}
                   contentContainerStyle={styles.list}
                   showsVerticalScrollIndicator
+                  onScroll={gate.onScroll}
+                  scrollEventThrottle={16}
+                  // Kein Überzieh-Schimmer oben: Dort übernimmt das Blatt.
+                  overScrollMode="never"
+                  bounces={false}
                 >
                   {/* Hero = nächste Abfahrt mit Countdown-Ring. „Danach"-Label
                       nur rendern wenn es noch weitere Items gibt, sonst wirkt
@@ -1203,12 +1294,14 @@ function StopDetailSheetInner() {
                       onPress={() => onSelectDeparture(it)}
                     />
                   ))}
-                </ScrollView>
+                </Animated.ScrollView>
+                </GestureDetector>
               )}
             </View>
           </>
         )}
       </Animated.View>
+      </GestureDetector>
     </>
   );
 }

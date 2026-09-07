@@ -405,10 +405,26 @@ const styles = scaledStyles({
     // Card slidet).
     overflow: "hidden",
   },
+  /**
+   * Die Zone beginnt NICHT am linken Rand — und das ist der Rest des
+   * Ecken-Problems.
+   *
+   * Der Kommentar am Mount-auf-Abruf oben stimmt, aber er deckt nur die halbe
+   * Ursache: Solange die Karte noch nahe ihrer Ruhelage steht (die ersten
+   * Bilder nach dem langen Druck und die letzten beim Zurückgleiten), liegen
+   * zwei gerundete Rechtecke mit demselben Radius exakt übereinander. Die
+   * Kantenglättung der oberen Ecke ist teildurchsichtig — darunter kommt Rot
+   * durch. Sichtbar wurde das links oben und unten, weil rechts ohnehin Rot
+   * hingehört.
+   *
+   * Weiter links als die Wischstrecke (80) wird nie etwas aufgedeckt. Die Zone
+   * kann dort also gefahrlos enden, und hinter den linken Ecken der Karte
+   * liegt wieder der Bildschirm statt Rot.
+   */
   deleteZone: {
     position: "absolute",
     top: 0,
-    left: 0,
+    left: 24,
     right: 0,
     bottom: 0,
     backgroundColor: C.delete,

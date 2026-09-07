@@ -230,8 +230,9 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
         {
           text: t("settings.signout.confirm.ok"),
           style: "destructive",
+          // Kein `haptic` mehr hier — der Dialog gibt für einen löschenden
+          // Knopf schon den kräftigen Stoß, sonst kämen zwei übereinander.
           onPress: async () => {
-            haptic("important");
             if (token) {
               try {
                 await authLogout(token);
@@ -246,6 +247,9 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
           },
         },
       ],
+      // Trauriger Bo statt des roten Ausrufezeichens: Abmelden ist kein
+      // Unglück, sondern ein Abschied.
+      "bo-sad",
     );
   };
 

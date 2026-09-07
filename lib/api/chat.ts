@@ -60,6 +60,14 @@ export type ChatStreamEvent =
       action: "save_trip" | "unsave_trip" | "open_results";
       payload?: Record<string, unknown>;
     }
+  /**
+   * Die Unterhaltung, in der dieser Turn landet — kommt als ERSTES Ereignis.
+   *
+   * Der Client kennt die Kennung nicht, wenn er einen neuen Chat beginnt: Sie
+   * entsteht auf dem Server, wenn dort die Zeile angelegt wird. Ohne dieses
+   * Ereignis bekäme jeder Turn eines frischen Chats eine eigene Unterhaltung.
+   */
+  | { type: "conversation"; id: string }
   | { type: "usage"; input: number; output: number; cacheRead: number; cacheWrite: number }
   | { type: "error"; message: string }
   | { type: "done" };
@@ -73,6 +81,10 @@ export interface ChatStreamRequest {
    *  Turn-State, sodass Tools wie open_all_results über Turns hinweg
    *  funktionieren. */
   lastSearch?: LastSearchParams;
+  /** In welche gespeicherte Unterhaltung der Turn gehört. Fehlt bei einem
+   *  neuen Chat — der Server legt dann eine an und meldet sie als erstes
+   *  Ereignis zurück. */
+  conversationId?: string | null;
   /** Session-Token — Bo ist kontogebunden (Server antwortet 401 ohne). */
   authToken?: string | null;
   signal?: AbortSignal;
@@ -265,6 +277,7 @@ export async function streamChat(req: ChatStreamRequest): Promise<void> {
         currency: req.currency,
         today: req.today,
         ...(req.lastSearch ? { lastSearch: req.lastSearch } : {}),
+        ...(req.conversationId ? { conversationId: req.conversationId } : {}),
       }),
     );
   });

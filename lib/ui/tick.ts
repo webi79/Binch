@@ -4,69 +4,86 @@
  * Beides zusammen in EINER Funktion, und zwar aus einem Grund: Sie teilen sich
  * die Sperre. Ein Rad läuft im Auslaufen mit über zwanzig Zahlen je Sekunde
  * durch; getrennt gedrosselt gerieten Ton und Vibration gegeneinander aus dem
- * Takt, und aus dem Klicken würde ein Rauschen.
+ * Takt.
  *
- * Der Ton ist Androids EIGENER Klick (`Effect_Tick` aus dem AOSP, Apache-2.0 —
- * Herkunft und Bearbeitung stehen in `assets/sounds/README.md`). Es ist derselbe
- * Klang, den `NumberPicker` und `TimePicker` beim Drehen spielen.
+ * ── Warum der Klang NICHT über `expo-audio` läuft ──────────────────────────
  *
- * Vorher stand hier ein selbst erzeugter: eine gedämpfte Sinuswelle, deren
- * Tonhöhe von 2100 auf 1500 Hz fiel. Genau das war der Fehler — eine fallende
- * Tonhöhe auf einem schmalen Ton IST die Signatur einer Laserpistole. Ein
- * Anschlag klingt anders: breitbandig, sehr kurz, ohne wandernde Tonhöhe. Das
- * ist nichts, was man aus Formeln errät; dafür nimmt man einen echten.
+ * Er lief es, und er kam verzögert oder gar nicht. Der Grund steht in dessen
+ * Quelle: Auf Android fährt `expo-audio` einen ExoPlayer, also einen
+ * Media-Player für Streams. Sein `play()` reicht über den Haupt-Looper zum
+ * Player, der Ton beginnt erst, wenn die Ausgabe angelaufen ist. Und ein
+ * Media-Player ENDET nach dem Stück — jeder weitere Klick braucht erst ein
+ * Zurückspulen, das als Zusage später eingelöst wird. Beide Male ist die
+ * Verzögerung nicht die Datei, sondern das Werkzeug.
  *
- * Der Stups ist Androids EIGENER Uhren-Tick (`Clock_Tick`) — dieselbe Rückmeldung,
- * die das System für die Stunden- und Minutenauswahl seiner Uhr benutzt. Damit
- * ist er so leicht, wie das Gerät ihn kann, und nicht so leicht, wie wir eine
- * Dauer in Millisekunden geraten hätten.
+ * Androids Werkzeug für kurze Bedien-Klänge heißt `SoundPool`: Der Klang liegt
+ * entpackt im Speicher, `play()` startet ihn sofort, Überlagerungen sind
+ * eingeplant, und Audio-Fokus fordert es gar nicht erst an (fremde Musik läuft
+ * also unbehelligt weiter). Das steckt im lokalen Modul `modules/tick-sound`.
+ *
+ * `expo-audio` bleibt als Rückfall für iOS und für einen Dev-Client ohne
+ * frischen Build — dort mit derselben Verzögerung wie zuvor, aber hörbar.
+ *
+ * ── Zum Klang selbst ───────────────────────────────────────────────────────
+ *
+ * Herkunft und Bearbeitung stehen in `assets/sounds/README.md`. Zwei Dinge
+ * daran sind nicht offensichtlich:
+ *
+ *  - Der ZUSCHNITT. In der Vorlage standen 134 ms Stille vor dem Anschlag, und
+ *    die spielt jeder Abspieler brav mit ab.
+ *  - Er bleibt STEREO. Die beiden Kanäle der Aufnahme sind kaum verwandt
+ *    (Korrelation +0,25); die Mono-Summe löschte 38% der Energie aus und machte
+ *    aus dem Anschlag einen hohlen Klang.
+ *
+ * Der Stups ist Androids EIGENER Uhren-Tick (`Clock_Tick`) — dieselbe
+ * Rückmeldung, die das System für die Stunden- und Minutenauswahl seiner Uhr
+ * benutzt. Damit ist er so leicht, wie das Gerät ihn kann, und nicht so leicht,
+ * wie wir eine Dauer in Millisekunden geraten hätten.
  */
 import { createAudioPlayer, setAudioModeAsync, type AudioPlayer } from "expo-audio";
+import { tickSound } from "@/modules/tick-sound";
 import { haptic } from "@/lib/haptics";
 
 const SOURCE = require("../../assets/sounds/tick.wav");
 
 /**
- * Drei Abspieler im Wechsel.
+ * Kürzester Abstand zwischen zwei Klicks — und er muss LÄNGER sein als der
+ * Klang selbst (52ms).
  *
- * Einer allein müsste vor jedem Klick zurückspulen, und das Zurückspulen ist
- * eine Zusage, die erst später eingelöst wird — bei zwanzig Klicks je Sekunde
- * verschluckt es die Hälfte. Im Wechsel hat jeder rund eine Zehntelsekunde Ruhe,
- * bei 18ms Ton also reichlich.
+ * Bei 35ms lagen zwei Klicks 23ms übereinander. Zwei Kopien desselben Anschlags,
+ * leicht versetzt gemischt, löschen sich in Teilen des Spektrums aus und
+ * verstärken sich in anderen — das ist ein Kammfilter, und genau danach klingt
+ * es: nach seltsamem Klackern statt nach einzelnen Anschlägen. Mit 60ms liegt
+ * zwischen zwei Klicks immer etwas Luft.
+ *
+ * Kostet an schnellen Stellen einzelne Ticks (höchstens 16 je Sekunde) — die
+ * fallen nicht auf, ein verschmierter Anschlag schon.
  */
-const VOICES = 3;
-/** Kürzester Abstand zwischen zwei Ticks. Darüber wird aus dem Klicken ein Surren. */
-const MIN_GAP_MS = 35;
+const MIN_GAP_MS = 60;
 /** Unter dem Daumen, nicht im Raum. */
-const VOLUME = 0.5;
+const VOLUME = 0.25;
+
+let last = 0;
+
+/* -------------------------------------------------- Rückfall: `expo-audio` */
+
+/** Vier Abspieler im Wechsel — siehe `playFallback`. */
+const VOICES = 4;
+/** Erst deutlich NACH dem Klang zurückspulen, sonst schneidet es ihn ab. */
+const REARM_MS = 260;
 
 let pool: AudioPlayer[] | null = null;
 let next = 0;
-let last = 0;
 
-/**
- * Abspieler anlegen — bewusst NICHT beim Aufbau des Blattes.
- *
- * Ein Abspieler ist auf Android ein echter Decoder; drei davon im selben
- * Durchgang wie die Einfahrt wären genau die Art Arbeit, die dort nicht
- * hingehört. Angelegt wird deshalb erst, wenn das Blatt steht — oder wenn ein
- * Finger das Rad berührt, je nachdem, was zuerst kommt.
- */
-export function primeTick(): void {
+function primeFallback(): void {
   if (pool) return;
   /**
    * OHNE Audio-Fokus abspielen — sonst pausiert jeder Klick die Musik.
    *
    * Steht in `AudioModule.kt` von expo-audio: Ohne gesetzten Modus fordert das
    * Abspielen `AUDIOFOCUS_GAIN_TRANSIENT` an, und das hält fremde Wiedergabe
-   * an. Bei einem Klick je gescrollter Zahl hieße das: Wer beim Suchen Musik
-   * hört, dem stottert sie im Takt des Rades. `mixWithOthers` fordert auf
-   * Android gar keinen Fokus an — genau dafür ist der Modus da („Best suited
-   * for sound effects, UI feedback").
-   *
-   * Der Modus gilt für die ganze App, deshalb wird er beim Abbau wieder
-   * zurückgestellt: Eine Sprachnachricht in Bo SOLL die Musik weiterhin
-   * anhalten.
+   * an. `mixWithOthers` fordert auf Android gar keinen Fokus an. Nur für diesen
+   * Weg nötig — `SoundPool` fragt nie nach Fokus.
    */
   setAudioModeAsync({ interruptionMode: "mixWithOthers" }).catch(() => undefined);
   try {
@@ -81,8 +98,37 @@ export function primeTick(): void {
   }
 }
 
-/** Beim Abbau des Blattes: Die Decoder gehören nicht der ganzen Sitzung. */
-export function releaseTick(): void {
+/**
+ * Abspielen und danach zurückspulen — nicht davor.
+ *
+ * Ein Media-Player steht nach dem Klang am Ende und spielt ohne Zurückspulen
+ * nicht wieder an. Läge das Zurückspulen VOR dem Abspielen, käme der Klang
+ * verspätet; liegt es zu kurz danach, schneidet es ihn ab — der Anlauf des
+ * Players kann länger dauern als der 52ms-Klang selbst. Deshalb 260ms, und vier
+ * Abspieler, damit trotzdem keiner drankommt, bevor er wieder bereit ist.
+ */
+function playFallback(): void {
+  if (!pool) primeFallback();
+  const players = pool;
+  if (!players) return;
+  const p = players[next % players.length]!;
+  next = (next + 1) % players.length;
+  try {
+    p.play();
+    setTimeout(() => {
+      try {
+        p.pause();
+        void p.seekTo(0);
+      } catch {
+        // Abspieler schon abgeräumt (Blatt zu) — dann ist ja gut.
+      }
+    }, REARM_MS);
+  } catch {
+    // Ein verschluckter Klick ist harmlos.
+  }
+}
+
+function releaseFallback(): void {
   const old = pool;
   pool = null;
   next = 0;
@@ -99,6 +145,32 @@ export function releaseTick(): void {
   }
 }
 
+/* -------------------------------------------------------------- Öffentlich */
+
+/**
+ * Klang bereitlegen — bewusst NICHT im Durchgang, der das Blatt öffnet.
+ *
+ * Entpacken und Laden gehören nicht neben die Einfahrt. Aufgerufen wird das,
+ * wenn das Blatt steht — oder beim Aufsetzen des Fingers, je nachdem, was
+ * zuerst kommt.
+ */
+export function primeTick(): void {
+  if (tickSound) {
+    tickSound.prime();
+    return;
+  }
+  primeFallback();
+}
+
+/** Beim Abbau des Blattes: Der Klang gehört nicht der ganzen Sitzung. */
+export function releaseTick(): void {
+  if (tickSound) {
+    tickSound.release();
+    return;
+  }
+  releaseFallback();
+}
+
 /**
  * Eine Zahl weiter. Läuft auf dem JS-Strang, angestoßen aus dem Worklet des
  * Rades — die Bewegung selbst bleibt davon unberührt.
@@ -111,15 +183,9 @@ export function wheelTick(): void {
   // Prüft selbst, ob der Nutzer Haptik überhaupt möchte.
   haptic("tick");
 
-  if (!pool) primeTick();
-  const players = pool;
-  if (!players) return;
-  const p = players[next % players.length]!;
-  next = (next + 1) % players.length;
-  try {
-    void p.seekTo(0);
-    p.play();
-  } catch {
-    // Ein verschluckter Klick ist harmlos.
+  if (tickSound) {
+    tickSound.play(VOLUME);
+    return;
   }
+  playFallback();
 }

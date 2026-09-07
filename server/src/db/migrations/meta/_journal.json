@@ -99,6 +99,20 @@
       "when": 1785936962360,
       "tag": "0013_little_wasp",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1788709740383,
+      "tag": "0014_famous_norman_osborn",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1788725838109,
+      "tag": "0015_high_corsair",
+      "breakpoints": true
     }
   ]
 }

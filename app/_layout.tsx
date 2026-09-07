@@ -20,6 +20,7 @@ import { LegTimelineOverlay } from "@/components/results/LegTimelineOverlay";
 import { DetailsOverlay } from "@/components/results/DetailsOverlay";
 import { StopDetailSheet } from "@/components/surroundings/StopDetailSheet";
 import { AppAlertHost } from "@/components/ui/AppAlertHost";
+import { NotificationsSheet } from "@/components/home/NotificationsSheet";
 import { ConnectionNotFoundHost } from "@/components/ui/ConnectionNotFoundModal";
 // FloatingTabBar entfernt — der native Tab-Bar des
 // createNativeBottomTabNavigator (siehe app/(tabs)/_layout.tsx) übernimmt
@@ -312,6 +313,11 @@ export default function RootLayout() {
             <ConnectionNotFoundHost />
             <SavedToastHost />
             <StationSaveToastHost />
+            {/* Die Glocke im Landingscreen. HIER und nicht im Tab: Nur von der
+                Wurzel aus deckt das Blatt die Tab-Leiste mit ab. Vor den beiden
+                Wählern, also darunter — aus dem Such-Blatt heraus können die
+                über ihm geöffnet werden. */}
+            <NotificationsSheet />
             {/* DatePickerHost ZULETZT vor Auth → liegt VISUELL ÜBER den
                 Tabs/Overlays inkl. Nav-Bar, sodass die Nav-Bar während des
                 Pickers nicht klickbar ist. */}

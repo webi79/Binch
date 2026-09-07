@@ -1,0 +1,9 @@
+# Gradle-/Build-Output des tick-sound Native-Moduls.
+# Wird bei JEDEM (Release-)Build neu erzeugt und gehört nie ins Repo — sonst
+# tauchen nach jedem Build über tausend Artefakt-Dateien als „pending changes"
+# auf. Der Root-.gitignore-Eintrag `/android` deckt nur den CNG-Root-Ordner ab,
+# nicht diesen verschachtelten Modul-Pfad. Dieselbe Datei liegt aus demselben
+# Grund in `modules/screen-corners/android/`.
+build/
+.gradle/
+.cxx/

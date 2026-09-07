@@ -1,33 +1,32 @@
-import { useEffect, useState, useRef, useCallback, useMemo } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import {
   StyleSheet,
   View,
   BackHandler,
   Platform,
-  ScrollView,
   Text,
   Pressable,
   useWindowDimensions,
 } from "react-native";
 import { usePalette } from "@/lib/theme/appBg";
 import { ClearSearchHistoryAlert } from "@/components/ui/ClearSearchHistoryAlert";
+import { SHEET_SUBTITLE, SHEET_TITLE } from "@/components/ui/SheetModal";
 import Animated, {
   FadeIn,
   FadeOut,
   useAnimatedStyle,
   useSharedValue,
-  withSpring,
   withTiming,
-  runOnJS,
 } from "react-native-reanimated";
-import { Gesture, GestureDetector } from "react-native-gesture-handler";
+import { GestureDetector } from "react-native-gesture-handler";
 import { Trash2 } from "lucide-react-native";
 import { useSearchStore } from "@/stores/searchStore";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
 import { RecentCard } from "@/components/home/RecentCard";
 import { scaledStyles } from "@/lib/ui/compact";
+import { SWIPE_OUT, useSheetScrollGate, useSheetSwipe } from "@/lib/ui/sheetSwipe";
 
 /**
  * Bottom-sheet overlay showing the full recent-search history.
@@ -123,38 +122,39 @@ function RecentHistorySheet() {
     closeTimer.current = setTimeout(close, SHEET_OUT.duration);
   }, [close, sheetHeight, translateY]);
 
-  /** Nur den Abschluss planen — die Wisch-Geste fährt selbst, auf dem UI-Strang. */
-  const scheduleClose = useCallback(() => {
-    if (closingRef.current) return;
-    closingRef.current = true;
-    closeTimer.current = setTimeout(close, SHEET_OUT.duration);
-  }, [close]);
+  /**
+   * Nur den Abschluss planen — die Wisch-Geste fährt selbst, auf dem UI-Strang.
+   *
+   * Die Dauer kommt von ihr mit: Der Abwurf nimmt die kürzere Kurve
+   * (`SWIPE_OUT`), weil der Finger den halben Weg schon gemacht hat. Vorher
+   * stand hier die volle Ausfahrt — dieses Blatt war damit das einzige, das
+   * nach dem Loslassen noch gemächlich weiterkroch.
+   */
+  const scheduleClose = useCallback(
+    (afterMs: number = SHEET_OUT.duration) => {
+      if (closingRef.current) return;
+      closingRef.current = true;
+      closeTimer.current = setTimeout(close, afterMs);
+    },
+    [close],
+  );
 
   /**
-   * In `useMemo` — sonst entsteht der Erkenner bei jedem Render neu.
+   * Gezogen wird am ganzen Blatt — und der Torhüter ist hier Pflicht.
    *
-   * Jedes neue `Gesture.Pan()`-Objekt muss der Detektor gegen seinen nativen
-   * Gegenpart abgleichen und neu einrichten. Die anderen Blätter der App haben
-   * das längst; diese drei waren übrig.
+   * Dieses Blatt ist zum größten Teil Liste, und die ist regelmäßig länger als
+   * die Fläche. Ohne die gleichzeitige Anmeldung bräche das Anspringen der
+   * Wisch-Geste jedes Scrollen ab; ohne den Scroll-Stand risse eine Liste in
+   * der Mitte das ganze Blatt mit nach unten. Beides steckt in
+   * `useSheetScrollGate`.
    */
-  const panGesture = useMemo(() =>
-    Gesture.Pan()
-    .activeOffsetY(8)
-    .failOffsetY(-8)
-    .onUpdate((e) => {
-      translateY.value = Math.max(0, e.translationY);
-    })
-    .onEnd((e) => {
-      if (e.translationY > 110 || e.velocityY > 700) {
-        // Bewegung SOFORT von hier, auf dem UI-Strang — der Finger ist gerade
-        // erst weg. Abgemeldet wird erst danach; identisch zum Ticket-Blatt.
-        translateY.value = withTiming(sheetHeight, SHEET_OUT);
-        runOnJS(scheduleClose)();
-      } else {
-        translateY.value = withSpring(0, { damping: 22, stiffness: 220 });
-      }
-    }),
-  [sheetHeight, translateY, scheduleClose]);
+  const gate = useSheetScrollGate();
+  const panGesture = useSheetSwipe({
+    y: translateY,
+    travel: sheetHeight,
+    onDismiss: scheduleClose,
+    gate,
+  });
 
   const [confirmVisible, setConfirmVisible] = useState(false);
   const handleClear = () => {
@@ -179,41 +179,52 @@ function RecentHistorySheet() {
       >
         <Pressable style={StyleSheet.absoluteFill} onPress={requestClose} />
       </Animated.View>
-      <Animated.View
-        style={[styles.sheet, { backgroundColor: palette.s1 }, sheetAnim, { top: sheetTop }]}
-      >
-        <GestureDetector gesture={panGesture}>
+      <GestureDetector gesture={panGesture}>
+        <Animated.View
+          style={[styles.sheet, { backgroundColor: palette.s1 }, sheetAnim, { top: sheetTop }]}
+        >
+          {/* Nur noch Zeichen, nicht mehr Griff — gezogen wird überall. */}
           <View style={styles.handleWrap}>
             <View style={styles.handle} />
           </View>
-        </GestureDetector>
-        <View style={styles.titleRow}>
-          <Text style={styles.title}>{t("home.recent.title")}</Text>
-          <Pressable
-            onPress={handleClear}
-            hitSlop={10}
-            disabled={recentSearches.length === 0}
-            style={({ pressed }) => [
-              styles.trashBtn,
-              { backgroundColor: palette.s2 },
-              { opacity: recentSearches.length === 0 ? 0.35 : pressed ? 0.6 : 1 },
-            ]}
-            accessibilityLabel={t("home.recent.clear.title")}
-          >
-            <Trash2 size={20} color="#FF3B5C" strokeWidth={2} />
-          </Pressable>
-        </View>
-        <Text style={styles.subtitle}>{t("home.recent.subtitle")}</Text>
-        <ScrollView
-          style={styles.scroll}
-          contentContainerStyle={styles.scrollContent}
-          showsVerticalScrollIndicator={false}
-        >
-          {recentSearches.map((s) => (
-            <RecentCard key={s.id} search={s} bordered />
-          ))}
-        </ScrollView>
-      </Animated.View>
+          <View style={styles.titleRow}>
+            <Text style={styles.title}>{t("home.recent.title")}</Text>
+            <Pressable
+              onPress={handleClear}
+              hitSlop={10}
+              disabled={recentSearches.length === 0}
+              style={({ pressed }) => [
+                styles.trashBtn,
+                { backgroundColor: palette.s2 },
+                { opacity: recentSearches.length === 0 ? 0.35 : pressed ? 0.6 : 1 },
+              ]}
+              accessibilityLabel={t("home.recent.clear.title")}
+            >
+              <Trash2 size={20} color="#FF3B5C" strokeWidth={2} />
+            </Pressable>
+          </View>
+          <Text style={styles.subtitle}>{t("home.recent.subtitle")}</Text>
+          {/* Eigener nativer Erkenner um die Liste — sonst würgt das Ziehen am
+              Blatt jedes Scrollen ab. */}
+          <GestureDetector gesture={gate.native}>
+            <Animated.ScrollView
+            ref={gate.ref}
+              style={styles.scroll}
+              contentContainerStyle={styles.scrollContent}
+              showsVerticalScrollIndicator={false}
+              onScroll={gate.onScroll}
+              scrollEventThrottle={16}
+              // Kein Überzieh-Schimmer oben: Dort übernimmt ab sofort das Blatt.
+              overScrollMode="never"
+              bounces={false}
+            >
+              {recentSearches.map((s) => (
+                <RecentCard key={s.id} search={s} bordered />
+              ))}
+            </Animated.ScrollView>
+          </GestureDetector>
+        </Animated.View>
+      </GestureDetector>
 
       <ClearSearchHistoryAlert
         visible={confirmVisible}
@@ -250,14 +261,11 @@ const styles = scaledStyles({
     alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: 20,
-    marginBottom: 6,
+    // 8 statt 6 — auf dem Raster, und der größere Titel braucht etwas mehr Luft.
+    marginBottom: 8,
   },
-  title: {
-    fontSize: 18,
-    fontWeight: "700",
-    color: "#F4F4F5",
-    flex: 1,
-  },
+  /** Aufschrift des Blattes — dieselbe wie in jedem anderen (SHEET_TITLE). */
+  title: { ...SHEET_TITLE, flex: 1 },
   trashBtn: {
     width: 44,
     height: 44,
@@ -266,13 +274,7 @@ const styles = scaledStyles({
     justifyContent: "center",
     backgroundColor: "#171719",
   },
-  subtitle: {
-    fontSize: 13,
-    color: "#8E8E93",
-    marginBottom: 18,
-    lineHeight: 18,
-    paddingHorizontal: 20,
-  },
+  subtitle: { ...SHEET_SUBTITLE, marginBottom: 16, paddingHorizontal: 20 },
   scroll: { flex: 1 },
   scrollContent: { paddingBottom: 24 },
 });

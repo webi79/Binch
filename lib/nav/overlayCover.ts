@@ -268,6 +268,7 @@ export function warmPushCurves(): void {
   warm(ticketPush, PUSH_SPRING);
   warm(settingsPush, PUSH_SPRING);
   warm(assistantPush, ASSISTANT_IN);
+  warm(assistantDrawer, SHEET_IN);
   warm(searchHeroPush, PUSH_SPRING);
   // Fehlte als einzige. Sie treibt zwei bildschirmfüllende Auswerter bei der
   // Übergabe vom Such-Blatt an die Ergebnisliste — der allererste Übergang
@@ -573,6 +574,109 @@ export const ASSISTANT_IN = PUSH_SPRING;
 export const ASSISTANT_OUT = POP_SPRING;
 
 export const assistantPush = makeMutable(0);
+
+/**
+ * Fortschritt der Chat-Schublade in Bos Bildschirm. 0 = zu, 1 = offen.
+ *
+ * Sie ist KEINE weitere Einfahrt: Es fährt nichts über den Bildschirm, sondern
+ * der Bildschirm selbst schrumpft und rückt zur Seite, bis er zur Hälfte am
+ * rechten Rand steht und die Fläche dahinter freigibt.
+ *
+ * Trotzdem steht der Wert HIER und nicht im Bildschirm — aus demselben Grund
+ * wie `detailsPush`: Von hier aus kann die Kurve im Berührungs-Bild starten,
+ * während der Aufbau der Schublade daneben läuft statt davor.
+ *
+ * Warum `SHEET_IN`/`SHEET_OUT` und nicht `ASSISTANT_IN`: Die Push-Kurven sind
+ * für einen ganzen Bildschirmwechsel gemacht und tragen entsprechend Weg. Hier
+ * legt der Bildschirm eine halbe Breite zurück und bleibt dabei sichtbar — das
+ * ist dieselbe Größenordnung wie ein Blatt von unten.
+ */
+export const assistantDrawer = makeMutable(0);
+
+/**
+ * Wie weit der Bildschirm schrumpft, wenn die Schublade offen ist.
+ *
+ * Die Verschiebung ist bewusst NICHT von diesem Wert abhängig: Rückt der
+ * Bildschirm um genau eine halbe Bildschirmbreite nach rechts, bleibt er immer
+ * exakt zur Hälfte sichtbar — egal wie stark er schrumpft. Denn die
+ * Verkleinerung geschieht um seine Mitte, seine linke Kante liegt danach bei
+ * `W - s·W/2`, und sichtbar bleibt `s·W/2`, also die Hälfte seiner eigenen
+ * Breite. Damit lässt sich der Schrumpf-Faktor nach Gefühl ändern, ohne dass
+ * die Hälfte verrutscht.
+ *
+ * Er steht hier, weil ihn zwei Seiten brauchen: die Bewegung und die
+ * Schublade, deren Inhalt nicht unter den stehengebliebenen Rest laufen darf.
+ */
+export const ASSISTANT_DRAWER_SCALE = 0.72;
+
+/**
+ * Herausfahren. `done` läuft, wenn der Bildschirm zur Seite gerückt STEHT —
+ * daran hängt, ab wann in der Schublade etwas angetippt werden darf.
+ */
+export function startAssistantDrawer(done?: () => void): void {
+  markTransitionBusy(SHEET_IN.duration);
+  setSheetMoving(true, "assistantDrawer");
+  assistantDrawer.value = withTiming(1, SHEET_IN, (finished) => {
+    "worklet";
+    if (!finished) return;
+    runOnJS(setSheetMoving)(false, "assistantDrawer");
+    if (done) runOnJS(done)();
+  });
+}
+
+/**
+ * Zurückfahren. `done` läuft, wenn der Bildschirm wirklich wieder steht —
+ * daran hängt der Abbau der Schublade.
+ *
+ * Der Rückruf der Kurve und nicht eine Stoppuhr: Eine Stoppuhr misst ab dem
+ * Moment, in dem sie gestellt wurde, nicht ab dem Start der Bewegung. Genau
+ * dieselbe Korrektur steht in `startAssistantPush` bei `assistantArrived`.
+ */
+export function endAssistantDrawer(done?: () => void): void {
+  markTransitionBusy(SHEET_OUT.duration);
+  setSheetMoving(true, "assistantDrawer");
+  assistantDrawer.value = withTiming(0, SHEET_OUT, (finished) => {
+    "worklet";
+    if (!finished) return;
+    runOnJS(setSheetMoving)(false, "assistantDrawer");
+    if (done) runOnJS(done)();
+  });
+}
+
+/**
+ * Anmeldung OHNE Kurve — für den Abschluss der Wisch-Geste.
+ *
+ * Dort startet die Bewegung im Worklet, also auf dem UI-Faden und im selben
+ * Moment, in dem der Finger abhebt. Über den JS-Faden zu gehen, nur um die
+ * Kurve zu starten, kostet genau eine Runde: Der Abschluss wird zugestellt, ein
+ * React-Commit läuft, und erst danach fährt der Bildschirm weiter. Das ist der
+ * spürbare Stopp beim Loslassen.
+ *
+ * Also übernimmt das Worklet die Bewegung, und hier bleibt nur die Buchhaltung:
+ * beim Übergangs-Register und beim Textur-Riegel anmelden, damit während der
+ * Nachfahrt nichts abgeräumt wird.
+ */
+export function markAssistantDrawerSettling(open: boolean): void {
+  markTransitionBusy(open ? SHEET_IN.duration : SHEET_OUT.duration);
+  setSheetMoving(true, "assistantDrawer");
+}
+
+/** Gegenstück: abmelden, wenn die Nachfahrt durch ist. */
+export function endAssistantDrawerSettled(): void {
+  setSheetMoving(false, "assistantDrawer");
+}
+
+/**
+ * Beim Abbau des Bildschirms zurücksetzen — Lage UND Anmeldung.
+ *
+ * Wird Bo mit offener Schublade verlassen, bliebe der Wert auf 1 stehen: Beim
+ * nächsten Öffnen stünde der Bildschirm geschrumpft am rechten Rand. Und der
+ * Schlüssel bliebe im Textur-Riegel hängen, siehe `resetAssistantPush`.
+ */
+export function resetAssistantDrawer(): void {
+  setSheetMoving(false, "assistantDrawer");
+  assistantDrawer.value = 0;
+}
 
 /**
  * Fortschritt des Detail-Blattes („Auswählen" an einer Ticket-Karte).

@@ -33,6 +33,7 @@ import {
 import { useAppBg, usePalette } from "@/lib/theme/appBg";
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { keyboardHeight } from "@/lib/nav/keyboardHeight";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import {
@@ -56,6 +57,7 @@ import Animated, {
   cancelAnimation,
   useAnimatedScrollHandler,
   useDerivedValue,
+  runOnJS,
   runOnUI,
   type SharedValue,
   type AnimatedRef,
@@ -74,6 +76,13 @@ import {
   resetAssistantPush,
   SHEET_IN,
   SHEET_OUT,
+  assistantDrawer,
+  ASSISTANT_DRAWER_SCALE,
+  startAssistantDrawer,
+  endAssistantDrawer,
+  resetAssistantDrawer,
+  markAssistantDrawerSettling,
+  endAssistantDrawerSettled,
 } from "@/lib/nav/overlayCover";
 import { loadAuthToken } from "@/lib/auth/tokenStorage";
 import { Bo, boBodyHeight, type BoMood } from "@/components/assistant/Bo";
@@ -84,13 +93,14 @@ import { useT } from "@/lib/i18n/useT";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
 import { ScreenHeading, HEADING_LINE_HEIGHT } from "@/components/ui/ScreenHeading";
-import { GUTTER, HEADING_TOP } from "@/lib/theme/spacing";
+import { GUTTER, HEADING_TOP, SPACE, CLOSE_ICON_SIZE, TOPBAR_TOP } from "@/lib/theme/spacing";
 import { MicBox } from "@/components/assistant/MicBox";
 import { useAudioRecorder, RecordingPresets } from "expo-audio";
 import { joinWavFiles } from "@/lib/assistant/wavJoin";
 import {
   ensureModel,
   isModelReady,
+  subscribeModelProgress,
   lastWhisperIssue,
   releaseWhisper,
   transcribeVoice,
@@ -101,6 +111,17 @@ import { useSearchStore } from "@/stores/searchStore";
 import { type StopBoardResponse } from "@/lib/api/client";
 import { streamChat, todayLocal, ChatApiError, type ChatStreamEvent, type LastSearchParams } from "@/lib/api/chat";
 import { pickWelcome } from "@/lib/assistant/welcomes";
+import { useQueryClient } from "@tanstack/react-query";
+import { ChatDrawer } from "@/components/assistant/ChatDrawer";
+import {
+  chatThreadKey,
+  chatThreadsKey,
+  chatThreadsKeyFor,
+  fetchChatThread,
+  fetchChatThreads,
+  CHAT_THREADS_PAGE_SIZE,
+  type ChatMessageRow,
+} from "@/lib/api/chats";
 import { StopBoardCard } from "@/components/assistant/StopBoardCard";
 import type { SearchResult } from "@/types/search";
 import { ms, scaledStyles } from "@/lib/ui/compact";
@@ -479,6 +500,190 @@ export function AssistantScreen() {
    */
   const openSeq = useSearchStore((st) => st.assistantOpenSeq);
 
+  /** Steht weit oben, weil ihn drei Stellen brauchen: Vorabruf der Chat-Liste,
+   *  das Öffnen einer Unterhaltung und der Strom, der die Liste veralten lässt. */
+  const queryClient = useQueryClient();
+
+  /**
+   * DIE CHAT-SCHUBLADE — Zustand und Bedienung.
+   *
+   * Es gibt zwei Merker, und sie meinen verschiedene Dinge:
+   *
+   *  - `drawerUp` ist eine Zustandsgröße: Steht die Schublade IM BAUM (und
+   *    trägt der Bildschirm deshalb runde Ecken)? Sie wird schon beim
+   *    AUFSETZEN des Fingers gesetzt, nicht beim Tipp.
+   *  - `drawerOpenNow` ist der Verteiler weiter unten: Ist sie BEDIENBAR? Er
+   *    wird erst gesetzt, wenn die Kurve durch ist.
+   *
+   * Die Aufteilung ist der ganze Trick an der Sache. Der Aufbau der Schublade
+   * ist ein Commit über einen ganzen Bildschirm voll Liste, und ein Commit
+   * hält Reanimateds Bewegung an — das steht an mehreren Stellen in dieser
+   * Datei mit Messwerten. Zwischen Aufsetzen und Loslassen liegen 80 bis
+   * 150ms, die ohnehin verstreichen; genau dorthin gehört er. Losgefahren wird
+   * danach auf einem Baum, der schon steht.
+   *
+   * Dasselbe Muster wie `armClose`/`closeScreen` am X-Knopf, nur für die
+   * andere Richtung.
+   */
+  const [drawerUp, setDrawerUp] = useState(false);
+  const drawerUpRef = useRef(false);
+  const drawerOpenRef = useRef(false);
+  const drawerDisarmRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Das Bild Vorlauf zwischen Aufbau und Fahrt — muss beim Abbau mit weg. */
+  const drawerRafRef = useRef<number | null>(null);
+
+  const armDrawer = useCallback(() => {
+    if (drawerDisarmRef.current) {
+      clearTimeout(drawerDisarmRef.current);
+      drawerDisarmRef.current = null;
+    }
+    /**
+     * NUR anhalten — hier wird NICHTS in den Baum gehängt.
+     *
+     * Hier stand der Aufbau der Schublade, mit der Begründung, er gehöre in die
+     * 80 bis 150ms des Fingers. Die Überlegung stimmt für Bos X-Knopf, aber
+     * nicht für diesen: Dort werden nur Verteiler umgelegt, hier kam eine
+     * bildschirmfüllende ANSICHT als neues Geschwister dazu — mitten in der
+     * laufenden Berührung.
+     *
+     * Genau das hat der Nutzer gemeldet: „manchmal passiert gar nichts". Fällt
+     * dieser Commit zwischen Aufsetzen und Loslassen, muss Fabric die
+     * Berührungsziele neu auflösen, und das Loslassen findet seinen Empfänger
+     * nicht mehr — `onPress` bleibt aus. Ob es passiert, hängt daran, wie
+     * schnell getippt wird; deshalb nur manchmal.
+     *
+     * Anhalten allein ist gefahrlos: `setSliding` legt Modul-Verteiler um
+     * (`setBoBlocked`, `setDotsPaused`), ohne die Struktur anzufassen. Genau
+     * das tut `armClose` am X-Knopf gegenüber seit jeher.
+     */
+    setSliding(true);
+  }, []);
+
+  /**
+   * Abgebrochener Tipp — mit Abstand zurücknehmen.
+   *
+   * Beim echten Tipp läuft `onPressOut` VOR `onPress`; ein sofortiges
+   * Zurücknehmen bäute die Schublade also genau in dem Moment wieder ab, in
+   * dem sie gebraucht wird. Dieselbe Frist wie bei `disarmClose`.
+   */
+  const disarmDrawer = useCallback(() => {
+    if (drawerDisarmRef.current) clearTimeout(drawerDisarmRef.current);
+    drawerDisarmRef.current = setTimeout(() => {
+      drawerDisarmRef.current = null;
+      if (drawerOpenRef.current || closingRef.current) return;
+      setSliding(false);
+    }, 400);
+  }, []);
+
+  const openDrawer = useCallback(() => {
+    if (drawerOpenRef.current) return;
+    if (drawerDisarmRef.current) {
+      clearTimeout(drawerDisarmRef.current);
+      drawerDisarmRef.current = null;
+    }
+    // Wege ohne Berührung (Bedienhilfe, Tastatur) haben kein `onTouchStart`
+    // gehabt — dann fällt der Aufbau eben hier an.
+    if (!drawerUpRef.current) {
+      drawerUpRef.current = true;
+      setDrawerUp(true);
+    }
+    drawerOpenRef.current = true;
+    haptic("button");
+    /**
+     * Aufbauen, ein Bild warten, dann fahren.
+     *
+     * Der Aufbau ist der größte Commit dieses Vorgangs, und ein Commit hält
+     * Reanimateds Kurve an — er darf also nicht IN die Fahrt fallen. In die
+     * Berührung davor darf er auch nicht (siehe `armDrawer`, das hat die Tipps
+     * verschluckt). Bleibt der Platz dazwischen: In diesem Durchgang entsteht
+     * die Schublade, im nächsten Bild läuft die Kurve los. Die Verzögerung ist
+     * ein einzelnes Bild und damit unsichtbar; dasselbe Muster nutzt der
+     * Bildschirm schon für seinen Direkteinstieg.
+     */
+    if (drawerUpRef.current) {
+      startAssistantDrawer(() => setDrawerOpenNow(true));
+      return;
+    }
+    drawerUpRef.current = true;
+    setDrawerUp(true);
+    if (drawerRafRef.current !== null) cancelAnimationFrame(drawerRafRef.current);
+    drawerRafRef.current = requestAnimationFrame(() => {
+      drawerRafRef.current = null;
+      // In der Zwischenzeit zurückgenommen? Dann nicht doch noch losfahren.
+      if (!drawerOpenRef.current) return;
+      startAssistantDrawer(() => setDrawerOpenNow(true));
+    });
+  }, []);
+
+  /**
+   * Zurückfahren, und danach optional noch etwas tun.
+   *
+   * Das `then` läuft im Abschluss der KURVE, nicht auf einer Stoppuhr — der
+   * Unterschied ist im Projekt mehrfach begründet (eine Stoppuhr misst ab dem
+   * Stellen, nicht ab dem Start der Bewegung). Gebraucht wird es vom Tipp auf
+   * die Profil-Karte: Bo darf erst danach hinausfahren, sonst verlässt ein
+   * GESCHRUMPFTER Bildschirm das Bild.
+   */
+  const closeDrawerThen = useCallback((then?: () => void) => {
+    if (!drawerOpenRef.current) return;
+    /**
+     * Gesperrt wird über die ABLAGE, nicht über den Verteiler.
+     *
+     * Hier stand `setDrawerOpenNow(false)` — und das ist ein Commit im
+     * Berührungs-Bild, direkt bevor die Kurve losläuft. Genau so ein Commit
+     * hält Reanimated an; beim Wischen war er als Stocken zu spüren.
+     *
+     * Die Sperre gegen ein zweites Auslösen macht die Ablage genauso gut, und
+     * sie kostet nichts. Der Verteiler wird erst am ENDE umgelegt, zusammen mit
+     * dem Abbau — dann steht ohnehin alles still.
+     */
+    drawerOpenRef.current = false;
+    endAssistantDrawer(() => {
+      // In der Zwischenzeit wieder geöffnet? Dann steht der Abbau quer.
+      if (drawerOpenRef.current) return;
+      setDrawerOpenNow(false);
+      drawerUpRef.current = false;
+      setDrawerUp(false);
+      if (!closingRef.current) setSliding(false);
+      then?.();
+    });
+  }, []);
+
+  /**
+   * Die Fassung für die Oberfläche — OHNE Argument.
+   *
+   * `closeDrawerThen` direkt als `onPress` zu übergeben wäre ein Fehler mit
+   * Ansage: React Native reicht dort das Berührungs-Ereignis herein, und das
+   * landete als `then` in einem Aufruf.
+   */
+  const closeDrawer = useCallback(() => closeDrawerThen(), [closeDrawerThen]);
+
+  /**
+   * Abschluss der Wisch-Geste — die BEWEGUNG läuft schon.
+   *
+   * Sie wird im Worklet gestartet, in dem Bild, in dem der Finger abhebt. Hier
+   * kommt nur noch die Buchhaltung nach, und die darf ruhig ein, zwei Bilder
+   * später eintreffen: Sie meldet die Fahrt beim Übergangs-Register und beim
+   * Textur-Riegel an, damit während der Nachfahrt nichts abgeräumt wird.
+   *
+   * Beim Zurückfahren fällt hier KEIN Commit an — der Verteiler bleibt stehen,
+   * die Ablage genügt als Sperre. Umgelegt wird er erst am Ende.
+   */
+  const settleDrawerStart = useCallback((open: boolean) => {
+    markAssistantDrawerSettling(open);
+    if (!open) drawerOpenRef.current = false;
+  }, []);
+
+  /** Und wenn die Nachfahrt durch ist: abmelden und ggf. abbauen. */
+  const settleDrawerDone = useCallback((open: boolean) => {
+    endAssistantDrawerSettled();
+    if (open || drawerOpenRef.current) return;
+    setDrawerOpenNow(false);
+    drawerUpRef.current = false;
+    setDrawerUp(false);
+    if (!closingRef.current) setSliding(false);
+  }, []);
+
   /**
    * Erst zurückfahren, dann zurücknavigieren.
    *
@@ -506,16 +711,33 @@ export function AssistantScreen() {
       // Gerundete führende Kante — gemeinsam mit dem Schatten geschaltet.
       // Ohne ihn ist sie unsichtbar, und sie ist pro Bild ein `clipPath` über
       // die volle Fläche. Begründung samt Beleg bei `SLIDE_LIFT`.
-      borderRadius: SLIDE_LIFT > 0 ? SCREEN_CORNER_RADIUS : 0,
-      overflow: SHELL_OVERFLOW,
+      /**
+       * Für die Schublade kommt die Rundung zurück — und zwar GESCHALTET, nicht
+       * animiert.
+       *
+       * Bei `SLIDE_LIFT` steht, was sie kostet: RN 0.81 legt für runde Ecken bei
+       * jedem Zeichnen einen frischen `Path` an und fährt `clipPath` über die
+       * ganze Fläche. Das trifft die EINfahrt, in der sich der Baum noch
+       * aufbaut. Hier ist es anders — der Inhalt steht fest, Bo ist angehalten,
+       * bewegt wird nur eine fertige Zeichenliste. Eine Verschiebung zeichnet
+       * nichts neu.
+       *
+       * Genau `SCREEN_CORNER_RADIUS` und kein größerer Wert: Das ist die echte
+       * Eckenrundung des Geräts. Bei voller Größe deckt die Gehäusekante sie
+       * exakt ab, das Schalten ist also unsichtbar — es gibt keinen Moment, in
+       * dem plötzlich Ecken auftauchen. Geschrumpft wirkt sie um denselben
+       * Faktor kleiner; das ist der Preis dafür, dass nichts springt.
+       *
+       * `overflow` muss mit: Ohne „hidden" rundet Android den Rahmen, die
+       * Kinder malen aber weiter bis in die Ecken.
+       */
+      borderRadius: drawerUp || SLIDE_LIFT > 0 ? SCREEN_CORNER_RADIUS : 0,
+      overflow: drawerUp ? ("hidden" as const) : SHELL_OVERFLOW,
     }),
-    [palette.bg],
+    [palette.bg, drawerUp],
   );
   const inputbarWrapStyle = useMemo(() => ({ backgroundColor: appBg }), [appBg]);
-  const closeBtnStyle = useMemo(
-    () => [styles.closeBtn, { backgroundColor: palette.s2 }],
-    [palette.s2],
-  );
+  const closeBtnStyle = styles.closeBtn;
 
   const closingRef = useRef(false);
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -566,6 +788,9 @@ export function AssistantScreen() {
   useEffect(() => () => {
     if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
     if (disarmTimerRef.current) clearTimeout(disarmTimerRef.current);
+    if (drawerDisarmRef.current) clearTimeout(drawerDisarmRef.current);
+    if (drawerRafRef.current !== null) cancelAnimationFrame(drawerRafRef.current);
+    if (threadApplyRef.current) clearTimeout(threadApplyRef.current);
     if (closeRafRef.current !== null) cancelAnimationFrame(closeRafRef.current);
   }, []);
   const closeScreen = useCallback(() => {
@@ -741,6 +966,20 @@ export function AssistantScreen() {
     if (!isFocused) return;
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
       /**
+       * Steht die Schublade offen, schließt die Geste ZUERST nur sie.
+       *
+       * Gelesen wird aus der Ablage und nicht aus einer Zustandsgröße: Hinge
+       * dieser Effekt am Schubladen-Zustand, meldete er seinen Zuhörer bei
+       * jedem Öffnen ab und wieder an. Bei mehreren Anmeldern gewinnt der
+       * zuletzt angemeldete — die Reihenfolge gegenüber dem
+       * Benachrichtigungs-Blatt hinge dann davon ab, was der Nutzer zuletzt
+       * angefasst hat.
+       */
+      if (drawerOpenRef.current) {
+        closeDrawer();
+        return true;
+      }
+      /**
        * Erst die Vorarbeit, dann ein Bild später die Fahrt.
        *
        * Der X-Knopf bekommt diese Staffelung geschenkt: Textur und Anhalten
@@ -773,12 +1012,85 @@ export function AssistantScreen() {
     });
     return () => sub.remove();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [closeScreen, isFocused, armClose]);
+  }, [closeScreen, isFocused, armClose, closeDrawer]);
+  /**
+   * Die Chat-Liste holen, BEVOR jemand die Schublade öffnet.
+   *
+   * Ohne den Vorabruf beginnt die Abfrage frühestens beim Aufsetzen des
+   * Fingers auf dem Zeichen. Sie käme dann irgendwann während der Fahrt zurück
+   * — und ihr Ergebnis ist ein Commit über eine ganze Liste, also genau das,
+   * was Reanimateds Kurve anhält. Danach steht sie im Zwischenspeicher und die
+   * Schublade zeichnet sie beim Aufbau gleich mit.
+   *
+   * Er wartet, bis nichts mehr fährt: Die Einfahrt dieses Bildschirms ist
+   * selbst eine Bewegung, und ein Netzabruf, der mitten hinein zurückkommt,
+   * ist derselbe Ruck an anderer Stelle. Dasselbe Warte-Muster wie bei der
+   * Begrüßungs-Blase weiter oben.
+   */
+  useEffect(() => {
+    if (!isFocused) return;
+    let id: ReturnType<typeof setTimeout> | null = null;
+    const attempt = () => {
+      if (isTransitionBusy()) {
+        id = setTimeout(attempt, 200);
+        return;
+      }
+      id = null;
+      void queryClient
+        .prefetchQuery({
+          queryKey: chatThreadsKeyFor(useSearchStore.getState().authUser?.id ?? null),
+          queryFn: () => fetchChatThreads({ limit: CHAT_THREADS_PAGE_SIZE }),
+          staleTime: 60_000,
+        })
+        // Nicht angemeldet oder kein Netz — dann zeigt die Schublade ihren
+        // eigenen Zustand. Hier ist es nur ein Vorabruf, der eben nichts bringt.
+        .catch(() => {});
+    };
+    id = setTimeout(attempt, 600);
+    return () => {
+      if (id !== null) clearTimeout(id);
+    };
+  }, [isFocused, queryClient]);
+
   /** Neustart-Zeitgeber der Spracheingabe — muss beim Verlassen sterben. */
   const restartRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isFocusedRef = useRef(isFocused);
   isFocusedRef.current = isFocused;
   const locale = useSearchStore((s) => s.locale);
+
+  /**
+   * Kontowechsel: Der offene Verlauf gehört dem VORIGEN Konto.
+   *
+   * Er blieb stehen, bis die App neu startete — und das ist nicht nur
+   * kosmetisch: Die Kennung der Unterhaltung ist serverseitig an den Nutzer
+   * gebunden. Der nächste Turn liefe damit gegen eine Unterhaltung, die dem
+   * neuen Konto nicht gehört, und käme als „nicht gefunden" zurück.
+   *
+   * Der Vergleich läuft über eine Ablage, nicht über eine Abhängigkeit: Beim
+   * ERSTEN Durchgang darf nichts zurückgesetzt werden, sonst verlöre ein
+   * frisch geöffneter Bildschirm seinen gerade wiederhergestellten Verlauf.
+   */
+  const authUserId = useSearchStore((st) => st.authUser?.id ?? null);
+  const lastUserIdRef = useRef(authUserId);
+  useEffect(() => {
+    if (lastUserIdRef.current === authUserId) return;
+    lastUserIdRef.current = authUserId;
+    abortRef.current?.abort();
+    conversationIdRef.current = null;
+    setConversationId(null);
+    lastSearchRef.current = null;
+    if (threadApplyRef.current) {
+      clearTimeout(threadApplyRef.current);
+      threadApplyRef.current = null;
+    }
+    setMood("idle");
+    setMessages([{ id: idGen(), kind: "bot", text: pickWelcome(locale) }]);
+    // Die Listen beider Konten aus dem Zwischenspeicher nehmen. Nötig ist es
+    // seit dem Konto-Schlüssel nicht mehr — es hält den Speicher aber frei von
+    // Unterhaltungen, an die niemand mehr herankommt.
+    queryClient.removeQueries({ queryKey: chatThreadsKey });
+  }, [authUserId, locale, queryClient]);
+
   const currency = useSearchStore((s) => s.currency);
   const openAuthOverlay = useSearchStore((s) => s.openAuthOverlay);
 
@@ -884,6 +1196,22 @@ export function AssistantScreen() {
   // open_all_results funktionieren („zeig mir alle gefundenen Verbindungen"
   // im 2. Turn nach einer Suche).
   const lastSearchRef = useRef<LastSearchParams | null>(null);
+  /**
+   * In welcher gespeicherten Unterhaltung dieser Verlauf steht.
+   *
+   * `null` heißt „neuer Chat": Der Server legt dann beim ersten Turn eine
+   * Unterhaltung an und meldet ihre Kennung als erstes Ereignis zurück.
+   *
+   * Zweimal geführt, und das ist Absicht: Die Zustandsgröße hebt die Zeile in
+   * der Schublade hervor, die Ablage wird vom Strom gelesen. Der Strom läuft
+   * asynchron — läse er die Zustandsgröße, hielte er den Wert aus dem
+   * Durchgang fest, in dem er gestartet ist.
+   */
+  const [conversationId, setConversationId] = useState<string | null>(null);
+  const conversationIdRef = useRef<string | null>(null);
+  /** Der aufgeschobene Einsetz-Versuch eines geladenen Verlaufs — muss beim
+   *  Abbau sterben, sonst setzt er in einen Baum, den es nicht mehr gibt. */
+  const threadApplyRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Mutable Ref auf messages — von mehreren Effects (re-focus-wave,
   // onRetry-Callback) gelesen ohne dass sie als Dependency triggern.
   const messagesRef = useRef(messages);
@@ -1627,20 +1955,50 @@ export function AssistantScreen() {
    */
   useEffect(() => {
     if (!USE_WHISPER || !voiceMode) return;
-    let alive = true;
-    void (async () => {
-      if (await isModelReady()) return;
-      if (!alive) return;
-      setModelProgress(0);
-      const ok = await ensureModel((p) => {
-        if (alive) setModelProgress(p);
-      });
-      if (alive) setModelProgress(ok ? -1 : -1);
-    })();
-    return () => {
-      alive = false;
-    };
+    // Ohne `await`: `ensureModel` prüft selbst, ob überhaupt etwas zu tun ist,
+    // und mehrfache Aufrufe teilen sich denselben Ladevorgang. Der Balken
+    // hängt nicht mehr an diesem Aufruf, sondern am Lader (siehe unten) —
+    // deshalb braucht es hier auch keinen „lebt noch"-Wächter.
+    void ensureModel();
   }, [voiceMode]);
+
+  /**
+   * Der Balken SPIEGELT den Lader, er führt nicht selbst Buch.
+   *
+   * Vorher stand die Zahl in diesem Bildschirm und wurde nur so lange
+   * fortgeschrieben, wie der Effekt oben lief. Schloss man die Aufnahme-Box,
+   * während die 60 MB liefen, hörte er auf zuzuhören — und beim nächsten Öffnen
+   * war das Modell fertig, es wurde also nichts mehr geladen und nichts mehr
+   * gemeldet. Die letzte Zahl blieb stehen: „Sprachmodell wird geladen 16%",
+   * bis die App neu startete.
+   *
+   * Jetzt gibt es nur eine Quelle. Beim Anmelden kommt sofort der aktuelle
+   * Stand, und das Ende eines Ladevorgangs meldet in JEDEM Fall „-1".
+   */
+  /**
+   * ...aber nur, solange dieser Bildschirm auch zu sehen ist.
+   *
+   * Ohne Schranke war das ein Rückschritt gegenüber dem Zustand, den der Umbau
+   * ablösen sollte: Der Bildschirm wird nach dem Start EINMAL gebaut und nie
+   * wieder abgebaut (siehe `AssistantHost`). Ein dauerhaftes Abonnement hätte
+   * also während der 60 MB den größten Baum der App durchgerechnet — auf Home,
+   * in der Ergebnisliste, überall —, für eine Zahl, die dort niemand sieht.
+   *
+   * Die Schranke ist `isFocused` und ausdrücklich NICHT `voiceMode`: Die Zeile
+   * darunter zeigt sich bewusst auch dann, wenn die Aufnahme-Box schon zu ist
+   * (siehe dort — sonst sieht das Laden und Abschreiben nach einer hängenden
+   * App aus). An `voiceMode` gehängt wäre genau diese Zeile wieder verschwunden.
+   *
+   * Der Fehler von damals kommt dadurch nicht zurück. Er lag nicht am Abmelden,
+   * sondern daran, dass die Zahl dem Bildschirm gehörte und niemand sie
+   * zurücksetzte. Sie gehört jetzt dem Lader, und der liefert beim Anmelden
+   * sofort den aktuellen Stand — beim Wiederöffnen steht also entweder der echte
+   * Fortschritt oder „nichts läuft".
+   */
+  useEffect(() => {
+    if (!isFocused) return;
+    return subscribeModelProgress(setModelProgress);
+  }, [isFocused]);
 
   /**
    * Eine Zeile, zwei Wartezeiten — die jeweils zutreffende gewinnt.
@@ -2886,6 +3244,8 @@ export function AssistantScreen() {
           // Server-State (der per-Turn neu erstellt wird) wieder weiß was
           // gerade präsentiert wurde.
           lastSearch: lastSearchRef.current ?? undefined,
+          // Aus der Ablage, nicht aus der Zustandsgröße: siehe dort.
+          conversationId: conversationIdRef.current,
           authToken: await resolveAuthToken(),
           signal: ctrl.signal,
           onEvent: (ev) => handleStreamEvent(ev, botId),
@@ -3276,6 +3636,25 @@ export function AssistantScreen() {
           // sichtbare State-Change. Hier reicht's, das Event zu loggen.
           if (__DEV__) console.log("[chat] tool_use:", event.name);
           return;
+        case "conversation":
+          /**
+           * Die Kennung kommt vom Server, sobald die Unterhaltung dort steht.
+           *
+           * Ohne diesen Zweig bekäme jeder Turn eines frischen Chats eine
+           * eigene Unterhaltung: Der Client schickt weiter kein
+           * `conversationId`, der Server legt weiter jedes Mal eine neue an.
+           *
+           * Der Vergleich davor ist nicht bloß Sparsamkeit — `setConversationId`
+           * rendert diesen ganzen Bildschirm neu, und das mitten im Strom.
+           */
+          if (conversationIdRef.current !== event.id) {
+            conversationIdRef.current = event.id;
+            setConversationId(event.id);
+            // Die Liste in der Schublade ist damit veraltet. Nur als „veraltet"
+            // markieren: Nachgeladen wird erst, wenn die Schublade offen ist.
+            queryClient.invalidateQueries({ queryKey: chatThreadsKey });
+          }
+          return;
         case "usage":
           if (__DEV__) {
             console.log(
@@ -3402,9 +3781,9 @@ export function AssistantScreen() {
          * statt gar nicht.
          */
         if (!(await isModelReady())) {
-          setModelProgress(0);
-          await ensureModel(setModelProgress);
-          setModelProgress(-1);
+          // Der Balken kommt vom Lader selbst (siehe `subscribeModelProgress`)
+          // — hier nur warten, bis die Datei da ist.
+          await ensureModel();
         }
         setTranscribing(true);
         try {
@@ -4003,7 +4382,34 @@ export function AssistantScreen() {
      * Kommt die Kante zurück, gehört `elevation` NICHT hierher, sondern in einen
      * Stil, der nur beim Wechsel von "steht" auf "fährt" neu gesetzt wird.
      */
-    return { transform: [{ translateX: (1 - p) * PARK_X }] };
+    /**
+     * Die Schublade fährt im SELBEN Worklet und im selben Transform-Array.
+     *
+     * Ein zweiter animierter Knoten wäre ein zweiter nativer Schreibvorgang pro
+     * Bild auf demselben Baum — und Reanimated vergleicht flach, `transform`
+     * ist bei jeder Auswertung ohnehin ein frisches Array. Zwei Objekte kosten
+     * also doppelt und bringen nichts.
+     *
+     * REIHENFOLGE IST NICHT EGAL: `translateX` VOR `scale`. Das Array wird als
+     * Matrixkette gelesen (T · S), der Punkt läuft also erst durch die
+     * Skalierung und dann durch die Verschiebung — die Verschiebung bleibt
+     * damit in unskalierten Bildschirmpunkten. Andersherum würde sie mit
+     * verkleinert, und der Bildschirm käme nur um `0,72 · W/2` heraus statt um
+     * `W/2`. Sichtbar wäre das als „er bleibt zu weit drin".
+     *
+     * Und `PARK_X / 2` ist kein gerundeter Erfahrungswert: Weil um die MITTE
+     * verkleinert wird, liegt die linke Kante danach bei `W - s·W/2`, sichtbar
+     * bleibt also `s·W/2` — exakt die Hälfte der eigenen Breite, unabhängig vom
+     * Schrumpf-Faktor. Deshalb darf `ASSISTANT_DRAWER_SCALE` verstellt werden,
+     * ohne dass die Hälfte verrutscht.
+     */
+    const d = assistantDrawer.value;
+    return {
+      transform: [
+        { translateX: (1 - p) * PARK_X + d * (PARK_X / 2) },
+        { scale: 1 - d * (1 - ASSISTANT_DRAWER_SCALE) },
+      ],
+    };
   });
 
   /**
@@ -4115,6 +4521,29 @@ export function AssistantScreen() {
       // Parallax-Strecke verschoben, wenn Bo je auf einem anderen Weg als über
       // `closeScreen` verlassen wird (Verknüpfung, Wiederherstellung).
       resetAssistantPush();
+      /**
+       * Und die Schublade gleich mit — sonst stünde der Bildschirm beim
+       * nächsten Öffnen geschrumpft am rechten Rand.
+       *
+       * Der Verteiler muss ebenfalls zurück: Er ist eine Modul-Variable und
+       * überlebt den Abbau des Baums. Eine Fangschicht, die beim nächsten
+       * Öffnen sofort wieder da ist, würde jeden Tipp auf Bo schlucken.
+       */
+      resetAssistantDrawer();
+      setDrawerOpenNow(false);
+      /**
+       * Und die Merker mit — sonst ist die Schublade danach TOT.
+       *
+       * Dieser Aufräumer läuft nicht nur beim Abbau, sondern bei jedem Verlust
+       * des Fokus (die Ergebnisliste legt sich über Bo). Bliebe
+       * `drawerOpenRef` dabei auf „offen" stehen, während die Lage auf 0
+       * zurückgesetzt ist, stiege `openDrawer` beim nächsten Tipp sofort wieder
+       * aus — die Schublade ginge nie wieder auf, ohne dass irgendwo ein Fehler
+       * sichtbar wird.
+       */
+      drawerOpenRef.current = false;
+      drawerUpRef.current = false;
+      setDrawerUp(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isFocused]);
@@ -4639,432 +5068,615 @@ export function AssistantScreen() {
   );
 
 
+  /**
+   * „Neuer Chat" — der Verlauf beginnt von vorn.
+   *
+   * Der laufende Strom wird abgebrochen: Sonst schriebe seine Antwort weiter in
+   * die alte Unterhaltung und träfe hier auf einen Verlauf, zu dem sie nicht
+   * gehört. Die Kennung fällt auf `null` zurück, der Server legt beim nächsten
+   * Absenden eine neue Unterhaltung an.
+   */
+  const startNewConversation = useCallback(() => {
+    closeDrawer();
+    abortRef.current?.abort();
+    conversationIdRef.current = null;
+    setConversationId(null);
+    lastSearchRef.current = null;
+    // Ein noch laufendes Nachladen darf den frischen Chat nicht überschreiben.
+    if (threadApplyRef.current) {
+      clearTimeout(threadApplyRef.current);
+      threadApplyRef.current = null;
+    }
+    setMood("idle");
+    setMessages([{ id: idGen(), kind: "bot", text: pickWelcome(locale) }]);
+  }, [closeDrawer, locale]);
+
+  /**
+   * Tipp auf die Profil-Karte: Schublade zurück, Bo schließen, Tab wechseln.
+   *
+   * Die Reihenfolge ist der ganze Punkt. Erst die Schublade — würde Bo sofort
+   * hinausfahren, führe ein auf 72% geschrumpfter Bildschirm zur Seite aus dem
+   * Bild. Der Wechsel läuft dann hinter Bos Ausfahrt, ist also nicht zu sehen;
+   * beim nächsten Betreten steht Bo wieder normal da, weil der Aufräumer beim
+   * Fokusverlust Lage UND Merker der Schublade zurücksetzt.
+   */
+  const openProfileTab = useCallback(() => {
+    closeDrawerThen(() => {
+      router.navigate("/settings");
+      closeScreen();
+    });
+  }, [closeDrawerThen, closeScreen, router]);
+
+  /**
+   * Eine frühere Unterhaltung öffnen.
+   *
+   * Geladen wird über den Zwischenspeicher der Abfragen (`fetchQuery`), nicht
+   * mit einem eigenen Abruf: Wer eine Unterhaltung zum zweiten Mal öffnet, soll
+   * sie sofort sehen.
+   *
+   * Der Wächter nach dem Warten vergleicht gegen die ABLAGE, nicht gegen die
+   * Zustandsgröße aus diesem Durchgang — sonst wäre er immer wahr und ein
+   * schnelles Weiterklicken schriebe die zuerst eingetroffene Antwort über die
+   * zuletzt gewählte Unterhaltung.
+   */
+  const openConversation = useCallback(
+    (id: string) => {
+      closeDrawer();
+      if (conversationIdRef.current === id) return;
+      abortRef.current?.abort();
+      conversationIdRef.current = id;
+      setConversationId(id);
+      void (async () => {
+        try {
+          const detail = await queryClient.fetchQuery({
+            queryKey: chatThreadKey(id),
+            queryFn: () => fetchChatThread(id),
+          });
+          if (conversationIdRef.current !== id) return;
+          /**
+           * Einsetzen erst, wenn die Schublade wirklich WEG ist.
+           *
+           * Ein ganzer Verlauf auf einmal ist der größte Commit, den dieser
+           * Bildschirm kennt — und die Zurückfahrt läuft noch, wenn die Antwort
+           * aus dem Netz eintrifft. Genau dafür hält die Datei das Muster schon
+           * bereit (siehe die Begrüßungs-Blase): warten, bis nichts mehr fährt,
+           * und es dann in einem Zug setzen. Zu sehen ist die Verzögerung nicht,
+           * denn während der Fahrt liegt der alte Verlauf ohnehin hinter der
+           * Schublade.
+           */
+          const apply = () => {
+            if (isTransitionBusy()) {
+              threadApplyRef.current = setTimeout(apply, 120);
+              return;
+            }
+            threadApplyRef.current = null;
+            // Nochmal prüfen: In der Wartezeit kann ein neuer Chat begonnen
+            // oder eine andere Unterhaltung gewählt worden sein.
+            if (conversationIdRef.current !== id) return;
+            lastSearchRef.current =
+              (detail.conversation.lastSearch as LastSearchParams | null) ?? null;
+            setMood("idle");
+            const restored = messagesFromRows(detail.messages);
+            setMessages(
+              restored.length > 0
+                ? restored
+                : [{ id: idGen(), kind: "bot", text: pickWelcome(locale) }],
+            );
+          };
+          apply();
+        } catch {
+          /**
+           * Fehlgeschlagen — dann bleibt der bisherige Verlauf stehen, statt
+           * einen leeren Bildschirm zu hinterlassen. Die Kennung wird
+           * zurückgenommen, sonst schriebe der nächste Turn in eine
+           * Unterhaltung, die wir nie gesehen haben.
+           */
+          if (conversationIdRef.current !== id) return;
+          conversationIdRef.current = null;
+          setConversationId(null);
+        }
+      })();
+    },
+    [closeDrawer, locale, queryClient],
+  );
+
   return (
     // Chat-Layout: FlatList full-height, Inputbar overlay'd absolut darüber.
     // Der letzte sichtbare Bubble wird über contentContainer.paddingBottom
     // geschützt → er steht immer über dem Inputbar, egal ob Keyboard auf
     // oder zu ist.
-    <Animated.View
-      style={rootStyle}
-      /**
-       * Textur für BEIDE Richtungen — die Einfahrt kann das jetzt auch.
-       *
-       * Hier stand nur `closing`, mit der ausdrücklichen Begründung, für die
-       * Einfahrt tauge das nicht: Dort baue sich der Baum gerade erst auf, die
-       * Textur wäre sofort wieder ungültig und müsste neu hochgeladen werden.
-       * Das stimmte — solange die Kurve im Tipp-Handler losfuhr und der Aufbau
-       * in sie hineinfiel.
-       *
-       * Und sie gilt weiterhin: Die Kurve startet im Tipp-Handler des
-       * Landingscreens, dieser Bildschirm mountet also WÄHREND der Fahrt. Seine
-       * ersten fünf Zeilen entstehen in den ersten Bildern — eine Ebene wäre
-       * dort sofort wieder ungültig und damit teurer als keine.
-       *
-       * Für die AUSFAHRT ist es umgekehrt: Der Inhalt steht fest, Bo ist
-       * angehalten, und ohne Ebene würden bei jedem Bild sämtliche Kinder neu
-       * gezeichnet (im Projekt mit 14,7ms gegen ein Budget von 8,3ms vermessen).
-       */
-      /**
-       * IMMER fangen, solange der Bildschirm da ist.
-       *
-       * Hier stand `closing ? "none" : "auto"` — genau verkehrt herum. Die
-       * Absicht war richtig: Während der Ausfahrt gibt diese bildschirmfüllende
-       * Wurzel den Landingscreen von links her frei, und ein Tipp auf dessen
-       * Suchleiste startet Bo wieder — während die Doppeldruck-Sperre noch steht
-       * und der Abbau-Wecker läuft. Er fährt dann herein und wird 500ms später
-       * trotzdem abgebaut.
-       *
-       * Nur bewirkt `none` das GEGENTEIL: Es macht Bo für Berührungen
-       * durchlässig, der Tipp erreicht den Landingscreen also erst recht.
-       * Gebraucht wird das Fangen — und zwar über die ganze Ausfahrt, bis der
-       * Baum wirklich weg ist.
-       */
-      /**
-       * KEINE GPU-Ebene für die Ausfahrt — und das ist kein Kompromiss.
-       *
-       * Hier lag eine, mit der Begründung, der Baum werde beim Wandern sonst in
-       * jedem Bild neu gezeichnet. Diese Annahme galt lange als gesetzt und ist
-       * falsch: Android hält je Ansicht eine AUFGEZEICHNETE Zeichenliste, eine
-       * Verschiebung ist eine Eigenschaft davon und löst keine Neuaufzeichnung
-       * aus. Die vermessenen 14,7ms fallen erst an, wenn NACHFAHREN ungültig
-       * werden — und Bos Inhalt steht während der Ausfahrt ausdrücklich still
-       * (`sliding` hält das Maskottchen an, die Tipp-Punkte pausieren, der
-       * Strom wird gestaut). Genau der Fall, in dem eine Ebene nichts einspart.
-       *
-       * Gekostet hat sie dagegen sicher: Text verliert in einer GPU-Ebene die
-       * Subpixel-Glättung, weshalb Schriftzug und Maskottchen beim Aufsetzen
-       * des Fingers sichtbar weich wurden. Der Aufbau der Ebene selbst liegt bei
-       * gemessenen 66ms und fiel in dasselbe Berührungs-Bild. Und der Merker
-       * dafür war ein React-Zustand — jedes Setzen und Zurücknehmen ein Commit
-       * auf dem Bildschirm, der gleich fahren soll.
-       *
-       * Dieselbe Falle wie beim Landingscreen, wo dieselbe Annahme dieselbe
-       * Maschinerie getragen hat. Wieder aufnehmen nur mit Messung am Gerät.
-       */
-    >
-        {/* Slim Top-Bar: Binch-Logo links, Close-Button rechts. Da wir die
-            FloatingTabBar im Chat verstecken, ist X der einzige Weg zurück
-            (System-Back funktioniert nicht zwischen Tab-Geschwistern). */}
-      <View style={[styles.topbar, { paddingTop: insets.top + TOPBAR_TOP }]}>
-        {/* Dieselbe Komponente wie in allen anderen Tabs — nicht mehr ein
-            nachgebauter Text. Die Zahlen waren zwar gleich, aber `lineHeight`
-            fehlte, und genau das entscheidet hier über die Position. */}
-        <ScreenHeading>
-          B<Text style={{ color: accent.solid }}>i</Text>nch
-        </ScreenHeading>
-        {/* Die Statuszeile sitzt IN der Kopfzeile und senkrecht mittig zum
-            Schriftzug — dafür absolut über die volle Breite gelegt und
-            zentriert, statt sie zwischen Schriftzug und Knopf einzureihen
-            (dort wäre sie von deren Breiten abhängig und nie wirklich mittig). */}
-        <Text
-          style={[
-            styles.mood,
-            // Deckungsgleich mit der Zeile des Schriftzugs: gleiche Oberkante,
-            // gleiche Höhe. Damit liegt die Mitte beider exakt aufeinander,
-            // unabhängig von den Schriftgrößen.
-            /**
-             * Das Kästchen ist die ZEILE selbst, nicht die Höhe des Schriftzugs.
-             *
-             * Vorher stand hier dessen volle Höhe, und mittig gesetzt wurde die
-             * Zeile darin über `textAlignVertical` — das es nur auf Android
-             * gibt. Auf iOS säße sie oben. Ein Kästchen in Zeilenhöhe, um die
-             * halbe Differenz nach unten gerückt, trifft die Mitte überall,
-             * ohne sich auf die Ausrichtung zu verlassen.
-             */
-            {
-              top: insets.top + TOPBAR_TOP + (HEADING_LINE_HEIGHT - MOOD_LINE_H) / 2,
-              height: MOOD_LINE_H,
-            },
-            mood === "error" && { color: C.error },
-          ]}
-          numberOfLines={1}
-          pointerEvents="none"
-        >
-          {moodLabel.toUpperCase()}
-        </Text>
-        <Pressable
-          onTouchStart={armClose}
-          onPressIn={() => {
-            chatInputRef.current?.blur();
-            Keyboard.dismiss();
-          }}
-          onPressOut={disarmClose}
-          onPress={closeScreen}
-          hitSlop={10}
-          style={closeBtnStyle}
-          accessibilityLabel="Close"
-        >
-          <X size={20} color="#E5E7EB" strokeWidth={2} />
-        </Pressable>
-      </View>
-
-
-      {/* Conversation-Thread — INVERTED FlatList. Das ist DAS Standard-Chat-
-          Pattern (Discord, WhatsApp, Slack). Mechanik:
-          - `inverted` flippt die Y-Axis: scroll-Y=0 ist visuell UNTEN
-          - data wird reversed übergeben → neueste Nachricht steht bei
-            index=0, also visuell IMMER am Bottom
-          - Neue Messages werden bei index=0 prepended → erscheinen ohne
-            jegliches scrollTo automatisch im sichtbaren Bottom-Bereich
-          - contentContainerStyle.paddingBottom ist mit `inverted` visuell
-            am Bottom (unter der neuesten Bubble) → reserviert Platz für
-            Inputbar + Lift + Gap
-          Damit ist ZERO scroll-Synchronisation nötig: die letzte Bubble
-          steht IMMER über der Bar, weil sie strukturell dort hingerendert
-          wird, nicht weil wir hin-scrollen müssen. */}
-      {/* Steht still und schneidet — bewegt wird die Hülle darin. So bleibt der
-          sichtbare Ausschnitt exakt der von vorher, als jede Zeile sich einzeln
-          verschoben hat. */}
-      <View style={styles.threadClip}>
-        <Animated.View ref={threadWrapRef} style={[styles.threadFill, threadShiftStyle]}>
-          {thread}
-        </Animated.View>
-      </View>
-
-      {/* Bo + Mood-Label.
-          `paused={!isFocused}` schaltet Bo's Reanimated-Worklets ab wenn der
-          User auf einem anderen Tab ist. Ohne das laufen 5-8 endlose Repeats
-          (Schweben, Blinzeln, ggf. Wink/Yap) auf der UI-Thread im Hinter-
-          grund weiter — verlangsamt jeden anderen Tab spürbar. */}
-      <View style={[styles.hero, { top: insets.top + HERO_TOP }]} pointerEvents="none">
-        <BoGate state={mood} size={BO_SIZE} />
-      </View>
-
-      {/* Input-Bar Wrapper — absolut bei bottom:0, die Hochbewegung kommt
-          frame-synced mit dem Keyboard via barAnimStyle (useAnimatedKeyboard,
-          UI-Thread). onLayout misst die echte Bar-Höhe für die
-          contentPaddingBottom-Berechnung. */}
-      <Animated.View
-        style={[styles.inputbarWrap, { backgroundColor: palette.bg }, inputbarWrapStyle, barAnimStyle]}
-        onLayout={(e) => {
-          const h = e.nativeEvent.layout.height;
-          // Ohne Umweg über React: Diesen Wert braucht nur der UI-Strang (der
-          // Fahrweg der Zeile), er kostet damit keinen Durchgang.
-          barTravel.value = h;
-          /**
-           * NICHT während der Fahrt — jeder Commit hält die Kurve an.
-           *
-           * Belegt in Reanimateds eigener Quelle: Kommt ein Commit von React,
-           * klont der Commit-Hook den Shadow-Tree-Pfad für JEDEN animierten
-           * Knoten der App und pausiert danach ausdrücklich Reanimateds eigene
-           * Commits („if we didn't pause Reanimated commits, it could lead to
-           * RN commits being delayed until the animation is finished"). Ein
-           * `setState` mitten in der Einfahrt ist damit kein bisschen
-           * Mehrarbeit, sondern eine PAUSE der Bewegung.
-           *
-           * Die Zahl selbst eilt nicht: Sie steuert nur den Innenabstand am
-           * unteren Listenrand, und ihr Startwert wird gerechnet statt geraten
-           * (siehe dort) — die Abweichung ist im Regelfall null.
-           */
-          if (Math.abs(h - inputbarHeight) <= 1) return;
-          /**
-           * Aufschieben heißt NACHHOLEN, nicht verwerfen.
-           *
-           * Der Wert wurde hier nur in eine Ablage geschrieben und nie wieder
-           * angewandt — die Leisten-Höhe blieb also auf ihrem gerechneten
-           * Startwert stehen, wenn die Messung zufällig in eine Fahrt fiel. An
-           * ihr hängt der Abstand zwischen letzter Blase und Eingabeleiste.
-           */
-          if (isTransitionBusy()) {
-            pendingBarHeightRef.current = h;
-            if (barHeightTimerRef.current) return;
-            const apply = () => {
-              if (isTransitionBusy()) {
-                barHeightTimerRef.current = setTimeout(apply, 200);
-                return;
-              }
-              barHeightTimerRef.current = null;
-              const pending = pendingBarHeightRef.current;
-              pendingBarHeightRef.current = null;
-              if (pending !== null) setInputbarHeight(pending);
-            };
-            barHeightTimerRef.current = setTimeout(apply, 200);
-            return;
-          }
-          pendingBarHeightRef.current = null;
-          setInputbarHeight(h);
-        }}
-      >
-      {/**
-        * Was gerade mit der Sprachnachricht passiert.
-        *
-        * Zwei Wartezeiten, die der Nutzer sonst nicht einordnen kann: das
-        * einmalige Laden des Sprachmodells (rund 60 MB) und das Abschreiben
-        * einer Aufnahme. Beides passiert, während die Aufnahme-Box schon zu ist
-        * — ohne diese Zeile sähe es aus, als hinge die App.
-        */}
-      {voiceStatus ? (
-        <View style={styles.voiceStatusRow} pointerEvents="none">
-          <Text style={[styles.voiceStatusText, { backgroundColor: palette.s3 }]}>{voiceStatus}</Text>
-        </View>
-      ) : null}
-      {/* Der Sprachbalken (Wellenform, Aufnahmepunkt, Zeitanzeige) ist hier
-          ausgebaut — die Mikrofon-Funktion wird neu gebaut. Die Komponente
-          liegt unangetastet unter `components/assistant/VoiceRecordBar.tsx`,
-          falls Teile davon wieder gebraucht werden. */}
-      <View style={[styles.inputbar, { backgroundColor: palette.s2, paddingBottom: inputbarPadBottom }]}>
-        <View style={[styles.field, { backgroundColor: palette.s3 }]}>
-          <TextInput
-            ref={chatInputRef}
-            value={input}
-            onChangeText={setInput}
-            placeholder={t("assistant.placeholder")}
-            placeholderTextColor={C.textTertiary}
-            style={styles.fieldText}
-            multiline
-            maxLength={500}
-            // KEIN editable={!busy} — sonst dropt Android beim Stream den
-            // Focus → keyboard closet → onBlur feuert → kbOffset auf 0 →
-            // Bar springt runter mitten in Bo's Antwort. User soll während
-            // des Streams die nächste Frage schon vortippen können (Send-
-            // Button ist via canSend disabled, also kein versehentliches
-            // Doppel-Senden).
-            onSubmitEditing={() => send(input)}
-            onFocus={onInputFocus}
-            onBlur={onInputBlur}
-            blurOnSubmit={false}
-            returnKeyType="send"
-          />
-        </View>
-
-        <Pressable
-          style={[
-            styles.iconBtn,
-            { backgroundColor: C.surface3 },
-            !voiceAvailable && { opacity: 0.4 },
-          ]}
-          disabled={!voiceAvailable}
-          onPress={() => {
-            haptic("button");
-            // Tastatur zuerst schließen: Der Kasten sitzt über der Eingabezeile,
-            // und die wandert mit der Tastatur.
-            /**
-             * Erst die Tastatur wegräumen, DANN den Kasten zeigen.
-             *
-             * Beides im selben Bild sah aus, als spränge der Kasten aus dem
-             * Nichts über die noch fahrende Tastatur. Mit dem kurzen Abstand
-             * fährt zuerst die Tastatur hinunter, die Eingabezeile geht mit —
-             * und erst auf den freien Platz kommt der Kasten.
-             *
-             * Ohne offene Tastatur gibt es nichts zu warten: dann sofort.
-             */
-            const hadKeyboard = Keyboard.isVisible();
-            Keyboard.dismiss();
-            const begin = () => {
-              setVoiceMode(true);
-              if (!MODULE_RECORDS_AUDIO) void startRecording();
-              setMicRecording(true);
-              // Immer: Diese Sitzung IST die Aufnahme, auch ohne Erkenner.
-              void startVoice();
-            };
-            if (hadKeyboard) setTimeout(begin, 220);
-            else begin();
-          }}
-          accessibilityLabel="Voice"
-        >
-          <Mic size={20} color={C.white} strokeWidth={2} />
-        </Pressable>
-
-        <Pressable
-          style={[
-            styles.iconBtn,
-            {
-              backgroundColor: canSend ? accent.solid : C.surface3,
-              opacity: canSend || busy ? 1 : 0.5,
-            },
-          ]}
-          disabled={!canSend}
-          onPress={() => send(input)}
-          accessibilityLabel="Send"
-        >
-          {busy ? (
-            <ActivityIndicator color={C.white} size="small" />
-          ) : (
-            <Send size={20} color={canSend ? accent.textOnSolid : C.white} strokeWidth={2} />
-          )}
-        </Pressable>
-      </View>
-      </Animated.View>
-
-      {/**
-        * Der Mikrofon-Kasten.
-        *
-        * Unterkante GENAU auf der Unterkante des Mikrofon-Knopfes: Der sitzt in
-        * der Eingabezeile, deren unterer Innenabstand `inputbarPadBottom` ist —
-        * also derselbe Abstand vom Bildschirmrand.
-        *
-        * Er liegt NEBEN der Eingabezeile im Baum, nicht darin: Deren Hülle ist
-        * nur so hoch wie die Zeile selbst, und was darüber hinausragt, läge
-        * außerhalb seines Elternteils — auf Android damit weder sichtbar noch
-        * berührbar.
-        *
-        * `pointerEvents="none"`, solange er leer ist: So bleibt die Zeile
-        * darunter bedienbar, und ein zweiter Druck auf das Mikrofon nimmt ihn
-        * wieder weg.
-        */}
-      {voiceMode ? (
-        <MicBox
-          /**
-           * An der AUFNAHME, nicht an der Erkennung.
-           *
-           * `listening` gehört dem Erkenner, und der endet bei jeder Sprechpause
-           * und läuft neu an. Die Tonspur fror dabei ein — „auf einmal passiert
-           * gar nichts mehr" —, obwohl weiter aufgenommen wurde. Der Ton läuft
-           * durch, also läuft auch die Spur durch.
-           */
-          recording={micRecording}
-          /**
-           * NICHT an Bos Sperre hängen — das war der Grund für die toten Balken.
-           *
-           * `voiceBarPaused` folgt `boBlocked`, und das ist wahr, sobald Bo
-           * gerade fährt, den Fokus nicht hat ODER die Liste gescrollt wird
-           * (siehe `publishPause`). Der Anfangswert ist ebenfalls wahr. Steht
-           * einer dieser drei Fälle beim Öffnen des Kastens an — oder bleibt er
-           * hängen —, wird der Bild-Rückruf der Tonspur nie eingeschaltet: Es
-           * kommt Pegel an, aber niemand tastet ihn ab.
-           *
-           * Diese Sperre ist für Bos Dauer-Animationen gedacht, die im
-           * Hintergrund weiterliefen. Die Tonspur ist etwas anderes: Sie läuft
-           * nur, solange der Kasten offen ist — also genau dann, wenn der
-           * Nutzer hinsieht.
-           */
-          paused={false}
-          micVolumeSV={micVolumeSV}
-          style={[styles.micBox, { height: MIC_BOX_H, bottom: inputbarPadBottom }]}
-          onToggle={() => {
-            if (listening) {
-              stopVoice();
-              // Der Ton hält mit an — sonst liefe die Pause als Stille mit in
-              // die Aufnahme.
-              setMicRecording(false);
-              try {
-                if (!MODULE_RECORDS_AUDIO) recorder.pause();
-              } catch {
-                // Aufnehmer nicht in einem Zustand, in dem sich pausieren
-                // lässt — dann bleibt es beim Weiterlaufen.
-              }
-            } else {
-              // Fortsetzen, nicht neu anfangen: Text und Ton von vor der Pause
-              // bleiben stehen.
-              resumingRef.current = true;
-              setMicRecording(true);
-              try {
-                if (!MODULE_RECORDS_AUDIO) recorder.record();
-              } catch {
-                // siehe oben
-              }
-              void startVoice();
-            }
-          }}
-          onDelete={() => {
-            voiceSendRef.current = false;
-            if (listening) stopVoice();
-            void discardVoiceRecording();
-            setInput("");
-            setVoiceMode(false);
-          }}
-          onSend={() => {
-            /**
-             * Direkt aus der laufenden Aufnahme heraus — kein Umweg über Pause.
-             *
-             * Gestoppt wird hier, eingesammelt wird erst, wenn die Datei
-             * geschlossen ist (siehe `sendMaybeVoice`). Vorher wurde beides in
-             * dieser Reihenfolge verkehrt gemacht, und genau daher kamen die
-             * abgehackten und die ausbleibenden Nachrichten.
-             */
-            voiceSendRef.current = true;
-            if (listening) {
-              /**
-               * Abgeschickt wird JETZT, nicht wenn der Erkenner soweit ist.
-               *
-               * Vorher wurde nur gestoppt und auf das Schluss-Ergebnis gewartet
-               * — kam keines (weil nichts verstanden wurde oder der Dienst sich
-               * Zeit ließ), sah es aus, als hätte man bloß angehalten.
-               *
-               * Jetzt läuft eine kurze Frist mit: Kommt das Schluss-Ergebnis in
-               * dieser Zeit, geht es damit raus; kommt keines, eben mit dem
-               * bisherigen Stand. Die Aufnahme selbst ist davon ohnehin
-               * unabhängig.
-               */
-              pendingSendRef.current = true;
-              stopVoice();
-              setVoiceMode(false);
-              const guard = setTimeout(() => {
-                if (!pendingSendRef.current) return;
-                pendingSendRef.current = false;
-                void sendMaybeVoice(transcriptLiveRef.current.trim());
-              }, 700);
-              sendGuardRef.current = guard;
-            } else {
-              // Aus der Ablage, nicht aus `input` — siehe Begründung am
-              // „end"-Zweig: Der Zustand hier stammt aus einem alten Durchgang.
-              setVoiceMode(false);
-              void sendMaybeVoice(transcriptLiveRef.current.trim());
-            }
-          }}
+    /**
+     * DIE BÜHNE — sie steht still, bewegt wird nur, was darin liegt.
+     *
+     * Warum ein zusätzlicher Knoten und nicht die Schublade als Geschwister
+     * am Wurzel-Layout: Die Tab-Leiste liegt dort NEBEN Bo (zIndex 0 gegen
+     * 50) und wird von ihm nur verdeckt. Schrumpft er, käme sie darunter
+     * hervor. Alles, was die Schublade abdecken soll, muss deshalb in
+     * DIESELBE Hülle — dann erbt es Bos Platz in der Schichtung, statt sich
+     * neben ihm einsortieren zu müssen.
+     *
+     * `box-none`, damit sich am heutigen Verhalten nichts ändert: Gefangen
+     * wird weiterhin von Bos eigener Fläche (Begründung dort), die Bühne
+     * selbst ist für Berührungen durchlässig.
+     */
+    <View style={styles.stage} pointerEvents="box-none">
+      {/* Erst im Baum, wenn der Finger auf dem Zeichen liegt — der Aufbau
+          gehört in die 80 bis 150ms des Fingers, nicht in die Fahrt. */}
+      {drawerUp ? (
+        <DrawerGate
+          activeId={conversationId}
+          onSelect={openConversation}
+          onNewChat={startNewConversation}
+          onClose={closeDrawer}
+          onOpenProfile={openProfileTab}
         />
       ) : null}
-    </Animated.View>
+      <Animated.View
+        style={rootStyle}
+        /**
+         * Textur für BEIDE Richtungen — die Einfahrt kann das jetzt auch.
+         *
+         * Hier stand nur `closing`, mit der ausdrücklichen Begründung, für die
+         * Einfahrt tauge das nicht: Dort baue sich der Baum gerade erst auf, die
+         * Textur wäre sofort wieder ungültig und müsste neu hochgeladen werden.
+         * Das stimmte — solange die Kurve im Tipp-Handler losfuhr und der Aufbau
+         * in sie hineinfiel.
+         *
+         * Und sie gilt weiterhin: Die Kurve startet im Tipp-Handler des
+         * Landingscreens, dieser Bildschirm mountet also WÄHREND der Fahrt. Seine
+         * ersten fünf Zeilen entstehen in den ersten Bildern — eine Ebene wäre
+         * dort sofort wieder ungültig und damit teurer als keine.
+         *
+         * Für die AUSFAHRT ist es umgekehrt: Der Inhalt steht fest, Bo ist
+         * angehalten, und ohne Ebene würden bei jedem Bild sämtliche Kinder neu
+         * gezeichnet (im Projekt mit 14,7ms gegen ein Budget von 8,3ms vermessen).
+         */
+        /**
+         * IMMER fangen, solange der Bildschirm da ist.
+         *
+         * Hier stand `closing ? "none" : "auto"` — genau verkehrt herum. Die
+         * Absicht war richtig: Während der Ausfahrt gibt diese bildschirmfüllende
+         * Wurzel den Landingscreen von links her frei, und ein Tipp auf dessen
+         * Suchleiste startet Bo wieder — während die Doppeldruck-Sperre noch steht
+         * und der Abbau-Wecker läuft. Er fährt dann herein und wird 500ms später
+         * trotzdem abgebaut.
+         *
+         * Nur bewirkt `none` das GEGENTEIL: Es macht Bo für Berührungen
+         * durchlässig, der Tipp erreicht den Landingscreen also erst recht.
+         * Gebraucht wird das Fangen — und zwar über die ganze Ausfahrt, bis der
+         * Baum wirklich weg ist.
+         */
+        /**
+         * KEINE GPU-Ebene für die Ausfahrt — und das ist kein Kompromiss.
+         *
+         * Hier lag eine, mit der Begründung, der Baum werde beim Wandern sonst in
+         * jedem Bild neu gezeichnet. Diese Annahme galt lange als gesetzt und ist
+         * falsch: Android hält je Ansicht eine AUFGEZEICHNETE Zeichenliste, eine
+         * Verschiebung ist eine Eigenschaft davon und löst keine Neuaufzeichnung
+         * aus. Die vermessenen 14,7ms fallen erst an, wenn NACHFAHREN ungültig
+         * werden — und Bos Inhalt steht während der Ausfahrt ausdrücklich still
+         * (`sliding` hält das Maskottchen an, die Tipp-Punkte pausieren, der
+         * Strom wird gestaut). Genau der Fall, in dem eine Ebene nichts einspart.
+         *
+         * Gekostet hat sie dagegen sicher: Text verliert in einer GPU-Ebene die
+         * Subpixel-Glättung, weshalb Schriftzug und Maskottchen beim Aufsetzen
+         * des Fingers sichtbar weich wurden. Der Aufbau der Ebene selbst liegt bei
+         * gemessenen 66ms und fiel in dasselbe Berührungs-Bild. Und der Merker
+         * dafür war ein React-Zustand — jedes Setzen und Zurücknehmen ein Commit
+         * auf dem Bildschirm, der gleich fahren soll.
+         *
+         * Dieselbe Falle wie beim Landingscreen, wo dieselbe Annahme dieselbe
+         * Maschinerie getragen hat. Wieder aufnehmen nur mit Messung am Gerät.
+         */
+      >
+          {/* Slim Top-Bar: Binch-Logo links, Close-Button rechts. Da wir die
+              FloatingTabBar im Chat verstecken, ist X der einzige Weg zurück
+              (System-Back funktioniert nicht zwischen Tab-Geschwistern). */}
+        <View style={[styles.topbar, { paddingTop: insets.top + TOPBAR_TOP }]}>
+          {/* Zeichen und Schriftzug bilden EINE Gruppe.
+              So steht ihr Abstand fest und hängt nicht davon ab, was sonst noch
+              in der Zeile liegt — die Statuszeile ist absolut gesetzt und die
+              Aufteilung der Zeile käme sonst aus `space-between`. */}
+          <View style={styles.brand}>
+            {/* Die Staffelung wie am X-Knopf gegenüber: Beim AUFSETZEN wird die
+                Schublade aufgebaut und Bo angehalten, beim Loslassen fährt der
+                Bildschirm zur Seite. Dazwischen liegen die 80 bis 150ms des
+                Fingers — genau der Platz für den Commit, der sonst in die
+                ersten Bilder der Fahrt fiele. */}
+            <Pressable
+              style={styles.markBtn}
+              onTouchStart={armDrawer}
+              onPressIn={() => {
+                /**
+                 * Die Tastatur erst im GEDRÜCKTEN Zustand, nicht schon beim
+                 * Aufsetzen: Ein abgebrochener Tipp soll sie nicht schließen.
+                 * Und auf keinen Fall später — unter `adjustResize` erzwingt
+                 * das Schließen eine Neuvermessung des ganzen Baums samt jeder
+                 * gemounteten Zeile, und die fiele sonst in die Fahrt.
+                 */
+                chatInputRef.current?.blur();
+                Keyboard.dismiss();
+              }}
+              onPressOut={disarmDrawer}
+              onPress={openDrawer}
+              hitSlop={16}
+              accessibilityRole="button"
+              accessibilityLabel={t("assistant.threads.open")}
+            >
+              <ThreadMark color={C.textTertiary} />
+            </Pressable>
+            {/* Dieselbe Komponente wie in allen anderen Tabs — nicht mehr ein
+                nachgebauter Text. Die Zahlen waren zwar gleich, aber `lineHeight`
+                fehlte, und genau das entscheidet hier über die Position. */}
+            <ScreenHeading>
+              B<Text style={{ color: accent.solid }}>i</Text>nch
+            </ScreenHeading>
+          </View>
+          {/* Die Statuszeile sitzt IN der Kopfzeile und senkrecht mittig zum
+              Schriftzug — dafür absolut über die volle Breite gelegt und
+              zentriert, statt sie zwischen Schriftzug und Knopf einzureihen
+              (dort wäre sie von deren Breiten abhängig und nie wirklich mittig). */}
+          <Text
+            style={[
+              styles.mood,
+              // Deckungsgleich mit der Zeile des Schriftzugs: gleiche Oberkante,
+              // gleiche Höhe. Damit liegt die Mitte beider exakt aufeinander,
+              // unabhängig von den Schriftgrößen.
+              /**
+               * Das Kästchen ist die ZEILE selbst, nicht die Höhe des Schriftzugs.
+               *
+               * Vorher stand hier dessen volle Höhe, und mittig gesetzt wurde die
+               * Zeile darin über `textAlignVertical` — das es nur auf Android
+               * gibt. Auf iOS säße sie oben. Ein Kästchen in Zeilenhöhe, um die
+               * halbe Differenz nach unten gerückt, trifft die Mitte überall,
+               * ohne sich auf die Ausrichtung zu verlassen.
+               */
+              {
+                top: insets.top + TOPBAR_TOP + (HEADING_LINE_HEIGHT - MOOD_LINE_H) / 2,
+                height: MOOD_LINE_H,
+              },
+              mood === "error" && { color: C.error },
+            ]}
+            numberOfLines={1}
+            pointerEvents="none"
+          >
+            {moodLabel.toUpperCase()}
+          </Text>
+          <Pressable
+            onTouchStart={armClose}
+            onPressIn={() => {
+              chatInputRef.current?.blur();
+              Keyboard.dismiss();
+            }}
+            onPressOut={disarmClose}
+            onPress={closeScreen}
+            hitSlop={10}
+            style={closeBtnStyle}
+            accessibilityLabel="Close"
+          >
+            <X size={CLOSE_ICON_SIZE} color="#E5E7EB" strokeWidth={2} />
+          </Pressable>
+        </View>
+
+
+        {/* Conversation-Thread — INVERTED FlatList. Das ist DAS Standard-Chat-
+            Pattern (Discord, WhatsApp, Slack). Mechanik:
+            - `inverted` flippt die Y-Axis: scroll-Y=0 ist visuell UNTEN
+            - data wird reversed übergeben → neueste Nachricht steht bei
+              index=0, also visuell IMMER am Bottom
+            - Neue Messages werden bei index=0 prepended → erscheinen ohne
+              jegliches scrollTo automatisch im sichtbaren Bottom-Bereich
+            - contentContainerStyle.paddingBottom ist mit `inverted` visuell
+              am Bottom (unter der neuesten Bubble) → reserviert Platz für
+              Inputbar + Lift + Gap
+            Damit ist ZERO scroll-Synchronisation nötig: die letzte Bubble
+            steht IMMER über der Bar, weil sie strukturell dort hingerendert
+            wird, nicht weil wir hin-scrollen müssen. */}
+        {/* Steht still und schneidet — bewegt wird die Hülle darin. So bleibt der
+            sichtbare Ausschnitt exakt der von vorher, als jede Zeile sich einzeln
+            verschoben hat. */}
+        <View style={styles.threadClip}>
+          <Animated.View ref={threadWrapRef} style={[styles.threadFill, threadShiftStyle]}>
+            {thread}
+          </Animated.View>
+        </View>
+
+        {/* Bo + Mood-Label.
+            `paused={!isFocused}` schaltet Bo's Reanimated-Worklets ab wenn der
+            User auf einem anderen Tab ist. Ohne das laufen 5-8 endlose Repeats
+            (Schweben, Blinzeln, ggf. Wink/Yap) auf der UI-Thread im Hinter-
+            grund weiter — verlangsamt jeden anderen Tab spürbar. */}
+        <View style={[styles.hero, { top: insets.top + HERO_TOP }]} pointerEvents="none">
+          <BoGate state={mood} size={BO_SIZE} />
+        </View>
+
+        {/* Input-Bar Wrapper — absolut bei bottom:0, die Hochbewegung kommt
+            frame-synced mit dem Keyboard via barAnimStyle (useAnimatedKeyboard,
+            UI-Thread). onLayout misst die echte Bar-Höhe für die
+            contentPaddingBottom-Berechnung. */}
+        <Animated.View
+          style={[styles.inputbarWrap, { backgroundColor: palette.bg }, inputbarWrapStyle, barAnimStyle]}
+          onLayout={(e) => {
+            const h = e.nativeEvent.layout.height;
+            // Ohne Umweg über React: Diesen Wert braucht nur der UI-Strang (der
+            // Fahrweg der Zeile), er kostet damit keinen Durchgang.
+            barTravel.value = h;
+            /**
+             * NICHT während der Fahrt — jeder Commit hält die Kurve an.
+             *
+             * Belegt in Reanimateds eigener Quelle: Kommt ein Commit von React,
+             * klont der Commit-Hook den Shadow-Tree-Pfad für JEDEN animierten
+             * Knoten der App und pausiert danach ausdrücklich Reanimateds eigene
+             * Commits („if we didn't pause Reanimated commits, it could lead to
+             * RN commits being delayed until the animation is finished"). Ein
+             * `setState` mitten in der Einfahrt ist damit kein bisschen
+             * Mehrarbeit, sondern eine PAUSE der Bewegung.
+             *
+             * Die Zahl selbst eilt nicht: Sie steuert nur den Innenabstand am
+             * unteren Listenrand, und ihr Startwert wird gerechnet statt geraten
+             * (siehe dort) — die Abweichung ist im Regelfall null.
+             */
+            if (Math.abs(h - inputbarHeight) <= 1) return;
+            /**
+             * Aufschieben heißt NACHHOLEN, nicht verwerfen.
+             *
+             * Der Wert wurde hier nur in eine Ablage geschrieben und nie wieder
+             * angewandt — die Leisten-Höhe blieb also auf ihrem gerechneten
+             * Startwert stehen, wenn die Messung zufällig in eine Fahrt fiel. An
+             * ihr hängt der Abstand zwischen letzter Blase und Eingabeleiste.
+             */
+            if (isTransitionBusy()) {
+              pendingBarHeightRef.current = h;
+              if (barHeightTimerRef.current) return;
+              const apply = () => {
+                if (isTransitionBusy()) {
+                  barHeightTimerRef.current = setTimeout(apply, 200);
+                  return;
+                }
+                barHeightTimerRef.current = null;
+                const pending = pendingBarHeightRef.current;
+                pendingBarHeightRef.current = null;
+                if (pending !== null) setInputbarHeight(pending);
+              };
+              barHeightTimerRef.current = setTimeout(apply, 200);
+              return;
+            }
+            pendingBarHeightRef.current = null;
+            setInputbarHeight(h);
+          }}
+        >
+        {/**
+          * Was gerade mit der Sprachnachricht passiert.
+          *
+          * Zwei Wartezeiten, die der Nutzer sonst nicht einordnen kann: das
+          * einmalige Laden des Sprachmodells (rund 60 MB) und das Abschreiben
+          * einer Aufnahme. Beides passiert, während die Aufnahme-Box schon zu ist
+          * — ohne diese Zeile sähe es aus, als hinge die App.
+          */}
+        {voiceStatus ? (
+          <View style={styles.voiceStatusRow} pointerEvents="none">
+            <Text style={[styles.voiceStatusText, { backgroundColor: palette.s3 }]}>{voiceStatus}</Text>
+          </View>
+        ) : null}
+        {/* Der Sprachbalken (Wellenform, Aufnahmepunkt, Zeitanzeige) ist hier
+            ausgebaut — die Mikrofon-Funktion wird neu gebaut. Die Komponente
+            liegt unangetastet unter `components/assistant/VoiceRecordBar.tsx`,
+            falls Teile davon wieder gebraucht werden. */}
+        <View style={[styles.inputbar, { backgroundColor: palette.s2, paddingBottom: inputbarPadBottom }]}>
+          <View style={[styles.field, { backgroundColor: palette.s3 }]}>
+            <TextInput
+              ref={chatInputRef}
+              value={input}
+              onChangeText={setInput}
+              placeholder={t("assistant.placeholder")}
+              placeholderTextColor={C.textTertiary}
+              style={styles.fieldText}
+              multiline
+              maxLength={500}
+              // KEIN editable={!busy} — sonst dropt Android beim Stream den
+              // Focus → keyboard closet → onBlur feuert → kbOffset auf 0 →
+              // Bar springt runter mitten in Bo's Antwort. User soll während
+              // des Streams die nächste Frage schon vortippen können (Send-
+              // Button ist via canSend disabled, also kein versehentliches
+              // Doppel-Senden).
+              onSubmitEditing={() => send(input)}
+              onFocus={onInputFocus}
+              onBlur={onInputBlur}
+              blurOnSubmit={false}
+              returnKeyType="send"
+            />
+          </View>
+
+          <Pressable
+            style={[
+              styles.iconBtn,
+              { backgroundColor: C.surface3 },
+              !voiceAvailable && { opacity: 0.4 },
+            ]}
+            disabled={!voiceAvailable}
+            onPress={() => {
+              haptic("button");
+              // Tastatur zuerst schließen: Der Kasten sitzt über der Eingabezeile,
+              // und die wandert mit der Tastatur.
+              /**
+               * Erst die Tastatur wegräumen, DANN den Kasten zeigen.
+               *
+               * Beides im selben Bild sah aus, als spränge der Kasten aus dem
+               * Nichts über die noch fahrende Tastatur. Mit dem kurzen Abstand
+               * fährt zuerst die Tastatur hinunter, die Eingabezeile geht mit —
+               * und erst auf den freien Platz kommt der Kasten.
+               *
+               * Ohne offene Tastatur gibt es nichts zu warten: dann sofort.
+               */
+              const hadKeyboard = Keyboard.isVisible();
+              Keyboard.dismiss();
+              const begin = () => {
+                setVoiceMode(true);
+                if (!MODULE_RECORDS_AUDIO) void startRecording();
+                setMicRecording(true);
+                // Immer: Diese Sitzung IST die Aufnahme, auch ohne Erkenner.
+                void startVoice();
+              };
+              if (hadKeyboard) setTimeout(begin, 220);
+              else begin();
+            }}
+            accessibilityLabel="Voice"
+          >
+            <Mic size={20} color={C.white} strokeWidth={2} />
+          </Pressable>
+
+          <Pressable
+            style={[
+              styles.iconBtn,
+              {
+                backgroundColor: canSend ? accent.solid : C.surface3,
+                opacity: canSend || busy ? 1 : 0.5,
+              },
+            ]}
+            disabled={!canSend}
+            onPress={() => send(input)}
+            accessibilityLabel="Send"
+          >
+            {busy ? (
+              <ActivityIndicator color={C.white} size="small" />
+            ) : (
+              <Send size={20} color={canSend ? accent.textOnSolid : C.white} strokeWidth={2} />
+            )}
+          </Pressable>
+        </View>
+        </Animated.View>
+
+        {/**
+          * Der Mikrofon-Kasten.
+          *
+          * Unterkante GENAU auf der Unterkante des Mikrofon-Knopfes: Der sitzt in
+          * der Eingabezeile, deren unterer Innenabstand `inputbarPadBottom` ist —
+          * also derselbe Abstand vom Bildschirmrand.
+          *
+          * Er liegt NEBEN der Eingabezeile im Baum, nicht darin: Deren Hülle ist
+          * nur so hoch wie die Zeile selbst, und was darüber hinausragt, läge
+          * außerhalb seines Elternteils — auf Android damit weder sichtbar noch
+          * berührbar.
+          *
+          * `pointerEvents="none"`, solange er leer ist: So bleibt die Zeile
+          * darunter bedienbar, und ein zweiter Druck auf das Mikrofon nimmt ihn
+          * wieder weg.
+          */}
+        {voiceMode ? (
+          <MicBox
+            /**
+             * An der AUFNAHME, nicht an der Erkennung.
+             *
+             * `listening` gehört dem Erkenner, und der endet bei jeder Sprechpause
+             * und läuft neu an. Die Tonspur fror dabei ein — „auf einmal passiert
+             * gar nichts mehr" —, obwohl weiter aufgenommen wurde. Der Ton läuft
+             * durch, also läuft auch die Spur durch.
+             */
+            recording={micRecording}
+            /**
+             * NICHT an Bos Sperre hängen — das war der Grund für die toten Balken.
+             *
+             * `voiceBarPaused` folgt `boBlocked`, und das ist wahr, sobald Bo
+             * gerade fährt, den Fokus nicht hat ODER die Liste gescrollt wird
+             * (siehe `publishPause`). Der Anfangswert ist ebenfalls wahr. Steht
+             * einer dieser drei Fälle beim Öffnen des Kastens an — oder bleibt er
+             * hängen —, wird der Bild-Rückruf der Tonspur nie eingeschaltet: Es
+             * kommt Pegel an, aber niemand tastet ihn ab.
+             *
+             * Diese Sperre ist für Bos Dauer-Animationen gedacht, die im
+             * Hintergrund weiterliefen. Die Tonspur ist etwas anderes: Sie läuft
+             * nur, solange der Kasten offen ist — also genau dann, wenn der
+             * Nutzer hinsieht.
+             */
+            paused={false}
+            micVolumeSV={micVolumeSV}
+            style={[styles.micBox, { height: MIC_BOX_H, bottom: inputbarPadBottom }]}
+            onToggle={() => {
+              if (listening) {
+                stopVoice();
+                // Der Ton hält mit an — sonst liefe die Pause als Stille mit in
+                // die Aufnahme.
+                setMicRecording(false);
+                try {
+                  if (!MODULE_RECORDS_AUDIO) recorder.pause();
+                } catch {
+                  // Aufnehmer nicht in einem Zustand, in dem sich pausieren
+                  // lässt — dann bleibt es beim Weiterlaufen.
+                }
+              } else {
+                // Fortsetzen, nicht neu anfangen: Text und Ton von vor der Pause
+                // bleiben stehen.
+                resumingRef.current = true;
+                setMicRecording(true);
+                try {
+                  if (!MODULE_RECORDS_AUDIO) recorder.record();
+                } catch {
+                  // siehe oben
+                }
+                void startVoice();
+              }
+            }}
+            onDelete={() => {
+              voiceSendRef.current = false;
+              if (listening) stopVoice();
+              void discardVoiceRecording();
+              setInput("");
+              setVoiceMode(false);
+            }}
+            onSend={() => {
+              /**
+               * Direkt aus der laufenden Aufnahme heraus — kein Umweg über Pause.
+               *
+               * Gestoppt wird hier, eingesammelt wird erst, wenn die Datei
+               * geschlossen ist (siehe `sendMaybeVoice`). Vorher wurde beides in
+               * dieser Reihenfolge verkehrt gemacht, und genau daher kamen die
+               * abgehackten und die ausbleibenden Nachrichten.
+               */
+              voiceSendRef.current = true;
+              if (listening) {
+                /**
+                 * Abgeschickt wird JETZT, nicht wenn der Erkenner soweit ist.
+                 *
+                 * Vorher wurde nur gestoppt und auf das Schluss-Ergebnis gewartet
+                 * — kam keines (weil nichts verstanden wurde oder der Dienst sich
+                 * Zeit ließ), sah es aus, als hätte man bloß angehalten.
+                 *
+                 * Jetzt läuft eine kurze Frist mit: Kommt das Schluss-Ergebnis in
+                 * dieser Zeit, geht es damit raus; kommt keines, eben mit dem
+                 * bisherigen Stand. Die Aufnahme selbst ist davon ohnehin
+                 * unabhängig.
+                 */
+                pendingSendRef.current = true;
+                stopVoice();
+                setVoiceMode(false);
+                const guard = setTimeout(() => {
+                  if (!pendingSendRef.current) return;
+                  pendingSendRef.current = false;
+                  void sendMaybeVoice(transcriptLiveRef.current.trim());
+                }, 700);
+                sendGuardRef.current = guard;
+              } else {
+                // Aus der Ablage, nicht aus `input` — siehe Begründung am
+                // „end"-Zweig: Der Zustand hier stammt aus einem alten Durchgang.
+                setVoiceMode(false);
+                void sendMaybeVoice(transcriptLiveRef.current.trim());
+              }
+            }}
+          />
+        ) : null}
+        {/* GANZ ZULETZT und damit ganz oben: Ein Tipp auf den geschrumpften
+            Bildschirm fährt zurück. Sie liegt INNERHALB der Hülle, wird also
+            mit verkleinert und verschoben — und deckt damit genau den Rest
+            ab, der stehen geblieben ist, ohne dass jemand nachrechnen muss,
+            wo der liegt. */}
+        <DrawerDismissLayer
+          onPress={closeDrawer}
+          onSettleStart={settleDrawerStart}
+          onSettleDone={settleDrawerDone}
+          label={t("common.close")}
+        />
+      </Animated.View>
+    </View>
   );
 }
 
@@ -5496,6 +6108,90 @@ function makeRecedingCell(
 }
 
 
+/**
+ * Gespeicherte Zeilen zurück in Blasen übersetzen.
+ *
+ * Zwei Dinge, die man dabei falsch machen kann:
+ *
+ *  1. Die REIHENFOLGE. Eine Antwort ist nicht ein Text, sondern eine Folge —
+ *     Text, dann Karten, dann der Knopf. Der Server vergibt dafür `seq`; hier
+ *     wird nur durchgelaufen, nicht umsortiert.
+ *  2. Die ZUGEHÖRIGKEIT. Karten und Knopf hängen über `botId` an ihrer
+ *     Textblase (daran hängt der Wiederholen-Knopf und die Gruppierung). Beim
+ *     Wiederherstellen gibt es keine laufende Blase — also merkt sich die
+ *     Schleife die zuletzt gesehene Textblase des Assistenten.
+ *
+ * Alles, was nicht zweifelsfrei passt, fällt weg: Die Nutzlast kommt vom
+ * Server als offenes Objekt, und eine halb gefüllte Karte ist schlimmer als
+ * keine.
+ */
+function messagesFromRows(rows: ChatMessageRow[]): Msg[] {
+  const out: Msg[] = [];
+  let botId = "";
+  for (const row of rows) {
+    if (row.kind === "text") {
+      const text = row.content ?? "";
+      if (!text) continue;
+      if (row.role === "user") {
+        out.push({ id: row.id, kind: "user", text });
+      } else {
+        botId = row.id;
+        out.push({ id: row.id, kind: "bot", text });
+      }
+      continue;
+    }
+    const payload = row.payload;
+    if (!payload) continue;
+    if (row.kind === "result") {
+      const result = payload.result as SearchResult | undefined;
+      if (result?.id) out.push({ id: row.id, kind: "result", result, botId });
+      continue;
+    }
+    if (row.kind === "board") {
+      const stop = payload.stop as { code?: string; label?: string } | undefined;
+      const board = payload.board as "departures" | "arrivals" | undefined;
+      if (!stop?.code || !board) continue;
+      /**
+       * OHNE `data` — die gespeicherte Tafel ist in Minuten veraltet.
+       *
+       * Die Karte lädt sich dann selbst nach; das ist genau der Fall, für den
+       * das Feld optional ist.
+       */
+      out.push({
+        id: row.id,
+        kind: "board",
+        stop: { code: stop.code, label: stop.label ?? stop.code },
+        board,
+        botId,
+      });
+      continue;
+    }
+    if (row.kind === "action") {
+      // Nur „alle Treffer" wird zu einem Knopf; speichern/entfernen waren
+      // einmalige Wirkungen und haben nie eine Blase erzeugt.
+      if (payload.action !== "open_results") continue;
+      const p = (payload.payload ?? {}) as Partial<LastSearchParams>;
+      if (!p.mode || !p.origin || !p.destination || !p.departDate) continue;
+      out.push({
+        id: row.id,
+        kind: "action",
+        params: {
+          origin: p.origin,
+          destination: p.destination,
+          originLabel: p.originLabel ?? "",
+          destLabel: p.destLabel ?? "",
+          mode: p.mode,
+          departDate: p.departDate,
+          passengers: p.passengers ?? 1,
+          currency: p.currency ?? "EUR",
+        },
+        botId,
+      });
+    }
+  }
+  return out;
+}
+
 function idGen(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -5840,6 +6536,178 @@ const BoGate = memo(function BoGate({ state, size }: { state: BoMood; size: numb
   return <Bo state={state} size={size} paused={paused} />;
 });
 
+/**
+ * Ob die Schublade OFFEN steht — als Verteiler, nicht als Zustandsgröße.
+ *
+ * Dieselbe Begründung wie bei `setBoBlocked` direkt darüber: Eine
+ * Zustandsgröße hier rendert den GANZEN Bildschirm neu, und zwar genau in dem
+ * Moment, in dem die Kurve läuft. Gebraucht wird der Wert an zwei winzigen
+ * Stellen — der Schublade selbst (Berührungen freigeben) und der Fangschicht
+ * über dem geschrumpften Bildschirm. Nur die beiden sollen aufwachen.
+ *
+ * Er wird bewusst ERST im Abschluss der Kurve gesetzt: Solange gefahren wird,
+ * soll man in der Schublade nichts antippen können, und der Commit fällt so
+ * hinter die Bewegung statt hinein.
+ */
+let drawerOpenNow = false;
+const drawerOpenListeners = new Set<(open: boolean) => void>();
+
+function setDrawerOpenNow(open: boolean): void {
+  if (drawerOpenNow === open) return;
+  drawerOpenNow = open;
+  for (const fn of drawerOpenListeners) fn(open);
+}
+
+function subscribeDrawerOpen(fn: (open: boolean) => void): () => void {
+  drawerOpenListeners.add(fn);
+  fn(drawerOpenNow);
+  return () => {
+    drawerOpenListeners.delete(fn);
+  };
+}
+
+/**
+ * Die Schublade hinter dem Verteiler — nur dieser Knoten rendert beim Öffnen
+ * neu, nicht der Bildschirm darum.
+ */
+const DrawerGate = memo(function DrawerGate({
+  activeId,
+  onSelect,
+  onNewChat,
+  onClose,
+  onOpenProfile,
+}: {
+  activeId: string | null;
+  onSelect: (id: string) => void;
+  onNewChat: () => void;
+  onClose: () => void;
+  onOpenProfile: () => void;
+}) {
+  const [open, setOpen] = useState(drawerOpenNow);
+  useEffect(() => subscribeDrawerOpen(setOpen), []);
+  return (
+    <ChatDrawer
+      open={open}
+      activeId={activeId}
+      onSelect={onSelect}
+      onNewChat={onNewChat}
+      onClose={onClose}
+      onOpenProfile={onOpenProfile}
+    />
+  );
+});
+
+/**
+ * Fängt Berührungen auf dem geschrumpften Bildschirm ab und fährt zurück.
+ *
+ * Sie hängt am selben Verteiler und ist deshalb erst da, wenn die Fahrt VORBEI
+ * ist. Das erspart die Sperre, die das Benachrichtigungs-Blatt braucht (dort
+ * verwirft ein Zeitstempel Tipps während der Einfahrt): Was es nicht gibt,
+ * kann auch nichts schlucken — insbesondere nicht den Tipp auf das Zeichen,
+ * mit dem die Schublade gerade geöffnet wird.
+ */
+const DrawerDismissLayer = memo(function DrawerDismissLayer({
+  onPress,
+  onSettleStart,
+  onSettleDone,
+  label,
+}: {
+  onPress: () => void;
+  /** Ende der Geste: `true` = offen lassen, `false` = zurückfahren. */
+  onSettleStart: (open: boolean) => void;
+  onSettleDone: (open: boolean) => void;
+  label: string;
+}) {
+  const [open, setOpen] = useState(drawerOpenNow);
+  useEffect(() => subscribeDrawerOpen(setOpen), []);
+  const startAbs = useSharedValue(0);
+  const startD = useSharedValue(1);
+
+  /**
+   * Den Bildschirm mit dem Finger zurückziehen — der dritte Weg zurück.
+   *
+   * WARUM `absoluteX` UND NICHT `translationX`: Diese Schicht liegt INNERHALB
+   * des Knotens, der gerade auf 72% verkleinert ist. Eine Verschiebung, die im
+   * Koordinatensystem dieses Knotens gemeldet wird, ist um denselben Faktor
+   * gestaucht — der Bildschirm liefe dem Finger hinterher. Die absolute Lage im
+   * Fenster kennt die Verkleinerung nicht.
+   *
+   * Der Weg von „offen" nach „zu" ist eine halbe Bildschirmbreite (siehe die
+   * Herleitung im Transform), deshalb ist genau das der Nenner: Der Bildschirm
+   * folgt dem Finger 1:1.
+   *
+   * `activeOffsetX` gibt kurze Tipper an den Knopf darunter ab — ohne das würde
+   * jeder Tipp erst zur Geste und das Antippen zum Schließen ginge verloren.
+   */
+  const pan = useMemo(
+    () =>
+      Gesture.Pan()
+        .activeOffsetX([-12, 12])
+        .onStart((e) => {
+          startAbs.value = e.absoluteX;
+          startD.value = assistantDrawer.value;
+        })
+        .onUpdate((e) => {
+          const dx = e.absoluteX - startAbs.value;
+          const next = startD.value + dx / (PARK_X / 2);
+          assistantDrawer.value = Math.min(1, Math.max(0, next));
+        })
+        .onEnd((e) => {
+          /**
+           * Der Schwung entscheidet mit, nicht nur die Strecke.
+           *
+           * Ein schneller kurzer Wisch nach links ist eindeutig gemeint —
+           * ohne die Geschwindigkeit im Urteil federte er zurück, weil der
+           * Finger die halbe Strecke nicht geschafft hat.
+           */
+          const flung = e.velocityX < -600;
+          const held = e.velocityX > 600;
+          const shouldOpen = held || (!flung && assistantDrawer.value > 0.5);
+
+          /**
+           * Die Kurve startet HIER — im Worklet, im Bild des Loslassens.
+           *
+           * Vorher ging der Abschluss zuerst über den JS-Faden, und erst der
+           * startete die Bewegung. Dazwischen liegt eine Zustellung plus ein
+           * React-Commit: Der Bildschirm stand für ein paar Bilder still und
+           * lief dann weiter. Genau das war zu spüren.
+           *
+           * Die Dauer wächst mit der RESTSTRECKE, mit einem Boden von 15%.
+           * Wer fast bis zum Anschlag gezogen hat, wartet sonst die volle
+           * Zeit auf ein paar verbleibende Punkte.
+           */
+          const target = shouldOpen ? 1 : 0;
+          const base = shouldOpen ? SHEET_IN : SHEET_OUT;
+          const rest = Math.abs(target - assistantDrawer.value);
+          const duration = Math.max(base.duration * 0.15, base.duration * rest);
+          // Die Buchhaltung läuft daneben auf dem JS-Faden, nicht davor.
+          runOnJS(onSettleStart)(shouldOpen);
+          assistantDrawer.value = withTiming(
+            target,
+            { duration, easing: base.easing },
+            (finished) => {
+              "worklet";
+              if (!finished) return;
+              runOnJS(onSettleDone)(shouldOpen);
+            },
+          );
+        }),
+    [onSettleStart, onSettleDone, startAbs, startD],
+  );
+
+  if (!open) return null;
+  return (
+    <GestureDetector gesture={pan}>
+      <Pressable
+        style={StyleSheet.absoluteFill}
+        onPress={onPress}
+        accessibilityRole="button"
+        accessibilityLabel={label}
+      />
+    </GestureDetector>
+  );
+});
+
 let dotsPaused = false;
 const dotsListeners = new Set<(paused: boolean) => void>();
 
@@ -5945,7 +6813,43 @@ function Dot({ delay }: { delay: number }) {
  * Also den Überhang herausrechnen, wie es der Landingscreen auch tut. Beide
  * Schriftzüge beginnen damit exakt HEADING_TOP unter der sicheren Fläche.
  */
-const CLOSE_BTN_SIZE = 36;
+
+/**
+ * Das Zeichen links vom Schriftzug — zwei Striche, der obere lang, der untere
+ * kurz.
+ *
+ * Zwei Ansichten statt eines SVG: Es sind zwei gerade Striche mit runden Enden,
+ * und die zeichnet Android als gewöhnliche Kästchen mit `borderRadius`, ohne
+ * dafür eine eigene Zeichenfläche aufzumachen. Lucide hat kein Zeichen mit
+ * genau zwei unterschiedlich langen Strichen; die Geometrie folgt aber dessen
+ * Regeln — gerade Linien, runde Enden, 2er-Stärke —, damit es neben dem X in
+ * derselben Zeile nicht fremd wirkt.
+ *
+ * Es ist NIEDRIGER als die Textzeile (12 gegen 32) und ändert deshalb nichts an
+ * der Höhe der Kopfzeile: `TOPBAR_CONTENT_H` bleibt beim Schließen-Knopf, der
+ * Schriftzug steht weiter exakt HEADING_TOP unter der sicheren Fläche.
+ */
+const MARK_W = 22;
+const MARK_W_SHORT = 13;
+const MARK_LINE_H = 2.5;
+/** Gesamthöhe des Zeichens: zwei Striche plus die Lücke dazwischen. */
+const MARK_H = MARK_LINE_H * 2 + 7;
+/**
+ * Wie weit die Statuszeile an beiden Seiten wegbleibt.
+ *
+ * Links das Zeichen samt seinem Abstand zum Schriftzug, rechts derselbe Betrag
+ * — die Zeile bleibt dadurch mittig und deckt weder Zeichen noch Knopf ab.
+ */
+const MOOD_SIDE_INSET = GUTTER + MARK_W + SPACE.lg;
+
+function ThreadMark({ color }: { color: string }) {
+  return (
+    <View style={styles.mark}>
+      <View style={[styles.markLine, { backgroundColor: color }]} />
+      <View style={[styles.markLine, styles.markLineShort, { backgroundColor: color }]} />
+    </View>
+  );
+}
 /**
  * Die Liste mit animierten Eigenschaften — als eigener, typisierter Alias.
  *
@@ -5962,7 +6866,6 @@ const AnimatedThread = Animated.createAnimatedComponent(
   FlatList,
 ) as unknown as React.ComponentType<ThreadProps>;
 
-const TOPBAR_TOP = HEADING_TOP - (CLOSE_BTN_SIZE - HEADING_LINE_HEIGHT) / 2;
 /**
  * Wo Bo schwebt — gemessen von der sicheren Fläche.
  *
@@ -5971,7 +6874,7 @@ const TOPBAR_TOP = HEADING_TOP - (CLOSE_BTN_SIZE - HEADING_LINE_HEIGHT) / 2;
  * was der Fluss vorher ergab: Kopfzeile plus deren Innenabstand, minus der
  * Überhang, mit dem der Block schon vorher nach oben gezogen wurde.
  */
-const TOPBAR_CONTENT_H = Math.max(CLOSE_BTN_SIZE, HEADING_LINE_HEIGHT);
+const TOPBAR_CONTENT_H = Math.max(CLOSE_ICON_SIZE, HEADING_LINE_HEIGHT);
 const HERO_TOP = TOPBAR_TOP + TOPBAR_CONTENT_H + 14 - HERO_PULL_UP;
 
 const styles = scaledStyles({
@@ -5995,6 +6898,19 @@ const styles = scaledStyles({
    * also hinter Bo: unsichtbar, aber da. Genau der Fall, den der Nutzer
    * gemeldet hat.
    */
+  /**
+   * Die Bühne trägt die Schichtung, der Bildschirm darin nur noch sich selbst.
+   *
+   * Innerhalb der Bühne gibt es genau zwei Kinder, und deren Reihenfolge im
+   * Baum entscheidet — Schublade zuerst, Bildschirm darüber. Keine
+   * `elevation`: Sie ordnet auf Android quer zu `zIndex` und würde die Bühne
+   * über Blätter heben, die ausdrücklich über Bo liegen (Ergebnisliste,
+   * Detail- und Ticket-Blatt, die beiden Wähler).
+   */
+  stage: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 50,
+  },
   root: {
     ...StyleSheet.absoluteFillObject,
     zIndex: 50,
@@ -6011,15 +6927,57 @@ const styles = scaledStyles({
     alignItems: "center",
     justifyContent: "space-between",
   },
+  /**
+   * Zeichen und Schriftzug als ein Block.
+   *
+   * Der Abstand dazwischen ist kleiner als der zum Bildschirmrand (GUTTER 20),
+   * sonst lesen sie als zwei Dinge, die zufällig nebeneinander stehen, statt
+   * als eine Gruppe. `alignItems: center` legt die Mitte des Zeichens auf die
+   * Mitte der Textzeile — deren optische Mitte liegt bei dieser Schrift einen
+   * halben Punkt darüber, das ist unter der Wahrnehmungsschwelle.
+   */
+  brand: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: SPACE.lg,
+  },
+  /**
+   * Die Trefferfläche ist eine ECHTE 44er-Fläche, kein `hitSlop`.
+   *
+   * `hitSlop` vergrößert nur den Bereich, in dem DIESE Ansicht antwortet — es
+   * hilft nicht gegen etwas, das darüber liegt. Innenabstand plus negativer
+   * Außenabstand ergibt eine wirkliche Fläche von 44x44, ohne dass die Zeile
+   * dadurch höher oder das Zeichen verschoben wird.
+   */
+  markBtn: {
+    paddingVertical: (44 - MARK_H) / 2,
+    paddingHorizontal: (44 - MARK_W) / 2,
+    marginVertical: -(44 - MARK_H) / 2,
+    marginHorizontal: -(44 - MARK_W) / 2,
+  },
+  mark: { gap: 7 },
+  markLine: {
+    width: MARK_W,
+    height: MARK_LINE_H,
+    // Voller Radius = runde Enden, wie `strokeLinecap="round"` bei Lucide.
+    borderRadius: MARK_LINE_H,
+  },
+  markLineShort: { width: MARK_W_SHORT },
+
+  /**
+   * Das X steht FREI — kein Kreis, keine Fläche.
+   *
+   * So macht es die App in jedem Blatt (Ortswähler, Benachrichtigungen,
+   * Suchverlauf); Bos Kopfzeile war die einzige Stelle mit einem gefüllten
+   * Kreis darum.
+   *
+   * Innenabstand plus negativer Außenabstand statt `hitSlop`: ergibt eine
+   * echte 44er-Fläche, ohne dass die Zeile höher wird oder das Zeichen
+   * wandert. Dieselbe Begründung wie beim Zeichen links.
+   */
   closeBtn: {
-    // Über die Konstante, damit der Überhang in TOPBAR_TOP mitwandert, falls
-    // der Knopf je eine andere Größe bekommt.
-    width: CLOSE_BTN_SIZE,
-    height: CLOSE_BTN_SIZE,
-    borderRadius: CLOSE_BTN_SIZE / 2,
-    backgroundColor: C.surface2,
-    borderWidth: 1,
-    borderColor: C.border,
+    padding: (44 - CLOSE_ICON_SIZE) / 2,
+    margin: -(44 - CLOSE_ICON_SIZE) / 2,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -6056,8 +7014,23 @@ const styles = scaledStyles({
    */
   mood: {
     position: "absolute",
-    left: 0,
-    right: 0,
+    /**
+     * NICHT mehr über die volle Breite — das hat die Tipps auf das Zeichen
+     * geschluckt.
+     *
+     * Die Zeile ist absolut gesetzt und steht im Baum NACH dem Zeichen, liegt
+     * also darüber. Ihre Fläche ist bildschirmbreit, ihre Höhe entspricht
+     * genau der Textzeile — und das Zeichen sitzt mittig in derselben Zeile.
+     * Sie deckte es damit vollständig ab. Übrig blieb der Teil der
+     * Trefferfläche, der oben und unten darüber hinausragt; genau das kam als
+     * „geht nur, wenn ich oben drauf drücke" zurück.
+     *
+     * Beide Seiten um denselben Betrag einrücken: Die Zeile bleibt damit exakt
+     * mittig (sie ist über `textAlign` zentriert, nicht über ihre Lage), gibt
+     * aber links das Zeichen und rechts den Schließen-Knopf frei.
+     */
+    left: MOOD_SIDE_INSET,
+    right: MOOD_SIDE_INSET,
     textAlign: "center",
     textAlignVertical: "center",
     fontSize: 11,

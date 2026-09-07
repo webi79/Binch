@@ -1,36 +1,97 @@
 import { Modal, Pressable, StyleSheet, Text, View } from "react-native";
 import Animated, { FadeIn, FadeOut, ZoomIn, ZoomOut } from "react-native-reanimated";
+import { CircleAlert, Info } from "lucide-react-native";
+import { Bo } from "@/components/assistant/Bo";
 import { useAlertStore, type AlertButton } from "@/lib/alert";
-import { GradientFill } from "@/components/ui/GradientFill";
 import { haptic } from "@/lib/haptics";
+import { useT } from "@/lib/i18n/useT";
+import { useAccent } from "@/lib/theme/accent";
 import { usePalette } from "@/lib/theme/appBg";
-import { scaledStyles } from "@/lib/ui/compact";
+import { ms, scaledStyles } from "@/lib/ui/compact";
 
 const C = {
-  sheet: "#171719",
-  border: "#212123",
   white: "#F4F4F5",
   gray1: "#C8C8CC",
-  gray2: "#8E8E93",
-  black: "#000000",
-  red: "#FF3B5C",
-  surface3: "#212123",
+  /** Weicher Rand wie an den beiden anderen Dialogen — kein harter Kasten. */
+  border: "rgba(255,255,255,0.08)",
+  scrim: "rgba(0,0,0,0.55)",
+  /** Destruktiv-Rot, derselbe Wert wie am Papierkorb der Recent-Karte. */
+  danger: "#E5484D",
 };
 
-/** Mounted once at the app root. Renders styled alerts triggered via `showAlert(...)`. */
+/**
+ * Bos Größe im Dialog — durch `ms()` gedreht, NICHT roh.
+ *
+ * Sie ist eine Eigenschaft, kein Stilwert, wird von `scaledStyles` also nicht
+ * miterfasst. Roh stehen gelassen würde Bo auf einem kurzen Gerät als einziger
+ * Teil der Karte seine volle Größe behalten, während Ränder, Titel und Knöpfe
+ * um ihn herum schrumpfen — er säße dann sichtbar zu groß darin.
+ *
+ * 104 statt der 138 aus den leeren Listen: Dort trägt Bo die ganze Fläche, hier
+ * steht ein Titel mit Text und zwei Knöpfen unter ihm.
+ */
+const BO_SIZE = ms(104);
+
+/**
+ * Einmal an der Wurzel gehängt, zeigt alles an, was über `showAlert(...)` kommt.
+ *
+ * Das Aussehen ist NICHT hier erfunden, sondern von den beiden handgebauten
+ * Dialogen der App übernommen — [ClearSearchHistoryAlert] und
+ * [ConnectionNotFoundModal]. Beide sagen dasselbe:
+ *
+ *   Karte auf `s2`, Radius 28, weicher Rand · oben ein Symbol im Kreis ·
+ *   Titel 21/800 mittig · Text 14/21 mittig · darunter GESTAPELTE Knöpfe:
+ *   die Aktion als Akzent-Knopf (Radius 16), „Abbrechen" als reiner Textknopf.
+ *
+ * Vorher war dieser Host eine eigene Sprache: 20er Radius mit hartem Rand,
+ * Titel 17, Kapsel-Knöpfe nebeneinander auf halber Breite, kein Symbol. Für
+ * sich genommen sauber, neben den anderen beiden aber sichtbar ein Fremdkörper
+ * — und da hier die Mehrheit aller Meldungen durchläuft, hat ausgerechnet die
+ * generische Stelle das Bild bestimmt.
+ *
+ * Zwei Regeln kommen mit, die man beim Lesen leicht für Fehler hält:
+ *
+ *  - **Der bestätigende Knopf ist auch beim Löschen der Akzent-Knopf, nicht
+ *    rot.** Das Rot steckt im Symbolkreis. Genau so macht es der
+ *    Verlauf-löschen-Dialog; zwei verschiedene Antworten auf dieselbe Frage
+ *    wären hier das eigentliche Problem.
+ *  - **Die Aktion steht OBEN, „Abbrechen" darunter** — unabhängig von der
+ *    Reihenfolge im Aufruf. Die Aufrufe folgen der iOS-Sitte und stellen
+ *    „Abbrechen" nach vorn; gestapelt gehört die Aktion aber an die betonte
+ *    Stelle.
+ *
+ * Das Symbol oben leitet der Host selbst her. Nur wo das zu wenig ist, sagt es
+ * der Aufruf über `showAlert(..., "bo-sad")`: Dann steht dort ein trauriger Bo
+ * statt des Zeichens — heute beim Abmelden, wo das rote Ausrufezeichen nach
+ * einem Unglück aussah statt nach „schade, dass du gehst". Alles andere an der
+ * Karte bleibt gleich; es ist bewusst KEIN eigener Dialog geworden, sondern
+ * dieselbe Karte mit einem anderen Bild.
+ */
 export function AppAlertHost() {
+  const t = useT();
   const palette = usePalette();
+  const accent = useAccent();
   const visible = useAlertStore((s) => s.visible);
   const title = useAlertStore((s) => s.title);
   const body = useAlertStore((s) => s.body);
   const buttons = useAlertStore((s) => s.buttons);
+  const art = useAlertStore((s) => s.art);
   const dismiss = useAlertStore((s) => s.dismiss);
 
   const fallback: AlertButton[] = [{ text: "OK", style: "default" }];
   const list = buttons && buttons.length > 0 ? buttons : fallback;
 
+  /** Aktion(en) zuerst, „Abbrechen" ans Ende — siehe Kopf. */
+  const ordered = [
+    ...list.filter((b) => b.style !== "cancel"),
+    ...list.filter((b) => b.style === "cancel"),
+  ];
+
+  /** Rot statt Akzent im Symbolkreis, sobald irgendein Knopf löscht. */
+  const isDestructive = list.some((b) => b.style === "destructive");
+
   const handlePress = (btn: AlertButton) => {
-    haptic("button");
+    haptic(btn.style === "destructive" ? "important" : "button");
     dismiss();
     btn.onPress?.();
   };
@@ -39,143 +100,215 @@ export function AppAlertHost() {
     <Modal visible={visible} transparent animationType="none" statusBarTranslucent onRequestClose={dismiss}>
       <Animated.View
         entering={FadeIn.duration(180)}
-        exiting={FadeOut.duration(150)}
-        style={styles.backdrop}
+        exiting={FadeOut.duration(140)}
+        style={styles.scrim}
       >
-        <Pressable style={StyleSheet.absoluteFill} onPress={dismiss} />
-      </Animated.View>
-      <View style={styles.center} pointerEvents="box-none">
+        <Pressable
+          style={StyleSheet.absoluteFill}
+          accessibilityRole="button"
+          accessibilityLabel={t("common.close")}
+          onPress={dismiss}
+        />
         <Animated.View
           entering={ZoomIn.duration(200)}
-          exiting={ZoomOut.duration(150)}
-          // Ein Dialog ist eine BOX auf der Verdunkelung, kein Blatt —
-          // dieselbe Stufe wie die beiden anderen Alerts der App.
-          style={[styles.dialog, { backgroundColor: palette.s2 }]}
+          exiting={ZoomOut.duration(140)}
+          style={styles.cardWrap}
         >
-          {title ? <Text style={styles.title}>{title}</Text> : null}
-          {body ? <Text style={styles.body}>{body}</Text> : null}
-          <View
-            style={[
-              list.length > 2
-                ? styles.actionsStacked
-                : list.length === 2
-                ? styles.actionsTwo
-                : styles.actionsOne,
-            ]}
+          {/**
+            * Der innere Pressable schluckt Tipper auf die Karte, sonst würde die
+            * Verdunkelung darunter schließen.
+            *
+            * `accessible={false}` ist dabei Pflicht und nicht Kür: `Pressable`
+            * setzt die Eigenschaft von sich aus auf wahr, und damit wird die
+            * Karte auf iOS zu EINEM Bedienelement — VoiceOver steigt dann nicht
+            * mehr zu den Kindern ab, liest die ganze Karte als Knopf mit einem
+            * Handler vor, der nichts tut, und erreicht weder „Abmelden" noch
+            * „Abbrechen". Der Knopf hier fängt nur Berührungen ab; ein
+            * Bedienelement ist er nicht.
+            */}
+          <Pressable
+            style={[styles.card, { backgroundColor: palette.s2 }]}
+            onPress={() => {}}
+            accessible={false}
           >
-            {list.map((btn, idx) => {
-              const isPrimary = btn.style === "default" || btn.style === undefined;
-              const isDestructive = btn.style === "destructive";
-              const wStyle =
-                list.length > 2
-                  ? styles.btnStacked
-                  : list.length === 2
-                  ? styles.btnHalf
-                  : styles.btnFull;
-              return (
-                <Pressable
-                  key={`${btn.text}-${idx}`}
-                  onPress={() => handlePress(btn)}
-                  style={({ pressed }) => [
-                    styles.btn,
-                    !isPrimary && !isDestructive && { backgroundColor: palette.s3 },
-                    wStyle,
-                    isDestructive && styles.btnDestructive,
-                    !isPrimary && !isDestructive && styles.btnCancel,
-                    pressed && { opacity: 0.85 },
-                  ]}
-                >
-                  {isPrimary && <GradientFill />}
-                  <Text
-                    style={[
-                      styles.btnText,
-                      isPrimary && { color: C.black, fontWeight: "700" },
-                      isDestructive && { color: C.white, fontWeight: "700" },
-                      !isPrimary && !isDestructive && { color: C.gray1, fontWeight: "600" },
-                    ]}
+            {art === "bo-sad" ? (
+              /* Ohne `paused` — der Dialog steht nur ein paar Sekunden, und in
+                 der Zeit darf Bo atmen. Die leeren Listen halten ihn deshalb
+                 still, weil er dort dauerhaft hängt; hier baut ihn das Fenster
+                 mit ab. */
+              <View style={styles.boSlot}>
+                <Bo state="sad" size={BO_SIZE} />
+              </View>
+            ) : (
+              <View
+                style={[
+                  styles.iconCircle,
+                  isDestructive ? { backgroundColor: C.danger } : { backgroundColor: accent.subtle },
+                ]}
+              >
+                {isDestructive ? (
+                  <CircleAlert size={32} color={C.white} strokeWidth={2.2} />
+                ) : (
+                  <Info size={32} color={accent.solid} strokeWidth={2.2} />
+                )}
+              </View>
+            )}
+
+            {title ? (
+              <Text
+                style={[styles.title, !body && styles.titleAlone]}
+                maxFontSizeMultiplier={1.4}
+              >
+                {title}
+              </Text>
+            ) : null}
+            {body ? (
+              <Text style={styles.body} maxFontSizeMultiplier={1.5}>
+                {body}
+              </Text>
+            ) : null}
+
+            {ordered.map((btn, idx) => {
+              /**
+               * Der erste Knopf trägt den Akzent. Nach dem Sortieren oben ist
+               * das die Aktion — und wenn ein Aufruf ausschließlich
+               * „Abbrechen" anbietet, eben der einzige Weg hinaus.
+               */
+              const isPrimary = idx === 0;
+              const isGhost = !isPrimary && btn.style === "cancel";
+
+              if (isPrimary) {
+                return (
+                  <View
+                    key={`${btn.text}-${idx}`}
+                    // Hintergrund am umschließenden View, nicht am Pressable:
+                    // Auf Android fällt eine Hintergrundfarbe aus einer
+                    // Pressable-Stilfunktion gelegentlich aus.
+                    style={[styles.solidBtn, { backgroundColor: accent.solid }]}
                   >
-                    {btn.text}
-                  </Text>
-                </Pressable>
+                    <Pressable
+                      onPress={() => handlePress(btn)}
+                      android_ripple={{ color: "rgba(0,0,0,0.15)" }}
+                      style={styles.solidTouch}
+                      accessibilityRole="button"
+                      accessibilityLabel={btn.text}
+                    >
+                      <Text style={[styles.solidLabel, { color: accent.textOnSolid }]}>{btn.text}</Text>
+                    </Pressable>
+                  </View>
+                );
+              }
+
+              if (isGhost) {
+                return (
+                  <View key={`${btn.text}-${idx}`} style={styles.ghostBtn}>
+                    <Pressable
+                      onPress={() => handlePress(btn)}
+                      style={styles.ghostTouch}
+                      accessibilityRole="button"
+                      accessibilityLabel={btn.text}
+                    >
+                      <Text style={styles.ghostLabel}>{btn.text}</Text>
+                    </Pressable>
+                  </View>
+                );
+              }
+
+              /* Dritter Fall, heute von keinem Aufruf genutzt: eine zweite
+                 Aktion neben der ersten. Gedeckt statt Akzent — es darf nur
+                 einen betonten Knopf geben. */
+              return (
+                <View key={`${btn.text}-${idx}`} style={[styles.solidBtn, { backgroundColor: palette.s3 }]}>
+                  <Pressable
+                    onPress={() => handlePress(btn)}
+                    android_ripple={{ color: "rgba(255,255,255,0.12)" }}
+                    style={styles.solidTouch}
+                    accessibilityRole="button"
+                    accessibilityLabel={btn.text}
+                  >
+                    <Text style={[styles.solidLabel, { color: C.white }]}>{btn.text}</Text>
+                  </Pressable>
+                </View>
               );
             })}
-          </View>
+          </Pressable>
         </Animated.View>
-      </View>
+      </Animated.View>
     </Modal>
   );
 }
 
 const styles = scaledStyles({
-  backdrop: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: "rgba(0,0,0,0.6)",
-  },
-  center: {
-    ...StyleSheet.absoluteFillObject,
+  scrim: {
+    flex: 1,
+    backgroundColor: C.scrim,
     alignItems: "center",
     justifyContent: "center",
-    padding: 32,
+    paddingHorizontal: 20,
   },
-  dialog: {
-    width: "100%",
-    maxWidth: 360,
-    backgroundColor: C.sheet,
-    borderRadius: 20,
+  cardWrap: { width: "100%", maxWidth: 360 },
+  card: {
+    borderRadius: 28,
     borderWidth: 1,
     borderColor: C.border,
-    paddingTop: 22,
+    paddingTop: 28,
     paddingHorizontal: 22,
-    paddingBottom: 16,
+    paddingBottom: 18,
+    alignItems: "center",
   },
-  title: {
-    fontSize: 17,
-    fontWeight: "700",
-    color: C.white,
-    marginBottom: 8,
-    letterSpacing: -0.2,
-  },
-  body: {
-    fontSize: 14,
-    lineHeight: 20,
-    color: C.gray1,
-    marginBottom: 18,
-  },
-  actionsOne: {
-    flexDirection: "row",
-    justifyContent: "center",
-    marginTop: 4,
-  },
-  actionsTwo: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginTop: 4,
-  },
-  actionsStacked: {
-    flexDirection: "column",
-    marginTop: 4,
-    gap: 8,
-  },
-  btn: {
-    height: 44,
-    borderRadius: 9999,
+  iconCircle: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
     alignItems: "center",
     justifyContent: "center",
-    paddingHorizontal: 18,
+    marginTop: 4,
+    marginBottom: 18,
+  },
+  /**
+   * Kein eigener Abstand nach unten: Bos Rahmen ist absichtlich höher als die
+   * Figur (`boFrameHeight` = Größe × 1,62, der Körper endet bei × 1,25), unter
+   * dem Kinn liegen also schon rund 38 Punkte für Schatten und Leuchten. Noch
+   * ein Rand darunter risse Bild und Titel auseinander.
+   */
+  boSlot: { marginTop: 2 },
+  title: {
+    fontSize: 21,
+    fontWeight: "800",
+    letterSpacing: -0.6,
+    color: C.white,
+    textAlign: "center",
+    marginBottom: 8,
+  },
+  /** Ohne Fließtext trägt der Titel dessen Abstand zum ersten Knopf. */
+  titleAlone: { marginBottom: 22 },
+  body: {
+    fontSize: 14,
+    lineHeight: 21,
+    color: C.gray1,
+    textAlign: "center",
+    paddingHorizontal: 6,
+    marginBottom: 22,
+  },
+
+  /** Gefüllter Knopf — Maße wie der „Preise vergleichen"-Knopf im Such-Screen. */
+  solidBtn: {
+    borderRadius: 16,
+    alignSelf: "stretch",
+    marginTop: 4,
+    marginBottom: 4,
     overflow: "hidden",
   },
-  btnFull: { width: "100%" },
-  btnHalf: { width: "48%" },
-  btnStacked: { width: "100%" },
-  btnCancel: {
-    backgroundColor: C.surface3,
+  solidTouch: {
+    paddingVertical: 17,
+    paddingHorizontal: 24,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
   },
-  btnDestructive: {
-    backgroundColor: C.red,
-  },
-  btnText: {
-    fontSize: 14,
-    letterSpacing: -0.1,
-    textAlign: "center",
-  },
+  solidLabel: { fontSize: 17, fontWeight: "700", textAlign: "center" },
+
+  ghostBtn: { alignSelf: "stretch" },
+  ghostTouch: { height: 44, alignItems: "center", justifyContent: "center" },
+  ghostLabel: { fontSize: 14, fontWeight: "600", color: C.gray1, textAlign: "center" },
 });

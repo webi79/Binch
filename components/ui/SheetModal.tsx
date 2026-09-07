@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, type ReactNode } from "react";
 import {
   Dimensions,
   Modal,
@@ -6,26 +6,21 @@ import {
   StyleSheet,
   View,
   type LayoutChangeEvent,
+  type TextStyle,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Animated, {
-  Easing,
   FadeIn,
   FadeOut,
-  runOnJS,
   useAnimatedStyle,
   useSharedValue,
-  withSpring,
   withTiming,
 } from "react-native-reanimated";
-import {
-  Gesture,
-  GestureDetector,
-  GestureHandlerRootView,
-} from "react-native-gesture-handler";
+import { GestureDetector, GestureHandlerRootView } from "react-native-gesture-handler";
 import { usePalette } from "@/lib/theme/appBg";
 import { SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import { scaledStyles } from "@/lib/ui/compact";
+import { useSheetSwipe } from "@/lib/ui/sheetSwipe";
 
 /**
  * Blatt von unten — die Hülle, die sich das Ticket-Blatt und die Optionen des
@@ -90,9 +85,6 @@ export function SheetModal({ visible, onClose, children }: Props) {
     </Modal>
   );
 }
-
-/** Wisch-Abwurf: kürzer, die Geste hat den Weg schon halb zurückgelegt. */
-const SWIPE_OUT = { duration: 220, easing: Easing.out(Easing.quad) } as const;
 
 function Sheet({
   onClose,
@@ -204,28 +196,19 @@ function Sheet({
   }, [scheduleClose, translateY, sheetH]);
   useEffect(() => registerClose(requestClose), [registerClose, requestClose]);
 
-  // In `useMemo` — sonst entstünde die Geste bei jedem Render neu, und der
-  // Erkenner müsste sie mitten in der laufenden Bewegung neu einrichten.
-  const panGesture = useMemo(
-    () =>
-      Gesture.Pan()
-        .activeOffsetY(8)
-        .failOffsetY(-8)
-        .onUpdate((e) => {
-          translateY.value = Math.max(0, e.translationY);
-        })
-        .onEnd((e) => {
-          if (e.translationY > 110 || e.velocityY > 700) {
-            // Bewegung SOFORT von hier, auf dem UI-Strang — der Finger ist
-            // gerade erst weg. Abgemeldet wird erst danach.
-            translateY.value = withTiming(sheetH.value || 900, SWIPE_OUT);
-            runOnJS(scheduleClose)(SWIPE_OUT.duration);
-          } else {
-            translateY.value = withSpring(0, { damping: 22, stiffness: 220 });
-          }
-        }),
-    [translateY, sheetH, scheduleClose],
-  );
+  /**
+   * Die Wisch-Geste liegt auf dem GANZEN Blatt, nicht mehr nur auf dem Griff.
+   *
+   * Sie kommt aus `useSheetSwipe` — dort steht auch, warum ein Tipper auf einen
+   * Knopf trotzdem ein Tipper bleibt. Eine Liste hat hier keines der drei
+   * Blätter (Uhrzeit, Reisende, Klasse); käme eine dazu, gehört ihr der
+   * Torhüter aus derselben Datei.
+   */
+  const panGesture = useSheetSwipe({
+    y: translateY,
+    travel: sheetH,
+    onDismiss: scheduleClose,
+  });
 
   return (
     <GestureHandlerRootView style={styles.root}>
@@ -239,26 +222,57 @@ function Sheet({
         <Pressable style={StyleSheet.absoluteFill} onPress={requestClose} />
       </Animated.View>
       <View style={styles.sheetWrap} pointerEvents="box-none">
-        <Animated.View
-          onLayout={onSheetLayout}
-          style={[
-            styles.sheet,
-            { backgroundColor: palette.s1, paddingBottom: bottomPad },
-            sheetAnim,
-          ]}
-        >
-          <GestureDetector gesture={panGesture}>
+        <GestureDetector gesture={panGesture}>
+          <Animated.View
+            onLayout={onSheetLayout}
+            style={[
+              styles.sheet,
+              { backgroundColor: palette.s1, paddingBottom: bottomPad },
+              sheetAnim,
+            ]}
+          >
+            {/* Der Strich ist nur noch Zeichen, nicht mehr Griff: Gezogen wird
+                überall. Er bleibt, weil er ansagt, DASS gezogen werden kann. */}
             <View style={styles.handleWrap}>
               <View style={styles.handle} />
             </View>
-          </GestureDetector>
 
-          {children(requestClose)}
-        </Animated.View>
+            {children(requestClose)}
+          </Animated.View>
+        </GestureDetector>
       </View>
     </GestureHandlerRootView>
   );
 }
+
+/**
+ * Titel und Unterzeile eines Blattes — EINMAL, für alle.
+ *
+ * Es gab hiervon zwei Fassungen, und keine wusste von der anderen: Die Wähler
+ * (Ort, Datum) setzten ihren Titel groß und halbfett, die Blätter von unten
+ * (Suchverlauf, Ticket hinzufügen, Reisende, Klasse, Uhrzeit) klein und fett.
+ * Nebeneinander gelesen wirkte das nicht wie zwei Sorten Blatt, sondern wie
+ * zwei Entwürfe.
+ *
+ * 24/600 ist die Fassung der Wähler und damit die, die als Aufschrift eines
+ * Blattes gedacht war — nicht als zweite Bildschirm-Überschrift (26/900, das ist
+ * `ScreenHeading` für die Tabs) und nicht als Abschnittstitel (18/700).
+ *
+ * Als ROHWERTE zum Hineinstreuen, nicht als fertiges Stilblatt: Jede Datei
+ * dreht ihre Maße selbst durch `scaledStyles`, und ein hier schon skaliertes
+ * Objekt bekäme den Faktor dort ein zweites Mal.
+ */
+export const SHEET_TITLE: TextStyle = {
+  fontSize: 24,
+  fontWeight: "600",
+  color: "#F4F4F5",
+};
+
+export const SHEET_SUBTITLE: TextStyle = {
+  fontSize: 13,
+  lineHeight: 18,
+  color: "#8E8E93",
+};
 
 const styles = scaledStyles({
   root: { flex: 1 },

@@ -1,5 +1,6 @@
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { TAB_BAR_H } from "@/components/ui/BinchTabBar";
+import { HEADING_LINE_HEIGHT } from "@/components/ui/ScreenHeading";
 import { ms } from "@/lib/ui/compact";
 /**
  * EIN Raster für die ganze App.
@@ -54,6 +55,62 @@ export const GUTTER = SPACE.xl;
  */
 export const HEADING_TOP = SPACE.xxl;
 export const HEADING_GAP = SPACE.lg;
+
+/**
+ * Das Schließen-Zeichen einer Kopfzeile — und wo die Zeile dafür beginnt.
+ *
+ * Beides wird von zwei Kopfzeilen gebraucht (Bos Bildschirm und die
+ * Chat-Schublade dahinter). Zwei Kopien laufen auseinander, und der Fehler
+ * wäre nicht offensichtlich: Die Überschriften stünden um wenige Punkte
+ * versetzt.
+ *
+ * Das X steht FREI, ohne Kreis — so wie in allen Blättern der App. Es war in
+ * Bos Kopfzeile als einziges in einen 36er-Kreis gesetzt.
+ *
+ * `TOPBAR_TOP` ist hergeleitet, nicht geschätzt: `alignItems: "center"`
+ * schiebt die Textzeile um die halbe Differenz nach unten, WENN das Zeichen
+ * daneben höher ist als sie. Mit dem freien X (26 gegen 32) ist es das nicht
+ * mehr — der Überhang ist null, und die Überschrift beginnt schlicht auf
+ * HEADING_TOP. Das `Math.max` hält die Herleitung trotzdem sichtbar: Wächst
+ * das Zeichen je über die Zeilenhöhe, rechnet sie wieder mit.
+ */
+export const CLOSE_ICON_SIZE = 26;
+export const TOPBAR_TOP =
+  HEADING_TOP - Math.max(0, (CLOSE_ICON_SIZE - HEADING_LINE_HEIGHT) / 2);
+
+/** Kantenlänge der Glocke rechts in der Kopfzeile des Landingscreens. */
+export const BELL_SIZE = 44;
+
+/**
+ * Um so viel überragt die Glocke die Textzeile nach oben UND unten.
+ *
+ * Die Kopfzeile ist so hoch wie die Glocke (44), nicht wie der Text (32).
+ * `alignItems: "center"` schiebt den Text damit um die halbe Differenz nach
+ * unten — die Abstände darüber und darunter werden um genau diesen Betrag
+ * gekürzt, damit die Überschrift trotzdem auf denselben Werten sitzt wie in
+ * den Tabs ohne Glocke.
+ */
+export const BELL_OVERHANG = (BELL_SIZE - HEADING_LINE_HEIGHT) / 2;
+
+/**
+ * Höhe des Kopfblocks im Landingscreen — ab der sicheren Fläche gerechnet,
+ * also OHNE `insets.top`.
+ *
+ * Damit endet er, und damit beginnt das erste Element darunter (die Suchleiste).
+ * Das Benachrichtigungs-Blatt der Glocke braucht diesen Wert, weil es genau an
+ * dieser Kante stehen bleibt statt bis nach oben zu fahren.
+ *
+ * SCHON SKALIERT — wie `useNavbarSpace()` und aus demselben Grund: Der Wert
+ * wird direkt als Position gesetzt und läuft durch kein Stilblatt. In ein
+ * `scaledStyles`-Blatt gehört er deshalb NICHT, dort bekäme er den Faktor ein
+ * zweites Mal.
+ *
+ * Die drei Summanden werden EINZELN gedreht, nicht die Summe: Genau so stehen
+ * sie im Stilblatt der Kopfzeile, und nur so trifft das Ergebnis die dortige
+ * Rundung auf den Punkt.
+ */
+export const HOME_HEADER_H =
+  ms(HEADING_TOP - BELL_OVERHANG) + ms(BELL_SIZE) + ms(HEADING_GAP - BELL_OVERHANG);
 
 /**
  * Höhe eines Eingabefeldes — und des Such-Knopfes.

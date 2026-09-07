@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import { Minus, Plus } from "lucide-react-native";
-import { SheetModal } from "@/components/ui/SheetModal";
+import { SheetModal, SHEET_SUBTITLE, SHEET_TITLE } from "@/components/ui/SheetModal";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { usePalette } from "@/lib/theme/appBg";
 import { useAccent } from "@/lib/theme/accent";
@@ -366,8 +366,8 @@ function SheetFooter({
 }
 
 const styles = scaledStyles({
-  title: { fontSize: 18, fontWeight: "700", color: "#F4F4F5", marginBottom: 6 },
-  subtitle: { fontSize: 13, color: "#8E8E93", marginBottom: 16, lineHeight: 18 },
+  title: { ...SHEET_TITLE, marginBottom: 8 },
+  subtitle: { ...SHEET_SUBTITLE, marginBottom: 16 },
 
   list: { gap: 8 },
 

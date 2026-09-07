@@ -245,6 +245,22 @@ const MAX_RECENT_HISTORY = 30;
 
 export type SearchStoreState = SearchStore;
 
+/**
+ * Eine Benachrichtigung.
+ *
+ * Bewusst knapp: Was tatsächlich hineingehört, entscheidet sich erst mit der
+ * Quelle — Preisalarm, Verspätung, Buchungshinweis. Erfunden wird hier nichts
+ * über das hinaus, was der Papierkorb im Blatt zum Arbeiten braucht.
+ */
+export interface NotificationItem {
+  id: string;
+  title: string;
+  body?: string;
+  /** ISO-Zeitpunkt. */
+  createdAt: string;
+  read?: boolean;
+}
+
 interface SearchStore {
   activeMode: TravelMode;
   setActiveMode: (mode: TravelMode) => void;
@@ -274,6 +290,37 @@ interface SearchStore {
   stationToast: StationToast | null;
   showStationToast: (title: string, subtitle: string) => void;
   hideStationToast: () => void;
+  /**
+   * Das Benachrichtigungs-Blatt der Glocke im Landingscreen.
+   *
+   * Ein Schalter, kein Auftrag: Das Blatt trägt keinen Inhalt von außen. Es
+   * hängt trotzdem am Speicher und nicht im Landingscreen, weil es am
+   * Wurzel-Layout liegen muss — nur von dort deckt es die Tab-Leiste mit ab,
+   * genau wie die beiden Wähler.
+   */
+  notificationsOpen: boolean;
+  /**
+   * Wie weit UNTER der sicheren Fläche die Oberkante des Blattes stehen bleibt.
+   *
+   * Der Landingscreen rechnet ihn beim Antippen der Glocke aus, weil nur er
+   * weiß, wie weit er gerade gescrollt ist — seine Kopfzeile liegt in der
+   * Scroll-Fläche und wandert mit. 0 heißt „ganz nach oben, bis unter die
+   * Statusleiste".
+   */
+  notificationsRestY: number;
+  /**
+   * Die Benachrichtigungen selbst.
+   *
+   * Heute erzeugt sie noch niemand — die Liste bleibt also leer, und das Blatt
+   * zeigt durchweg seinen leeren Zustand. Sie steht trotzdem hier und nicht als
+   * Platzhalter im Blatt, weil der Papierkorb in seiner Kopfzeile etwas zum
+   * Leeren braucht: Ohne Liste wäre „alles löschen" eine Schaltfläche ohne
+   * Gegenstand.
+   */
+  notifications: NotificationItem[];
+  openNotifications: (restY?: number) => void;
+  closeNotifications: () => void;
+  clearNotifications: () => void;
   searchOverlayMode: TravelMode | null;
   /** Ursprungs-Rect (Fensterkoordinaten) + Farbe der angetippten Kategorie-
    *  Kachel. Treibt den „aus der Kachel wachsenden"-Launch-Übergang in
@@ -784,6 +831,17 @@ export const useSearchStore = create<SearchStore>()(
       setSearchContentVisible: (v) => {
         if (v !== get().searchContentVisible) set({ searchContentVisible: v });
       },
+      notificationsOpen: false,
+      notificationsRestY: 0,
+      notifications: [],
+      // Der Ruhepunkt wird MIT dem Öffnen gesetzt, in einem Zug: Zwei getrennte
+      // Schreibvorgänge wären zwei Renders, und der zweite fiele mitten in den
+      // Anlauf der Fahrt.
+      openNotifications: (restY = 0) => set({ notificationsOpen: true, notificationsRestY: restY }),
+      // Beim Schließen bleibt der Ruhepunkt stehen — das Blatt fährt auf
+      // demselben Weg zurück, auf dem es gekommen ist.
+      closeNotifications: () => set({ notificationsOpen: false }),
+      clearNotifications: () => set({ notifications: [] }),
       openSearchOverlay: (mode, launch) =>
         set((state) => ({
           searchOverlayMode: mode,

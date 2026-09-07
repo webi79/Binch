@@ -16,7 +16,6 @@ import {
   Pressable,
   StatusBar,
   StyleSheet,
-  Image,
   ImageBackground,
   useWindowDimensions,
   type GestureResponderEvent,
@@ -68,8 +67,17 @@ import Animated, {
 } from "react-native-reanimated";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
-import { GUTTER, SPACE, HEADING_TOP, HEADING_GAP, useNavbarSpace } from "@/lib/theme/spacing";
-import { ScreenHeading, HEADING_LINE_HEIGHT } from "@/components/ui/ScreenHeading";
+import {
+  GUTTER,
+  SPACE,
+  HEADING_TOP,
+  HEADING_GAP,
+  BELL_SIZE,
+  BELL_OVERHANG,
+  HOME_HEADER_H,
+  useNavbarSpace,
+} from "@/lib/theme/spacing";
+import { ScreenHeading } from "@/components/ui/ScreenHeading";
 import { MOTION } from "@/lib/motion";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
@@ -128,8 +136,20 @@ interface Destination {
   flag: string;
   priceFrom: number;
   currency: string;
-  // String = Remote-URL (Unsplash etc.), number = lokales require()-Asset.
-  imageUrl: string | number;
+  /**
+   * IMMER ein lokales `require()`-Asset, nie eine Adresse.
+   *
+   * Hier standen 15 Unsplash-Adressen, und das war ein echter Fehler: Wer die
+   * App lädt und sie ohne Netz zum ersten Mal öffnet, sah auf dem Landingscreen
+   * leere Karten. Die Bilder gehören zur Oberfläche, nicht zu den Daten — sie
+   * ändern sich nicht, sie sind nicht personalisiert, und es gibt keinen Grund,
+   * sie überhaupt zu holen.
+   *
+   * Der Typ lässt deshalb keine Zeichenkette mehr zu. Das ist Absicht: Eine
+   * einzelne wieder eingeschmuggelte Adresse würde denselben Fehler
+   * zurückbringen, und zwar unbemerkt — sichtbar nur ohne Netz.
+   */
+  imageUrl: number;
   popular?: boolean;
   mode: TravelMode;
 }
@@ -146,7 +166,7 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
       flag: "🇪🇸",
       priceFrom: 89,
       currency: "EUR",
-      imageUrl: "https://images.unsplash.com/photo-1593693397690-362cb9666fc2?w=900&q=80",
+      imageUrl: require("@/assets/destinations/tenerife.jpg"),
       popular: true,
       mode: "FLIGHT",
     },
@@ -157,7 +177,7 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
       flag: "🇮🇩",
       priceFrom: 612,
       currency: "EUR",
-      imageUrl: "https://images.unsplash.com/photo-1537996194471-e657df975ab4?w=900&q=80",
+      imageUrl: require("@/assets/destinations/bali.jpg"),
       mode: "FLIGHT",
     },
     {
@@ -167,7 +187,7 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
       flag: "🇬🇷",
       priceFrom: 219,
       currency: "EUR",
-      imageUrl: "https://images.unsplash.com/photo-1601581875309-fafbf2d3ed3a?w=900&q=80",
+      imageUrl: require("@/assets/destinations/mykonos.jpg"),
       mode: "FLIGHT",
     },
     {
@@ -177,7 +197,7 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
       flag: "🇲🇻",
       priceFrom: 749,
       currency: "EUR",
-      imageUrl: "https://images.unsplash.com/photo-1514282401047-d79a71a590e8?w=900&q=80",
+      imageUrl: require("@/assets/destinations/maldives.jpg"),
       mode: "FLIGHT",
     },
   ],
@@ -189,7 +209,7 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
       flag: "🇨🇭",
       priceFrom: 119,
       currency: "EUR",
-      imageUrl: "https://images.unsplash.com/photo-1530122037265-a5f1f91d3b99?w=900&q=80",
+      imageUrl: require("@/assets/destinations/zermatt.jpg"),
       popular: true,
       mode: "TRAIN",
     },
@@ -210,7 +230,7 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
       flag: "🇫🇷",
       priceFrom: 99,
       currency: "EUR",
-      imageUrl: "https://images.unsplash.com/photo-1551524559-8af4e6624178?w=900&q=80",
+      imageUrl: require("@/assets/destinations/chamonix.jpg"),
       mode: "TRAIN",
     },
     {
@@ -220,7 +240,7 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
       flag: "🇨🇦",
       priceFrom: 689,
       currency: "EUR",
-      imageUrl: "https://images.unsplash.com/photo-1561134643-668f9057cce4?w=900&q=80",
+      imageUrl: require("@/assets/destinations/banff.jpg"),
       mode: "FLIGHT",
     },
   ],
@@ -232,7 +252,7 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
       flag: "🇩🇪",
       priceFrom: 49,
       currency: "EUR",
-      imageUrl: "https://images.unsplash.com/photo-1469474968028-56623f02e42e?w=900&q=80",
+      imageUrl: require("@/assets/destinations/blackforest.jpg"),
       mode: "TRAIN",
     },
     {
@@ -242,7 +262,7 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
       flag: "🇦🇷",
       priceFrom: 899,
       currency: "EUR",
-      imageUrl: "https://images.unsplash.com/photo-1483683804023-6ccdb62f86ef?w=900&q=80",
+      imageUrl: require("@/assets/destinations/patagonia.jpg"),
       mode: "FLIGHT",
     },
     {
@@ -252,7 +272,7 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
       flag: "🇫🇮",
       priceFrom: 329,
       currency: "EUR",
-      imageUrl: "https://images.unsplash.com/photo-1483347756197-71ef80e95f73?w=900&q=80",
+      imageUrl: require("@/assets/destinations/lapland.jpg"),
       mode: "FLIGHT",
     },
     {
@@ -262,7 +282,7 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
       flag: "🇨🇷",
       priceFrom: 599,
       currency: "EUR",
-      imageUrl: "https://images.unsplash.com/photo-1518182170546-07661fd94144?w=900&q=80",
+      imageUrl: require("@/assets/destinations/costarica.jpg"),
       mode: "FLIGHT",
     },
   ],
@@ -274,7 +294,7 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
       flag: "🇺🇸",
       priceFrom: 456,
       currency: "USD",
-      imageUrl: "https://images.unsplash.com/photo-1496442226666-8d4d0e62e6e9?w=900&q=80",
+      imageUrl: require("@/assets/destinations/ny.jpg"),
       popular: true,
       mode: "FLIGHT",
     },
@@ -285,7 +305,7 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
       flag: "🇯🇵",
       priceFrom: 689,
       currency: "EUR",
-      imageUrl: "https://images.unsplash.com/photo-1540959733332-eab4deabeeaf?w=900&q=80",
+      imageUrl: require("@/assets/destinations/tokyo.jpg"),
       mode: "FLIGHT",
     },
     {
@@ -295,7 +315,7 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
       flag: "🇩🇪",
       priceFrom: 29,
       currency: "EUR",
-      imageUrl: "https://images.unsplash.com/photo-1560969184-10fe8719e047?w=900&q=80",
+      imageUrl: require("@/assets/destinations/berlin.jpg"),
       mode: "TRAIN",
     },
     {
@@ -305,7 +325,7 @@ const DESTINATIONS_BY_CATEGORY: Record<CategoryId, Destination[]> = {
       flag: "🇹🇭",
       priceFrom: 598,
       currency: "EUR",
-      imageUrl: "https://images.unsplash.com/photo-1508009603885-50cf7c579365?w=900&q=80",
+      imageUrl: require("@/assets/destinations/bangkok.jpg"),
       mode: "FLIGHT",
     },
   ],
@@ -777,63 +797,14 @@ const DECK_BAR_NARROW = 10;
  */
 const DECK_BY_CATEGORY = DESTINATIONS_BY_CATEGORY;
 
-/**
- * Die Bilder der ÜBRIGEN Kategorien vorladen — sonst nützt die schönste
- * Übergangs-Kurve nichts.
+/*
+ * Hier stand das Vorladen der Bilder anderer Kategorien.
  *
- * Beim ersten Wechsel auf „Berge" sind deren Fotos noch nirgends: Die Karten
- * stehen dann als dunkle Flächen da und die Bilder springen einzeln hinein,
- * sobald sie eintreffen. Das ist der unruhigste Teil des Wechsels, und er hat
- * mit der Animation nichts zu tun.
- *
- * Drei Vorsichtsmaßnahmen, damit das Laden selbst nichts kostet:
- *
- *  - Es beginnt ERST NACH einer Sekunde. Beim Start hat das Gerät genug zu tun,
- *    und die erste Kategorie steht ohnehin schon.
- *  - Die Bilder gehen EINZELN nacheinander los, nicht als Schwall. Zwölf
- *    gleichzeitige Anfragen würden die Verbindung für das blockieren, was der
- *    Nutzer gerade wirklich braucht.
- *  - Es läuft genau einmal je App-Start (Modul-Merker).
+ * Es ist mit den Remote-Adressen weggefallen: Alle Zielbilder liegen jetzt im
+ * Paket, es gibt also nichts mehr zu holen — sie sind da, bevor die App zum
+ * ersten Mal startet. Damit erledigt sich auch das, wogegen das Vorladen
+ * anlief: dunkle Karten beim ersten Wechsel auf „Berge".
  */
-let deckImagesWarmed = false;
-
-function warmDeckImages(): () => void {
-  if (deckImagesWarmed) return () => {};
-  deckImagesWarmed = true;
-  const urls: string[] = [];
-  for (const list of Object.values(DESTINATIONS_BY_CATEGORY)) {
-    for (const d of list) {
-      if (typeof d.imageUrl === "string") urls.push(sizedImageUrl(d.imageUrl));
-    }
-  }
-  let i = 0;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  /**
-   * Der Abbruch-Merker ist NICHT überflüssig.
-   *
-   * Ohne ihn hätte das Aufräumen eine Lücke: Läuft gerade eine Anfrage, wenn der
-   * Bildschirm verlassen wird, setzt ihr `finally` danach seelenruhig den
-   * nächsten Zeitgeber — der geräumte ist ja schon weg. Die Kette liefe weiter,
-   * am gelöschten Bildschirm vorbei, bis alle zwölf Bilder durch sind.
-   */
-  let cancelled = false;
-  const next = () => {
-    if (cancelled || i >= urls.length) return;
-    const url = urls[i++];
-    // Fehler sind hier bedeutungslos: Schlägt das Vorladen fehl, lädt das Bild
-    // später auf dem normalen Weg. Nur unbehandelt bleiben darf es nicht.
-    Image.prefetch(url)
-      .catch(() => {})
-      .finally(() => {
-        if (!cancelled) timer = setTimeout(next, 120);
-      });
-  };
-  timer = setTimeout(next, 1000);
-  return () => {
-    cancelled = true;
-    if (timer) clearTimeout(timer);
-  };
-}
 
 /**
  * Die Scroll-Fläche des Landingscreens.
@@ -951,6 +922,17 @@ function ParallaxScroll({
        * stand, beschrieb eine Wirkung, die der Wert nicht hatte.
        */
       scrollEventThrottle={17}
+      /**
+       * Der Empfänger für die Ereignisse, die es ohnehin gibt.
+       *
+       * Er schreibt eine Zahl in eine Modul-Variable — kein Zustand, kein
+       * Render, kein geteilter Wert. Der Drosselwert bleibt bei 17: Er
+       * bestimmt, wie alt die Zahl im schlimmsten Fall ist, wenn jemand
+       * antippt, und ein Sechzigstel Sekunde ist an dieser Stelle nichts.
+       */
+      onScroll={(e) => {
+        homeScrollY = e.nativeEvent.contentOffset.y;
+      }}
       style={[style, parallaxStyle]}
       contentContainerStyle={contentContainerStyle}
       showsVerticalScrollIndicator={false}
@@ -963,10 +945,32 @@ function ParallaxScroll({
 /** Ruhestellung des Parallax — als Konstante, kein neues Objekt pro Auswertung. */
 const NO_HOME_PARALLAX = { transform: [{ translateX: 0 }] } as const;
 
-/** Kantenlänge der Glocke rechts in der Kopfzeile (siehe styles.bell). */
-const BELL_SIZE = 44;
-/** Um so viel überragt die Glocke die Textzeile nach oben UND unten. */
-const BELL_OVERHANG = (BELL_SIZE - HEADING_LINE_HEIGHT) / 2;
+/* Glocken-Maße und die daraus abgeleitete Kopfzeilen-Höhe stehen im Raster
+   (`lib/theme/spacing.ts`) — das Benachrichtigungs-Blatt braucht dieselben
+   Zahlen, und zwei Fassungen davon würden beim nächsten Feinschliff
+   auseinanderlaufen. */
+
+/**
+ * Wie weit dieser Bildschirm gerade gescrollt ist.
+ *
+ * MODULWEIT und als einfache Zahl, nicht als Zustand: Gebraucht wird sie an
+ * genau einem Punkt — im Moment, in dem jemand die Glocke antippt. Als
+ * Zustandsgröße würde jedes Scroll-Ereignis den ganzen Landingscreen neu
+ * rendern, und das ist das Letzte, was diese Fläche gebrauchen kann.
+ *
+ * Warum es sie überhaupt braucht: Die Kopfzeile ist kein festes Chrome, sie
+ * liegt IN der Scroll-Fläche. Das Benachrichtigungs-Blatt soll aber an ihrer
+ * Unterkante stehen bleiben — und die wandert beim Scrollen mit. Ohne diesen
+ * Wert hielt das Blatt stur bei „ungescrollt", und wer die Glocke antippte,
+ * während sie schon ein Stück hochgewandert war, sah über dem Blatt einen
+ * Streifen der Suchleiste statt der Kopfzeile.
+ *
+ * Die Ereignisse dafür laufen ohnehin schon: Reanimated schickt sie auf dieser
+ * Fläche mit `scrollEventThrottle` 17 zum JS-Strang, und bisher gab es dort
+ * keinen Empfänger — sie waren, wie es im Kommentar unten steht, „restlos
+ * Abfall". Jetzt schreibt einer davon eine Zahl. Neue Kosten entstehen keine.
+ */
+let homeScrollY = 0;
 
 // === Subcomponents ============================================================
 
@@ -983,6 +987,21 @@ function Header() {
         hitSlop={6}
         accessibilityLabel="Notifications"
         borderless
+        onPress={() => {
+          haptic("button");
+          /**
+           * Wo die Unterkante der Kopfzeile GERADE steht — nicht, wo sie im
+           * Ruhezustand stünde.
+           *
+           * Nach unten begrenzt auf 0: Ist so weit gescrollt, dass die
+           * Kopfzeile ganz aus dem Bild ist, fährt das Blatt bis unter die
+           * sichere Fläche. Höher darf es nie, sonst läge es unter der
+           * Statusleiste.
+           */
+          useSearchStore
+            .getState()
+            .openNotifications(Math.max(0, HOME_HEADER_H - homeScrollY));
+        }}
       >
         <Bell size={19} color={C.white} />
         <View style={styles.bellDot} />
@@ -1214,15 +1233,9 @@ const HEART_RED = "#FF3B5C";
 const GLASS_FILL = "rgba(18,18,20,0.42)";
 const GLASS_EDGE = "rgba(255,255,255,0.20)";
 
-// Unsplash-URLs sind mit w=900 hinterlegt — die Karte ist aber nur ~340px breit
-// (×2 für Retina ≈ 700px). RNs Image dekodiert Remote-Bilder in VOLLER Quell-
-// Auflösung (kein Auto-Downsampling), d.h. 900px-JPEGs zu dekodieren kostet beim
-// Scrollen spürbar. Wir verkleinern die angefragte Breite auf 700 → ~40% weniger
-// Pixel zu dekodieren, ohne sichtbaren Schärfeverlust. (Echter Fix wäre expo-image
-// mit Disk-Cache + exaktem Downsampling — separate Dependency.)
-function sizedImageUrl(url: string): string {
-  return url.replace(/([?&]w=)\d+/, "$1700");
-}
+// Die Zielbilder liegen mit 700px Breite im Paket — die Karte ist rund 340
+// breit, mal zwei für hochauflösende Bildschirme. Dieselbe Zahl, die vorher zur
+// Laufzeit an die Adresse gehängt wurde; jetzt steckt sie in der Datei.
 
 /** Startzustand der Einblendung — siehe Begründung am JSX unten. */
 /** Seitenabstand der Kopfzeile in Gerätepunkten — Grundlage der Gegenrechnung. */
@@ -1368,12 +1381,14 @@ const DestinationCard = memo(function DestinationCard({
    *  Kennung in der Stil-Reihe und damit ein Prop-Wechsel ohne Anlass. */
   const zBox = useMemo(() => ({ zIndex: z }), [z]);
 
-  // Bild-Source STABIL memoisieren: sonst entsteht bei jedem Render ein neues
-  // `{uri}`-Objekt → RN-Image kann das Bild neu laden → sichtbares Flackern.
-  const imageSource = useMemo(
-    () => (typeof d.imageUrl === "number" ? d.imageUrl : { uri: sizedImageUrl(d.imageUrl) }),
-    [d.imageUrl],
-  );
+  /**
+   * Seit alle Bilder im Paket liegen, ist die Quelle schlicht die Kennung des
+   * Assets — eine Zahl, die sich nie ändert. Das Merken von früher ist damit
+   * hinfällig: Es war dafür da, das jedes Mal neu gebaute `{uri}`-Objekt
+   * festzuhalten, weil RN-Image sonst das Bild neu lud und es sichtbar
+   * flackerte. Ein solches Objekt entsteht hier nicht mehr.
+   */
+  const imageSource = d.imageUrl;
 
   /** Der Sprung beim Merken — er tritt die ganze Karte zurück. */
   const scale = useSharedValue(1);
@@ -2200,8 +2215,6 @@ export default function HomeScreen() {
    * sie dauern. Der Stapel, die Kartenhöhe und die Striche im Schalter hängen
    * alle am selben Wert und laufen vollständig auf dem UI-Strang.
    */
-  // Bilder der übrigen Kategorien im Hintergrund holen — siehe warmDeckImages.
-  useEffect(warmDeckImages, []);
 
   const deckOpen = useSharedValue(0);
   const deckOpenRef = useRef(false);
@@ -2543,9 +2556,13 @@ const styles = scaledStyles({
     paddingBottom: HEADING_GAP - BELL_OVERHANG,
   },
   bell: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+    // Aus dem Raster, NICHT als Zahl: An derselben Konstante hängt die Höhe der
+    // Kopfzeile (`HOME_HEADER_H`) und damit die Oberkante des
+    // Benachrichtigungs-Blattes. Stünde hier eine eigene 44, liefe beides beim
+    // nächsten Feinschliff auseinander — genau der Grund für den Umzug.
+    width: BELL_SIZE,
+    height: BELL_SIZE,
+    borderRadius: BELL_SIZE / 2,
     backgroundColor: C.surface2,
     alignItems: "center",
     justifyContent: "center",

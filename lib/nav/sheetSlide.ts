@@ -55,6 +55,33 @@ export function useSheetSlide(key: string, park: number) {
     dur: 1,
   });
   const rafRef = useRef<number | null>(null);
+  /**
+   * Welche Fahrt gerade gilt.
+   *
+   * Der Abschluss-Rückruf unten stieg bei `finished === false` wortlos aus, und
+   * das war lange richtig: Eine neue Fahrt bricht die alte ab, und deren
+   * Rückruf hätte sonst den Schlüssel wieder ausgetragen, den die neue eben
+   * gesetzt hat.
+   *
+   * Nur gibt es seit der Wisch-Geste einen zweiten Grund für einen Abbruch: Man
+   * fasst das Blatt an, WÄHREND es fährt. Dann kommt keine neue Fahrt, die
+   * aufräumt — der Schlüssel bliebe für den Rest des App-Laufs stehen, und an
+   * ihm hängt die Freigabe der bildschirmfüllenden Texturen.
+   *
+   * Die Nummer trennt die beiden Fälle: Abgeräumt wird immer, außer wenn
+   * inzwischen eine NEUERE Fahrt losgelaufen ist. Der Zähler liegt auf dem
+   * JS-Strang, der geteilte Wert bekommt ihn nur geschrieben — gelesen wird er
+   * ausschließlich im Worklet, wo das nichts kostet.
+   */
+  const genRef = useRef(0);
+  const gen = useSharedValue(0);
+  /** Läuft eine übernommene Fahrt (siehe `adopt`), meldet dieser Wecker sie ab. */
+  const adoptRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearAdopt = useCallback(() => {
+    if (adoptRef.current == null) return;
+    clearTimeout(adoptRef.current);
+    adoptRef.current = null;
+  }, []);
 
   const style = useAnimatedStyle(() => ({
     transform: [{ translateY: y.value }],
@@ -70,6 +97,9 @@ export function useSheetSlide(key: string, park: number) {
   const run = useCallback(
     (show: boolean, onFrame?: (show: boolean) => void) => {
       if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+      // Ein noch laufender Wecker aus `adopt` gehört WEG, bevor diese Fahrt sich
+      // anmeldet: Er trüge sonst mitten in ihr denselben Schlüssel wieder aus.
+      clearAdopt();
       cancelAnimation(y);
       const cfg = show ? SHEET_IN : SHEET_OUT;
       /**
@@ -116,18 +146,23 @@ export function useSheetSlide(key: string, park: number) {
       const cfgScaled = { duration: dur, easing: cfg.easing };
       markSheetMoving(dur);
       setSheetMoving(true, key);
+      genRef.current += 1;
+      const myGen = genRef.current;
+      gen.value = myGen;
       motionRef.current = { from, to: show ? 0 : park, at: Date.now(), dur: Math.max(1, dur) };
       rafRef.current = requestAnimationFrame(() => {
         rafRef.current = null;
         onFrame?.(show);
         y.value = withTiming(show ? 0 : park, cfgScaled, (finished) => {
           "worklet";
-          if (!finished) return;
+          // Nicht mehr `if (!finished) return` — siehe `gen`: Auch der Abbruch
+          // durch eine Berührung muss den Schlüssel zurückgeben.
+          if (gen.value !== myGen) return;
           runOnJS(setSheetMoving)(false, key);
         });
       });
     },
-    [key, park, y],
+    [clearAdopt, gen, key, park, y],
   );
 
   /**
@@ -151,8 +186,51 @@ export function useSheetSlide(key: string, park: number) {
     });
   }, [park, y]);
 
+  /**
+   * Eine Fahrt anmelden, die JEMAND ANDERES fährt.
+   *
+   * Gedacht für die Wisch-Geste: Die muss ihre Ausfahrt im Bild des Loslassens
+   * selbst anstoßen, auf dem UI-Strang — der Umweg über den JS-Strang und einen
+   * React-Durchgang liegt sonst als spürbares Stocken zwischen Finger und
+   * Bewegung. Genau deshalb kann sie nicht `run` benutzen: Das legt ein Bild
+   * Vorlauf ein und rechnet die Dauer aus einer Schätzung, die für eine schon
+   * halb gezogene Strecke nicht stimmt.
+   *
+   * Hier bleibt deshalb nur die BUCHHALTUNG: Anmeldung, damit sich nichts in die
+   * laufende Bewegung hineincommittet, und der Merker für die Lage — ohne ihn
+   * hielte die nächste Umkehr die Strecke für längst zurückgelegt und führe sie
+   * in einem Bruchteil der Zeit.
+   *
+   * @param fromY Wo das Blatt beim Loslassen stand.
+   */
+  const adopt = useCallback(
+    (show: boolean, durationMs: number, fromY: number) => {
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      clearAdopt();
+      // Eine noch laufende Fahrt gilt nicht mehr — ihr Rückruf darf den
+      // Schlüssel nicht austragen, den diese Buchung gleich setzt.
+      genRef.current += 1;
+      gen.value = genRef.current;
+      const dur = Math.max(1, Math.round(durationMs));
+      markSheetMoving(dur);
+      setSheetMoving(true, key);
+      motionRef.current = { from: fromY, to: show ? 0 : park, at: Date.now(), dur };
+      // Abgemeldet wird über die Dauer: Der Abschluss-Rückruf gehört der fremden
+      // Kurve, und die kennt diesen Schlüssel nicht.
+      adoptRef.current = setTimeout(() => {
+        adoptRef.current = null;
+        setSheetMoving(false, key);
+      }, dur);
+    },
+    [clearAdopt, gen, key, park],
+  );
+
   /** Ohne Bewegung an den Ausgangspunkt — für den ersten Aufbau. */
   const parkNow = useCallback(() => {
+    clearAdopt();
     if (rafRef.current != null) {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
@@ -176,12 +254,13 @@ export function useSheetSlide(key: string, park: number) {
     cancelAnimation(y);
     motionRef.current = { from: park, to: park, at: 0, dur: 1 };
     y.value = park;
-  }, [key, park, y]);
+  }, [clearAdopt, key, park, y]);
 
   // Beim Abbau nichts zurücklassen — dieselbe Begründung wie oben.
   useEffect(
     () => () => {
       if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+      if (adoptRef.current != null) clearTimeout(adoptRef.current);
       cancelAnimation(y);
       setSheetMoving(false, key);
     },
@@ -189,5 +268,5 @@ export function useSheetSlide(key: string, park: number) {
     [key],
   );
 
-  return { y, style, run, parkNow, warm };
+  return { y, style, run, adopt, parkNow, warm };
 }

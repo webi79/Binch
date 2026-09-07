@@ -62,8 +62,61 @@ export type ModelState =
   | { status: "error"; message: string };
 
 let downloadPromise: Promise<boolean> | null = null;
-/** Wer den Fortschritt sehen will — es kann mehr als einer sein. */
+
+/**
+ * Der Ladefortschritt liegt HIER, nicht beim Bildschirm.
+ *
+ * Vorher reichte `ensureModel` den Fortschritt nur an einen mitgegebenen
+ * Rückruf durch, und der Bildschirm führte darüber selbst Buch. Das ging so
+ * lange gut, wie er zusah — und genau das tut er nicht durchgehend:
+ *
+ *   Aufnahme starten (Laden beginnt, 16%) → Aufnahme-Box schließen (der
+ *   Bildschirm hört auf zuzuhören) → Laden läuft im Hintergrund fertig →
+ *   Aufnahme-Box wieder öffnen → das Modell IST fertig, also wird gar nicht
+ *   mehr geladen, also kommt kein Rückruf mehr — und die 16% von vorhin stehen
+ *   bis zum Neustart der App über der Eingabezeile.
+ *
+ * Deshalb liegt der Stand jetzt beim Lader: „-1" heißt „es lädt nichts", und
+ * das ist immer wahr, sobald ein Ladevorgang endet — ob er gelungen ist,
+ * fehlgeschlagen oder gar nicht erst nötig war. Wer zuhört, bekommt beim
+ * Anmelden sofort den aktuellen Stand und kann nichts Altes anzeigen.
+ */
+let progress = -1;
 const progressListeners = new Set<(p: number) => void>();
+
+/**
+ * Gemeldet wird nur, wenn sich die ANGEZEIGTE Zahl ändert.
+ *
+ * Der Rückruf des Downloads feuert pro geschriebenem Datenpaket, also viele Male
+ * pro Sekunde. Angezeigt wird davon eine auf ganze Prozent gerundete Zahl — von
+ * 16,4% auf 16,7% ändert sich am Bild nichts, wohl aber rendert der Bildschirm,
+ * der zuhört. Bei 60 MB sind das tausende Durchgänge für rund hundert sichtbare
+ * Schritte.
+ *
+ * Der genaue Wert wird trotzdem IMMER fortgeschrieben: Wer sich später anmeldet,
+ * soll den aktuellen Stand bekommen, nicht den letzten gemeldeten.
+ */
+function setProgress(next: number): void {
+  const changed = Math.round(next * 100) !== Math.round(progress * 100);
+  progress = next;
+  if (!changed) return;
+  for (const listener of progressListeners) listener(next);
+}
+
+/**
+ * Den Ladefortschritt mitlesen. Liefert die Abmeldung zurück.
+ *
+ * Der Rückruf bekommt SOFORT den aktuellen Stand — sonst zeigte ein Bildschirm,
+ * der sich mitten in einem Ladevorgang anmeldet, bis zum nächsten Datenpaket
+ * gar nichts.
+ */
+export function subscribeModelProgress(listener: (p: number) => void): () => void {
+  progressListeners.add(listener);
+  listener(progress);
+  return () => {
+    progressListeners.delete(listener);
+  };
+}
 
 /**
  * Woran es zuletzt lag.
@@ -97,7 +150,7 @@ export async function isModelReady(): Promise<boolean> {
  * Verbindung ab, liegt kein halbes Modell unter dem richtigen Namen, das beim
  * nächsten Start als „fertig" durchginge und Whisper zum Absturz brächte.
  */
-export async function ensureModel(onProgress?: (p: number) => void): Promise<boolean> {
+export async function ensureModel(): Promise<boolean> {
   /**
    * Die Sperre wird SOFORT gesetzt — vor dem ersten `await`.
    *
@@ -112,7 +165,6 @@ export async function ensureModel(onProgress?: (p: number) => void): Promise<boo
    * Weil der Rumpf einer `async`-Funktion bis zum ersten `await` synchron
    * läuft, reicht es, die Sperre als allererstes zu setzen.
    */
-  if (onProgress) progressListeners.add(onProgress);
   if (downloadPromise) return downloadPromise;
 
   downloadPromise = (async () => {
@@ -120,14 +172,16 @@ export async function ensureModel(onProgress?: (p: number) => void): Promise<boo
     const partial = `${target}.part`;
     try {
       if (await isModelReady()) return true;
+      // Erst JETZT auf 0 — vor der Prüfung wäre für einen Wimpernschlag ein
+      // Ladebalken zu sehen, obwohl gar nichts geladen wird.
+      setProgress(0);
       await FileSystem.makeDirectoryAsync(`${FileSystem.documentDirectory ?? ""}models`, {
         intermediates: true,
       });
       await FileSystem.deleteAsync(partial, { idempotent: true });
       const task = FileSystem.createDownloadResumable(MODEL_URL, partial, {}, (p) => {
         if (p.totalBytesExpectedToWrite > 0) {
-          const done = p.totalBytesWritten / p.totalBytesExpectedToWrite;
-          for (const listener of progressListeners) listener(done);
+          setProgress(p.totalBytesWritten / p.totalBytesExpectedToWrite);
         }
       });
       const res = await task.downloadAsync();
@@ -152,15 +206,26 @@ export async function ensureModel(onProgress?: (p: number) => void): Promise<boo
       // Umbenennen auf eine bestehende Datei schlägt sonst fehl.
       await FileSystem.deleteAsync(target, { idempotent: true });
       await FileSystem.moveAsync({ from: partial, to: target });
-      for (const listener of progressListeners) listener(1);
       return true;
     } catch (err) {
       lastIssue = String((err as Error)?.message ?? err).slice(0, 60);
       await FileSystem.deleteAsync(partial, { idempotent: true }).catch(() => undefined);
       return false;
     } finally {
+      /**
+       * Beides zusammen, und beides IMMER.
+       *
+       * Der Zweig ist gleichgültig: fertig, fehlgeschlagen, abgebrochen oder
+       * nie nötig gewesen — hinterher lädt nichts mehr, und genau das sagt die
+       * -1.
+       *
+       * Die Zuhörer bleiben dabei angemeldet. Früher wurden sie hier
+       * weggeräumt, und das war richtig, solange jeder Aufruf seinen Rückruf
+       * selbst mitbrachte. Jetzt gehören sie dem Bildschirm und überdauern
+       * einzelne Ladevorgänge — abgemeldet wird beim Abbau, nicht hier.
+       */
       downloadPromise = null;
-      progressListeners.clear();
+      setProgress(-1);
     }
   })();
   return downloadPromise;

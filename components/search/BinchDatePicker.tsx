@@ -17,6 +17,7 @@ import { subscribeLayer, holdLayer, rearmLayer } from "@/lib/nav/transitionLayer
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import { PICKER_IN, PICKER_OUT } from "@/lib/nav/overlayCover";
 import { useSheetSlide } from "@/lib/nav/sheetSlide";
+import { SHEET_TITLE } from "@/components/ui/SheetModal";
 import { prepareLayer } from "@/lib/nav/transitionLayer";
 import { showAlert } from "@/lib/alert";
 import { setSheetMoving } from "@/lib/nav/searchHandoff";
@@ -942,17 +943,21 @@ const DatePickerContent = memo(function DatePickerContent({
           Tab) damit alles unter der Statusbar liegt. Title-Style matched
           den "Saved"-Header (26px, font-black, tracking-tight). */}
       <View style={[s.header, { paddingTop: insets.top + 24 }]}>
+        {/* Das X steht FREI — wie im Ortswähler, mit dem sich dieses Blatt
+            abwechselt, und wie in jedem anderen Blatt der App. Es war die
+            letzte Stelle mit einem gefüllten Kreis darum. */}
         <Pressable
-          style={[s.closeBtn, { backgroundColor: palette.s2 }]}
+          style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
+          hitSlop={12}
+          accessibilityRole="button"
           // Die Ebene für die AUSFAHRT schon beim Aufsetzen anlegen — für die
           // Einfahrt tut das `prepareLayer` beim Berühren des Feldes seit
           // Längerem, der Rückweg hatte diesen Vorlauf nie und baute die
           // Textur im ersten Bild der Bewegung auf.
           onPressIn={() => prepareLayer("pickerDate")}
           onPress={onClose}
-          hitSlop={8}
         >
-          <X color={C.white} size={18} strokeWidth={2.4} />
+          <X color="#E5E7EB" size={26} />
         </Pressable>
         <Text style={s.title}>{title}</Text>
       </View>
@@ -1323,24 +1328,26 @@ const DayCell = memo(function DayCell({
 const s = scaledStyles({
   root: { flex: 1, backgroundColor: C.bg },
 
+  /** Maße wie im Ortswähler, mit dem sich dieses Blatt abwechselt: Abstand 12,
+   *  Rand 20 (GUTTER), unten 16. Vorher 14/16/14 — jeder Wert knapp daneben. */
   header: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 14,
-    paddingHorizontal: 16,
-    paddingBottom: 14,
+    gap: 12,
+    paddingHorizontal: 20,
+    paddingBottom: 16,
   },
-  closeBtn: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
-    backgroundColor: C.surface2,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  // Matched die "Saved"-Überschrift aus app/(tabs)/saved.tsx:
-  //   text-[26px] font-black text-white tracking-tight
-  title: { fontSize: 26, fontWeight: "900", color: C.white, letterSpacing: -0.6 },
+
+  /**
+   * Aus der gemeinsamen Quelle (SHEET_TITLE), nicht mehr aus der Tab-Überschrift.
+   *
+   * Hier stand 26/900 mit dem Vermerk „matched die Saved-Überschrift". Genau das
+   * war der Fehler: `saved.tsx` beschriftet einen TAB, dieses Blatt legt sich
+   * darüber. Es trug damit als einziges Blatt die Schrift einer
+   * Bildschirm-Überschrift — neben dem Ortswähler, mit dem es sich abwechselt,
+   * fiel das sofort auf.
+   */
+  title: SHEET_TITLE,
 
   // Tabs — matched SearchHero's toggleRow: 14px außen, 11px innen, padding 4
   tabs: {

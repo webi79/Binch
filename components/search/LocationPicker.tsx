@@ -29,6 +29,8 @@ import { useSearchStore } from "@/stores/searchStore";
 import { useAccent } from "@/lib/theme/accent";
 import { SaveStarButton } from "@/components/surroundings/SaveStarButton";
 import { haptic } from "@/lib/haptics";
+import { SHEET_TITLE } from "@/components/ui/SheetModal";
+import { scaledStyles } from "@/lib/ui/compact";
 
 type Field = "from" | "to";
 
@@ -76,6 +78,14 @@ const MODE_ICON = { FLIGHT: Plane, TRAIN: Train, BUS: Bus, CRUISE: Ship } as con
  * Einmal beim Laden gelesen ist auch die Fenster-Höhe unbedenklich: Zu dem
  * Zeitpunkt gibt es keine Tastatur, die sie verkleinern könnte.
  */
+/**
+ * Die Aufschrift des Blattes — aus der gemeinsamen Quelle, durch `scaledStyles`
+ * gedreht. Der einzige Stil dieser Datei, die sonst vollständig über Klassen
+ * gesetzt ist; genau das war der Grund, warum ihr Titel als Einziger auf kurzen
+ * Bildschirmen nicht mitschrumpfte.
+ */
+const pickerTitleStyle = scaledStyles({ title: SHEET_TITLE }).title;
+
 const PARK_Y = Dimensions.get("window").height;
 const EMPTY_LOCATIONS: Location[] = [];
 /** Stabile Vorgaben für die Liste — siehe dort. */
@@ -775,7 +785,11 @@ const LocationPickerInner = function LocationPicker({
           >
             <X color="#E5E7EB" size={26} />
           </Pressable>
-          <Text className="text-2xl font-semibold text-white">
+          {/* Aus dem gemeinsamen Stil statt aus Klassen: Die Werte waren
+              dieselben (24/600), aber Klassen laufen NICHT durch `scaledStyles`
+              — auf einem kurzen Bildschirm schrumpfte hier als Einzigem der
+              Titel nicht mit. */}
+          <Text style={pickerTitleStyle}>
             {title ?? t(field === "from" ? "search.location.title.from" : "search.location.title.to")}
           </Text>
         </View>

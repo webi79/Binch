@@ -1,11 +1,10 @@
-import { memo, useEffect, useRef, useState, useMemo } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import {
   StyleSheet,
   View,
   Text,
   Pressable,
-  ScrollView,
   BackHandler,
   Platform,
   useWindowDimensions,
@@ -14,11 +13,9 @@ import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
   useAnimatedStyle,
   useSharedValue,
-  withSpring,
   withTiming,
-  runOnJS,
 } from "react-native-reanimated";
-import { Gesture, GestureDetector } from "react-native-gesture-handler";
+import { GestureDetector } from "react-native-gesture-handler";
 import { format, parseISO } from "date-fns";
 import { de, enGB, es, fr } from "date-fns/locale";
 import { ChevronDown, Footprints, Clock, CircleDot, Map as MapIcon } from "lucide-react-native";
@@ -28,6 +25,7 @@ import { useT } from "@/lib/i18n/useT";
 import { formatTimeInZone, shiftIsoByMinutes } from "@/lib/time-format";
 import { LegInfo, SearchResult } from "@/types/search";
 import { buildRoutePlan } from "@/lib/routing/buildRoute";
+import { useSheetScrollGate, useSheetSwipe } from "@/lib/ui/sheetSwipe";
 import { fetchTripPolylines } from "@/lib/api/client";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
@@ -303,11 +301,21 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
   // Startet unten außerhalb des Bildes — der Baum steht ab jetzt dauerhaft,
   // sichtbar wird er erst durch `open`.
   const translateY = useSharedValue(sheetHeight);
-  const backdrop = useSharedValue(0);
   const sheetAnim = useAnimatedStyle(() => ({
     transform: [{ translateY: translateY.value }],
   }));
-  const backdropAnim = useAnimatedStyle(() => ({ opacity: backdrop.value }));
+  /**
+   * Die Verdunkelung hängt an der LAGE des Blattes, nicht an einem zweiten Wert.
+   *
+   * Sie tat rechnerisch immer schon dasselbe — dieselbe Dauer, dieselbe Kurve,
+   * dieselbe Richtung —, war aber eine eigene Kurve. Beim Ziehen mit dem Finger
+   * fiel das auf: Das Blatt wanderte, die Verdunkelung blieb stehen, weil sie
+   * nur von den beiden Fahrten geschrieben wurde. Als Anteil der Strecke geht
+   * sie nun immer mit, ohne dass jemand daran denken muss.
+   */
+  const backdropAnim = useAnimatedStyle(() => ({
+    opacity: 1 - Math.min(1, Math.max(0, translateY.value / sheetHeight)),
+  }));
   // Ganz unten angekommen ⇔ unsichtbar und nicht anfassbar.
   const rootAnim = useAnimatedStyle(() => ({
     opacity: hidden || translateY.value >= sheetHeight - 1 ? 0 : 1,
@@ -357,8 +365,7 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
         // asymptotisch, während die Kurve des Such-Blattes exakt endet. Neben
         // einem anderen Blatt fällt genau dieser Auslauf auf.
         markSheetMoving();
-      translateY.value = withTiming(0, SHEET_IN);
-        backdrop.value = withTiming(1, SHEET_IN);
+        translateY.value = withTiming(0, SHEET_IN);
       });
       return () => cancelAnimationFrame(id);
     }
@@ -372,42 +379,53 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
      * Asymmetrie ist in `overlayCover` für die Push-Wege schon einmal
      * ausformuliert worden: „Angemeldet wurden anfangs nur die vier HINwege."
      */
+    /**
+     * Fährt die Wisch-Geste schon, wird hier NICHT noch einmal angesetzt.
+     *
+     * Sie stößt ihre Ausfahrt im Bild des Loslassens an, auf dem UI-Strang —
+     * anders bliebe das Blatt genau dann stehen, wenn der Finger das Glas
+     * verlässt (Sprung auf den JS-Strang plus ein React-Durchgang). Eine zweite
+     * Kurve von hier aus liefe gegen sie an: Sie setzte von der inzwischen
+     * erreichten Stelle mit voller Dauer neu an, sichtbar als Tempo-Wechsel.
+     */
+    if (settlingRef.current) {
+      settlingRef.current = false;
+      return undefined;
+    }
     markSheetMoving(SHEET_OUT.duration);
     translateY.value = withTiming(sheetHeight, SHEET_OUT);
-    backdrop.value = withTiming(0, SHEET_OUT);
     return undefined;
-  }, [open, sheetHeight, translateY, backdrop]);
+  }, [open, sheetHeight, translateY]);
 
   /**
-   * In `useMemo` — sonst entsteht der Erkenner bei jedem Render neu.
+   * Gezogen wird am ganzen Blatt, und die Streckenliste behält ihr Scrollen.
    *
-   * Jedes neue `Gesture.Pan()`-Objekt muss der Detektor gegen seinen nativen
-   * Gegenpart abgleichen und neu einrichten. Die anderen Blätter der App haben
-   * das längst; diese drei waren übrig.
+   * Zwei Eigenheiten bleiben, wie sie waren:
+   *
+   *  - `enabled(open)`: Das Blatt ist dauerhaft gemountet. Ein dauerhaft
+   *    scharfer Erkenner konkurrierte sonst mit der Zurück-Geste des
+   *    Bildschirms darunter.
+   *  - Die Ausfahrt fährt die GESTE, nicht der Effekt oben: im Bild des
+   *    Loslassens, auf dem UI-Strang. Der Effekt hält sich über `settlingRef`
+   *    heraus — zwei Kurven auf demselben Wert wären als Tempo-Wechsel am Ende
+   *    der Wischbewegung zu sehen.
    */
-  const panGesture = useMemo(() =>
-    Gesture.Pan()
-    // Nur aktiv, solange das Blatt offen ist. Dauerhaft gemountet hinge sonst
-    // auch dauerhaft ein nativer Gesten-Erkenner im Baum, der mit der
-    // Zurück-Geste des darunterliegenden Bildschirms konkurriert.
-    .enabled(open)
-    .activeOffsetY(8)
-    .failOffsetY(-8)
-    .onUpdate((e) => {
-      translateY.value = Math.max(0, e.translationY);
-    })
-    .onEnd((e) => {
-      if (e.translationY > 110 || e.velocityY > 700) {
-        // NUR schließen — die Ausfahrt gehört dem Effekt oben. Vorher lief hier
-        // zusätzlich ein eigenes withTiming, und `close()` startete daneben ein
-        // zweites von der aktuellen Position: zwei konkurrierende Animationen,
-        // sichtbar als Geschwindigkeitswechsel am Ende der Wischbewegung.
-        runOnJS(close)();
-      } else {
-        translateY.value = withSpring(0, { damping: 22, stiffness: 220 });
-      }
-    }),
-  [open, sheetHeight, translateY, close]);
+  const gate = useSheetScrollGate();
+  /** Zeigt dem Effekt oben an, dass die Ausfahrt bereits läuft. */
+  const settlingRef = useRef(false);
+  const dismissBySwipe = useCallback(() => {
+    // Angemeldet hat die Geste die Fahrt schon selbst — hier bleibt die
+    // Buchhaltung: Der Effekt oben darf sie nicht ein zweites Mal ansetzen.
+    settlingRef.current = true;
+    close();
+  }, [close]);
+  const panGesture = useSheetSwipe({
+    y: translateY,
+    travel: sheetHeight,
+    onDismiss: dismissBySwipe,
+    enabled: open,
+    gate,
+  });
 
   const dateLocale = DATE_LOCALES[locale] ?? enGB;
   const legs = result.legs && result.legs.length > 0 ? result.legs : buildFallbackLegs(result);
@@ -448,14 +466,14 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
       <Animated.View style={[styles.backdrop, backdropAnim]}>
         <Pressable style={StyleSheet.absoluteFill} onPress={close} />
       </Animated.View>
+      <GestureDetector gesture={panGesture}>
       <Animated.View
         style={[styles.sheet, { backgroundColor: palette.s1 }, sheetAnim, { top: sheetTop }]}
       >
-        <GestureDetector gesture={panGesture}>
-          <View style={styles.handleWrap}>
-            <View style={styles.handle} />
-          </View>
-        </GestureDetector>
+        {/* Nur noch Zeichen, nicht mehr Griff — gezogen wird überall. */}
+        <View style={styles.handleWrap}>
+          <View style={styles.handle} />
+        </View>
 
         {/* Stat-Box (Date | Departure | Stops). Symmetrische Anordnung:
             Date linksbündig, Uhrzeit zentriert, Stops rechtsbündig — gleicher
@@ -482,9 +500,18 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
           />
         </View>
 
-        <ScrollView
+        {/* Eigener nativer Erkenner um die Liste — sonst würgt das Ziehen am
+            Blatt jedes Scrollen ab. */}
+        <GestureDetector gesture={gate.native}>
+        <Animated.ScrollView
+          ref={gate.ref}
           contentContainerStyle={styles.scrollContent}
           showsVerticalScrollIndicator={false}
+          onScroll={gate.onScroll}
+          scrollEventThrottle={16}
+          // Kein Überzieh-Schimmer oben: Dort übernimmt ab sofort das Blatt.
+          overScrollMode="never"
+          bounces={false}
         >
           <View style={styles.timeline}>
             {/* Vertical lime rail behind all dots — abs-positioned, exakt
@@ -577,8 +604,10 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
             <MapIcon size={15} color={accent.solid} strokeWidth={2.5} />
             <Text style={[styles.mapBtnLabel, { color: accent.solid }]}>{t("details.showmap")}</Text>
           </RippleTouch>
-        </ScrollView>
+        </Animated.ScrollView>
+        </GestureDetector>
       </Animated.View>
+      </GestureDetector>
     </Animated.View>
   );
 });

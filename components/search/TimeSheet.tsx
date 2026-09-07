@@ -67,7 +67,7 @@ import Animated, {
 } from "react-native-reanimated";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { LinearGradient } from "expo-linear-gradient";
-import { SheetModal } from "@/components/ui/SheetModal";
+import { SheetModal, SHEET_SUBTITLE, SHEET_TITLE } from "@/components/ui/SheetModal";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { usePalette } from "@/lib/theme/appBg";
 import { useAccent } from "@/lib/theme/accent";
@@ -141,18 +141,49 @@ const FADE_H = ITEM * 2;
  * Bewegung, die mit der Geschwindigkeit des Fingers losläuft und bei null
  * ankommt. Die Zahl gleitet in ihre Endlage, statt hineinzuspringen.
  */
-/** Weg eines Wisches: Geschwindigkeit × diese Zeit (in Sekunden). */
-const GLIDE_TRAVEL = 0.4;
 /**
- * Bei `Easing.out(Easing.cubic)` ist die Anfangsgeschwindigkeit das Dreifache
- * der Durchschnittsgeschwindigkeit. Aus `Dauer = 3 × Weg / Geschwindigkeit`
- * läuft die Bewegung deshalb exakt so schnell an, wie der Finger sie verlassen
- * hat — der Übergang ist nicht zu sehen.
+ * Die Zeitkonstante der Reibung, in Sekunden — der einzige Regler für das
+ * Gefühl. Sie bestimmt beides: den Weg (Geschwindigkeit × sie) und wie lange
+ * das Rad zum Stehen braucht.
  */
-const GLIDE_SLOPE = 3;
-const GLIDE_EASE = Easing.out(Easing.cubic);
-const GLIDE_MIN_MS = 170;
-const GLIDE_MAX_MS = 1400;
+const GLIDE_TAU = 0.75;
+/**
+ * Ausrollen wie unter Reibung — KEIN Polynom.
+ *
+ * Erst kubisch, dann fünfter Grad: Beides endete zu abrupt, und zwar aus einem
+ * Grund, den man der Formel ansieht. Ein Polynom vom Grad n hat nach 60% der
+ * Zeit noch (0,4)^n des Weges übrig — bei n=5 also ein Hundertstel. Der Rest
+ * der Bewegung liegt UNTER einem Pixel: mathematisch fährt sie noch, zu sehen
+ * ist nichts. Sichtbar endet sie damit schlagartig, und ein höherer Grad macht
+ * es schlimmer statt besser.
+ *
+ * Reibung sieht anders aus: Der Restweg fällt exponentiell, in gleichen
+ * Zeitschritten immer um denselben ANTEIL. Nach einer Zeitkonstante sind noch
+ * 37% übrig, nach zweien 14%, nach dreien 5%. Es bleibt also über die ganze
+ * Strecke etwas Sichtbares übrig — genau das, was „ausfaden" meint, und genau
+ * das, was eine echte Scroll-Ansicht tut.
+ *
+ * Gefahren werden sieben Zeitkonstanten (vorher sechs); die Teilung durch
+ * `GLIDE_NORM` streckt die Kurve so, dass sie am Ende exakt auf der Zeile
+ * ankommt statt bei 99,9%. Die siebte Konstante kostet nichts und nimmt der
+ * letzten Bewegung den Rest an Geschwindigkeit: Am Schluss läuft das Rad noch
+ * mit einem halben Prozent seines Durchschnitts, statt mit anderthalb.
+ */
+const GLIDE_SPAN = 7;
+const GLIDE_NORM = 1 - Math.exp(-GLIDE_SPAN);
+function glideEase(t: number): number {
+  "worklet";
+  return (1 - Math.exp(-GLIDE_SPAN * t)) / GLIDE_NORM;
+}
+/**
+ * Die Anfangssteigung der Kurve. Aus `Dauer = Steigung × Weg / Geschwindigkeit`
+ * läuft die Bewegung exakt so schnell an, wie der Finger sie verlassen hat.
+ */
+const GLIDE_SLOPE = GLIDE_SPAN / GLIDE_NORM;
+const GLIDE_MIN_MS = 200;
+/** Über `GLIDE_SLOPE × GLIDE_TAU` (5250ms), sonst verfälschte der Deckel die
+ *  Anfangsgeschwindigkeit. */
+const GLIDE_MAX_MS = 6000;
 /** Darunter war es kein Wisch, sondern ein Loslassen: nur noch einrasten. */
 const FLING_MIN_SPEED = 60;
 const SETTLE = { duration: 240, easing: Easing.out(Easing.cubic) } as const;
@@ -199,7 +230,12 @@ function nearest(values: number[], v: number): number {
  * ganzen Tag zurück, obwohl zehn Zeilen vorwärts genügen. Der Stand darf dabei
  * über die Runde hinauslaufen; gerechnet wird ohnehin modulo.
  */
-function spinTo(offset: SharedValue<number>, values: number[], target: number) {
+function spinTo(
+  offset: SharedValue<number>,
+  moving: SharedValue<boolean>,
+  values: number[],
+  target: number,
+) {
   const len = values.length;
   const k = values.indexOf(target);
   if (k < 0) return;
@@ -208,7 +244,10 @@ function spinTo(offset: SharedValue<number>, values: number[], target: number) {
   if (delta > len / 2) delta -= len;
   if (delta < -len / 2) delta += len;
   if (delta === 0) return;
-  offset.value = withTiming((cur + delta) * ITEM, SPIN);
+  moving.value = true;
+  offset.value = withTiming((cur + delta) * ITEM, SPIN, (done) => {
+    if (done) moving.value = false;
+  });
 }
 
 /* ---------------------------------------------------------------------- Rad */
@@ -220,10 +259,13 @@ function spinTo(offset: SharedValue<number>, values: number[], target: number) {
 function Wheel({
   values,
   offset,
+  moving,
   label,
 }: {
   values: number[];
   offset: SharedValue<number>;
+  /** Läuft dieses Rad gerade? Siehe `resetStyle` im Blatt. */
+  moving: SharedValue<boolean>;
   label: string;
 }) {
   const len = values.length;
@@ -328,6 +370,7 @@ function Wheel({
         .onBegin(() => {
           // Wer ein laufendes Rad anfasst, hält es an.
           cancelAnimation(offset);
+          moving.value = true;
           /**
            * Und wer es überhaupt anfasst, bekommt die fehlenden Runden sofort —
            * ohne auf den Wecker zu warten. Sonst könnte ein sehr früher, sehr
@@ -351,7 +394,7 @@ function Wheel({
           const speed = -e.velocityY;
           const from = offset.value;
           // Wo käme es von selbst zur Ruhe — und welche Zeile ist das?
-          const target = Math.round((from + speed * GLIDE_TRAVEL) / ITEM) * ITEM;
+          const target = Math.round((from + speed * GLIDE_TAU) / ITEM) * ITEM;
           const dist = Math.abs(target - from);
           const duration =
             Math.abs(speed) < FLING_MIN_SPEED
@@ -360,7 +403,11 @@ function Wheel({
                   GLIDE_MAX_MS,
                   Math.max(GLIDE_MIN_MS, (GLIDE_SLOPE * 1000 * dist) / Math.abs(speed)),
                 );
-          offset.value = withTiming(target, { duration, easing: GLIDE_EASE });
+          offset.value = withTiming(target, { duration, easing: glideEase }, (done) => {
+            // Nur bei ECHTEM Ende melden: Ein Abbruch heißt, dass schon wieder
+            // ein Finger auf dem Rad liegt.
+            if (done) moving.value = false;
+          });
         })
         /**
          * Der Fall ohne `onEnd`: antippen, um ein laufendes Rad anzuhalten.
@@ -372,9 +419,15 @@ function Wheel({
          */
         .onFinalize((_e, success) => {
           if (success) return;
-          offset.value = withTiming(Math.round(offset.value / ITEM) * ITEM, SETTLE);
+          offset.value = withTiming(
+            Math.round(offset.value / ITEM) * ITEM,
+            SETTLE,
+            (done) => {
+              if (done) moving.value = false;
+            },
+          );
         }),
-    [offset, expand],
+    [offset, moving, expand],
   );
 
   return (
@@ -530,6 +583,9 @@ function TimeBody({
   }));
   const hourOffset = useSharedValue(HOURS.indexOf(start.hour) * ITEM);
   const minOffset = useSharedValue(minuteValues.indexOf(start.minute) * ITEM);
+  /** Läuft eines der Räder? Nur dafür — siehe `resetStyle`. */
+  const hourMoving = useSharedValue(false);
+  const minMoving = useSharedValue(false);
 
   /** Die Decoder des Klicks gehören dem Blatt, nicht der ganzen Sitzung. */
   useEffect(() => releaseTick, []);
@@ -546,14 +602,20 @@ function TimeBody({
    * `disabled` der Geschwister-Blätter, nur ohne Render. Gesperrt ist der Knopf
    * bewusst nicht: Ein Druck fährt dann auf die Zahl, auf der das Rad ohnehin
    * schon steht, und kostet nichts.
+   *
+   * Aber NUR im Stillstand. Die Verblassung liest den Wert live mit, und beim
+   * Vorbeiscrollen an 9:30 traf sie für ein paar Bilder zu — der Knopf blinkte
+   * also mitten in der Bewegung auf und wieder ab. Solange eines der Räder
+   * läuft, bleibt er deshalb voll da: Was er aussagt, gilt für einen Stand, und
+   * einen Stand gibt es erst, wenn nichts mehr fährt.
    */
-  const resetStyle = useAnimatedStyle(() => ({
-    opacity:
+  const resetStyle = useAnimatedStyle(() => {
+    if (hourMoving.value || minMoving.value) return { opacity: 1 };
+    const atDefault =
       valueAt(HOURS, hourOffset.value) === DEFAULT_TIME.hour &&
-      valueAt(minuteValues, minOffset.value) === DEFAULT_TIME.minute
-        ? 0.4
-        : 1,
-  }));
+      valueAt(minuteValues, minOffset.value) === DEFAULT_TIME.minute;
+    return { opacity: atDefault ? 0.4 : 1 };
+  });
 
   return (
     <>
@@ -583,11 +645,17 @@ function TimeBody({
           style={[w.band, { backgroundColor: accent.subtle, borderColor: accent.border }]}
         />
         <View style={w.cols}>
-          <Wheel values={HOURS} offset={hourOffset} label={t("search.time.hour")} />
+          <Wheel
+            values={HOURS}
+            offset={hourOffset}
+            moving={hourMoving}
+            label={t("search.time.hour")}
+          />
           <Text style={[w.colon, { color: accent.solid }]}>:</Text>
           <Wheel
             values={minuteValues}
             offset={minOffset}
+            moving={minMoving}
             label={t("search.time.minute")}
           />
         </View>
@@ -611,8 +679,8 @@ function TimeBody({
           <RippleTouch
             onPress={() => {
               haptic("button");
-              spinTo(hourOffset, HOURS, DEFAULT_TIME.hour);
-              spinTo(minOffset, minuteValues, DEFAULT_TIME.minute);
+              spinTo(hourOffset, hourMoving, HOURS, DEFAULT_TIME.hour);
+              spinTo(minOffset, minMoving, minuteValues, DEFAULT_TIME.minute);
             }}
             style={[styles.reset, { backgroundColor: palette.s2 }]}
           >
@@ -645,8 +713,8 @@ const AnimatedTextInput = Animated.createAnimatedComponent(TextInput);
 const styles = scaledStyles({
   head: { flexDirection: "row", alignItems: "flex-start", gap: 12 },
   headText: { flex: 1, minWidth: 0 },
-  title: { fontSize: 18, fontWeight: "700", color: "#F4F4F5", marginBottom: 6 },
-  subtitle: { fontSize: 13, color: "#8E8E93", lineHeight: 18, marginBottom: 16 },
+  title: { ...SHEET_TITLE, marginBottom: 8 },
+  subtitle: { ...SHEET_SUBTITLE, marginBottom: 16 },
   /** Ohne Innenabstand und ohne die Schriftpolsterung von Android — sonst
    *  sitzt das Feld tiefer als der Titel daneben. */
   headTime: {

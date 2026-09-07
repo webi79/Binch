@@ -1184,7 +1184,18 @@ const styles = scaledStyles({
     gap: 8,
     minWidth: 0,
   },
-  chipText: { fontSize: 14, fontWeight: "600", color: C.white, flexShrink: 1 },
+  /**
+   * `flex: 1` statt `flexShrink: 1` — daran hängt, WO der Pfeil steht.
+   *
+   * Schrumpfen allein macht den Text nur so breit wie seine Beschriftung; der
+   * Pfeil rückte damit direkt hinter „Economy" und stand in beiden Knöpfen an
+   * einer anderen Stelle. Wächst der Text stattdessen mit, nimmt er den freien
+   * Platz ein und schiebt den Pfeil an den rechten Rand des Kastens — auf
+   * dieselbe Linie in beiden Knöpfen, im selben Abstand zur Kante wie das
+   * Symbol links (`paddingHorizontal`). Der `gap: 8` bleibt als Mindestabstand,
+   * falls die Beschriftung die ganze Breite braucht.
+   */
+  chipText: { fontSize: 14, fontWeight: "600", color: C.white, flex: 1 },
 
   cta: {
     // EXAKT die Feldhöhe — das war der Wunsch: Felder so groß wie dieser Knopf.

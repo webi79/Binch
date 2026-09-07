@@ -231,6 +231,114 @@ export const sessions = pgTable(
   }),
 );
 
+/**
+ * Bo-Unterhaltungen. Bisher lag der Verlauf ausschließlich im Client — ein
+ * Gerätewechsel oder ein geleerter App-Speicher hat ihn mitgenommen.
+ *
+ * Bewusst denormalisiert: `lastMessageAt`, `lastMessagePreview` und
+ * `messageCount` sind aus `chat_messages` ableitbar, stehen aber redundant
+ * hier. Der häufigste Zugriff ist die Übersichts-Liste („meine letzten
+ * Unterhaltungen"), und die soll die (um Größenordnungen dickere) Nachrichten-
+ * Tabelle gar nicht erst anfassen: Ein Index-Scan über
+ * (user_id, last_message_at) liefert die Seite fertig aus. Preis dafür ist,
+ * dass diese drei Spalten beim Schreiben einer Antwort mitgezogen werden
+ * müssen — das passiert in derselben Transaktion (siehe routes/chat.ts).
+ */
+export const chatConversations = pgTable(
+  "chat_conversations",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** Aus der ersten Nutzer-Nachricht abgeleitet, an Wortgrenze gekürzt.
+     *  Null, solange die Unterhaltung leer ist (per POST angelegt, aber noch
+     *  nichts gesagt). */
+    title: varchar("title", { length: 120 }),
+    locale: varchar("locale", { length: 8 }).notNull().default("de"),
+    /** Sortier-Schlüssel der Liste. Beim Anlegen = createdAt, damit eine
+     *  leere Unterhaltung nicht ans Ende der Keyset-Pagination fällt. */
+    lastMessageAt: timestamp("last_message_at", { withTimezone: true }).notNull().defaultNow(),
+    /**
+     * Angeheftet / archiviert — als ZEITPUNKT, nicht als Ja-Nein.
+     *
+     * Der Zeitstempel sagt zusätzlich, WANN es passiert ist, und genau daran
+     * ordnen sich die angehefteten Unterhaltungen untereinander: zuletzt
+     * angeheftet steht oben. Mit einem Booleschen bräuchte man dafür eine
+     * zweite Spalte.
+     */
+    pinnedAt: timestamp("pinned_at", { withTimezone: true }),
+    archivedAt: timestamp("archived_at", { withTimezone: true }),
+    lastMessagePreview: varchar("last_message_preview", { length: 200 }),
+    messageCount: integer("message_count").notNull().default(0),
+    /** Letzte Such-Parameter dieser Unterhaltung (aus dem `search_result`-
+     *  Event mit isMain). Der Client schickt sie beim nächsten Turn als
+     *  `lastSearch` zurück — mit dem Verlauf auf dem Server überlebt dieser
+     *  Kontext jetzt auch das Wiederöffnen auf einem anderen Gerät.
+     *  JSONB statt Spalten: reine Durchreiche, nie eine Filterbedingung. */
+    lastSearch: jsonb("last_search").$type<Record<string, unknown>>(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    /** Deckt die Liste komplett ab: filtern nach user_id, sortieren nach
+     *  last_message_at (DESC), Keyset-Cursor statt OFFSET. */
+    userRecent: index("idx_chat_conversations_user_recent").on(t.userId, t.lastMessageAt),
+    /**
+     * Die Standard-Liste fragt „meine, nicht archivierten, angeheftete zuerst".
+     * Der Index deckt die ersten beiden Bedingungen; die Sortierung darüber
+     * läuft im Speicher — bei einer Handvoll hundert Zeilen pro Nutzer ist das
+     * billiger als ein Ausdrucks-Index, der bei jedem Schreiben mitgepflegt
+     * werden müsste.
+     */
+    userPinned: index("idx_chat_conversations_user_pinned").on(t.userId, t.pinnedAt),
+  }),
+);
+
+export type ChatMessageRole = "user" | "assistant";
+/** Was die Zeile im Chat wird: eine Sprechblase (`text`), eine Ergebniskarte
+ *  (`result`), eine Abfahrtstafel (`board`) oder ein Aktions-Knopf (`action`). */
+export type ChatMessageKind = "text" | "result" | "board" | "action";
+
+/**
+ * Einzelne Chat-Zeilen, aufsteigend nach `seq` innerhalb einer Unterhaltung.
+ *
+ * `content` ist eine eigene Spalte, `payload` dagegen JSONB — das ist kein
+ * Zufall, sondern die Trennlinie zwischen Gesprächs- und Anzeige-Daten: Der
+ * Agent baut die Historie für Claude ausschließlich aus role + content (siehe
+ * ChatMessage in services/chatAgent.ts). Diese Spalte wird also gelesen,
+ * gelängt und limitiert — das gehört nach SQL. Die Anhänge (Treffer,
+ * Stop-Board, Action) sieht das Modell nie; sie gehen nur zurück an den
+ * Client, der sie rendert, und ihre Form variiert pro Typ und wandert mit dem
+ * Frontend. Ein Spalten-Schema dafür wäre eine Wartungslast ohne Gegenwert.
+ *
+ * Der Unique-Index auf (conversation_id, seq) ist die Reihenfolge-Garantie:
+ * Der Client rendert Karten und Knöpfe als eigene Nachrichten NACH dem Text.
+ */
+export const chatMessages = pgTable(
+  "chat_messages",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    conversationId: uuid("conversation_id")
+      .notNull()
+      .references(() => chatConversations.id, { onDelete: "cascade" }),
+    role: varchar("role", { length: 16 }).notNull().$type<ChatMessageRole>(),
+    kind: varchar("kind", { length: 16 }).notNull().default("text").$type<ChatMessageKind>(),
+    /** Nur bei kind="text" gesetzt — der reine Gesprächstext. */
+    content: text("content"),
+    /** Nur bei den Anhang-Kinds gesetzt: das rohe SSE-Event-Payload
+     *  (result/params, stop/board, action/payload). */
+    payload: jsonb("payload").$type<Record<string, unknown>>(),
+    /** Fortlaufend ab 1 pro Unterhaltung. Wird in der Transaktion aus
+     *  MAX(seq)+1 vergeben, nicht aus einem vorher gelesenen Wert. */
+    seq: integer("seq").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    convSeq: uniqueIndex("uq_chat_messages_conv_seq").on(t.conversationId, t.seq),
+  }),
+);
+
 export const locations = pgTable(
   "locations",
   {
