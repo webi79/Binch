@@ -240,6 +240,17 @@ const WARM_AFTER_MS = 150 + 480 + 700 + 200;
  * und damit den Stillstand, gegen den der Anlauf überhaupt gebaut wurde.
  * `beginSearchHandoff` räumt sie deshalb weg.
  */
+/**
+ * Die Kennungen der Anlauf-Wecker — abgelaufene fliegen SELBST wieder heraus.
+ *
+ * Geleert wurde die Liste nur in `cancelWarm()`, und das läuft ausschließlich
+ * beim Start einer Übergabe. Bricht der Anlauf dagegen ab (der Bildschirm ist
+ * inzwischen zu, es fährt etwas), setzt er `warmedOnce` zurück und wird bei der
+ * nächsten Enthüllung erneut eingereiht — die Liste wuchs damit über die
+ * Sitzung um eine tote Kennung pro Anlauf. Folgenlos für die Rechenzeit, aber
+ * es ist eine Menge, die nur wächst, und beim Suchen nach genau solchen Mengen
+ * fällt sie auf.
+ */
 let warmTimers: ReturnType<typeof setTimeout>[] = [];
 
 function cancelWarm(): void {
@@ -247,11 +258,24 @@ function cancelWarm(): void {
   warmTimers = [];
 }
 
+/**
+ * Einen Wecker einreihen und ihn nach seinem Lauf wieder austragen.
+ *
+ * Der Aufschub bleibt abbrechbar (dafür ist die Liste da), aber eine Kennung,
+ * die schon gefeuert hat, gehört nicht mehr hinein.
+ */
+function pushWarmTimer(run: () => void, ms: number): void {
+  const id = setTimeout(() => {
+    warmTimers = warmTimers.filter((t) => t !== id);
+    run();
+  }, ms);
+  warmTimers.push(id);
+}
+
 export function warmHandoffLayer(): void {
   if (warmedOnce) return;
   warmedOnce = true;
-  warmTimers.push(
-    setTimeout(() => {
+  pushWarmTimer(() => {
       // Nur, wenn der Such-Screen dann noch offen ist — sonst hätte niemand etwas
       // davon, und auf einer unsichtbaren Fläche entsteht ohnehin keine Ebene.
       // Und nicht, wenn die Übergabe schon läuft: Dann ist die Ebene ohnehin da,
@@ -264,9 +288,8 @@ export function warmHandoffLayer(): void {
       // Ein paar Bilder stehen lassen, damit wirklich einmal gerastert wird —
       // sofort wieder abschalten hieße, den Puffer vor dem ersten Zeichnen zu
       // verwerfen.
-      warmTimers.push(setTimeout(releaseHandoffLayer, 250));
-    }, WARM_AFTER_MS),
-  );
+      pushWarmTimer(releaseHandoffLayer, 250);
+  }, WARM_AFTER_MS);
 }
 
 /**

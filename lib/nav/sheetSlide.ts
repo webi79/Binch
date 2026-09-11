@@ -10,7 +10,13 @@ import { SHEET_IN, SHEET_OUT, markSheetMoving } from "./overlayCover";
 import { setSheetMoving } from "./searchHandoff";
 
 /**
- * EINE Fahrt für alle Blätter von unten.
+ * EINE Fahrt für alle Blätter — von unten wie von oben.
+ *
+ * Die Richtung steckt allein im VORZEICHEN von `park`: positiv heißt „geparkt
+ * unterhalb des Bildrands" (alle Blätter von unten), negativ „geparkt oberhalb"
+ * (die Such-Slide der Ergebnisliste). Gefahren wird in beiden Fällen auf 0 zu,
+ * es gibt also keinen zweiten Pfad, der auseinanderlaufen könnte — genau darum
+ * geht es in dieser Datei.
  *
  * Warum das hier steht und nicht in jedem Blatt einzeln: Weil sie über Monate
  * auseinandergelaufen sind, ohne dass es jemandem auffiel. Zuletzt unterschieden
@@ -133,15 +139,37 @@ export function useSheetSlide(key: string, park: number) {
       const m = motionRef.current;
       const t = Math.min(1, Math.max(0, (Date.now() - m.at) / m.dur));
       const from = m.from + (m.to - m.from) * t;
-      const rest = show ? from : park - from;
+      /**
+       * Restweg und Gesamtstrecke als BETRAG — beides.
+       *
+       * Hier stand die Strecke vorzeichenbehaftet, und davor ein `park > 0`.
+       * Für ein Blatt von unten geht das auf: `from` liegt zwischen 0 und
+       * `park`, beide Differenzen sind positiv, der Anteil stimmt. Für ein Blatt
+       * von OBEN ist `park` negativ — der Zähler wird negativ, der Nenner auch,
+       * und der Wächter davor schaltet die Kürzung ersatzlos ab. Die Umkehr
+       * führe dann IMMER die volle Dauer, also aus zwei Fingerbreit Restweg
+       * heraus dieselben 260ms wie über die ganze Strecke. Genau das Kriechen,
+       * gegen das der Boden von 0,15 unten gesetzt wurde, nur eine Ebene höher.
+       *
+       * Der Betrag ist hier das Richtige, weil aus beiden Zahlen ausschließlich
+       * ein VERHÄLTNIS wird: „wie viel Weg ist noch übrig". Eine Richtung hat
+       * diese Frage nicht — die trägt schon `to` unten. Für positives `park`
+       * ändert sich damit nichts: Beide Differenzen waren dort ohnehin nie
+       * negativ, `Math.abs` ist auf ihnen die Identität.
+       */
+      const rest = Math.abs(show ? from : park - from);
+      const span = Math.abs(park);
       /**
        * Boden bei 0,15 statt 0,35 — sonst wird die Umkehr ZÄHER, je kürzer sie
        * ist. Bei 35% Mindestdauer für 2% Restweg kriecht das Blatt über einen
        * Fingerbreit. Und angemeldet wird die TATSÄCHLICHE Dauer: Mit der vollen
        * gälte der Bildschirm nach einer 100ms-Umkehr noch 380ms als „fährt",
        * und alles, was darauf wartet, bliebe unnötig lange liegen.
+       *
+       * `span > 0` bleibt als Division-Wächter stehen — ein Blatt ohne Strecke
+       * hat keinen Anteil, den man kürzen könnte.
        */
-      const frac = park > 0 ? Math.min(1, Math.max(0.15, rest / park)) : 1;
+      const frac = span > 0 ? Math.min(1, Math.max(0.15, rest / span)) : 1;
       const dur = Math.round(cfg.duration * frac);
       const cfgScaled = { duration: dur, easing: cfg.easing };
       markSheetMoving(dur);

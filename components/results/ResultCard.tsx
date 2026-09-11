@@ -21,6 +21,7 @@ import { useAccent } from "@/lib/theme/accent";
 import { useQueryClient } from "@tanstack/react-query";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import { ClearSearchHistoryAlert } from "@/components/ui/ClearSearchHistoryAlert";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { displayCode, displayProvider, logoUrls } from "@/lib/results/logos";
 import { tripSignature } from "@/lib/results/signature";
@@ -106,6 +107,14 @@ function ResultCardInner({ result, passengers = 1, underlay }: Props) {
   // → Re-Render dieser einen Card nur wenn IHR favored-State sich ändert,
   // unabhängig wie viele Trips gespeichert sind.
   const favored = useSearchStore((s) => s.savedTripSignatures.has(resultSig));
+  /**
+   * Steht die Rückfrage vor dem Entfernen offen?
+   *
+   * Zustand DIESER Karte — im Saved-Reiter sind alle Reisen gleichzeitig
+   * gemountet, ein gemeinsamer Zustand weiter oben müsste zusätzlich mitführen,
+   * WELCHE gemeint ist.
+   */
+  const [confirmRemove, setConfirmRemove] = useState(false);
   // App-Sprache für die Deeplink-Lokalisierung (Teil des Prefetch-QueryKeys,
   // muss mit DetailsOverlay übereinstimmen damit der Prefetch-Cache greift).
   const locale = useSearchStore((s) => s.locale);
@@ -285,9 +294,32 @@ function ResultCardInner({ result, passengers = 1, underlay }: Props) {
     transform: [{ scale: scale.value }],
   }));
 
+  /**
+   * Das Herz — und der Grund, warum hier NICHT immer nachgefragt wird.
+   *
+   * Diese eine Karte steht an drei Stellen (siehe `underlay`): in der
+   * Ergebnisliste, im Saved-Reiter und in Bos Antworten. Nur im Saved-Reiter
+   * ist das Herz ein AUSTRAGEN — dort ist die Liste selbst das Ergebnis der
+   * Geste, und ein Fehlgriff im Vorbeiscrollen nimmt eine Reise weg, die man
+   * sich einmal bewusst gemerkt hat.
+   *
+   * In der Ergebnisliste ist dasselbe Herz das EINTRAGEN, und ein zweiter Tipp
+   * darauf nimmt den ersten zurück. Eine Rückfrage stünde dort vor der Rücknahme
+   * eines Versehens — also vor genau der Korrektur, die sie verhindern soll.
+   *
+   * Unterschieden wird deshalb an `underlay === "saved"` — welche Fläche unter
+   * dieser Karte liegt, weiß nur die aufrufende Seite, und nur `saved.tsx` setzt
+   * das — UND an `favored`: Auch dort kann eine Reise gerade ungemerkt sein,
+   * wenn man sie entfernt und die Liste noch nicht verlassen hat; sie wieder zu
+   * merken ist keine Frage wert.
+   */
   function onToggleFav() {
     haptic("button");
     const justSaved = !favored;
+    if (!justSaved && underlay === "saved") {
+      setConfirmRemove(true);
+      return;
+    }
     // toggleSavedTrip batcht Save + Toast in einem set() (sonst zwei
     // Render-Wellen). Hier nur noch die lokale Scale-Bounce-Animation.
     toggleSavedTrip(result, passengers);
@@ -297,6 +329,14 @@ function ResultCardInner({ result, passengers = 1, underlay }: Props) {
         withTiming(1, { duration: 320, easing: Easing.elastic(1.5) })
       );
     }
+  }
+
+  function onConfirmRemoveFav() {
+    // Erst schließen, dann entfernen: Mit dem Entfernen fällt diese Karte aus
+    // der Liste des Saved-Reiters, und ein noch offener Dialog hinge an einer
+    // Komponente, die gerade abgebaut wird.
+    setConfirmRemove(false);
+    toggleSavedTrip(result, passengers);
   }
 
   function onShowRoute() {
@@ -513,6 +553,22 @@ function ResultCardInner({ result, passengers = 1, underlay }: Props) {
         </Animated.View>
       </View>
     </Animated.View>
+
+    {/* Derselbe Dialog wie beim Suchverlauf, den Meldungen, den Tickets und den
+        Preis-Alarmen. Er hängt an der Bedingung oben: In der Ergebnisliste wird
+        er nie sichtbar, weil `onToggleFav` ihn dort gar nicht öffnet. */}
+    <ClearSearchHistoryAlert
+      visible={confirmRemove}
+      onCancel={() => setConfirmRemove(false)}
+      onConfirm={onConfirmRemoveFav}
+      title={t("saved.trip.remove.title")}
+      message={t("saved.trip.remove.body").replace(
+        "{route}",
+        `${result.originLabel} → ${result.destLabel}`,
+      )}
+      confirmLabel={t("saved.trip.remove.confirm")}
+      cancelLabel={t("common.cancel")}
+    />
     </View>
   );
 }

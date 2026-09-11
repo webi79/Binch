@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "536050771703",
+    "project_id": "binchmobileapp",
+    "storage_bucket": "binchmobileapp.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:536050771703:android:fb635d426414a3a27315f2",
+        "android_client_info": {
+          "package_name": "com.binch.mobile"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAuOLbo2R6Dcbf_wzSDGsYokaeuDVRscCI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

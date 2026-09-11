@@ -8,6 +8,7 @@ import {
   NotificationsEmpty,
   type NotificationsEmptyVariant,
 } from "@/components/home/NotificationsEmpty";
+import { AlertHitList } from "@/components/home/AlertHitList";
 import { ClearSearchHistoryAlert } from "@/components/ui/ClearSearchHistoryAlert";
 import { SHEET_TITLE } from "@/components/ui/SheetModal";
 import { SHEET_IN } from "@/lib/nav/overlayCover";
@@ -149,6 +150,24 @@ export function NotificationsSheet() {
    * später losläuft.
    */
   const [variant, setVariant] = useState<NotificationsEmptyVariant>(randomVariant);
+  /**
+   * Nur die ANZAHL lesen, nicht die Liste.
+   *
+   * Ein Selektor auf das Feld selbst weckte dieses Blatt bei jeder Änderung
+   * daran — und es hängt dauerhaft am Wurzel-Layout. Gebraucht wird hier
+   * ausschließlich die Entscheidung „Liste oder Leer-Zustand"; die Liste selbst
+   * liest ihre Einträge drüben.
+   */
+  /**
+   * Was die Glocke zeigt, sind AUSGELÖSTE Alarme — nicht gesetzte.
+   *
+   * Hier stand `priceAlerts.length`, also die stehenden Beobachtungen. Damit
+   * zeigte die Glocke etwas an, das noch gar nicht passiert war, und ein
+   * gesetzter Alarm sah aus wie eine ungelesene Nachricht. Die gesetzten
+   * Alarme leben jetzt unter „Gespeichert"; hierher gehört, was angeschlagen
+   * hat.
+   */
+  const hasAlerts = useSearchStore((s) => s.alertHits.length > 0);
   const shownFor = useRef(open);
   if (shownFor.current !== open) {
     shownFor.current = open;
@@ -367,10 +386,29 @@ export function NotificationsSheet() {
           </Pressable>
         </View>
 
-        {/* Leerer Zustand. `active` NUR solange das Blatt offen ist: Es hängt
-            dauerhaft am Wurzel-Layout, und die Schleifen der Varianten liefen
-            sonst die ganze Sitzung über mit. */}
-        <NotificationsEmpty variant={variant} active={open} />
+        {/**
+          * Ausgelöste Alarme, wenn es welche gibt — sonst der leere Zustand.
+          *
+          * Hier lagen zwischenzeitlich die GESETZTEN Alarme, weil sie sonst
+          * keinen Ort hatten. Das war ein Zwischenschritt und sachlich falsch:
+          * Eine Glocke steht für Ereignisse, ein gesetzter Alarm ist aber eine
+          * Beobachtung, die noch aussteht. Er lebt jetzt unter „Gespeichert",
+          * wo man seine Reisen wiederfindet; hierher kommt er erst, wenn er
+          * angeschlagen hat.
+          *
+          * ENTWEDER-ODER, nicht beides: Die Zeichnungen des leeren Zustands
+          * (Bo, Geisterzeilen) sind ein Bild für „hier ist nichts". Über einer
+          * gefüllten Liste wären sie eine Falschaussage.
+          *
+          * `active` NUR solange das Blatt offen ist: Es hängt dauerhaft am
+          * Wurzel-Layout, und die Schleifen der Varianten liefen sonst die
+          * ganze Sitzung über mit.
+          */}
+        {hasAlerts ? (
+          <AlertHitList />
+        ) : (
+          <NotificationsEmpty variant={variant} active={open} />
+        )}
       </Animated.View>
       </GestureDetector>
 

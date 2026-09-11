@@ -4,7 +4,7 @@ import { persist, type PersistStorage, type StorageValue } from "zustand/middlew
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { AppState } from "react-native";
 import { SearchResult, TravelMode, Location } from "@/types/search";
-import { SavedTrip, Ticket } from "@/types/saved";
+import { AlertHit, PriceAlert, SavedTrip, Ticket } from "@/types/saved";
 import { POPULAR_LOCATIONS } from "@/lib/data/popularLocations";
 import { tripSignature } from "@/lib/results/signature";
 import { saveAuthToken } from "@/lib/auth/tokenStorage";
@@ -318,6 +318,15 @@ interface SearchStore {
    * Gegenstand.
    */
   notifications: NotificationItem[];
+  /**
+   * Wie viele ausgelöste Alarme seit dem letzten Blick dazugekommen sind.
+   *
+   * Dasselbe Mittel wie `savedBadge` am Reiter: Die Zahl selbst wird nirgends
+   * angezeigt, nur ob sie über null liegt. Genullt wird sie beim ÖFFNEN des
+   * Blattes, nicht beim Schließen — der Punkt bedeutet „seit deinem letzten
+   * Blick ist etwas dazugekommen", und der Blick ist genau dieses Öffnen.
+   */
+  notificationsBadge: number;
   openNotifications: (restY?: number) => void;
   closeNotifications: () => void;
   clearNotifications: () => void;
@@ -595,6 +604,46 @@ interface SearchStore {
   removeRecentSpot: (query: string) => void;
   favoriteResultIds: string[];
   toggleFavorite: (id: string) => void;
+  /**
+   * Preis-Alarme auf Strecken — siehe `PriceAlert`.
+   *
+   * Persistiert, weil ein Alarm den App-Lauf überdauern MUSS: Sein ganzer Sinn
+   * ist, zu gelten, während man gerade nicht hinschaut.
+   *
+   * Eine Strecke trägt höchstens EINEN Alarm. Wer denselben Weg zum selben
+   * Datum ein zweites Mal beobachtet, meint fast immer eine andere Schwelle und
+   * nicht einen zweiten Alarm daneben — zwei parallele Schwellen auf derselben
+   * Strecke ergäben zwei Meldungen für dasselbe Ereignis.
+   */
+  priceAlerts: PriceAlert[];
+  addPriceAlert: (alert: Omit<PriceAlert, "id" | "createdAt">) => void;
+  /**
+   * Den Alarm ANLEGEN und in einem Zug melden: roter Punkt am Reiter plus
+   * Hinweis auf dem Bildschirm.
+   *
+   * In EINEM `set()`, nicht in drei Aufrufen hintereinander — sonst wären es
+   * drei Benachrichtigungen an den Speicher und damit drei Render-Wellen über
+   * alle Abonnenten. Dieselbe Begründung steht am Speichern einer Reise, wo
+   * Eintrag, Punkt und Hinweis aus demselben Grund zusammen geschrieben werden.
+   */
+  addPriceAlertNoted: (alert: Omit<PriceAlert, "id" | "createdAt">, title: string, subtitle: string) => void;
+  /** Nur die Anzeige — das Löschen auf dem Server macht der Aufrufer. */
+  removePriceAlert: (id: string) => void;
+  /** Die Server-Kennung nachtragen — siehe `syncPriceAlerts`. */
+  updatePriceAlertServerId: (id: string, serverId: string) => void;
+  /** An- und Abschalten, ohne den Eintrag wegzuwerfen — siehe `PriceAlert.active`. */
+  setPriceAlertActive: (id: string, on: boolean, serverId?: string) => void;
+  /**
+   * AUSGELÖSTE Alarme — die Liste unter der Glocke.
+   *
+   * Gedeckelt auf 50: Es ist eine Chronik, kein Archiv. Wer fünfzig Meldungen
+   * ungelesen hat, findet die einundfünfzigste ohnehin nicht mehr, und eine
+   * unbegrenzte Liste im dauerhaften Speicher wächst still bis zur Bremse.
+   */
+  alertHits: AlertHit[];
+  addAlertHit: (hit: Omit<AlertHit, "id">) => void;
+  removeAlertHit: (id: string) => void;
+  clearAlertHits: () => void;
   savedTrips: SavedTrip[];
   /** Set der `tripSignature(trip)` aller gespeicherten Trips. Wird in Sync
    *  mit `savedTrips` gehalten und gibt O(1) "is-saved?"-Lookups statt der
@@ -722,6 +771,70 @@ export interface RoutePlan {
   previousHref?: { pathname: string; params?: Record<string, string> };
 }
 
+/**
+ * Einen Alarm in die Liste einfügen — und einen vorhandenen auf derselben
+ * Strecke dabei ERSETZEN.
+ *
+ * Herausgezogen, weil zwei Aktionen ihn brauchen: das schlichte Anlegen und das
+ * Anlegen mit Hinweis. Zweimal geschrieben wäre der Schlüssel unten zweimal da,
+ * und genau der ist die heikle Stelle — fehlt in einer Kopie ein Feld, läuft
+ * die Anzeige vom Server weg.
+ *
+ * DIE RÜCKREISE GEHÖRT MIT IN DEN SCHLÜSSEL. Der Server unterscheidet Alarme
+ * genau darüber (sein eindeutiger Index führt sie mit), hier fehlte sie einmal.
+ * Ablauf: Hinfahrt suchen, Alarm setzen. In der Such-Slide ein Rückdatum
+ * ergänzen — die Ansicht bleibt stehen — und erneut einen Alarm setzen. In der
+ * App ERSETZTE der zweite den ersten, auf dem Server stand er DANEBEN. Der
+ * erste war damit unsichtbar und unlöschbar und meldete weiter alle zwölf
+ * Stunden.
+ */
+/**
+ * Die IDENTITÄT eines Alarms — exportiert, weil drei Stellen sie brauchen.
+ *
+ * Sie muss Feld für Feld dieselbe sein wie der eindeutige Index auf dem Server.
+ * Läuft eine Kopie davon weg, hält die App zwei Alarme für denselben, die der
+ * Server getrennt führt — oder umgekehrt. Beides endet in einem Alarm, den man
+ * nicht mehr findet und der weiter meldet.
+ */
+export function priceAlertKey(a: {
+  mode: string;
+  origin: string;
+  destination: string;
+  departDate: string;
+  returnDate?: string;
+  passengers: number;
+  travelClass: string;
+  currency: string;
+}): string {
+  // Beide optionalen Felder gegen `undefined` absichern, nicht nur eines:
+  // Aus `${undefined}` wird die Zeichenkette „undefined", und der Schlüssel
+  // trifft dann keinen einzigen gespeicherten Alarm mehr. Lokal steht für
+  // „keine Klasse" die leere Zeichenkette, und das ist auch die Form, die der
+  // eindeutige Index auf dem Server führt.
+  return `${a.mode}|${a.origin}|${a.destination}|${a.departDate}|${a.returnDate ?? ""}|${a.passengers}|${a.travelClass ?? ""}|${a.currency}`;
+}
+
+function withPriceAlert(
+  current: PriceAlert[],
+  alert: Omit<PriceAlert, "id" | "createdAt">,
+): PriceAlert[] {
+  const key = priceAlertKey(alert);
+  const rest = current.filter((a) => priceAlertKey(a) !== key);
+  return [
+    {
+      ...alert,
+      // Die Strecke steckt mit in der Kennung: So bleibt sie über einen
+      // Neustart hinweg dieselbe und ist beim Nachsehen lesbar.
+      id: `${key}|${Date.now()}`,
+      createdAt: new Date().toISOString(),
+    },
+    ...rest,
+    // Deckel wie bei den Merkzetteln: Ein persistiertes Feld ohne Obergrenze
+    // wächst über Monate unbegrenzt, und jeder Eintrag liegt bei jedem Sichern
+    // im JSON.
+  ].slice(0, 50);
+}
+
 export const useSearchStore = create<SearchStore>()(
   persist(
     (set, get) => ({
@@ -837,11 +950,27 @@ export const useSearchStore = create<SearchStore>()(
       // Der Ruhepunkt wird MIT dem Öffnen gesetzt, in einem Zug: Zwei getrennte
       // Schreibvorgänge wären zwei Renders, und der zweite fiele mitten in den
       // Anlauf der Fahrt.
-      openNotifications: (restY = 0) => set({ notificationsOpen: true, notificationsRestY: restY }),
+      notificationsBadge: 0,
+      openNotifications: (restY = 0) =>
+        // Der Punkt erlischt mit dem Öffnen — siehe `notificationsBadge`.
+        set({ notificationsOpen: true, notificationsRestY: restY, notificationsBadge: 0 }),
       // Beim Schließen bleibt der Ruhepunkt stehen — das Blatt fährt auf
       // demselben Weg zurück, auf dem es gekommen ist.
       closeNotifications: () => set({ notificationsOpen: false }),
-      clearNotifications: () => set({ notifications: [] }),
+      /**
+       * Leert, was unter der Glocke SICHTBAR ist — beides.
+       *
+       * Hier stand nur `notifications: []`. Diese Liste befüllt aber niemand
+       * (siehe ihre Erklärung an der Schnittstelle); angezeigt werden die
+       * ausgelösten Alarme aus `alertHits`. Der Papierkorb in der Kopfzeile des
+       * Blattes war damit wirkungslos: Man bestätigte einen Löschdialog, und
+       * danach stand alles noch da. Ein Knopf, der nach einer Rückfrage nichts
+       * tut, liest sich als kaputte App.
+       *
+       * Der Punkt an der Glocke geht mit: Es ist nichts mehr da, worauf er
+       * hinweisen könnte.
+       */
+      clearNotifications: () => set({ notifications: [], alertHits: [], notificationsBadge: 0 }),
       openSearchOverlay: (mode, launch) =>
         set((state) => ({
           searchOverlayMode: mode,
@@ -1238,6 +1367,156 @@ export const useSearchStore = create<SearchStore>()(
         set((state) => ({
           recentSpots: state.recentSpots.filter((s) => s !== query),
         })),
+      priceAlerts: [],
+      addPriceAlert: (alert) => set((state) => ({ priceAlerts: withPriceAlert(state.priceAlerts, alert) })),
+      addPriceAlertNoted: (alert, title, subtitle) =>
+        set((state) => ({
+          priceAlerts: withPriceAlert(state.priceAlerts, alert),
+          /**
+           * Derselbe rote Punkt wie beim Merken einer Reise.
+           *
+           * Ein Alarm landet unter „Gespeichert", also muss der Reiter das auch
+           * sagen — sonst legt man einen an und sieht ihn nie wieder, weil man
+           * nicht weiß, dass dort etwas Neues liegt. Gelöscht wird der Punkt
+           * beim Betreten des Reiters, nicht beim Verlassen: Er bedeutet „seit
+           * deinem letzten Blick ist etwas dazugekommen".
+           */
+          savedBadge: state.savedBadge + 1,
+          /**
+           * Der Hinweis läuft über `stationToast` — trotz des Namens.
+           *
+           * Das ist der zweizeilige Hinweis der App (Titel plus Unterzeile),
+           * gebaut für gespeicherte Haltestellen und seither der einzige
+           * allgemeine. `savedToast` daneben ist es NICHT: Der trägt Preis,
+           * Währung und einen „Ansehen"-Knopf, der eine gespeicherte Reise
+           * öffnet — hier führte er ins Leere. Den Namen geradezuziehen ist eine
+           * eigene Aufräumarbeit und gehört nicht in diese Änderung.
+           */
+          stationToast: { key: Date.now(), title, subtitle },
+        })),
+      removePriceAlert: (id) =>
+        set((state) => ({
+          priceAlerts: state.priceAlerts.filter((a) => a.id !== id),
+        })),
+      updatePriceAlertServerId: (id, serverId) =>
+        set((state) => {
+          const idx = state.priceAlerts.findIndex((a) => a.id === id);
+          // Unverändert lassen, wenn es nichts zu ändern gibt: Ein neues Feld
+          // wäre sonst ein Schreibvorgang, der jeden Abonnenten weckt und die
+          // Persistenz anstößt — für denselben Inhalt.
+          if (idx < 0 || state.priceAlerts[idx].serverId === serverId) return state;
+          const next = state.priceAlerts.slice();
+          next[idx] = { ...next[idx], serverId };
+          return { priceAlerts: next };
+        }),
+      setPriceAlertActive: (id, on, serverId) =>
+        set((state) => {
+          const idx = state.priceAlerts.findIndex((a) => a.id === id);
+          if (idx < 0) return state;
+          const next = state.priceAlerts.slice();
+          /**
+           * Beim ABSCHALTEN geht die Server-Kennung MIT.
+           *
+           * Sie zeigt dann auf eine Zeile, die es nicht mehr gibt. Bliebe sie
+           * stehen, versuchte ein späteres Löschen sie noch einmal — und der
+           * Abgleich beim Start hielte den Alarm für angelegt, obwohl der
+           * Server ihn nicht kennt.
+           */
+          next[idx] = on
+            ? { ...next[idx], active: true, ...(serverId ? { serverId } : {}) }
+            : { ...next[idx], active: false, serverId: undefined };
+          return { priceAlerts: next };
+        }),
+      alertHits: [],
+      addAlertHit: (hit) => {
+        /**
+         * ERST WARTEN, BIS DIE PLATTE GELESEN IST — sonst rollt sie alles zurück.
+         *
+         * DAS WAR DER FEHLER, und er sah aus wie ein kaputtes Produkt: Meldung
+         * kam an, Tipp öffnete die Ergebnisliste, aber unter der Glocke blieb es
+         * leer und der Alarm stand weiter unter „Gespeichert".
+         *
+         * Der Grund steckt in der Persistenz-Schicht. Ihr Standard-Zusammenführen
+         * ist `{ ...aktuell, ...gespeichert }` — der gespeicherte Stand gewinnt
+         * Feld für Feld — und sie setzt ihn mit `set(zusammengeführt, true)`, also
+         * ERSETZEND. Alles, was zwischen App-Start und dem Ende des Lesens
+         * geschrieben wurde, ist danach fort.
+         *
+         * Und genau in dieses Fenster fällt der häufigste Fall überhaupt: Die
+         * Meldung wird angetippt, während die App gar nicht läuft. Sie startet
+         * kalt, verarbeitet den Tipp — und die Hydrierung räumt hinterher auf.
+         * Deshalb klappte es nie, obwohl an der Kette sonst alles stimmte.
+         *
+         * Das Projekt hat dasselbe Rennen schon einmal verloren, bei den
+         * zuletzt gesuchten Orten; nachzulesen in `app/_layout.tsx`, wo es
+         * deshalb deterministisch an die Rehydrierung gehängt wurde. Hier
+         * dasselbe — aber im SPEICHER statt beim Aufrufer, damit es unabhängig
+         * davon wirkt, wer diese Funktion wann ruft.
+         *
+         * Keine Endlosschleife: Nach der Hydrierung ist `hasHydrated()` wahr,
+         * der zweite Durchlauf schreibt also wirklich.
+         */
+        if (!useSearchStore.persist.hasHydrated()) {
+          useSearchStore.persist.onFinishHydration(() => {
+            useSearchStore.getState().addAlertHit(hit);
+          });
+          return;
+        }
+        set((state) => {
+          /**
+           * Dieselbe Strecke ERSETZT ihren Vorgänger, sie legt sich nicht daneben.
+           *
+           * Auf dem Gerät räumt der Sammel-Schlüssel die Leiste schon auf: Eine
+           * neue Meldung derselben Strecke tritt an die Stelle der alten. Diese
+           * Liste muss dasselbe tun, sonst stünde unter der Glocke dreimal
+           * dieselbe Fahrt mit drei Preisen — und der oberste wäre nur zufällig
+           * der aktuelle.
+           */
+          const key = (h: { mode: string; origin: string; destination: string; departDate: string; returnDate?: string }) =>
+            `${h.mode}|${h.origin}|${h.destination}|${h.departDate}|${h.returnDate ?? ""}`;
+          const k = key(hit);
+          const rest = state.alertHits.filter((h) => key(h) !== k);
+          /**
+           * Der Alarm ist damit ERLEDIGT und verlässt „Gespeichert".
+           *
+           * Ein Preis-Alarm ist eine Frage („sag mir, wenn es billiger wird"),
+           * und diese Meldung ist die Antwort darauf. Ihn danach weiter unter
+           * den gespeicherten Reisen stehen zu lassen hieße, dieselbe Frage ein
+           * zweites Mal zu stellen, während die Antwort schon unter der Glocke
+           * liegt.
+           *
+           * Beides in EINEM `set()`: Zwei Aufrufe wären zwei Benachrichtigungen
+           * an den Speicher und damit zwei Render-Wellen — und dazwischen ein
+           * Bild, in dem der Alarm an beiden Orten steht.
+           *
+           * Auf dem SERVER löscht ihn der Aufrufer, siehe `recordHit`. Das darf
+           * hier nicht passieren (ein Speicher ruft kein Netz), muss aber
+           * passieren: Ein Alarm, der hier verschwindet und dort bleibt, ist
+           * genau die Falle, die im Projekt schon einmal zugeschnappt ist.
+           */
+          const fullKey = priceAlertKey({
+            mode: hit.mode,
+            origin: hit.origin,
+            destination: hit.destination,
+            departDate: hit.departDate,
+            returnDate: hit.returnDate,
+            passengers: hit.passengers,
+            travelClass: hit.travelClass,
+            currency: hit.currency,
+          });
+          return {
+            alertHits: [{ ...hit, id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}` }, ...rest].slice(0, 50),
+            priceAlerts: state.priceAlerts.filter((a) => priceAlertKey(a) !== fullKey),
+            // Der Punkt an der Glocke — im selben Vorgang wie alles andere,
+            // damit kein Bild entsteht, in dem das eine schon gilt und das
+            // andere noch nicht.
+            notificationsBadge: state.notificationsBadge + 1,
+          };
+        });
+      },
+      removeAlertHit: (id) =>
+        set((state) => ({ alertHits: state.alertHits.filter((h) => h.id !== id) })),
+      clearAlertHits: () => set({ alertHits: [] }),
       favoriteResultIds: [],
       toggleFavorite: (id) =>
         set((state) => ({
@@ -1471,6 +1750,16 @@ export const useSearchStore = create<SearchStore>()(
         recentSpots: state.recentSpots,
         lastKnownCoord: state.lastKnownCoord,
         favoriteResultIds: state.favoriteResultIds,
+        priceAlerts: state.priceAlerts,
+        alertHits: state.alertHits,
+        /**
+         * Der Punkt überlebt einen Neustart — er muss es sogar.
+         *
+         * Eine Meldung kommt oft an, während die App gar nicht läuft. Wäre der
+         * Zähler flüchtig, wäre der Hinweis beim nächsten Öffnen weg, obwohl
+         * genau dann etwas Neues unter der Glocke liegt.
+         */
+        notificationsBadge: state.notificationsBadge,
         savedTrips: state.savedTrips,
         savedStations: state.savedStations,
         tickets: state.tickets,

@@ -1,0 +1,1 @@
+ALTER TABLE "push_tokens" ADD COLUMN "device_model" varchar(64);

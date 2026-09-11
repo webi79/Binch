@@ -11,7 +11,10 @@ import {
   type ViewStyle,
 } from "react-native";
 import Animated, { useAnimatedStyle } from "react-native-reanimated";
-import type { SavedTrip, Ticket } from "@/types/saved";
+import type { PriceAlert, SavedTrip, Ticket } from "@/types/saved";
+import type { TravelMode } from "@/types/search";
+import { PriceAlertCard } from "@/components/saved/PriceAlertCard";
+import { SavedFilterRow, type SavedFilter } from "@/components/saved/SavedFilterRow";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useIsFocused } from "@react-navigation/native";
 import { useT } from "@/lib/i18n/useT";
@@ -77,6 +80,9 @@ function useFocusedStoreSnapshot<T>(
 
 type Tab = "trips" | "tickets";
 
+/** Eine Zeile der Reisen-Liste — eine gespeicherte Reise ODER ein Preis-Alarm. */
+type TripRow = { kind: "trip"; trip: SavedTrip } | { kind: "alert"; alert: PriceAlert };
+
 /**
  * Trägt den Parallax-Transform — und für die Dauer eines Übergangs eine
  * GPU-Textur.
@@ -121,6 +127,14 @@ export default function SavedScreen() {
   const accent = useAccent();
   const appBg = useAppBg();
   const [tab, setTab] = useState<Tab>("trips");
+  /**
+   * Die Kategorie-Auswahl der Reisen-Liste.
+   *
+   * Als Zustand DIESES Screens und nicht im Speicher: Sie ist eine Sicht auf
+   * eine Liste, keine Einstellung. Wer die App neu öffnet, will alles sehen —
+   * eine gemerkte Auswahl ließe ihn glauben, seine Reisen seien weg.
+   */
+  const [filter, setFilter] = useState<SavedFilter>("all");
   const [showModal, setShowModal] = useState(false);
   const isFocused = useIsFocused();
   const navbarSpace = useNavbarSpace();
@@ -205,8 +219,17 @@ export default function SavedScreen() {
     isFocused,
     (s) => s.tickets,
   );
+  /**
+   * Die Preis-Alarme — auf demselben Weg wie die Reisen, aus demselben Grund.
+   *
+   * Dieser Reiter bleibt dauerhaft gemountet. Ein gewöhnliches Abo weckte ihn
+   * bei jeder Änderung im Speicher, auch während man auf einem ganz anderen
+   * Reiter scrollt; siehe die lange Begründung darüber.
+   */
+  const priceAlertsSnapshot = useFocusedStoreSnapshot(isFocused, (s) => s.priceAlerts);
   const savedTrips = savedTripsSnapshot;
   const tickets = ticketsSnapshot;
+  const priceAlerts = priceAlertsSnapshot;
   const addTicket = useSearchStore.getState().addTicket;
 
   // Früher stand hier ein Skelett, das beim ERSTEN Besuch 220ms lang anstelle
@@ -216,8 +239,35 @@ export default function SavedScreen() {
   // hinter der Splash. Das Skelett hätte also nur noch genau den sichtbaren
   // Umbau beigesteuert, den es eigentlich verhindern sollte.
 
-  const today = useMemo(() => savedTrips.filter((tr) => isToday(tr.savedAt)), [savedTrips]);
-  const earlier = useMemo(() => savedTrips.filter((tr) => !isToday(tr.savedAt)), [savedTrips]);
+  /**
+   * Die Kategorie greift auf BEIDES — Reisen wie Alarme.
+   *
+   * „Züge" soll die Zug-Alarme genauso ausblenden wie die Zug-Reisen; eine
+   * Auswahl, die nur die Hälfte der Liste betrifft, wäre schlicht kaputt.
+   * Kreuzfahrten haben bewusst KEINEN eigenen Knopf (es sind vier, nicht fünf)
+   * — sie erscheinen unter „Alle" und sonst nirgends, was ehrlicher ist als ein
+   * Knopf, hinter dem fast immer nichts steht.
+   */
+  const inFilter = useCallback(
+    (mode: TravelMode) => filter === "all" || mode === filter,
+    [filter],
+  );
+  const visibleTrips = useMemo(() => savedTrips.filter((tr) => inFilter(tr.mode)), [savedTrips, inFilter]);
+  const visibleAlerts = useMemo(
+    () => priceAlerts.filter((a) => inFilter(a.mode)),
+    [priceAlerts, inFilter],
+  );
+  const today = useMemo(() => visibleTrips.filter((tr) => isToday(tr.savedAt)), [visibleTrips]);
+  const earlier = useMemo(() => visibleTrips.filter((tr) => !isToday(tr.savedAt)), [visibleTrips]);
+  /**
+   * Gibt es ÜBERHAUPT etwas hier? Ungefiltert gefragt.
+   *
+   * Daran hängen zwei Dinge: ob die Kategorie-Knöpfe erscheinen und ob der
+   * leere Zustand kommt. Beide müssen den GESAMTBESTAND ansehen, nicht den
+   * gefilterten — sonst verschwänden die Knöpfe genau dann, wenn eine Kategorie
+   * leer ist, und man käme nicht mehr zurück zu „Alle".
+   */
+  const hasAnything = savedTrips.length > 0 || priceAlerts.length > 0;
 
   /**
    * Beide Listen sind jetzt VIRTUALISIERT — vorher `.map()` in einer ScrollView.
@@ -234,31 +284,82 @@ export default function SavedScreen() {
    * Zahl gespeicherter Reisen; genau deshalb wurde die Slide „mit der Zeit
    * schlechter".
    */
+  /**
+   * Reisen UND Alarme in einer Liste — als ausgezeichnete Zeilen.
+   *
+   * Zwei Listen untereinander wären der naheliegende Weg und der schlechtere:
+   * Jede brächte eine eigene Scroll-Fläche mit, und zwei davon ineinander sind
+   * genau die Konstruktion, an der Gesten sich verhaken. Eine
+   * `SectionList` kann verschiedene Abschnitte tragen; unterschieden wird beim
+   * Zeichnen an einem Feld, nicht an der Herkunft.
+   */
   const tripSections = useMemo(
     () =>
       [
-        ...(today.length > 0 ? [{ key: "today", title: t("saved.section.today"), data: today }] : []),
+        ...(visibleAlerts.length > 0
+          ? [
+              {
+                key: "alerts",
+                /**
+                 * OHNE Überschrift — sie stünde direkt über einer Karte, deren
+                 * eigene Zeile schon „Preis-Alarme" sagt. Dasselbe Wort zweimal
+                 * untereinander liest sich nicht als Gliederung, sondern als
+                 * Versehen. Die Karte erklärt sich selbst.
+                 */
+                title: "",
+                data: visibleAlerts.map((a): TripRow => ({ kind: "alert", alert: a })),
+              },
+            ]
+          : []),
+        ...(today.length > 0
+          ? [
+              {
+                key: "today",
+                title: t("saved.section.today"),
+                data: today.map((tr): TripRow => ({ kind: "trip", trip: tr })),
+              },
+            ]
+          : []),
         ...(earlier.length > 0
-          ? [{ key: "earlier", title: t("saved.section.earlier"), data: earlier }]
+          ? [
+              {
+                key: "earlier",
+                title: t("saved.section.earlier"),
+                data: earlier.map((tr): TripRow => ({ kind: "trip", trip: tr })),
+              },
+            ]
           : []),
       ],
-    [today, earlier, t],
+    [visibleAlerts, today, earlier, t],
   );
   const renderTrip = useCallback(
-    ({ item }: { item: SavedTrip }) => (
+    ({ item }: { item: TripRow }) => (
       <View style={rowGap}>
-        <ResultCard result={item} passengers={item.passengers} underlay="saved" />
+        {item.kind === "alert" ? (
+          <PriceAlertCard alert={item.alert} />
+        ) : (
+          <ResultCard result={item.trip} passengers={item.trip.passengers} underlay="saved" />
+        )}
       </View>
     ),
     [],
   );
   const renderTripSection = useCallback(
-    ({ section }: { section: { title: string } }) => (
-      <Text className="text-[15px] font-semibold text-white mt-1 mb-2.5">{section.title}</Text>
-    ),
+    ({ section }: { section: { title: string } }) =>
+      // Leerer Titel = kein Kopf. `null` und nicht ein leerer `Text`: Der
+      // brächte trotzdem seine Außenabstände mit und risse eine Lücke.
+      section.title ? (
+        <Text className="text-[15px] font-semibold text-white mt-1 mb-2.5">{section.title}</Text>
+      ) : null,
     [],
   );
-  const tripKey = useCallback((item: SavedTrip) => item.id, []);
+  const tripKey = useCallback(
+    // Die Kennung MIT der Art: Eine Reise und ein Alarm könnten dieselbe
+    // tragen, und zwei gleiche Schlüssel in einer Liste sind ein stiller
+    // Zeichenfehler, den man erst am falsch wiederverwendeten Knoten merkt.
+    (item: TripRow) => (item.kind === "alert" ? `a:${item.alert.id}` : `t:${item.trip.id}`),
+    [],
+  );
   const renderTicket = useCallback(
     ({ item }: { item: Ticket }) => <TicketCard ticket={item} />,
     [],
@@ -305,7 +406,7 @@ export default function SavedScreen() {
           unabhängige Slides. */}
       <SlidingPanels activeIndex={tab === "trips" ? 0 : 1}>
         {/* TRIPS */}
-        {savedTrips.length === 0 ? (
+        {!hasAnything ? (
           <ScrollView
             className="flex-1"
             contentContainerStyle={padBottom}
@@ -335,6 +436,28 @@ export default function SavedScreen() {
             keyExtractor={tripKey}
             renderItem={renderTrip}
             renderSectionHeader={renderTripSection}
+            /**
+             * Die Kategorie-Knöpfe als KOPF DER LISTE, nicht als feste Leiste.
+             *
+             * Damit erscheinen sie von selbst erst, wenn es etwas zu filtern
+             * gibt: Ist nichts gespeichert, wird diese Liste gar nicht gezeigt,
+             * sondern der leere Zustand. Und sie scrollen mit — eine zweite
+             * feste Leiste unter „Reisen | Tickets" hätte den Bildschirm oben
+             * zugebaut, bevor die erste Karte anfängt.
+             */
+            ListHeaderComponent={<SavedFilterRow value={filter} onChange={setFilter} />}
+            /**
+             * Der leere Zustand DER AUSWAHL — nicht der leere Zustand des
+             * Reiters.
+             *
+             * „Keine Busse gespeichert" ist etwas anderes als „hier ist noch
+             * nichts". Ohne diese Zeile stünde man nach einem Tipp auf „Busse"
+             * vor einer leeren Fläche und wüsste nicht, ob die Auswahl greift
+             * oder die App hängt.
+             */
+            ListEmptyComponent={
+              <Text style={emptyFilterText}>{t("saved.filter.none")}</Text>
+            }
             stickySectionHeadersEnabled={false}
             contentContainerStyle={padBottomGutter}
             showsVerticalScrollIndicator={false}
@@ -406,6 +529,15 @@ export default function SavedScreen() {
  *  Ein Objektliteral dort ist bei jedem Bild ein NEUES Objekt, also für jede
  *  Zeile ein Stil-Vergleich, der garantiert scheitert. */
 const rowGap = { marginBottom: 12 } as const;
+
+/** Der Hinweis, wenn die gewählte Kategorie nichts enthält. */
+const emptyFilterText = {
+  fontSize: 14,
+  fontWeight: "500",
+  color: "#8E8E93",
+  paddingHorizontal: 20,
+  paddingTop: 8,
+} as const;
 
 /** Füllt den Bereich im Blätter-Container. Siehe Begründung an der SectionList. */
 const FILL = { flex: 1 } as const;

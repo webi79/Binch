@@ -1,0 +1,1 @@
+ALTER TABLE "price_alerts" ADD COLUMN "notified_price" numeric(10, 2);

@@ -9,6 +9,26 @@ import { useSearchStore } from "@/stores/searchStore";
 import { GradientFill } from "@/components/ui/GradientFill";
 import { scaledStyles } from "@/lib/ui/compact";
 
+/**
+ * WARUM DIESE LEISTE KEINE DRUCK-RÜCKMELDUNG TRÄGT.
+ *
+ * Ich hatte hier eine eingebaut — ein leichtes Zusammendrücken über einen
+ * geteilten Wert, ausgelöst beim Aufsetzen, wie bei den vier Launch-Kacheln.
+ * Die Rechnung dahinter stimmt weiterhin: Zwischen Loslassen und dem ersten
+ * SICHTBAREN Bild der Fahrt vergehen rund 80 bis 110ms, in denen nichts
+ * passiert, und eine Rückmeldung im nächsten Bild würde die genau füllen.
+ *
+ * Am Gerät sah es trotzdem schlechter aus, und der Grund steht schon in dieser
+ * Datei, nur ein paar Zeilen weiter unten: Diese Leiste enthält den
+ * Mikrofon-Knopf, und der ist ein SVG mit Verlauf. Eine Skalierung darüber ist
+ * keine billige Verschiebung — sie macht die Fläche in jedem Bild ungültig und
+ * lässt das SVG neu rastern. Dieselbe Falle, aus der die Material-Welle hier
+ * schon einmal entfernt wurde, nur mit anderem Auslöser.
+ *
+ * Die Rückmeldung müsste also ohne Skalierung und ohne Deckkraft AUF dieser
+ * Fläche auskommen — sonst ist der Gewinn an Direktheit teurer als das, was er
+ * kaschieren soll.
+ */
 const COLORS = {
   surface: "#171719",
   // lime entfernt — GradientFill liest den User-Akzent via useAccent().
@@ -219,11 +239,6 @@ export function SearchBar(props: Props) {
        * Mikrofon-Knopf zog sich über die volle Breite. Diese Datei geht durch
        * NativeWinds JSX-Umschreibung, und die verträgt sich an dieser Stelle
        * nicht mit der Funktions-Form.
-       *
-       * Die Druck-Rückmeldung entfällt damit — wie bei den vier Launch-Kacheln
-       * im Landingscreen, die aus demselben Grund ohne Welle auskommen. Sichtbar
-       * ist sie ohnehin kaum: Der Bildschirm fährt im selben Moment los, und
-       * DAS ist die Rückmeldung.
        */
       style={[styles.bar, { backgroundColor: palette.s2 }, style]}
       onPress={props.onPress ?? (() => router.navigate("/search"))}

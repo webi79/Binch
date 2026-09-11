@@ -113,6 +113,62 @@
       "when": 1788725838109,
       "tag": "0015_high_corsair",
       "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1788979103350,
+      "tag": "0016_mute_paladin",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1788997348232,
+      "tag": "0017_silly_retro_girl",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1789003181497,
+      "tag": "0018_tearful_ogun",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1789003322061,
+      "tag": "0019_known_spyke",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1789037552825,
+      "tag": "0020_fat_wallow",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1789042399710,
+      "tag": "0021_round_swordsman",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1789063167239,
+      "tag": "0022_wise_mongu",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1789096704444,
+      "tag": "0023_magenta_firedrake",
+      "breakpoints": true
     }
   ]
 }

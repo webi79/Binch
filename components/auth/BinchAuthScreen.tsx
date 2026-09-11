@@ -158,6 +158,22 @@ function Sheet() {
   useEffect(() => {
     if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
     if (open) {
+      /**
+       * Die laufende Ausfahrt für ungültig erklären — sonst baut ihr Rückruf
+       * den Inhalt ab, den diese Einfahrt gerade sichtbar macht.
+       *
+       * Genau das fehlte hier: Umgestellt wurde nur der Schließ-Zweig von
+       * `finished` auf eine Nummer, hochgezählt wurde sie aber nirgends sonst.
+       * Wer innerhalb der Ausfahrt wieder öffnet, bricht die Kurve ab, ihr
+       * Rückruf läuft mit UNVERÄNDERTER Nummer durch — und setzt `mounted` auf
+       * falsch. Der Bildschirm wäre dann dauerhaft leer, und weil die
+       * Abhängigkeit dieses Effekts nur `open` ist, käme er auch nie wieder.
+       *
+       * Aus einer Vorkehrung gegen einen Fehler wäre damit ein schlimmerer
+       * geworden. `SearchHeroOverlay` hat dieselbe Zeile; hier hat sie gefehlt.
+       */
+      closeGenRef.current += 1;
+      closeGen.value = closeGenRef.current;
       setMounted(true);
       setMoving(true);
       sheetY.value = WINDOW_H;
@@ -176,9 +192,26 @@ function Sheet() {
     if (!mounted) return undefined;
     setMoving(true);
     markSheetMoving(SHEET_OUT.duration);
-    sheetY.value = withTiming(WINDOW_H, SHEET_OUT, (finished) => {
+    /**
+     * Freigegeben wird auch, wenn die Ausfahrt ABGEBROCHEN wird.
+     *
+     * Hier stand `if (!finished) return;`, und daran hing der Abbau des ganzen
+     * Inhalts. Wer innerhalb der Ausfahrt wieder öffnet, bricht die Kurve ab —
+     * der Rückruf stieg dann aus, und Verlaufsband, Eingabefelder und
+     * Anbieter-Knöpfe blieben für den Rest des App-Laufs im Wurzelbaum stehen.
+     * Sie werden dort bei jeder Fenster-Vermessung mitgemessen, und unter
+     * `adjustResize` heißt das: bei jedem Öffnen der Tastatur.
+     *
+     * Die Nummer trennt Abbruch von Ablösung: Räumt eine NEUERE Bewegung
+     * bereits auf, hält dieser Rückruf sich heraus — sonst baute er den Inhalt
+     * ab, den die neue Einfahrt gerade sichtbar macht.
+     */
+    closeGenRef.current += 1;
+    const myGen = closeGenRef.current;
+    closeGen.value = myGen;
+    sheetY.value = withTiming(WINDOW_H, SHEET_OUT, () => {
       "worklet";
-      if (!finished) return;
+      if (closeGen.value !== myGen) return;
       runOnJS(setMoving)(false);
       // Erst wenn das Blatt unten steht, den Inhalt wieder freigeben.
       runOnJS(setMounted)(false);
@@ -186,6 +219,16 @@ function Sheet() {
     return undefined;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
+  /**
+   * Welche Ausfahrt gerade gilt — JS-Zahl zum Hochzählen, geteilter Wert zum
+   * Lesen im Worklet. Dieselbe Aufteilung wie in `lib/nav/sheetSlide.ts`: Ein
+   * Worklet fängt seine Umgebung beim Anlegen ein, `ref.current` wäre darin für
+   * immer der Stand von damals; und den geteilten Wert von JS aus zu lesen ist
+   * ein synchroner Sprung in die UI-Laufzeit.
+   */
+  const closeGenRef = useRef(0);
+  const closeGen = useSharedValue(0);
+
   const sheetStyleAnim = useAnimatedStyle(() => ({
     transform: [{ translateY: sheetY.value }],
   }));

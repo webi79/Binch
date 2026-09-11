@@ -4,12 +4,11 @@
  * Perforation + Countdown bis Abfahrt. Tap öffnet den Detail-Slide via
  * Store-Action `openTicketDetail`.
  */
-import { memo, useMemo } from "react";
+import { memo, useMemo, useState } from "react";
 import { View, Text, StyleSheet } from "react-native";
 import { usePalette } from "@/lib/theme/appBg";
 import { format, parseISO } from "date-fns";
 import { de, enGB, es, fr } from "date-fns/locale";
-import { showAlert } from "@/lib/alert";
 import { Ticket } from "@/types/saved";
 import { useT } from "@/lib/i18n/useT";
 import { GUTTER, SPACE } from "@/lib/theme/spacing";
@@ -17,6 +16,7 @@ import { useSearchStore } from "@/stores/searchStore";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import { ClearSearchHistoryAlert } from "@/components/ui/ClearSearchHistoryAlert";
 import { prepareLayer } from "@/lib/nav/transitionLayer";
 import { startTicketPush } from "@/lib/nav/overlayCover";
 import { deleteTicketFiles } from "@/lib/saved/ticketImages";
@@ -67,6 +67,14 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
   const removeTicket = useSearchStore.getState().removeTicket;
 
   const dateLocale = DATE_LOCALES[locale] ?? enGB;
+  /**
+   * Steht die Rückfrage vor dem Löschen offen?
+   *
+   * Zustand DIESER Karte: Im Reiter stehen beliebig viele Tickets, und ein
+   * gemeinsamer Zustand weiter oben müsste zusätzlich mitführen, WELCHES
+   * gemeint ist.
+   */
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   // Header-Datum + Abfahrtszeit ("22. Aug · 07:25").
   const headerLine = useMemo(() => {
@@ -127,27 +135,29 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
     requestAnimationFrame(() => openTicketDetail(ticket));
   };
 
+  /**
+   * Womit das Ticket in der Rückfrage benannt wird.
+   *
+   * Dieselbe Reihenfolge, die vorher im System-Dialog stand: die Gesellschaft,
+   * sonst der Dateiname des Imports, sonst die Buchungsnummer. Eine Frage, die
+   * bei drei Tickets untereinander nicht sagt, WELCHES sie meint, ist keine.
+   */
+  const deleteLabel =
+    ticket.carrier ?? ticket.originalName ?? bookingRefFor(ticket) ?? "ticket";
+
   const onLongPress = () => {
     haptic("important");
-    const label =
-      ticket.carrier ?? ticket.originalName ?? bookingRefFor(ticket) ?? "ticket";
-    showAlert(
-      t("saved.ticket.delete.title"),
-      t("saved.ticket.delete.body").replace("{label}", label),
-      [
-        { text: t("common.cancel"), style: "cancel" },
-        {
-          text: t("common.delete"),
-          style: "destructive",
-          onPress: () => {
-            // Bild-/PDF-Dateien best-effort mitlöschen, damit das Document-
-            // Directory nicht mit verwaisten Dateien zumüllt.
-            deleteTicketFiles(ticket);
-            removeTicket(ticket.id);
-          },
-        },
-      ],
-    );
+    setConfirmOpen(true);
+  };
+
+  const onConfirmDelete = () => {
+    // Erst schließen, dann löschen: Danach ist diese Karte weg, und ein noch
+    // offener Dialog hinge an einer Komponente, die gerade abgebaut wird.
+    setConfirmOpen(false);
+    // Bild-/PDF-Dateien best-effort mitlöschen, damit das Document-
+    // Directory nicht mit verwaisten Dateien zumüllt.
+    deleteTicketFiles(ticket);
+    removeTicket(ticket.id);
   };
 
   return (
@@ -211,6 +221,20 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
       </View>
 
       <Text style={styles.hint}>{t("saved.ticket.openHint")}</Text>
+
+      {/* Statt des System-Dialogs der App-eigene — derselbe, der auch den
+          Suchverlauf, die Meldungen und die Preis-Alarme abfragt. Der
+          System-Dialog sah auf jedem Gerät anders aus und als Einziger in
+          dieser App nicht nach ihr. */}
+      <ClearSearchHistoryAlert
+        visible={confirmOpen}
+        onCancel={() => setConfirmOpen(false)}
+        onConfirm={onConfirmDelete}
+        title={t("saved.ticket.delete.title")}
+        message={t("saved.ticket.delete.body").replace("{label}", deleteLabel)}
+        confirmLabel={t("saved.ticket.delete.confirm")}
+        cancelLabel={t("common.cancel")}
+      />
     </View>
   );
 }

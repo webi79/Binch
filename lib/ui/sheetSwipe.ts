@@ -1,5 +1,16 @@
 /**
- * Wischen nach unten schließt das Blatt — EINMAL, für alle Blätter von unten.
+ * Wegwischen schließt das Blatt — EINMAL, für alle Blätter.
+ *
+ * „Weg" heißt für ein Blatt von unten: nach unten. Für ein Blatt von OBEN (die
+ * Such-Slide der Ergebnisliste) heißt es nach oben, und das ist die EINZIGE
+ * Unterscheidung, die diese Datei kennt: `direction` wird zu einem Faktor `dir`
+ * aus +1 oder -1, und jede Stelle, an der eine Richtung steckt, multipliziert
+ * damit. Kein zweiter Zweig, keine zweite Fassung der Schwellen — sonst hätten
+ * wir in einem halben Jahr wieder zwei Gesten, die sich um zehn Punkte und eine
+ * Kurve unterscheiden. Genau davon handelt der Rest dieses Kommentars.
+ *
+ * Für `"down"` ist `dir === 1`, und jede Multiplikation damit ist die Identität:
+ * Der bestehende Weg rechnet Zahl für Zahl dasselbe wie vorher.
  *
  * Bis hierher hatte jedes Blatt seine eigene Wisch-Geste, und alle sahen fast
  * gleich aus: `activeOffsetY(8)`, `failOffsetY(-8)`, 110 Punkte oder 700
@@ -102,6 +113,20 @@ const RETURN_MS = 220;
 const RETURN_MIN_FRAC = 0.25;
 
 /**
+ * Die Fensterhöhe EINMAL beim Laden — als Notmaß, wenn ein Blatt seine eigene
+ * Höhe noch nicht kennt.
+ *
+ * Hier stand `Dimensions.get("window").height` MITTEN im Worklet des
+ * Loslassens. Das ist eine Zeitbombe: `Dimensions` ist ein gewöhnliches
+ * JS-Objekt, und ein Aufruf seiner Methode auf dem UI-Strang bricht ab. Nur
+ * kam er nie dran — davor steht ein `||`, und die Höhe war bisher immer
+ * gesetzt. Beim ersten Blatt, das vor seiner Vermessung weggewischt wird, wäre
+ * es ein Absturz gewesen. Als Zahl gelesen ist es harmlos: Zahlen dürfen ins
+ * Worklet.
+ */
+const WINDOW_H = Dimensions.get("window").height;
+
+/**
  * Der Torhüter für eine Liste im Blatt.
  *
  * `native` gehört an einen `GestureDetector` UM die Liste, `onScroll` und
@@ -110,9 +135,41 @@ const RETURN_MIN_FRAC = 0.25;
  * und ist genau dann veraltet, wenn er gebraucht wird.
  */
 export interface SheetScrollGate {
-  /** Gehört an die Liste (`ref={gate.ref}`) — darüber wird sie festgehalten. */
+  /**
+   * Gehört an die Liste (`ref={gate.ref}`) — darüber wird sie festgehalten.
+   *
+   * **NUR an eine `Animated.ScrollView`, NIEMALS an eine `Animated.FlatList`.**
+   * Das ist kein Geschmacksurteil, sondern eine Absturzkette: Reanimated löst
+   * aus einem Verweis die native Ansicht auf, indem es der Reihe nach
+   * `__internalInstanceHandle`, dann `getNativeScrollRef()` und erst dann
+   * `_reactInternals` probiert. Eine `FlatList` hat `getNativeScrollRef()` —
+   * damit greift der zweite Zweig, und der dritte wird übersprungen. Nur liefert
+   * die Methode über `VirtualizedList.getScrollRef()` die `ScrollView`-KLASSE
+   * zurück, nicht die native Ansicht; die hat kein `__internalInstanceHandle`,
+   * und die Zeile danach greift ungeprüft darauf zu. Ergebnis: Absturz beim
+   * Aufbau. Eine `Animated.ScrollView` reicht denselben Aufruf an die echte
+   * native Ansicht durch und geht deshalb gut.
+   *
+   * Eine `FlatList` benutzt vom Torhüter also nur `scrollY`, `onScroll` und
+   * `native` — und regelt das Festhalten über die Bedingung im eigenen Worklet
+   * (siehe `SurroundingsSheet`).
+   */
   ref: AnimatedRef<Animated.ScrollView>;
   scrollY: SharedValue<number>;
+  /**
+   * Liegt der Finger gerade AUF der Liste?
+   *
+   * Ohne diese Angabe war der Torhüter blind für die Stelle der Berührung — er
+   * las nur den Scroll-Stand. Eine gescrollte Liste sperrte damit das ganze
+   * Blatt: Man zog am Griff, an den Reitern, an der Überschrift, und nichts
+   * rührte sich, weil irgendwo darunter eine Liste nicht auf Anschlag stand.
+   * Am Umgebungs-Blatt hieß das „lässt sich manchmal gar nicht aufziehen"; es
+   * half nur, die Liste über einen Kategorie-Wechsel auf Null zu setzen.
+   *
+   * Die Angabe kommt vom nativen Erkenner der Liste selbst: Der bekommt eine
+   * Berührung nur, wenn sie auch auf ihr landet.
+   */
+  onList: SharedValue<boolean>;
   onScroll: ReturnType<typeof useAnimatedScrollHandler>;
   native: NativeGesture;
 }
@@ -120,13 +177,42 @@ export interface SheetScrollGate {
 export function useSheetScrollGate(): SheetScrollGate {
   const ref = useAnimatedRef<Animated.ScrollView>();
   const scrollY = useSharedValue(0);
+  const onList = useSharedValue(false);
   const onScroll = useAnimatedScrollHandler((e) => {
     scrollY.value = e.contentOffset.y;
   });
   // Fest — ein neues Gesten-Objekt zwingt den Erkenner, sich bei jedem
   // Durchgang neu gegen seinen nativen Gegenpart einzurichten.
-  const native = useMemo(() => Gesture.Native(), []);
-  return { ref, scrollY, onScroll, native };
+  const native = useMemo(
+    () =>
+      Gesture.Native()
+        // `onBegin` läuft beim Aufsetzen des Fingers, also VOR dem Anspringen
+        // der Zieh-Geste (die wartet acht Punkte). Der Wert steht damit
+        // rechtzeitig.
+        .onBegin(() => {
+          onList.value = true;
+        })
+        .onFinalize(() => {
+          onList.value = false;
+        }),
+    [onList],
+  );
+  /**
+   * Als FESTES Objekt zurück, nicht als frisches bei jedem Durchgang.
+   *
+   * Die Blätter mit Rastpunkten legen ihre Geste in einem `useMemo` an und
+   * führen den Torhüter in dessen Abhängigkeiten — mit einem neuen Objekt pro
+   * Durchgang entstünde die Geste also jedes Mal neu, und der Erkenner müsste
+   * sich gegen seinen nativen Gegenpart neu einrichten. Beide Dateien warnen
+   * genau davor: Das Haltestellen-Blatt rendert im Sekundentakt (Ticker für die
+   * Abfahrtszeiten), das Umgebungs-Blatt bei jeder Kartenbewegung.
+   *
+   * Alle fünf Teile sind für sich schon fest — es fehlte nur die Hülle.
+   */
+  return useMemo(
+    () => ({ ref, scrollY, onList, onScroll, native }),
+    [ref, scrollY, onList, onScroll, native],
+  );
 }
 
 /**
@@ -154,7 +240,10 @@ function settleBack(y: SharedValue<number>, rest: number) {
 export interface SheetSwipeOptions {
   /** Die Lage des Blattes — derselbe geteilte Wert, den auch die Einfahrt schreibt. */
   y: SharedValue<number>;
-  /** Der Weg nach unten aus dem Bild: die Höhe des Blattes. */
+  /**
+   * Der Weg aus dem Bild: die Höhe des Blattes. Immer POSITIV, auch bei
+   * `direction: "up"` — die Richtung steht dort und nur dort.
+   */
   travel: SharedValue<number> | number;
   /**
    * Läuft auf dem JS-Strang, sobald der Wisch als Abwurf gilt.
@@ -178,6 +267,18 @@ export interface SheetSwipeOptions {
   rest?: number;
   /** Liste im Blatt — siehe `useSheetScrollGate`. */
   gate?: SheetScrollGate | null;
+  /**
+   * Wohin das Blatt weggewischt wird. Vorgabe `"down"` — alle Blätter von
+   * unten.
+   *
+   * `"up"` gilt für ein Blatt, das von OBEN hereinfährt und dessen Parkplatz
+   * damit über dem Bildrand liegt (`y < rest`). Gedreht wird daran alles, was
+   * eine Richtung kennt: die Aktivierungs-Schwelle, die Seite, auf der die
+   * Bewegung überhaupt Platz hat, die Auswertung von Weg und Schwung beim
+   * Loslassen und das Vorzeichen der Ausfahrt. `travel` bleibt in BEIDEN Fällen
+   * eine positive Länge — es ist der Weg aus dem Bild, nicht ein Ziel.
+   */
+  direction?: "down" | "up";
 }
 
 export function useSheetSwipe({
@@ -188,6 +289,7 @@ export function useSheetSwipe({
   enabled = true,
   rest = 0,
   gate = null,
+  direction = "down",
 }: SheetSwipeOptions) {
   /**
    * Der Nullpunkt der Bewegung.
@@ -208,22 +310,48 @@ export function useSheetSwipe({
    * angehalten und dort weitergemacht, wo sie steht.
    */
   const startY = useSharedValue(0);
+  /**
+   * Ist die Geste in DIESER Berührung überhaupt angesprungen?
+   *
+   * `onFinalize` läuft auch für Berührungen, die nie eine Geste wurden — also
+   * für jeden Tipper auf einen Knopf im Blatt. Ohne diesen Merker holte der
+   * Abbruch-Zweig darin das Blatt an die Ruhelage: Wer während der EINFAHRT
+   * irgendwo hintippte, riss sie damit ab, und das Blatt sprang sofort an sein
+   * Ziel. Genau der Sprung, den wir gerade an drei anderen Stellen beseitigt
+   * haben.
+   */
+  const active = useSharedValue(false);
+
+  /**
+   * Die ganze Richtungs-Information dieser Datei — eine Zahl.
+   *
+   * Sie zeigt vom Ruhepunkt WEG, also dorthin, wo das Blatt verschwindet. Alles
+   * darunter rechnet in dieser gedrehten Achse: „weiter weg als" wird zu
+   * `(y - rest) * dir > …`, „nicht über den Ruhepunkt hinaus" zu einem
+   * Maximum in derselben Achse, und die Ausfahrt bekommt ihr Vorzeichen
+   * schlicht als Faktor.
+   */
+  const dir = direction === "up" ? -1 : 1;
 
   const travelSv = typeof travel === "number" ? null : travel;
   const travelConst = typeof travel === "number" ? travel : 0;
   const scrollY = gate?.scrollY ?? null;
+  const onList = gate?.onList ?? null;
   const scrollRef = gate?.ref ?? null;
   const nativeScroll = gate?.native ?? null;
 
   return useMemo(() => {
     const g = Gesture.Pan()
       .enabled(enabled)
-      .activeOffsetY(SWIPE_ACTIVATE)
-      // Nach OBEN sofort aufgeben: Dort liegt entweder eine Liste, die scrollen
-      // will, oder schlicht nichts, was das Blatt tun könnte.
-      .failOffsetY(-SWIPE_ACTIVATE)
+      .activeOffsetY(SWIPE_ACTIVATE * dir)
+      // Zur GEGENSEITE sofort aufgeben: Dort liegt entweder eine Liste, die
+      // scrollen will, oder schlicht nichts, was das Blatt tun könnte. Bei
+      // einem Blatt von oben sind beide Seiten getauscht — es springt auf acht
+      // Punkte nach oben an und gibt nach unten auf.
+      .failOffsetY(-SWIPE_ACTIVATE * dir)
       .failOffsetX([-FAIL_X, FAIL_X])
       .onStart((e) => {
+        active.value = true;
         // Eine laufende Kurve anhalten und von dort weitermachen — sonst reißt
         // das Zupacken das Blatt im ersten Bild an den Ruhepunkt.
         cancelAnimation(y);
@@ -243,8 +371,41 @@ export function useSheetSwipe({
          * Jetzt gilt: Solange das Blatt von seinem Platz weg ist, gehört ihm
          * die Geste — es folgt dem Finger bis zurück an die Ruhelage. Erst wenn
          * es dort liegt UND die Liste scrollt, übernimmt sie.
+         *
+         * ACHTUNG, FÜR EIN BLATT VON OBEN GILT DIESER TORHÜTER NICHT.
+         *
+         * Der Satz oben lässt sich nicht einfach spiegeln, und der Grund ist
+         * eine Asymmetrie im Scrollen selbst: Die Frage lautet immer „kann die
+         * Liste in die gewischte Richtung noch weiter?", und die Antwort steht
+         * an ihrem jeweiligen ANSCHLAG. Bei einem Blatt von unten wischt man
+         * nach unten, der Anschlag dafür ist der ANFANG der Liste — und den
+         * kennt `scrollY` genau, er ist die Null. Bei einem Blatt von oben
+         * wischt man nach oben, und der Anschlag dafür ist das ENDE der Liste.
+         * Das steht nicht im Scroll-Stand; dafür bräuchte es zusätzlich die
+         * Inhalts- und die Sichtfeldhöhe.
+         *
+         * Mit `scrollY > 0.5` beantwortet man dort also die falsche Frage: Eine
+         * Liste, die ganz oben steht, hätte nach unten den ganzen Inhalt vor
+         * sich — und bekäme die Geste trotzdem weggenommen. Wer das braucht,
+         * führt hier `contentSize` und `layoutMeasurement` mit und prüft gegen
+         * das Ende, statt diese Zeile umzudeuten.
+         *
+         * Die eine Aufrufstelle mit `direction: "up"` (die Such-Slide der
+         * Ergebnisliste) übergibt deshalb GAR KEINEN Torhüter: Ihr Formular
+         * passt in das Blatt und scrollt nicht. Läuft es doch einmal gegen den
+         * Deckel, schaltet sie die ganze Geste ab, statt sie zu raten.
+         *
+         * `(y - rest) * dir <= 0.5` ist dabei dieselbe Aussage wie vorher
+         * `y <= rest + 0.5` — „nicht nennenswert vom Platz weg" —, nur in der
+         * gedrehten Achse gemessen.
          */
-        const listOwns = scrollY !== null && y.value <= rest + 0.5 && scrollY.value > 0.5;
+        const listOwns =
+          scrollY !== null &&
+          // Nur wenn der Finger auch auf der Liste liegt — siehe `onList`.
+          onList !== null &&
+          onList.value &&
+          (y.value - rest) * dir <= 0.5 &&
+          scrollY.value > 0.5;
         if (listOwns) {
           // Der Nullpunkt wandert mit, damit das Blatt nicht später um die
           // ganze Scroll-Strecke nachspringt.
@@ -252,8 +413,17 @@ export function useSheetSwipe({
           startY.value = rest;
           return;
         }
-        // Nur nach unten — nach oben hat das Blatt keinen Platz.
-        y.value = Math.max(rest, startY.value + e.translationY - base.value);
+        /**
+         * Nur zur Wisch-Seite — zur Gegenseite hat das Blatt keinen Platz.
+         *
+         * Die Begrenzung ist für ein Blatt von unten eine UNTERgrenze und für
+         * eines von oben eine OBERgrenze. Statt zwei Zweigen wird in die
+         * gedrehte Achse gerechnet, dort begrenzt und zurückgedreht: Für
+         * `dir === 1` steht buchstäblich `Math.max(rest, next)` da, für
+         * `dir === -1` fällt daraus `Math.min(rest, next)`.
+         */
+        const next = startY.value + e.translationY - base.value;
+        y.value = Math.max(rest * dir, next * dir) * dir;
         /**
          * Liste festhalten, solange das Blatt hängt.
          *
@@ -262,15 +432,38 @@ export function useSheetSwipe({
          * zieht das Blatt hinunter, lässt es zurückschnappen, und die Liste
          * steht plötzlich woanders.
          */
-        if (scrollRef !== null && y.value > rest + 0.5 && scrollRef()) {
-          // Der Test auf die Verknüpfung gehört dazu: Nicht jedes Blatt zeigt
-          // immer eine Liste (Ladezustand, leerer Zustand). Ohne ihn schriebe
-          // Reanimated pro Bild eine Warnung.
+        if (
+          scrollRef !== null &&
+          // „Hängt das Blatt gerade?" — in der gedrehten Achse gemessen.
+          (y.value - rest) * dir > 0.5 &&
+          // NUR wenn sie wirklich weggelaufen ist. Vorher ging in JEDEM Bild
+          // eines Zuges ein nativer Scroll-Befehl hinaus, auch wenn die Liste
+          // längst oben stand — Arbeit ohne jede Wirkung, und zwar genau
+          // während der Bewegung.
+          scrollY !== null &&
+          scrollY.value > 0.5 &&
+          // Nicht jedes Blatt zeigt immer eine Liste (Ladezustand, leerer
+          // Zustand). Ohne die Prüfung schriebe Reanimated eine Warnung.
+          scrollRef()
+        ) {
           scrollTo(scrollRef, 0, 0, false);
         }
       })
       .onEnd((e) => {
-        const dy = startY.value - rest + e.translationY - base.value;
+        /**
+         * Gemessen wird der Weg des FINGERS, nicht der Abstand des Blattes zur
+         * Ruhelage.
+         *
+         * Beides ist im Normalfall dasselbe — nicht aber, wenn man ein Blatt
+         * anfasst, das gerade HEREINfährt. Es steht dann weit von seiner
+         * Ruhelage entfernt, und mit dem alten Maß galt schon das bloße
+         * Loslassen als Abwurf: Blatt angetippt, während es kam, und es ging
+         * wieder zu.
+         */
+        // Positiv heißt IMMER „in Wisch-Richtung" — bei einem Blatt von oben
+        // ist das ein negativer Finger-Weg. Die Schwellen darunter bleiben
+        // dadurch dieselben Zahlen für beide Richtungen.
+        const dy = (e.translationY - base.value) * dir;
         /**
          * Der Schwung allein wirft nur ein Blatt ab, das auch WIRKLICH hängt.
          *
@@ -279,8 +472,8 @@ export function useSheetSwipe({
          * bewegt nichts — und läse am Ende trotzdem die Geschwindigkeit des
          * Listen-Wischs als Abwurf.
          */
-        const displaced = y.value > rest + 0.5;
-        if (dy > DISMISS_DISTANCE || (displaced && e.velocityY > DISMISS_VELOCITY)) {
+        const displaced = (y.value - rest) * dir > 0.5;
+        if (dy > DISMISS_DISTANCE || (displaced && e.velocityY * dir > DISMISS_VELOCITY)) {
           if (drive) {
             /**
              * Die Bewegung SOFORT von hier, auf dem UI-Strang.
@@ -291,10 +484,10 @@ export function useSheetSwipe({
              * Wer `drive: false` setzt, MUSS die Ausfahrt anderswo im selben
              * Bild anstoßen; sonst ist genau dieses Stocken wieder da.
              */
-            const dist =
-              (travelSv ? travelSv.value : travelConst) ||
-              Dimensions.get("window").height;
-            y.value = withTiming(dist, SWIPE_OUT);
+            // `travel` ist eine LÄNGE, kein Ziel — das Vorzeichen kommt aus der
+            // Richtung. Ein Blatt von oben fährt nach `-dist` hinaus.
+            const dist = (travelSv ? travelSv.value : travelConst) || WINDOW_H;
+            y.value = withTiming(dist * dir, SWIPE_OUT);
             // Anmelden wie jede andere Fahrt: An `markSheetMoving` hängt der
             // Riegel, der eine GPU-Textur nicht mitten in der Bewegung
             // abreißen lässt.
@@ -312,7 +505,22 @@ export function useSheetSwipe({
        * das Blatt bliebe schief stehen, wo der Finger es gelassen hat.
        */
       .onFinalize((_e, success) => {
-        if (success) return;
+        /**
+         * Den Finger-auf-der-Liste-Merker beim ENDE der Berührung löschen, nicht
+         * erst beim Beginn der nächsten.
+         *
+         * Der native Erkenner der Liste tut das selbst — aber nur, wenn es ihn
+         * beim Loslassen noch gibt. Wird die Liste mitten in einer Berührung
+         * abgebaut (Ladezustand, Datenwechsel), bliebe der Merker auf „ja"
+         * stehen, und die Liste beanspruchte danach jede Geste. Hier ist die
+         * Reihenfolge unkritisch: Die nächste Berührung setzt ihn ohnehin neu,
+         * bevor diese Geste anspringt.
+         */
+        if (onList !== null) onList.value = false;
+        const wasActive = active.value;
+        active.value = false;
+        // Nur was angesprungen ist, gehört auch zurückgeholt — siehe `active`.
+        if (success || !wasActive) return;
         if (y.value !== rest) settleBack(y, rest);
       });
 
@@ -320,12 +528,15 @@ export function useSheetSwipe({
     // andere ab — siehe Kopf der Datei.
     return nativeScroll ? g.simultaneousWithExternalGesture(nativeScroll) : g;
   }, [
+    active,
     base,
     startY,
+    dir,
     drive,
     enabled,
     nativeScroll,
     onDismiss,
+    onList,
     rest,
     scrollRef,
     scrollY,

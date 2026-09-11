@@ -12,9 +12,9 @@ import {
 } from "react-native";
 import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
+  Easing,
   useAnimatedStyle,
   useSharedValue,
-  withSpring,
   withTiming,
 } from "react-native-reanimated";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
@@ -35,6 +35,7 @@ import { useT } from "@/lib/i18n/useT";
 import { MarkerKind, SheetMode, StopListItem } from "@/lib/surroundings/mockData";
 import { useAccent } from "@/lib/theme/accent";
 import { scaledStyles } from "@/lib/ui/compact";
+import { useSheetScrollGate } from "@/lib/ui/sheetSwipe";
 
 const LIME = "#7FEA4D";
 const LIME_SUB = "rgba(127,234,77,0.18)";
@@ -166,9 +167,39 @@ export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props)
     translateY.value = withTiming(snap.peek, SHEET_IN);
   }, []);
 
-  // Pan-Gesture an der Handle-Zone: aktualisiert translateY während Drag,
-  // snapt beim Loslassen auf den nächstgelegenen Punkt.
+  /**
+   * Gezogen wird am GANZEN Blatt, nicht nur am Strich oben.
+   *
+   * Damit ein Tipper auf einen Reiter oder eine Zeile ein Tipper bleibt, springt
+   * der Erkenner erst nach acht Punkten Weg an — bis dahin gehört die Berührung
+   * dem Knopf darunter. Beide Richtungen, denn hier wird hoch UND runter
+   * gezogen. Die Querschranke hält schräge Bewegungen heraus.
+   *
+   * Der Torhüter ist dieselbe Hilfe wie in allen anderen Blättern
+   * (`lib/ui/sheetSwipe.ts`): Die Liste bekommt einen eigenen nativen Erkenner,
+   * beide sind als gleichzeitig angemeldet — sonst bräche das Anspringen der
+   * einen die andere ab —, und der Scroll-Stand entscheidet, wer die Bewegung
+   * zeigt.
+   */
+  const gate = useSheetScrollGate();
   const startY = useSharedValue(0);
+  const base = useSharedValue(0);
+  /**
+   * Hat sich das Blatt in DIESER Geste schon bewegt?
+   *
+   * Damit entscheidet sich, wem die Berührung gehört, und zwar EINMAL pro
+   * Geste statt Bild für Bild: Solange sich nichts bewegt hat, darf die Liste
+   * scrollen; sobald das Blatt einmal gewandert ist, gehört ihm der Rest der
+   * Bewegung. Ohne diesen Merker entschiede allein der Scroll-Stand — und der
+   * kippt genau dann, wenn der Finger wieder nach oben geht: Das Blatt bliebe
+   * mitten im Zug stehen.
+   *
+   * Die anderen Blätter halten stattdessen die Liste fest (`scrollTo`). Das
+   * geht hier nicht, weil das an einen Verweis auf die Liste gebunden ist und
+   * eine `FlatList` daran abstürzt — die Begründung steht bei `ref` in
+   * `useSheetScrollGate`.
+   */
+  const moved = useSharedValue(false);
   /**
    * In `useMemo` — sonst entsteht sie bei jedem Render neu.
    *
@@ -179,15 +210,33 @@ export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props)
    */
   const pan = useMemo(() =>
     Gesture.Pan()
-    .onStart(() => {
+    .activeOffsetY([-8, 8])
+    .simultaneousWithExternalGesture(gate.native)
+    .onStart((e) => {
       startY.value = translateY.value;
+      base.value = e.translationY;
+      moved.value = false;
     })
     .onUpdate((e) => {
-      const next = startY.value + e.translationY;
+      // `gate.onList`: Nur eine Berührung, die AUF der Liste liegt, darf sie
+      // beanspruchen. Ohne das sperrte eine gescrollte Liste das ganze Blatt —
+      // auch das Ziehen am Griff oder an den Reitern. Das war das „lässt sich
+      // manchmal nicht aufziehen, bis man die Kategorie wechselt".
+      if (!moved.value && gate.onList.value && gate.scrollY.value > 0.5) {
+        // Die Liste scrollt noch — das Blatt bleibt stehen, der Nullpunkt geht
+        // mit. Ohne das Mitwandern spränge es um die ganze Scroll-Strecke,
+        // sobald die Liste oben ankommt.
+        startY.value = translateY.value;
+        base.value = e.translationY;
+        return;
+      }
+      const next = startY.value + (e.translationY - base.value);
       translateY.value = Math.max(snap.full, Math.min(snap.peek, next));
+      // Ab der ersten echten Bewegung gehört die Geste dem Blatt — siehe `moved`.
+      if (Math.abs(translateY.value - startY.value) > 0.5) moved.value = true;
     })
     .onEnd((e) => {
-      const final = startY.value + e.translationY;
+      const final = startY.value + (e.translationY - base.value);
       const points = [snap.full, snap.mid, snap.peek];
       let closest = points[0];
       let bestDist = Infinity;
@@ -198,16 +247,42 @@ export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props)
           closest = p;
         }
       }
-      // Flick: starke Vertikal-Geschwindigkeit überschreibt die nächste-Snap-Wahl
-      if (e.velocityY < -800) closest = snap.full;
-      else if (e.velocityY > 800) closest = snap.peek;
-      translateY.value = withSpring(closest, { damping: 22, stiffness: 220, mass: 0.8 });
+      /**
+       * Der Schwung zählt nur für ein Blatt, das sich auch bewegt hat.
+       *
+       * Sonst risse ein kräftiger Wisch IN der Liste das Blatt auf oder zu: Der
+       * Erkenner läuft dabei mit, bewegt nichts — und läse am Ende trotzdem die
+       * Geschwindigkeit des Listen-Wischs.
+       */
+      if (moved.value && e.velocityY < -800) closest = snap.full;
+      else if (moved.value && e.velocityY > 800) closest = snap.peek;
+      /**
+       * Zeitkurve statt Feder — wie im Haltestellen-Blatt daneben.
+       *
+       * Die Feder hier hatte einen Dämpfungsgrad von rund 0,68 und schwang
+       * damit um gut 5% über. Am obersten Rastpunkt heißt das: Das Blatt fährt
+       * über seine Oberkante hinaus, und unten blitzt für ein paar Bilder die
+       * Karte durch. Am Griff allein fiel das kaum auf; auf der ganzen Fläche
+       * zieht man deutlich häufiger.
+       */
+      translateY.value = withTiming(closest, { duration: 180, easing: Easing.out(Easing.quad) });
+    })
+    /**
+     * Merker „Finger liegt auf der Liste" beim Ende der Berührung löschen.
+     *
+     * Der native Erkenner der Liste tut das selbst — aber nur, wenn es ihn beim
+     * Loslassen noch gibt. Wird sie mitten in einer Berührung abgebaut, bliebe
+     * er stehen und die Liste beanspruchte danach jede Geste.
+     */
+    .onFinalize(() => {
+      gate.onList.value = false;
     }),
-  [snap, startY, translateY]);
+  [snap, startY, base, moved, translateY, gate]);
 
   const title = t(TITLE_KEY[mode]);
 
   return (
+    <GestureDetector gesture={pan}>
     <Animated.View
       style={[
         styles.sheet,
@@ -216,11 +291,11 @@ export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props)
         sheetAnim,
       ]}
     >
-      <GestureDetector gesture={pan}>
-        <View style={styles.handleZone}>
-          <View style={styles.handle} />
-        </View>
-      </GestureDetector>
+      {/* Nur noch Zeichen, nicht mehr Griff: Gezogen wird überall. Der Strich
+          bleibt, weil er ansagt, DASS gezogen werden kann. */}
+      <View style={styles.handleZone}>
+        <View style={styles.handle} />
+      </View>
 
       <View style={styles.tabRow}>
         {MODE_TABS.map(({ mode: tabMode, tKey, Icon }) => {
@@ -259,13 +334,21 @@ export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props)
       </View>
 
       <SelectStopContext.Provider value={onSelectStop}>
-      <FlatList
+      {/* Eigener nativer Erkenner um die Liste — sonst würgt das Ziehen am
+          Blatt jedes Scrollen ab. */}
+      <GestureDetector gesture={gate.native}>
+      <Animated.FlatList
         style={styles.scroll}
         data={items}
         keyExtractor={keyExtractor}
         renderItem={renderStopRow}
         contentContainerStyle={{ paddingBottom: snap.tabBarSpace + 40 }}
         showsVerticalScrollIndicator={false}
+        onScroll={gate.onScroll}
+        scrollEventThrottle={16}
+        // Kein Überzieh-Schimmer oben: Dort übernimmt ab sofort das Blatt.
+        overScrollMode="never"
+        bounces={false}
         // Performance: nur die sichtbaren Rows rendern statt alle 60 auf einmal.
         windowSize={5}
         maxToRenderPerBatch={8}
@@ -277,8 +360,10 @@ export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props)
           </Text>
         }
       />
+      </GestureDetector>
       </SelectStopContext.Provider>
     </Animated.View>
+    </GestureDetector>
   );
 }
 

@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { runSearch } from "../services/searchService.js";
 import { ipLimiter, rateLimit } from "../util/rateLimit.js";
+import { evaluateAlerts } from "../services/priceAlerts.js";
 import type { TravelMode } from "../db/schema.js";
 
 // Per-IP-Budget der Suche. Zwei Fenster: das Minutenfenster gegen Bursts, das
@@ -32,7 +33,12 @@ const querySchema = z.object({
   departTime: z.string().max(40).optional(),
   returnDate: z.string().max(40).optional(),
   passengers: z.coerce.number().int().min(1).max(9).default(1),
-  currency: z.string().max(8).default("EUR"),
+  // Groß geschrieben — die Alarm-Auswertung vergleicht die Währung zeichengenau.
+  currency: z
+    .string()
+    .max(8)
+    .default("EUR")
+    .transform((v) => v.trim().toUpperCase()),
   /** i18n-Key (z.B. "search.class.business"). Provider entscheiden selbst,
    *  ob/wie sie das umsetzen — wir reichen den Wert nur durch. */
   travelClass: z.string().max(60).optional(),
@@ -81,6 +87,41 @@ export async function searchRoutes(app: FastifyInstance) {
         // Spread würde das Feld stillschweigend verschlucken.
         allowNearby: parsed.data.nearby === true,
       });
+      /**
+       * Preis-Alarme im NACHLAUF prüfen — bewusst ohne `await`.
+       *
+       * Hier hängt die ganze Alarm-Funktion, und sie hängt genau hier, weil an
+       * dieser Stelle eine frische Trefferliste für eine Strecke vorliegt, für
+       * die gerade jemand bezahlt hat (oder die aus dem Cache kam). Ein eigener
+       * Lauf, der Alarme abarbeitet und dafür die Anbieter befragt, wäre der
+       * naheliegende Weg und der falsche: Das Kontingent bei db-vendo liegt bei
+       * rund 60 Anfragen pro Minute und gehört der SUCHE. So kostet die Prüfung
+       * die Anbieter nichts — es bleibt ein indizierter Nachschlag.
+       *
+       * NICHT abgewartet, und das ist kein Schludern: Der Suchende hat mit
+       * fremden Alarmen nichts zu tun, und seine Antwort darf nicht auf einen
+       * Push-Dienst warten. `evaluateAlerts` wirft nie (es fängt intern alles
+       * ab), es kann hier also keine unbehandelte Ablehnung entstehen.
+       *
+       * Auch bei einer Antwort aus dem Cache: Der Preis darin ist gültig, und
+       * der Server hält ihn über seine eigene Auffrischung frisch.
+       */
+      void evaluateAlerts(
+        {
+          mode,
+          origin: parsed.data.origin,
+          destination: parsed.data.destination,
+          departDate: parsed.data.departDate,
+          returnDate: parsed.data.returnDate,
+          // Die Währung der Suche — ohne sie verglich der Server Beträge in
+          // verschiedenen Währungen als wären es dieselben.
+          currency: parsed.data.currency,
+          // Und Reisende plus Klasse: Der Preis ist der Gesamtpreis der Gruppe.
+          passengers: parsed.data.passengers,
+          travelClass: parsed.data.travelClass ?? "",
+        },
+        result.results,
+      );
       return result;
     });
   }

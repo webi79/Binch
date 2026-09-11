@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import {
   View,
@@ -216,14 +216,23 @@ function AddTicketSheet({
    * diese Funktion, läge zwischen Loslassen und Losfahren ein Sprung auf den
    * JS-Strang — ein Bild, das man bei einer Wisch-Geste spürt.
    */
-  const scheduleClose = useCallback(
-    (afterMs: number) => {
-      if (closingRef.current) return;
-      closingRef.current = true;
-      closeTimer.current = setTimeout(onClose, afterMs);
-    },
-    [onClose],
-  );
+  /**
+   * Die Kennung dieser Funktion muss FEST sein.
+   *
+   * An ihr hängen `requestClose`, der Effekt, der die Zurück-Taste hinterlegt,
+   * und die Wisch-Geste. Hing sie am Rückruf von außen, genügte ein Aufrufer,
+   * der ihn als Pfeilfunktion hineinschreibt (`onClose={() => ...}`), damit bei
+   * JEDEM Durchgang des Bildschirms darüber alle drei neu entstehen — die Geste
+   * also mitten im Blatt neu eingerichtet wird. Der Rückruf kommt deshalb aus
+   * einem Merker, der still nachgeführt wird.
+   */
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const scheduleClose = useCallback((afterMs: number) => {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    closeTimer.current = setTimeout(() => onCloseRef.current(), afterMs);
+  }, []);
 
   /** Antippen: hinausfahren und danach abmelden. */
   const requestClose = useCallback(() => {

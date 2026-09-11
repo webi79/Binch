@@ -61,6 +61,21 @@ module.exports = {
       edgeToEdgeEnabled: true,
       predictiveBackGestureEnabled: false,
       package: "com.binch.mobile",
+      /**
+       * Die Firebase-Konfiguration des Android-Clients.
+       *
+       * Ohne sie kann sich das Gerät nicht bei Firebase registrieren, und die
+       * Anfrage nach einer Push-Kennung scheitert — genau daran hingen die
+       * Preis-Alarme. Sie enthält KEIN Geheimnis: Dieselben Werte stecken in
+       * jeder ausgelieferten APK und sind für jeden auslesbar. Der Schlüssel,
+       * mit dem tatsächlich VERSCHICKT wird, ist ein anderer und liegt
+       * ausschließlich auf dem Server (siehe `server/.env`).
+       *
+       * Deshalb wird sie auch mitversioniert: Ein Build aus dem Git-Stand
+       * (EAS) käme sonst wieder ohne Zustellweg heraus — der Ordner `android`
+       * ist bewusst nicht versioniert.
+       */
+      googleServicesFile: "./google-services.json",
     },
     web: {
       favicon: "./assets/favicon.png",
@@ -109,6 +124,20 @@ module.exports = {
        */
       "expo-audio",
       "./plugins/withDisplayRatePin",
+      /**
+       * Meldungen aufs Gerät — für die Preis-Alarme.
+       *
+       * Als Plugin und nicht von Hand am Android-Projekt: Der Ordner `android`
+       * ist bewusst nicht versioniert (CNG), jede Handarbeit darin wäre beim
+       * nächsten Neubau weg. Das Plugin trägt Berechtigung, Dienst und
+       * Empfänger selbst ein.
+       *
+       * KEIN eigenes Symbol und keine Farbe gesetzt: Beides wären Angaben, die
+       * eine Grafik voraussetzen, die es im Projekt nicht gibt — Android nähme
+       * dann eine leere Fläche. Ohne Angabe nimmt es das App-Symbol, und das
+       * ist bis auf Weiteres das Richtige.
+       */
+      "expo-notifications",
       "@react-native-community/datetimepicker",
       [
         "expo-location",

@@ -178,14 +178,23 @@ function Sheet({
    * diese Funktion, läge zwischen Loslassen und Losfahren ein Sprung auf den
    * JS-Strang — ein Bild, das man bei einer Wisch-Geste spürt.
    */
-  const scheduleClose = useCallback(
-    (afterMs: number) => {
-      if (closingRef.current) return;
-      closingRef.current = true;
-      closeTimer.current = setTimeout(onClose, afterMs);
-    },
-    [onClose],
-  );
+  /**
+   * Die Kennung dieser Funktion muss FEST sein.
+   *
+   * An ihr hängen `requestClose`, der Effekt, der die Zurück-Taste hinterlegt,
+   * und die Wisch-Geste. Hing sie am Rückruf von außen, genügte ein Aufrufer,
+   * der ihn als Pfeilfunktion hineinschreibt (`onClose={() => ...}`), damit bei
+   * JEDEM Durchgang des Bildschirms darüber alle drei neu entstehen — die Geste
+   * also mitten im Blatt neu eingerichtet wird. Der Rückruf kommt deshalb aus
+   * einem Merker, der still nachgeführt wird.
+   */
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const scheduleClose = useCallback((afterMs: number) => {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    closeTimer.current = setTimeout(() => onCloseRef.current(), afterMs);
+  }, []);
 
   /** Antippen: hinausfahren und danach abmelden. */
   const requestClose = useCallback(() => {
@@ -262,6 +271,23 @@ function Sheet({
  * dreht ihre Maße selbst durch `scaledStyles`, und ein hier schon skaliertes
  * Objekt bekäme den Faktor dort ein zweites Mal.
  */
+/**
+ * Der seitliche Abstand des Blattinhalts — EXPORTIERT, nicht eingemauert.
+ *
+ * Ein Blatt, das seinen Inhalt selbst vermessen muss, kann das erst NACH dem
+ * ersten Layout. Unter Android macht `Modal` dafür ein eigenes Fenster auf, und
+ * dessen erstes Layout kommt nicht im nächsten Bild, sondern spürbar später.
+ * Wer in dieser Lücke etwas zeichnet, das von der Breite abhängt, zeichnet es
+ * falsch — beim Preis-Regler standen Füllung und Griff sichtbar auseinander,
+ * bis die Messung eintraf.
+ *
+ * Mit dieser Zahl lässt sich die Breite VORHER ausrechnen (Fensterbreite minus
+ * zweimal diesen Abstand) und das erste Bild ist schon richtig. Sie muss
+ * deshalb an einer Stelle stehen und nicht zweimal: Eine Kopie, die
+ * auseinanderläuft, verschöbe den Regler um genau die Differenz.
+ */
+export const SHEET_PAD_H = 20;
+
 export const SHEET_TITLE: TextStyle = {
   fontSize: 24,
   fontWeight: "600",
@@ -283,7 +309,7 @@ const styles = scaledStyles({
   sheet: {
     borderTopLeftRadius: 28,
     borderTopRightRadius: 28,
-    paddingHorizontal: 20,
+    paddingHorizontal: SHEET_PAD_H,
     /**
      * Höher als das Fenster darf es nicht werden.
      *

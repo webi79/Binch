@@ -977,6 +977,14 @@ let homeScrollY = 0;
 function Header() {
   const accent = useAccent();
   const palette = usePalette();
+  /**
+   * Nur die ENTSCHEIDUNG lesen, nicht die Zahl.
+   *
+   * Der Vergleich steht im Selektor, damit der Kopf nur dann neu zeichnet, wenn
+   * sich „es liegt etwas an" ändert — und nicht bei jeder weiteren Meldung, die
+   * den Zähler bloß hochsetzt.
+   */
+  const hasNews = useSearchStore((st) => st.notificationsBadge > 0);
   return (
     <View style={styles.headerRow}>
       <ScreenHeading>
@@ -1004,11 +1012,59 @@ function Header() {
         }}
       >
         <Bell size={19} color={C.white} />
-        <View style={styles.bellDot} />
+        {/**
+          * Der Punkt erscheint NUR, wenn etwas anliegt.
+          *
+          * Vorher hing er fest an der Glocke — ein Hinweis, der immer da ist,
+          * ist kein Hinweis, sondern Dekoration. Und er war grün, während
+          * derselbe Punkt am Reiter „Gespeichert" rot ist; zwei Farben für
+          * dasselbe Signal lassen den Nutzer nach einem Unterschied suchen, den
+          * es nicht gibt.
+          *
+          * ZWEI Knoten, genau wie in der Navigationsleiste: Darunter liegt ein
+          * größerer Kreis in der Farbe der Glocken-Fläche. Er überdeckt den
+          * Punkt nicht, er liegt DARUNTER — sichtbar ist von ihm nur der Ring,
+          * der ringsum hervorschaut, und der schneidet die Glocke an dieser
+          * Stelle sauber weg. Ein Rand am Punkt selbst täte optisch dasselbe,
+          * liefe aber bei einem Themenwechsel auseinander, weil er die Farbe
+          * doppelt führt.
+          */}
+        {hasNews ? (
+          <>
+            <View style={[styles.bellRing, { backgroundColor: palette.s2 }]} />
+            <View style={styles.bellDot} />
+          </>
+        ) : null}
       </RippleTouch>
     </View>
   );
 }
+
+/**
+ * Der Meldungs-Punkt an der Glocke — Maße wie am Reiter „Gespeichert".
+ *
+ * `BELL_DOT_TOP`/`BELL_DOT_RIGHT` sind die MITTE des Punktes, gemessen von der
+ * oberen rechten Ecke des Glocken-Knopfes.
+ */
+const BELL_DOT = 9;
+const BELL_RING = BELL_DOT + 6;
+const BELL_GLYPH = 19;
+/**
+ * Die Lage ist NACHGERECHNET, nicht abgeschätzt.
+ *
+ * Die Navigationsleiste setzt ihren Punkt auf die Oberkante des Symbol-Kastens
+ * und zieht ihn dann fünfzehn Prozent in Richtung Symbolmitte hinein
+ * (`BADGE_PULL_IN`). Bei ihrem Kasten landet die Mitte damit auf rund elf
+ * Prozent der Symbolgröße unterhalb der Oberkante. Auf unsere 19 Punkte große
+ * Glocke übertragen sind das gut zwei Punkte — und weil die Glocke mittig in
+ * einem 44er Knopf sitzt, kommen deren 12,5 Punkte Rand dazu.
+ *
+ * Das Ergebnis liegt fast genau dort, wo der alte grüne Punkt saß (13/14); er
+ * springt beim Wechsel also nicht, er wird nur rot, größer und bekommt eine
+ * echte Aussparung statt eines Randes.
+ */
+const BELL_DOT_TOP = (BELL_SIZE - BELL_GLYPH) / 2 + Math.round(BELL_GLYPH * 0.11);
+const BELL_DOT_RIGHT = (BELL_SIZE - BELL_GLYPH) / 2 + Math.round(BELL_GLYPH * 0.11);
 
 /** Press-Feedback der Kategorie-Kacheln (HyperOS-Gefühl): beim Antippen leicht
  *  zusammendrücken. Interaktive Elemente brauchen sofortige Rückmeldung → hohe
@@ -2567,16 +2623,31 @@ const styles = scaledStyles({
     alignItems: "center",
     justifyContent: "center",
   },
+  /**
+   * Punkt und Ring — dieselben Maße und dieselbe Farbe wie am Reiter
+   * „Gespeichert" (`BinchTabBar`): neun Punkte Durchmesser, `#FF3B5C`, und drei
+   * Punkt Luft ringsum als Aussparung.
+   *
+   * Die Lage ist die obere rechte Rundung der Glocke, nicht der Rand des
+   * Knopfes: Der Punkt soll auf dem Symbol liegen und ein Stück davon
+   * wegnehmen — genau so sitzt er auch auf dem Reiter-Symbol.
+   */
+  bellRing: {
+    position: "absolute",
+    top: BELL_DOT_TOP - BELL_RING / 2,
+    right: BELL_DOT_RIGHT - BELL_RING / 2,
+    width: BELL_RING,
+    height: BELL_RING,
+    borderRadius: BELL_RING / 2,
+  },
   bellDot: {
     position: "absolute",
-    top: 9,
-    right: 10,
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: "#B6F44A",
-    borderWidth: 2,
-    borderColor: C.surface2,
+    top: BELL_DOT_TOP - BELL_DOT / 2,
+    right: BELL_DOT_RIGHT - BELL_DOT / 2,
+    width: BELL_DOT,
+    height: BELL_DOT,
+    borderRadius: BELL_DOT / 2,
+    backgroundColor: "#FF3B5C",
   },
 
   // SearchBar spacing

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode, useMemo } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode, useMemo } from "react";
 import {
   StyleSheet,
   View,
@@ -261,6 +261,39 @@ export function SearchHeroOverlay() {
   const finishRafRef = useRef<number | null>(null);
   /** Der aufgeschobene Teil desselben Aufräumens — muss mit abbrechbar sein. */
   const finishTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * Welche Ausfahrt gerade gilt — als Zahl auf dem JS-Strang UND als geteilter
+   * Wert daneben.
+   *
+   * Zwei Werte für eine Zahl, und beides ist nötig: Hochgezählt wird auf dem
+   * JS-Strang (dort startet das Schließen), gelesen wird im Abschluss-Worklet
+   * der Kurve. Ein `useRef` allein taugt dort nicht — ein Worklet fängt seine
+   * Umgebung beim Anlegen ein, `ref.current` wäre darin für immer der Stand von
+   * damals. Und den geteilten Wert von JS aus zu LESEN ist im Projekt an zwei
+   * Stellen wörtlich verboten (ein synchroner Sprung in die UI-Laufzeit, der
+   * beide Stränge gegeneinander sperrt) — deshalb wird er nur geschrieben.
+   *
+   * Dieselbe Aufteilung wie in `lib/nav/sheetSlide.ts` und in `overlayCover.ts`.
+   */
+  const closeGenRef = useRef(0);
+  const closeGen = useSharedValue(0);
+  /**
+   * Die laufende Ausfahrt für ungültig erklären.
+   *
+   * Aufgerufen von JEDEM, der `searchHeroPush` anfasst — also auch vom Öffnen
+   * und von den beiden Sofort-Schließungen. Ohne das wäre die Umstellung von
+   * `finished` auf eine Nummer eine Verschlimmbesserung: Wer innerhalb der
+   * Ausfahrt wieder öffnet, bricht die Kurve ab, ihr Rückruf liefe mit
+   * unveränderter Nummer durch — und `finishClose` räumte den Inhalt ab, den
+   * die Einfahrt gerade sichtbar macht. Genau davor schützte das `finished`.
+   *
+   * Die Nummer trennt beides sauber: Abgeschlossen wird bei Abbruch, aber nur,
+   * solange niemand anderes das Ruder übernommen hat.
+   */
+  const invalidateClose = useCallback(() => {
+    closeGenRef.current += 1;
+    closeGen.value = closeGenRef.current;
+  }, [closeGen]);
 
   /** 0 = Content unsichtbar (Splash deckt), 1 = Content sichtbar. Harter
    *  Schalter, KEIN Fade — der Wechsel passiert, während der Splash vollflächig
@@ -583,6 +616,9 @@ export function SearchHeroOverlay() {
        * auf Fortschritt 0, steht also vollständig rechts neben dem Bild.
        */
       overlayVisible.value = 1;
+      // Eine noch laufende Ausfahrt gilt ab hier nicht mehr — siehe
+      // `invalidateClose`.
+      invalidateClose();
       // Zuerst zurücksetzen (Screen ist noch unsichtbar), dann öffnen.
       setResetTick((n) => n + 1);
       setActive({ mode, session, rect: rect ?? FULLSCREEN });
@@ -609,6 +645,9 @@ export function SearchHeroOverlay() {
         // Beschnitt zurücksetzen, sonst bliebe dieser Screen beim nächsten Öffnen
         // seitlich verschoben stehen.
         heroClipPush.value = 0;
+        // Dieser Zweig räumt selbst auf — ein Rückruf der abgebrochenen Kurve
+        // hätte hier nichts mehr zu tun.
+        invalidateClose();
         searchHeroPush.value = 0;
         endSearchHeroPush();
         overlayVisible.value = 0;
@@ -653,9 +692,32 @@ export function SearchHeroOverlay() {
          */
         endSearchHeroPush();
         markSheetMoving(SLIDE_OUT.duration);
+        /**
+         * Welche Ausfahrt gerade gilt — statt `finished`.
+         *
+         * An diesem Rückruf hing ALLES, was das Schließen abschließt, und er
+         * lief nur, wenn die Kurve durchläuft. Wer innerhalb der 380ms wieder
+         * öffnet, bricht sie ab — und dann blieben zwei Schlüssel in der
+         * Bewegungs-Menge stehen UND `finishClose` lief nie. An dem hängt
+         * `hideSearchContent()`: Der Inhalt des Such-Blattes bleibt sonst für
+         * den Rest des App-Laufs im Baum, samt dem bildschirmfüllenden Dünen-SVG.
+         *
+         * Was das kostet, steht in `BinchHero.tsx` wörtlich und im Release
+         * nachgemessen: Bei geschlossener Suche mit einmal gezeichnetem SVG
+         * laggte der Scroll des Landingscreens DAUERHAFT. Und der Landingscreen
+         * ist die Fläche, die beim Öffnen der Ergebnisse als Parallax mitfährt —
+         * genau das, was gemeldet wurde.
+         *
+         * Der zweite Zweig unten (Notausgang) fängt den Fall bis heute nicht ab:
+         * Er prüft `active`, und `active` nullt ebenfalls nur `finishClose`.
+         */
+        invalidateClose();
+        const myCloseGen = closeGenRef.current;
         requestAnimationFrame(() => {
-        searchHeroPush.value = withTiming(0, SLIDE_OUT, (finished) => {
-          if (finished) {
+        searchHeroPush.value = withTiming(0, SLIDE_OUT, () => {
+          // Abgeschlossen wird IMMER, außer eine NEUERE Bewegung hat inzwischen
+          // begonnen — die räumt dann selbst auf.
+          if (closeGen.value === myCloseGen) {
             overlayVisible.value = 0;
             /**
              * Nur das Nötigste im Abschluss-Bild — der Rest zwei Bilder später.
@@ -710,6 +772,8 @@ export function SearchHeroOverlay() {
        * siehe die Warnungen in `overlayCover.ts`.
        */
       heroClipPush.value = 0;
+      // Auch hier: die abgebrochene Ausfahrt gilt nicht mehr.
+      invalidateClose();
       searchHeroPush.value = 0;
       endSearchHeroPush();
       overlayVisible.value = 0;
@@ -1079,6 +1143,19 @@ export function SearchHeroOverlay() {
           entranceTrigger={entranceTick}
           bgTrigger={bgTick}
           resetTrigger={resetTick}
+          /**
+           * Nur das OFFENE Formular darf ein Wähler-Ergebnis übernehmen.
+           *
+           * Seit die Ergebnisliste ihre eigene Such-Slide trägt, sind zwei
+           * Formulare gemountet, und Ort- wie Datumswähler antworten beiden
+           * über denselben globalen Zustand. Ohne diese Zeile stünde der Ort,
+           * den jemand in der Slide über den Ergebnissen wählt, anschließend
+           * auch hier — und beim nächsten Öffnen der Suche fände er ein
+           * Formular vor, das er nie ausgefüllt hat. `active` ist genau die
+           * Angabe, ob dieses Blatt offen ist; sie steuert eine Zeile darüber
+           * schon die Berührungen.
+           */
+          active={active !== null}
         />
       </Animated.View>
 

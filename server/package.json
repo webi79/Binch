@@ -17,7 +17,7 @@
     "db:migrate": "tsx --env-file=.env src/db/migrate.ts",
     "db:seed": "tsx --env-file=.env src/db/seed.ts && tsx --env-file=.env scripts/backfill-static-coords.ts",
     "db:studio": "drizzle-kit studio",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc --noEmit -p tsconfig.scripts.json",
     "build:marker-icons": "node scripts/build-marker-icons.mjs",
     "build:airports": "curl -sSL -o /tmp/airports.csv https://davidmegginson.github.io/ourairports-data/airports.csv && node scripts/build-airports.mjs",
     "migrate:gtfs-prefix": "tsx --env-file=.env scripts/migrate-gtfs-prefix.ts",
@@ -64,7 +64,14 @@
     "import:gtfs:be-delijn": "curl -L --fail -o /tmp/gtfs-be-delijn.zip https://gtfs.irail.be/de-lijn/de_lijn-gtfs.zip && rm -rf /tmp/gtfs-be-delijn && unzip -o /tmp/gtfs-be-delijn.zip -d /tmp/gtfs-be-delijn && GTFS_DIR=/tmp/gtfs-be-delijn GTFS_COUNTRY=Belgium GTFS_CODE_PREFIX=gtfs:be:dl: tsx --env-file=.env scripts/import-gtfs.ts",
     "import:gtfs:be-tec": "curl -L --fail -o /tmp/gtfs-be-tec.zip https://gtfs.irail.be/tec/tec-gtfs.zip && rm -rf /tmp/gtfs-be-tec && unzip -o /tmp/gtfs-be-tec.zip -d /tmp/gtfs-be-tec && GTFS_DIR=/tmp/gtfs-be-tec GTFS_COUNTRY=Belgium GTFS_CODE_PREFIX=gtfs:be:tec: tsx --env-file=.env scripts/import-gtfs.ts",
     "import:gtfs:be:all": "npm run import:gtfs:be && npm run import:gtfs:be-delijn && npm run import:gtfs:be-tec",
-    "import:gtfs:all": "npm run import:gtfs:de:all && npm run import:gtfs:at && npm run import:gtfs:fr && npm run import:gtfs:nl && npm run import:gtfs:ch && npm run import:gtfs:cz && npm run import:gtfs:pl && npm run import:gtfs:be:all"
+    "import:gtfs:all": "npm run import:gtfs:de:all && npm run import:gtfs:at && npm run import:gtfs:fr && npm run import:gtfs:nl && npm run import:gtfs:ch && npm run import:gtfs:cz && npm run import:gtfs:pl && npm run import:gtfs:be:all",
+    "alerts:test-push": "tsx --env-file=.env scripts/test-push.ts",
+    "alerts:status": "tsx --env-file=.env scripts/alerts-status.ts",
+    "alerts:selftest": "tsx --env-file=.env scripts/alerts-selftest.ts",
+    "alerts:copy-check": "tsx --env-file=.env scripts/alerts-copy-check.ts",
+    "alerts:diagnose": "tsx --env-file=.env scripts/alerts-diagnose.ts",
+    "alerts:inspect": "tsx --env-file=.env scripts/alerts-inspect.ts",
+    "alerts:probe": "tsx --env-file=.env scripts/alerts-probe.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.100.1",
@@ -75,6 +82,7 @@
     "date-fns-tz": "^3.2.0",
     "drizzle-orm": "^0.36.4",
     "fastify": "^5.1.0",
+    "firebase-admin": "^13.10.0",
     "hafas-client": "^6.3.6",
     "jose": "^6.2.8",
     "pdfjs-dist": "^5.6.205",

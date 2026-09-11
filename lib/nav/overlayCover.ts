@@ -201,6 +201,36 @@ export const SCREEN_CORNER_RADIUS =
  * gerade hereinfährt, unsichtbar außerhalb des Bildes.
  */
 let pushGen = 0;
+
+/**
+ * Derselbe Zähler als geteilter Wert — geschrieben auf dem JS-Strang, gelesen
+ * ausschließlich im Abschluss-Worklet der Einfahrt. Ein Modul-`let` ist von dort
+ * aus nicht sichtbar.
+ */
+const pushGenSv = makeMutable(0);
+
+/**
+ * Dieselben Zähler für Detail- und Ticket-Blatt.
+ *
+ * Beide trugen wortgleich denselben Fehler wie die Einfahrt der Ergebnisliste:
+ * Sie melden ihren Schlüssel als „fährt gerade" an und gaben ihn nur zurück,
+ * wenn die Kurve DURCHLÄUFT. Beide Blätter schreiben ihre Rückfahrt aber selbst
+ * auf denselben Wert (`DetailsOverlay`, `TicketDetailOverlay`) — wer während der
+ * Einfahrt zurückgeht, bricht die Kurve ab, der Rückruf meldet sich mit
+ * `finished === false` und stieg wortlos aus.
+ *
+ * Und anders als bei den Blättern von unten gibt es hier keinen zweiten
+ * Ausgang: „details" und „ticket" werden in der gesamten Codebasis an je genau
+ * einer Stelle gesetzt und an je genau einer ausgetragen. Bleibt der Schlüssel
+ * stehen, ist `isSheetMoving()` für den REST DES APP-LAUFS wahr — und daran
+ * hängen die Freigabe der bildschirmfüllenden Texturen (jede Freigabe wird dann
+ * um 1,4s aufgeschoben) und die Ebene über dem Such-Blatt, die dadurch dauerhaft
+ * klebt.
+ */
+const detailsGenSv = makeMutable(0);
+let detailsGen = 0;
+const ticketGenSv = makeMutable(0);
+let ticketGen = 0;
 let lastPushAt = 0;
 
 export function pushGeneration(): number {
@@ -291,11 +321,31 @@ export function startResultsPush(): void {
    */
   setSheetMoving(true, "results");
   pushGen += 1;
+  /**
+   * Welche Fahrt gerade gilt — als geteilter Wert, damit das Worklet unten sie
+   * lesen kann.
+   *
+   * Hier stand `if (!finished) return;`, und das ist genau der Fehler, der in
+   * `lib/nav/sheetSlide.ts` schon einmal gefunden und dort mit derselben Nummer
+   * behoben wurde. Er ist erreichbar: Wer während der 430ms langen Einfahrt
+   * zurückgeht, bricht diese Kurve ab (die Rückfahrt schreibt denselben Wert) —
+   * der Rückruf meldet sich mit `finished === false` und stieg wortlos aus. Der
+   * Schlüssel „results" blieb damit für den REST DES APP-LAUFS in der Menge
+   * stehen, und `isSheetMoving()` ist von da an dauerhaft wahr. Daran hängen die
+   * Freigabe der bildschirmfüllenden Texturen und zwei weitere Regeln in
+   * `searchHandoff.ts`.
+   *
+   * Die Nummer trennt die beiden Abbruch-Gründe: Abgeräumt wird IMMER, außer
+   * wenn inzwischen eine NEUERE Fahrt losgelaufen ist — die hat den Schlüssel
+   * gerade selbst gesetzt und braucht ihn noch.
+   */
+  const myGen = pushGen;
+  pushGenSv.value = myGen;
   lastPushAt = Date.now();
   resultsPush.value = 0;
-  resultsPush.value = withTiming(1, PUSH_SPRING, (finished) => {
+  resultsPush.value = withTiming(1, PUSH_SPRING, () => {
     "worklet";
-    if (!finished) return;
+    if (pushGenSv.value !== myGen) return;
     runOnJS(setSheetMoving)(false, "results");
   });
   // Beide Bewegungen im SELBEN Aufruf starten.
@@ -718,9 +768,12 @@ export function startTicketPush(): void {
   setSheetMoving(true, "ticket");
   markTransitionBusy(PUSH_SPRING.duration);
   ticketMoving = true;
-  ticketPush.value = withTiming(1, PUSH_SPRING, (finished) => {
+  ticketGen += 1;
+  const myGen = ticketGen;
+  ticketGenSv.value = myGen;
+  ticketPush.value = withTiming(1, PUSH_SPRING, () => {
     "worklet";
-    if (!finished) return;
+    if (ticketGenSv.value !== myGen) return;
     runOnJS(setSheetMoving)(false, "ticket");
   });
   overlayCover.value = withTiming(1, COVER_IN_SPRING);
@@ -729,6 +782,17 @@ export function startTicketPush(): void {
 export function endTicketPush(): void {
   markTransitionBusy(POP_SPRING.duration);
   ticketMoving = false;
+  /**
+   * Den Schlüssel MIT austragen — das fehlte hier ganz.
+   *
+   * `endSearchHeroPush` und `searchHeroSettled` tun es für ihre Schlüssel
+   * längst; dieses Gegenstück hat es nie getan. Zusammen mit dem Rückruf oben,
+   * der bei einer abgebrochenen Kurve ausstieg, gab es damit gar keinen Weg,
+   * auf dem „ticket" wieder verschwindet, sobald die Einfahrt einmal
+   * unterbrochen wurde. Doppelt auszutragen ist harmlos: Es ist eine Menge, und
+   * ein Schlüssel, der nicht darin liegt, wird beim Entfernen ignoriert.
+   */
+  setSheetMoving(false, "ticket");
 }
 
 /**
@@ -768,9 +832,14 @@ export function startDetailsPush(): void {
   // erneut auf eine Karte tippt, soll von dort aus weiterfahren statt erst nach
   // rechts aus dem Bild zu springen. Der Wurf war zusätzlich ein eigener
   // Auftrag an den UI-Strang, also ein Zustellvorgang mehr im heikelsten Moment.
-  detailsPush.value = withTiming(1, PUSH_SPRING, (finished) => {
+  detailsGen += 1;
+  const myGen = detailsGen;
+  detailsGenSv.value = myGen;
+  detailsPush.value = withTiming(1, PUSH_SPRING, () => {
     "worklet";
-    if (!finished) return;
+    // Abgeräumt wird IMMER, außer eine NEUERE Fahrt hat den Schlüssel gerade
+    // selbst gesetzt — siehe die Erklärung an `detailsGenSv`.
+    if (detailsGenSv.value !== myGen) return;
     runOnJS(setSheetMoving)(false, "details");
   });
   overlayCover.value = withTiming(1, COVER_IN_SPRING);

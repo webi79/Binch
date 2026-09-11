@@ -1,0 +1,16 @@
+{
+  "//": "Die Skripte MITPRÜFEN, ohne den Auslieferungsstand zu verändern.",
+  "//2": "Die Hauptkonfiguration schließt nur `src/**/*` ein, weil genau das nach `dist` gehört. Damit blieben die Skripte in `scripts/` aber vollständig ungeprüft — und das ist keine Kleinigkeit: `test-push.ts` ruft dieselben Funktionen auf wie der Ernstfall, und als `buildAlertTexts` ein Feld dazubekam, meldete niemand, dass der Aufruf dort unvollständig war. Ein Prüflauf, der die Hälfte der Aufrufer nicht ansieht, gibt eine Sicherheit, die es nicht gibt.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": [
+    "src/**/*",
+    "scripts/alerts-*.ts",
+    "scripts/test-push.ts"
+  ],
+  "//3": "`rootDir` muss mit: Die Hauptkonfiguration setzt ihn auf `src`, damit die Ausgabe flach in `dist` landet. Hier wird nichts ausgegeben, also darf er auf den Projektstamm zeigen — sonst lehnt TypeScript jede Datei außerhalb von `src` ab, noch bevor sie geprüft wird.",
+  "//4": "NOCH NICHT dabei: die älteren Import-Skripte (import-gtfs, import-stada, post-process-slip-throughs, count-chat-tokens, backfill-static-coords) — zusammen 13 Beanstandungen, alle aus der strengen Index-Prüfung. Sie hier aufzunehmen hieße, sie in derselben Runde umzubauen, in der die Alarme gebaut werden; ein roter Prüflauf, den alle ignorieren, wäre schlechter als ein grüner mit ehrlicher Grenze. Wer sie aufräumt, nimmt sie hier auf."
+}

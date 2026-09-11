@@ -12,6 +12,8 @@ import { stopsRoutes } from "./routes/stops.js";
 import { tripsRoutes } from "./routes/trips.js";
 import { flightBookingOptionsRoutes } from "./routes/flightBookingOptions.js";
 import { chatRoutes } from "./routes/chat.js";
+import { alertsRoutes } from "./routes/alerts.js";
+import { deactivateExpiredAlerts, startAlertExpiry, stopAlertExpiry } from "./services/priceAlerts.js";
 import { pool } from "./db/client.js";
 import { startStopBoardPreCache, stopStopBoardPreCache } from "./services/stopBoardPreCache.js";
 import { startDbVendoQueue, stopDbVendoQueue } from "./services/dbVendoQueue.js";
@@ -50,6 +52,7 @@ await app.register(authRoutes);
 await app.register(surroundingsRoutes);
 await app.register(stopsRoutes);
 await app.register(tripsRoutes);
+await app.register(alertsRoutes);
 await app.register(flightBookingOptionsRoutes);
 await app.register(chatRoutes);
 
@@ -66,6 +69,7 @@ const shutdown = async (signal: string) => {
   app.log.info({ signal }, "Shutting down");
   stopStopBoardPreCache();
   stopDbVendoQueue();
+  stopAlertExpiry();
   await app.close();
   await pool.end();
   process.exit(0);
@@ -77,6 +81,20 @@ process.on("SIGTERM", () => void shutdown("SIGTERM"));
 try {
   await app.listen({ port: config.PORT, host: config.HOST });
   app.log.info(`binch-server listening on http://${config.HOST}:${config.PORT}`);
+  /**
+   * Abgelaufene Alarme stilllegen — beim Start und danach alle sechs Stunden.
+   *
+   * Ohne diesen Aufruf lief die Funktion NIE: Sie war geschrieben, aber
+   * nirgends verdrahtet. Ein Alarm auf eine Reise, die längst stattgefunden
+   * hat, bliebe dann für immer aktiv — er würde bei jeder Suche auf dieser
+   * Strecke mitgeprüft und könnte melden, dass eine Fahrt billiger geworden
+   * ist, die es nicht mehr gibt.
+   *
+   * Nach dem Zuhören, nicht davor: Der Start soll nicht auf eine
+   * Datenbank-Abfrage warten, die niemand eilig braucht.
+   */
+  void deactivateExpiredAlerts();
+  startAlertExpiry();
 } catch (err) {
   app.log.error(err);
   process.exit(1);

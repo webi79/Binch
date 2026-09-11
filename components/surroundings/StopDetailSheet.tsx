@@ -935,6 +935,9 @@ function StopDetailSheetInner() {
   useLayoutEffect(() => {
     if (selectedStop) {
       setBodyReady(false);
+      // Sicherung: gehört zu genau einer Ausfahrt (siehe unten). Bliebe er
+      // stehen, übersprünge die nächste ihre Bewegung.
+      settlingRef.current = false;
       /**
        * Die Einfahrt wird hier NICHT mehr gestartet.
        *
@@ -1007,14 +1010,15 @@ function StopDetailSheetInner() {
      * Richtungen, denn hier wird auch nach OBEN gezogen (auf `full`).
      */
     .activeOffsetY([-8, 8])
-    .failOffsetX([-20, 20])
     .simultaneousWithExternalGesture(gate.native)
     .onStart((e) => {
       startY.value = translateY.value;
       base.value = e.translationY;
     })
     .onUpdate((e) => {
-      if (gate.scrollY.value > 0.5) {
+      // `gate.onList`: nur eine Berührung, die AUF der Liste liegt (sonst
+      // sperrte eine gescrollte Abfahrtsliste auch das Ziehen am Kopf).
+      if (gate.onList.value && gate.scrollY.value > 0.5) {
         // Die Liste scrollt noch — das Blatt bleibt stehen, der Nullpunkt geht mit.
         startY.value = translateY.value;
         base.value = e.translationY;
@@ -1073,6 +1077,16 @@ function StopDetailSheetInner() {
       if (e.velocityY < -800) closest = snap.full;
       else if (e.velocityY > 200 && final > snap.mid * 0.6) closest = snap.mid;
       translateY.value = withTiming(closest, { duration: 180, easing: Easing.out(Easing.quad) });
+    })
+    /**
+     * Merker „Finger liegt auf der Liste" beim Ende der Berührung löschen.
+     *
+     * Der native Erkenner der Liste tut das selbst — aber nur, wenn es ihn beim
+     * Loslassen noch gibt. Wird sie mitten in einer Berührung abgebaut, bliebe
+     * er stehen und die Liste beanspruchte danach jede Geste.
+     */
+    .onFinalize(() => {
+      gate.onList.value = false;
     }),
   [snap, startY, translateY, base, gate, closeBySwipe]);
 

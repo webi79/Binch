@@ -76,37 +76,40 @@ async function fetchWithTimeout(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { ...init, signal: controller.signal });
-    /**
-     * Der Zeitgeber LÄUFT WEITER — und zwar absichtlich.
-     *
-     * Hier stand ein `finally { clearTimeout(timer) }` mit dem Kommentar, es
-     * greife „erst nach dem `await` der Aufrufer". Das stimmt nicht: Ein
-     * `finally` läuft beim Verlassen DIESER Funktion, also bevor irgendein
-     * Aufrufer `res.json()` überhaupt anfasst. Die Uhr war damit genau in dem
-     * Abschnitt aus, den sie schützen sollte — ein Server, der Kopfzeilen sendet
-     * und den Rumpf stehen lässt, hing weiterhin unbegrenzt. Genau der Fall, den
-     * der Kommentar über dieser Funktion als Grund nennt („das Blatt klebte auf
-     * dem Ladekreis").
-     *
-     * Ohne Löschen deckt das Signal auch das Lesen des Rumpfes ab. Der Zeitgeber
-     * feuert nach einer erfolgreichen Antwort trotzdem noch einmal ins Leere —
-     * `abort()` auf eine bereits gelesene Antwort tut nichts. Das ist der Preis:
-     * ein anhängiger Zeitgeber je Anfrage, höchstens für die Dauer der
-     * Zeitgrenze.
-     *
-     * Ein abgebrochenes Lesen meldet sich beim Aufrufer als roher `AbortError`,
-     * nicht mit dem freundlichen Text unten — der ist nur für den Abbruch beim
-     * Verbindungsaufbau erreichbar. Unschön, aber allemal besser als ein Aufruf,
-     * der nie zurückkommt.
-     */
-    return res;
+    return await fetch(url, { ...init, signal: controller.signal });
   } catch (err) {
-    clearTimeout(timer);
     if (err instanceof Error && err.name === "AbortError") {
       throw new Error(`Request timeout after ${timeoutMs}ms — Server nicht erreichbar (${url})`);
     }
     throw err;
+  } finally {
+    /**
+     * Der Zeitgeber wird abgeräumt — mit offen genanntem Preis.
+     *
+     * Hier stand er absichtlich OHNE Löschung, damit das Abbruch-Signal auch das
+     * Lesen des Rumpfes noch abdeckt. Das Argument stimmt, nur ist die Rechnung
+     * andersherum aufgegangen: Jede Anfrage ließ dafür einen Wecker samt
+     * `AbortController` und der ganzen Schließung (`url`, `init`) bis zu zwanzig
+     * Sekunden liegen. Der Ergebnis-Bildschirm feuert pro Suche mehrere Anfragen
+     * — Erstabruf, ein Wiederversuch, die stille Auffrischung alle fünf Minuten
+     * —, und die lagen damit über Minuten gleichzeitig an. Sichtbar wird das
+     * nicht als Fehler, sondern als Grundrauschen auf dem JS-Strang, genau in
+     * einem Bildschirm, aus dem an einem Dutzend Stellen Arbeit herausgehalten
+     * wird.
+     *
+     * WAS DAMIT WEGFÄLLT, damit es niemand aus Versehen wieder einbaut: Ein
+     * Server, der Kopfzeilen schickt und den Rumpf stehen lässt, wird von dieser
+     * Uhr nicht mehr abgefangen. Alle vier Aufrufer lesen den Rumpf unmittelbar
+     * nach der Rückkehr (`postJson`, `authMe`, `authUpdateAvatar`,
+     * `parseTicketPdf`), das Fenster ist also klein — und `getJson`, über das
+     * die gesamte Suche läuft, hält es seit jeher genauso.
+     *
+     * `finally` läuft auch auf dem Abbruch-Pfad, und das ist unschädlich: Ist
+     * der Wecker schon gefeuert, ist `clearTimeout` wirkungslos; der `catch`
+     * darüber hat den `AbortError` da bereits in die freundliche Meldung
+     * übersetzt.
+     */
+    clearTimeout(timer);
   }
 }
 
@@ -670,4 +673,164 @@ export async function parseTicketPdf(
     );
   }
   return (await res.json()) as ParsedTicketResponse;
+}
+
+/**
+ * Ein Preis-Alarm auf einer Strecke.
+ *
+ * Der Besitzer ist die PUSH-KENNUNG des Geräts, nicht ein Konto — ein Alarm
+ * soll ohne Anmeldung funktionieren. Liegt trotzdem ein Sitzungs-Token vor,
+ * geht es mit: Der Server verknüpft den Alarm dann zusätzlich mit dem Konto,
+ * und er überlebt einen Gerätewechsel.
+ */
+export interface CreatePriceAlertInput {
+  pushToken: string;
+  mode: TravelMode;
+  origin: string;
+  destination: string;
+  originLabel: string;
+  destLabel: string;
+  /** ISO „yyyy-MM-dd". */
+  departDate: string;
+  /** ISO „yyyy-MM-dd" oder weggelassen — eine einfache Fahrt hat keine. */
+  returnDate?: string;
+  /** Reisende und Klasse gehören zum Preis — siehe `PriceAlert`. */
+  passengers: number;
+  travelClass: string;
+  currency: string;
+  basePrice: number;
+  desiredPrice: number;
+  notifyOnRise: boolean;
+}
+
+export async function createPriceAlert(
+  input: CreatePriceAlertInput,
+  authToken?: string | null,
+): Promise<{ id: string }> {
+  const url = buildUrl("/api/alerts");
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
+      body: JSON.stringify(input),
+    },
+    20000,
+  );
+  if (!res.ok) throw new Error(`API ${res.status} ${res.statusText} for ${url}`);
+  return (await res.json()) as { id: string };
+}
+
+/**
+ * Ein Alarm, wie der SERVER ihn führt.
+ *
+ * Nur die Felder, die der Abgleich braucht — nicht alles, was die Tabelle hat.
+ */
+export interface ServerPriceAlert {
+  id: string;
+  mode: TravelMode;
+  origin: string;
+  destination: string;
+  originLabel: string;
+  destLabel: string;
+  departDate: string;
+  returnDate: string;
+  passengers: number;
+  travelClass: string;
+  currency: string;
+  basePrice: string;
+  /** ISO-Zeitpunkt oder `null` — gesetzt, sobald der Alarm gemeldet HAT. */
+  lastNotifiedAt: string | null;
+  /** Der Preis, mit dem gemeldet wurde. Nicht der zuletzt gesehene. */
+  notifiedPrice: string | null;
+  active: boolean;
+}
+
+/**
+ * Die Alarme dieses Geräts beim Server erfragen.
+ *
+ * WOZU: Damit die App erfährt, was passiert ist, WÄHREND SIE NICHT LIEF. Eine
+ * Meldung, die bei toter App eintrifft, zeigt Android nativ an — ohne
+ * JavaScript zu starten. Tippt der Nutzer sie an, holt der Tipp sie ab; öffnet
+ * er die App stattdessen normal, erfährt sie davon auf KEINEM anderen Weg. Der
+ * Server ist dann die einzige Quelle: Er weiß, welcher Alarm gemeldet hat und
+ * mit welchem Preis.
+ *
+ * Die Kennung ist auch hier die Berechtigung und geht im Kopf mit — dieselbe
+ * Begründung wie beim Löschen.
+ */
+export async function listPriceAlerts(
+  pushToken: string,
+  authToken?: string | null,
+): Promise<ServerPriceAlert[]> {
+  const url = buildUrl("/api/alerts");
+  const res = await fetchWithTimeout(
+    url,
+    {
+      headers: {
+        Accept: "application/json",
+        "X-Push-Token": pushToken,
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
+    },
+    20000,
+  );
+  if (!res.ok) throw new Error(`API ${res.status} ${res.statusText} for ${url}`);
+  const json = (await res.json()) as { alerts?: ServerPriceAlert[] };
+  return json.alerts ?? [];
+}
+
+/**
+ * Einen Preis-Alarm löschen.
+ *
+ * Die Push-Kennung geht MIT, und zwar nicht als Beifang: Sie ist auf dem Server
+ * die Berechtigung. Ohne sie könnte jeder fremde Alarme löschen, der eine
+ * Kennung errät.
+ */
+export async function deletePriceAlert(id: string, pushToken: string): Promise<void> {
+  const url = buildUrl(`/api/alerts/${encodeURIComponent(id)}`);
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: "DELETE",
+      /**
+       * Die Kennung im KOPF, nicht in der URL.
+       *
+       * Sie ist hier die Berechtigung — wer sie hat, darf löschen. Im
+       * Query-String landete sie in jedem Zugriffsprotokoll zwischen App und
+       * Server. Der Server nimmt beides an, damit eine ältere installierte App
+       * weiterhin funktioniert.
+       */
+      headers: { "X-Push-Token": pushToken },
+    },
+    20000,
+  );
+  if (res.ok) return;
+  /**
+   * Die beiden 404 sind NICHT dasselbe — und diese Unterscheidung fehlte.
+   *
+   * Der Server antwortet mit 404 in zwei Fällen, und sie bedeuten das Gegenteil
+   * voneinander:
+   *
+   *  • `Unknown alert` — der Alarm liegt dort nicht (mehr). Das ist der BEWEIS,
+   *    dass er weg ist, also genau das Ziel. Ihn als Fehler zu behandeln machte
+   *    eine Listenzeile dauerhaft unlöschbar: Wer eine ältere Sicherung der
+   *    App-Daten zurückspielt, hat lokal einen Eintrag mit einer Server-Kennung,
+   *    die es nicht mehr gibt — und bekam bei jedem Tipp auf den Papierkorb
+   *    „konnte nicht gelöscht werden", ohne Ausweg.
+   *  • `Unknown device` — die Push-Kennung ist dem Server fremd. Dann wurde
+   *    NICHTS gelöscht, und der Alarm meldet weiter. Hier ist Scheitern richtig.
+   *
+   * Zuvor galt beides als Erfolg (der alte Fehler), danach beides als Fehler
+   * (mein Gegenschlag, zu breit). Richtig ist die Trennung.
+   */
+  if (res.status === 404) {
+    const detail = (await res.json().catch(() => null)) as { error?: string } | null;
+    if (detail?.error === "Unknown alert") return;
+  }
+  throw new Error(`API ${res.status} ${res.statusText} for ${url}`);
 }

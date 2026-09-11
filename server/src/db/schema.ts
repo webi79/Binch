@@ -578,3 +578,235 @@ export const gtfsStopTimes = pgTable(
     byStop: index("gtfs_stop_times_stop").on(t.feedId, t.stopId, t.departureSeconds),
   }),
 );
+
+/**
+ * Ein Gerät, das Meldungen empfangen kann.
+ *
+ * EIGENE Tabelle und nicht eine Spalte an `users`, aus zwei Gründen. Erstens
+ * hat eine Person mehrere Geräte, und eine Meldung gehört auf jedes davon.
+ * Zweitens — und das ist der wichtigere — braucht ein Preis-Alarm kein Konto:
+ * Wer die App installiert und einen Alarm setzt, soll ihn bekommen, ohne sich
+ * vorher anzumelden. Der Schlüssel ist deshalb das GERÄT, die Verknüpfung mit
+ * einem Konto ist optional und kommt später dazu, wenn sich jemand anmeldet.
+ *
+ * `token` ist die Kennung des Expo-Push-Dienstes („ExponentPushToken[…]"). Sie
+ * ist gerätegebunden und kann sich ändern (Neuinstallation, Wiederherstellung)
+ * — deshalb eindeutig und mit `updatedAt`: Meldet dasselbe Gerät eine neue
+ * Kennung, ersetzt sie die alte, statt eine Karteileiche zu hinterlassen.
+ */
+export const pushTokens = pgTable(
+  "push_tokens",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    token: varchar("token", { length: 255 }).notNull().unique(),
+    /** Optional: gesetzt, sobald das Gerät angemeldet ist. */
+    userId: uuid("user_id").references(() => users.id, { onDelete: "cascade" }),
+    platform: varchar("platform", { length: 16 }),
+    /**
+     * Die Sprache des Geräts — für den TEXT der Meldung.
+     *
+     * Sie muss hier stehen und nicht am Alarm: Geschrieben wird der Text erst
+     * beim Verschicken, und zwar auf dem Server. Er hat sonst keine Möglichkeit,
+     * sie zu erfahren — die App ist in dem Moment nicht beteiligt.
+     *
+     * Ohne dieses Feld wären alle Meldungen deutsch, in einer App mit vier
+     * Sprachen. Ein Franzose bekäme „Jetzt 21 statt 27 EUR" — was er entweder
+     * nicht versteht oder für einen Fehler hält.
+     */
+    locale: varchar("locale", { length: 5 }).notNull().default("en"),
+    /**
+     * Marke und Modell des Geräts — damit man WEISS, welches Handy das ist.
+     *
+     * Nicht für die Meldung: für die Fehlersuche. Bei fünf Kennungen desselben
+     * Menschen — Neuinstallationen, zwei Testgeräte — steht in der Tabelle
+     * sonst nur eine Zeichenkette wie „cih0oVrl…QCpiRs", und die Frage „auf
+     * welchem Gerät kam es an?" ist von hier aus nicht zu beantworten. Genau
+     * daran ist eine Diagnose stundenlang hängen geblieben.
+     *
+     * Kommt aus `Platform.constants` von React Native, ohne zusätzliche
+     * Abhängigkeit. Es ist keine Kennung eines Menschen: „Xiaomi 23127PN0CG"
+     * beschreibt ein Modell, das es millionenfach gibt.
+     */
+    deviceModel: varchar("device_model", { length: 64 }),
+    /**
+     * Die Zeitzone des Geräts — für die RUHEZEIT.
+     *
+     * Ein Preis-Alarm ist keine dringende Nachricht. Er um drei Uhr nachts zu
+     * schicken, weil zufällig jemand am anderen Ende der Welt diese Strecke
+     * gesucht hat, ist genau die Sorte Aufdringlichkeit, wegen der Leute
+     * Meldungen ganz abschalten — und dann ist die Funktion tot statt laut.
+     *
+     * Der Server kann die Ortszeit nicht erraten: Er weiß nur, wann eine fremde
+     * Suche lief, und die kann von überall kommen. Deshalb meldet das Gerät
+     * seine Zone (IANA, z.B. „Europe/Berlin") beim Registrieren mit.
+     */
+    timezone: varchar("timezone", { length: 64 }).notNull().default("Europe/Berlin"),
+    /**
+     * Wann dieses Gerät zuletzt eine Meldung EMPFANGEN hat — von ihm selbst
+     * bestätigt.
+     *
+     * Der Grund für diese Spalte: Dass Firebase eine Nachricht annimmt und eine
+     * Kennung zurückgibt, ist KEIN Beweis, dass sie auf dem Gerät ankam. Sie
+     * kann in der Warteschlange liegen, vom Energiesparmodus zurückgehalten
+     * werden oder an einem abgeschalteten Kanal scheitern — Firebase meldet in
+     * allen drei Fällen Erfolg. Der einzige belastbare Nachweis kommt vom
+     * Gerät.
+     *
+     * `lastTappedAt` ist der stärkere der beiden: Empfangen kann die App auch
+     * im Hintergrund melden, angetippt heißt, ein Mensch hat die Meldung
+     * gesehen.
+     */
+    lastDeliveredAt: timestamp("last_delivered_at", { withTimezone: true }),
+    lastTappedAt: timestamp("last_tapped_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    byUser: index("idx_push_tokens_user").on(t.userId),
+  }),
+);
+
+/**
+ * Ein Preis-Alarm auf einer STRECKE.
+ *
+ * Bewusst auf der Strecke und nicht auf einer einzelnen Verbindung: Der
+ * günstigste Zug von Köln nach Bielefeld am 12. September ist morgen ein
+ * anderer als heute. Ein Alarm auf genau einer Verbindung ginge fast immer ins
+ * Leere.
+ *
+ * DER INDEX IST DER GANZE ENTWURF. Geprüft wird nicht in einem eigenen Lauf,
+ * der die Anbieter abfragt — das verbietet sich, das Kontingent der Bahn liegt
+ * bei rund 60 Anfragen pro Minute und gehört der Suche. Geprüft wird, wenn
+ * IRGENDJEMAND diese Strecke sucht: Die Antwort liegt dann ohnehin vor, und es
+ * bleibt ein indizierter Nachschlag. Kosten für die Anbieter: null.
+ *
+ * `lastNotifiedAt` und `lastSeenPrice` sind die Entprellung. Ohne sie feuerte
+ * derselbe Alarm bei JEDER fremden Suche auf dieser Strecke erneut — bei einer
+ * beliebten Verbindung also im Minutentakt.
+ */
+export const priceAlerts = pgTable(
+  "price_alerts",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    /** Das Gerät, das die Meldung bekommt. Ein Alarm ohne Ziel wäre sinnlos. */
+    pushTokenId: uuid("push_token_id")
+      .notNull()
+      .references(() => pushTokens.id, { onDelete: "cascade" }),
+    /** Optional, wie bei `pushTokens` — ein Alarm braucht kein Konto. */
+    userId: uuid("user_id").references(() => users.id, { onDelete: "cascade" }),
+
+    mode: varchar("mode", { length: 8 }).notNull(),
+    origin: varchar("origin", { length: 64 }).notNull(),
+    destination: varchar("destination", { length: 64 }).notNull(),
+    /** Nur zur Anzeige in der Meldung — Codes sagen niemandem etwas. */
+    originLabel: varchar("origin_label", { length: 160 }).notNull(),
+    destLabel: varchar("dest_label", { length: 160 }).notNull(),
+    departDate: date("depart_date").notNull(),
+    /**
+     * Die Rückreise — LEERE ZEICHENKETTE bei einer einfachen Fahrt, nicht `null`.
+     *
+     * Sie muss mit in den Schlüssel, und das ist keine Genauigkeitsfrage,
+     * sondern eine Preisfrage: Eine Suche mit Rückreise liefert eine andere
+     * Trefferliste als dieselbe Strecke ohne, und damit einen anderen
+     * günstigsten Preis. Ohne dieses Feld verglich ein Alarm, der aus einer Hin-
+     * und Rückreise gesetzt wurde, seine Schwelle mit dem Preis einer einfachen
+     * Fahrt — und feuerte bei der nächsten fremden Suche sofort.
+     *
+     * WARUM KEIN `date` UND KEIN `null`: In Postgres gelten zwei `NULL` als
+     * VERSCHIEDEN. Der eindeutige Index unten hätte für einfache Fahrten also
+     * gar nicht gegriffen — man hätte beliebig viele Alarme auf dieselbe
+     * Strecke anlegen können, und das Ersetzen eines bestehenden (der
+     * `onConflictDoUpdate`-Pfad) wäre still ins Leere gelaufen. Eine leere
+     * Zeichenkette ist ein Wert wie jeder andere und macht beides richtig.
+     */
+    returnDate: varchar("return_date", { length: 10 }).notNull().default(""),
+    /**
+     * Reisende und Klasse — beide gehören in den Schlüssel, und zwar aus
+     * demselben Grund wie die Währung.
+     *
+     * Der Preis in einer Antwort ist der GESAMTPREIS der Reisegruppe (siehe
+     * `dbVendo.ts`, dort wird der Preis je Person mit der Zahl multipliziert).
+     * Ohne diese beiden Felder verglich der Server eine Schwelle, die für vier
+     * Personen in der Business-Klasse gesetzt wurde, mit dem Preis einer
+     * fremden Suche für eine Person in der Economy — und meldete einen
+     * sensationellen Sturz von 420 auf 95. Wer darauf tippt, findet 420.
+     *
+     * Der SUCH-Cache führt beide längst in seinem Schlüssel; der Alarm hatte sie
+     * nicht. Es ist dieselbe Klasse Fehler wie bei der Währung: eine Zahl gegen
+     * eine Schwelle gehalten, die etwas anderes bedeutete.
+     */
+    passengers: integer("passengers").notNull().default(1),
+    /** i18n-Schlüssel der Klasse, oder leer. Wird nur verglichen, nie gedeutet. */
+    travelClass: varchar("travel_class", { length: 60 }).notNull().default(""),
+
+    currency: varchar("currency", { length: 8 }).notNull(),
+    /**
+     * Der Preis, der beim Anlegen auf dem Bildschirm stand.
+     *
+     * Gespeichert, weil ohne ihn später nicht mehr zu sagen wäre, worauf sich
+     * die gewählte Schwelle bezog — und weil die Meldung „war 27, ist jetzt 21"
+     * ungleich mehr sagt als „ist jetzt 21".
+     */
+    basePrice: numeric("base_price", { precision: 10, scale: 2 }).notNull(),
+    desiredPrice: numeric("desired_price", { precision: 10, scale: 2 }).notNull(),
+    notifyOnRise: boolean("notify_on_rise").notNull().default(false),
+
+    /** Zuletzt bei einer Prüfung gesehener günstigster Preis. */
+    lastSeenPrice: numeric("last_seen_price", { precision: 10, scale: 2 }),
+    lastNotifiedAt: timestamp("last_notified_at", { withTimezone: true }),
+    /**
+     * Der Preis, mit dem GEMELDET wurde — nicht der zuletzt gesehene.
+     *
+     * Die beiden sind verschieden, und der Unterschied ist der Grund für diese
+     * Spalte: `lastSeenPrice` wird bei JEDER Prüfung fortgeschrieben, auch wenn
+     * nichts gemeldet wurde. Wer später fragt „mit welcher Zahl kam die
+     * Meldung?", bekäme also irgendeinen späteren Preis.
+     *
+     * Gebraucht wird das, weil die App eine Meldung verpassen kann: Kommt sie
+     * an, während die App tot ist, und öffnet der Nutzer die App später NORMAL
+     * statt über die Meldung, erfährt sie davon auf keinem anderen Weg — Android
+     * hat die Meldung nativ angezeigt, ohne dass JavaScript lief. Der Server ist
+     * dann die einzige Quelle, und er muss die Zahl von damals kennen, nicht
+     * eine von heute. Wir schätzen keine Preise; ein nachträglich eingesetzter
+     * wäre genau das.
+     */
+    notifiedPrice: numeric("notified_price", { precision: 10, scale: 2 }),
+    /** Abgelaufen oder vom Nutzer abgeschaltet — bleibt für den Verlauf stehen. */
+    active: boolean("active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    /**
+     * Der Nachschlage-Index der Prüfung. Genau die vier Felder, mit denen eine
+     * Suche hereinkommt, und `active` davor, damit abgeschaltete Alarme gar
+     * nicht erst gelesen werden.
+     */
+    byRoute: index("idx_price_alerts_route").on(
+      t.active,
+      t.mode,
+      t.origin,
+      t.destination,
+      t.departDate,
+    ),
+    byToken: index("idx_price_alerts_token").on(t.pushTokenId),
+    /** Eine Strecke trägt je Gerät höchstens einen Alarm — siehe Client. */
+    /**
+     * Die Rückreise gehört MIT in die Eindeutigkeit: Dieselbe Strecke einmal
+     * einfach und einmal hin und zurück sind zwei verschiedene Beobachtungen
+     * mit zwei verschiedenen Preisen, nicht ein Alarm, der den anderen ersetzt.
+     */
+    uniquePerDevice: uniqueIndex("uq_price_alerts_device_route").on(
+      t.pushTokenId,
+      t.mode,
+      t.origin,
+      t.destination,
+      t.departDate,
+      t.returnDate,
+      // Vier Personen in der Business sind eine ANDERE Beobachtung als eine in
+      // der Economy — kein Alarm, der den anderen ersetzt.
+      t.passengers,
+      t.travelClass,
+      t.currency,
+    ),
+  }),
+);

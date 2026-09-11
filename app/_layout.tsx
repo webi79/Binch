@@ -21,6 +21,7 @@ import { DetailsOverlay } from "@/components/results/DetailsOverlay";
 import { StopDetailSheet } from "@/components/surroundings/StopDetailSheet";
 import { AppAlertHost } from "@/components/ui/AppAlertHost";
 import { NotificationsSheet } from "@/components/home/NotificationsSheet";
+import { PriceAlertRouter } from "@/components/notifications/PriceAlertRouter";
 import { ConnectionNotFoundHost } from "@/components/ui/ConnectionNotFoundModal";
 // FloatingTabBar entfernt — der native Tab-Bar des
 // createNativeBottomTabNavigator (siehe app/(tabs)/_layout.tsx) übernimmt
@@ -318,6 +319,10 @@ export default function RootLayout() {
                 Wählern, also darunter — aus dem Such-Blatt heraus können die
                 über ihm geöffnet werden. */}
             <NotificationsSheet />
+            {/* Ein Tipp auf eine Preis-Alarm-Meldung öffnet die Suche dazu.
+                Rendert nichts — sie hängt hier, weil sie den Ergebnis-Bildschirm
+                öffnet, und der hängt ebenfalls an der Wurzel. */}
+            <PriceAlertRouter />
             {/* DatePickerHost ZULETZT vor Auth → liegt VISUELL ÜBER den
                 Tabs/Overlays inkl. Nav-Bar, sodass die Nav-Bar während des
                 Pickers nicht klickbar ist. */}

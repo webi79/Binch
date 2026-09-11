@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { prepareLayer } from "@/lib/nav/transitionLayer";
 import { armHeroClip, startResultsPush } from "@/lib/nav/overlayCover";
 import Animated, {
@@ -47,7 +47,7 @@ import { de as deLocale, enUS, fr as frLocale, es as esLocale, type Locale as Da
 import { Location, TravelMode } from "@/types/search";
 import { useT } from "@/lib/i18n/useT";
 import { useAppBg, usePalette } from "@/lib/theme/appBg";
-import { FIELD_H, GUTTER } from "@/lib/theme/spacing";
+import { FIELD_H, GUTTER, SPACE } from "@/lib/theme/spacing";
 import { beginSearchHandoff, endSearchHandoff, isSearchHandoff, prepareHandoffLayer, releaseHandoffLayer } from "@/lib/nav/searchHandoff";
 
 /** Notbremse, falls die Ergebnis-Slide nie zustande kommt. */
@@ -146,7 +146,68 @@ const MODE_ICON: Record<TravelMode, LucideIcon> = {
   CRUISE: Ship,
 };
 
-type TripType = "roundtrip" | "oneway" | "multicity";
+export type TripType = "roundtrip" | "oneway" | "multicity";
+
+/**
+ * Vorbelegung des Formulars — siehe die Eigenschaft `initial`.
+ *
+ * Die Felder sind genau das, was ein Ergebnis-Bildschirm über seine eigene
+ * Suche WEISS, und keines mehr: Er hat die Such-Parameter, nicht die Objekte,
+ * aus denen sie einmal entstanden sind. Deshalb steht hier `code` + `label`
+ * statt `Location` und eine Zahl statt der Aufteilung nach Erwachsenen,
+ * Kindern und Babys.
+ */
+export interface SearchHeroInitial {
+  origin: { code: string; label: string } | null;
+  destination: { code: string; label: string } | null;
+  /** `Date` oder ISO-Zeichenkette — beides, weil die Ergebnis-Parameter
+   *  Zeichenketten sind und ein Aufrufer mit `Date` nicht erst umbauen soll. */
+  departDate: Date | string | null;
+  returnDate: Date | string | null;
+  /** Die SUMME der Reisenden; die Aufteilung ist in den Parametern nicht drin. */
+  passengers: number | null;
+  /** Der i18n-Schlüssel der Klasse (`search.class.economy`, …). */
+  travelClassKey: string | null;
+  tripType: TripType | null;
+}
+
+/**
+ * Eine Zeichenkette aus den Ergebnis-Parametern zurück in ein Datum.
+ *
+ * Der Sonderfall ist `yyyy-MM-dd`: `new Date("2026-09-08")` liest die
+ * Zeichenkette laut Norm als UTC-Mitternacht. Westlich von Greenwich ist das
+ * LOKAL der Vortag — die Vorbelegung zeigte dort also ein Datum, das der
+ * Nutzer nie gewählt hat, und eine unveränderte Übernahme suchte einen Tag zu
+ * früh. Von Hand zerlegt entsteht dagegen lokale Mitternacht, und das ist
+ * dieselbe Größe, die der Datumswähler liefert.
+ *
+ * Alles andere (der volle UTC-Zeitstempel aus `departTime`) trägt seine Zone
+ * selbst und geht den normalen Weg.
+ */
+function toDate(value: Date | string | null | undefined): Date | null {
+  if (!value) return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  const ymd = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (ymd) return new Date(Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3]));
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+/**
+ * Aus Code und Beschriftung wieder ein `Location`.
+ *
+ * `city` und `country` bleiben leer, und das ist kein Versäumnis: Angezeigt
+ * wird im Formular ausschließlich `label`, und in die Suche geht ausschließlich
+ * `code`. Etwas zu erfinden, das der Nutzer nie eingegeben hat, wäre die
+ * gefährlichere Variante — es sähe echt aus.
+ */
+function toLocation(
+  value: { code: string; label: string } | null | undefined,
+  mode: TravelMode,
+): Location | null {
+  if (!value || !value.code) return null;
+  return { code: value.code, label: value.label, city: "", country: "", type: mode };
+}
 
 function tripTypesFor(mode: TravelMode): { id: TripType; key: string }[] {
   if (mode === "CRUISE") {
@@ -201,6 +262,89 @@ interface Props {
    * letztem Mal und würde beim Reveal sichtbar zurückspringen (Flackern).
    */
   resetTrigger?: number;
+  /**
+   * Das Formular OHNE seinen Bildschirm — für ein fremdes Blatt.
+   *
+   * Weg fallen dabei zwei Dinge: der Hero-Block (Himmel, Sonne, Mond, Dünen)
+   * und die `ScreenEntrance`-Hülle. Der Hero, weil er in einer Slide über einer
+   * Ergebnisliste nichts zu suchen hat — dort ist er weder Bildschirmkopf noch
+   * Stimmung, sondern der teuerste SVG-Baum der App über einer Liste, die
+   * gerade neu aufgebaut wird. Die Hülle, weil ihre Welle an einem FOKUS hängt;
+   * ein eingebettetes Formular bekommt keinen.
+   *
+   * Die `Reveal`-Hüllen darin bleiben stehen und laufen dann über den
+   * Vorgabewert des Kontextes (`armed: true`) genau einmal beim Aufbau. Das ist
+   * gewollt: Eingebettet wird lange VOR dem ersten Öffnen gemountet, die Welle
+   * ist also durch, bevor jemand das Blatt sieht.
+   */
+  embedded?: boolean;
+  /**
+   * Vorbelegung. Angewandt wird sie, wenn sich die IDENTITÄT dieses Objekts
+   * ändert — nicht bei jedem Durchgang.
+   *
+   * Der Aufrufer muss es deshalb festhalten (`useMemo`): Ein frisches Objekt
+   * pro Durchgang setzte das Formular fortlaufend auf den Ausgangsstand zurück,
+   * und zwar mitten in der Eingabe.
+   */
+  initial?: SearchHeroInitial | null;
+  /**
+   * Statt der Übergabe an den Ergebnis-Bildschirm: die fertigen Such-Parameter
+   * zurückgeben.
+   *
+   * Prüfung der Pflichtfelder, rote Ränder, Haptik und die Doppeltipp-Sperre
+   * laufen unverändert davor — es ist ein früher Ausstieg im SELBEN
+   * `handleSubmit`, kein zweiter Pfad. Ein zweiter liefe nach dem dritten
+   * Feinschliff woanders hin als dieser.
+   *
+   * Die Kennung gehört FESTGEHALTEN (`useCallback`) — dieser Baum ist `memo`,
+   * und eine Pfeilfunktion an dieser Stelle hebelte die Schranke bei jedem
+   * Durchgang des Aufrufers aus.
+   */
+  onSubmit?: (params: Record<string, string>) => void;
+  /**
+   * Darf DIESE Fassung ein Ergebnis der Wähler übernehmen? Vorgabe: ja.
+   *
+   * Es gibt zwei gemountete Formulare — das im Such-Blatt und das in der
+   * Such-Slide der Ergebnisliste —, und Ort- und Datumswähler geben ihr
+   * Ergebnis über GLOBALEN Zustand zurück. Ohne diesen Schalter trüge jede
+   * Auswahl in BEIDE Formulare ein: Der Ort, den man in der Slide wählt, stünde
+   * danach auch im verdeckten Formular des Such-Blattes, und wer es öffnet,
+   * fände eine Suche vor, die er nie eingegeben hat.
+   *
+   * Der Schalter verhindert nur das ANWENDEN. Die Sitzungs-Nummer wird trotzdem
+   * mitgeschrieben (siehe die beiden Effekte), sonst schlüge ein längst
+   * verbrauchtes Ergebnis nachträglich ein, sobald diese Fassung wieder aktiv
+   * wird.
+   */
+  active?: boolean;
+}
+
+/**
+ * Die `ScreenEntrance`-Hülle — oder eben keine.
+ *
+ * Als eigene Komponente und nicht als Bedingung im Baum unten: Der Rumpf ist
+ * über 200 Zeilen JSX, und ihn für diesen einen Schalter zu verschieben hieße,
+ * jede Zeile davon anzufassen. Der Schalter selbst wechselt zur Laufzeit nie —
+ * eine Fassung ist eingebettet oder sie ist es nicht.
+ */
+function EntranceHull({
+  embedded,
+  trigger,
+  resetTrigger,
+  children,
+}: {
+  embedded: boolean;
+  trigger?: number;
+  resetTrigger?: number;
+  children: ReactNode;
+}) {
+  if (embedded) return <>{children}</>;
+  // wave={false}: siehe die Begründung an der Aufrufstelle unten.
+  return (
+    <ScreenEntrance wave={false} trigger={trigger} resetTrigger={resetTrigger}>
+      {children}
+    </ScreenEntrance>
+  );
 }
 
 // MEMOISIERT (wichtig!): Seit der Screen dauerhaft gemountet bleibt, würde er
@@ -213,7 +357,16 @@ interface Props {
  *  neue Kennung und damit ein Render, den es nicht braucht. */
 const NO_ERRORS: Set<ErrorField> = new Set();
 
-function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }: Props) {
+function SearchHeroComponent({
+  mode,
+  entranceTrigger,
+  bgTrigger,
+  resetTrigger,
+  embedded = false,
+  initial = null,
+  onSubmit,
+  active = true,
+}: Props) {
   // Screen-Hintergrund (Theme): Container, Formular, Scrim und der BinchHero-
   // „melt" müssen exakt dieselbe Farbe tragen wie die Launch-Box am Ende.
   const appBg = useAppBg();
@@ -292,6 +445,217 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
     setTripType("roundtrip");
     setErrors(new Set());
   }, [resetTrigger]);
+
+  /**
+   * Vorbelegung — und sie steht mit Absicht DIREKT hinter dem Leeren darüber.
+   *
+   * React führt Effekte in der Reihenfolge aus, in der sie hier stehen. Fallen
+   * beide in denselben Commit (der eingebettete Fall bekommt heute keinen
+   * `resetTrigger`, aber das ist eine Zusage des Aufrufers, keine Eigenschaft
+   * dieser Datei), räumt erst das Leeren und schreibt dann die Vorbelegung.
+   * Andersherum bliebe ein leeres Formular stehen, und der Fehler wäre von der
+   * anderen Seite kaum zu finden: Er hinge daran, welcher der beiden Auslöser
+   * zufällig zuerst kippt.
+   *
+   * Angewandt wird nur bei einer neuen IDENTITÄT von `initial`. Der Merker ist
+   * dafür nötig und nicht der Vergleich der Abhängigkeiten allein: `mode` steht
+   * mit in der Liste (die Beschriftung braucht ihn), und ein Moduswechsel
+   * dürfte eine bereits übernommene Vorbelegung nicht ein zweites Mal über die
+   * Eingaben des Nutzers legen.
+   */
+  const appliedInitialRef = useRef<SearchHeroInitial | null>(null);
+  useEffect(() => {
+    if (!initial || initial === appliedInitialRef.current) return;
+    const nextOrigin = toLocation(initial.origin, mode);
+    const nextDestination = toLocation(initial.destination, mode);
+    const depart = toDate(initial.departDate);
+    const rawBack = toDate(initial.returnDate);
+    const back = rawBack && depart && rawBack < depart ? null : rawBack;
+    const trip = initial.tripType;
+    const total = initial.passengers;
+    /**
+     * Die AUFTEILUNG bleibt stehen, wenn die Summe stimmt.
+     *
+     * Die Such-Parameter tragen nur eine Zahl. Sie blind in „so viele
+     * Erwachsene" zurückzuübersetzen ist richtig, solange man nichts Besseres
+     * hat — aber sobald dieses Formular bereits eine Aufteilung HÄLT, ist die
+     * das Bessere. Ohne diese Bedingung fiel sie bei jeder Übernahme in sich
+     * zusammen: Wer zwei Erwachsene und ein Kind einstellt und sucht, fand beim
+     * nächsten Öffnen drei Erwachsene vor.
+     */
+    const nextPax =
+      total && total > 0 && paxTotal(pax) !== total
+        ? { adults: total, children: 0, infants: 0 }
+        : pax;
+    /**
+     * Die Klasse steht als i18n-Schlüssel im Parameter, im Formular ist sie ein
+     * INDEX in eine je Verkehrsmittel unterschiedlich lange Liste. Findet sich
+     * der Schlüssel dort nicht (Suche als Flug begonnen, Slide im Zug-Modus),
+     * bleibt es beim ersten Eintrag — ein Index aus der falschen Liste zeigte
+     * sonst ins Leere.
+     */
+    const rawIdx = initial.travelClassKey
+      ? extraOptionsFor(mode).indexOf(initial.travelClassKey)
+      : -1;
+    const nextIdx = rawIdx >= 0 ? rawIdx : 0;
+
+    /**
+     * Steht dasselbe schon da? Dann NICHTS anfassen.
+     *
+     * Das ist kein Feinschliff, sondern der Normalfall: Nach jedem Absenden aus
+     * der Slide ändern sich die Such-Parameter, und damit bekommt dieses
+     * Formular eine neue Vorbelegung — die exakt das enthält, was der Nutzer
+     * eben selbst eingetragen hat. Ohne diese Abkürzung liefen daraufhin sieben
+     * Zustandswechsel mit frisch gebauten Objekten (`Location`, `Date`) durch,
+     * also ein voller Durchgang dieses Baums, und zwar in genau den
+     * Millisekunden, in denen der Ergebnis-Bildschirm seine Liste neu aufbaut.
+     *
+     * Verglichen wird über Werte, nicht über Kennungen: `toDate` und
+     * `toLocation` liefern bei jedem Aufruf neue Objekte, ein Vergleich der
+     * Objekte selbst wäre immer „verschieden".
+     */
+    const unchanged =
+      (origin?.code ?? null) === (nextOrigin?.code ?? null) &&
+      (destination?.code ?? null) === (nextDestination?.code ?? null) &&
+      (departDate?.getTime() ?? null) === (depart?.getTime() ?? null) &&
+      (returnDate?.getTime() ?? null) === (back?.getTime() ?? null) &&
+      nextPax === pax &&
+      extraOpt === nextIdx &&
+      (!trip || tripType === trip);
+    if (unchanged) {
+      /**
+       * Auch das zählt als VERBRAUCHT.
+       *
+       * Der Merker unten steht erst am Anwenden — sonst ginge eine aufgeschobene
+       * Vorbelegung verloren. Dieser Zweig ist der andere Fall: Es steht bereits
+       * dasselbe da, die Vorbelegung ist also erledigt, ohne dass etwas zu tun
+       * war. Ohne den Vermerk bliebe sie „offen", und ein späterer Wechsel des
+       * Verkehrsmittels (der über `mode` in der Abhängigkeitsliste hier
+       * hereinkommt und die Klassen-Liste austauscht) legte sie nachträglich
+       * über die Eingaben des Nutzers.
+       */
+      appliedInitialRef.current = initial;
+      return;
+    }
+
+    /**
+     * Das Anwenden als eigener Aufruf — und NICHT unbedingt in diesem Bild.
+     *
+     * Ein Ergebnis-Bildschirm reicht seine Vorbelegung genau dann herein, wenn
+     * sich die Such-Parameter ändern — und das ist derselbe Zustandswechsel,
+     * der seine Liste neu aufbaut, unmittelbar nachdem `startResultsPush()` die
+     * Einfahrt losgeschickt hat. Der Weg dorthin ist gemessen belegt: Der
+     * Such-Bildschirm setzt die Parameter bewusst EIN Bild nach dem Start der
+     * Bewegung (siehe `handleSubmit` weiter unten, dieselbe Staffelung in
+     * `RecentCard`), die Bewegung ist über `PUSH_SPRING.duration` angemeldet,
+     * und die sieben Zustandswechsel darunter fielen damit in Bild 2 von 430ms
+     * Einfahrt. Sichtbar war das als Ruckeln der hereinfahrenden Liste und als
+     * stotternder Parallax darunter — und zwar erst ab der zweiten Suche pro
+     * App-Lauf, weil dieser Baum vorher noch gar nicht gemountet ist.
+     *
+     * Der Merker gehört HIERHER und nicht vor die Prüfung: Stünde er oben,
+     * wäre eine aufgeschobene Vorbelegung beim nächsten Durchlauf bereits als
+     * erledigt vermerkt und fiele ersatzlos aus.
+     */
+    const apply = () => {
+      appliedInitialRef.current = initial;
+      setOrigin(nextOrigin);
+      setDestination(nextDestination);
+      setDepartDate(depart);
+      /**
+       * Ein Rückdatum VOR dem Hindatum gibt es nicht — die Regel steckt oben in
+       * `back`, dieselbe, die auch der Datumswähler beim Setzen des Hindatums
+       * anwendet. Sie verhindert, dass eine widersprüchliche Vorbelegung als
+       * gültiges Formular dasteht.
+       */
+      setReturnDate(back);
+      /**
+       * Die Reiseart gehört MIT übernommen — sie entscheidet, ob das Rückfeld
+       * überhaupt dasteht.
+       *
+       * Ohne sie bliebe das Formular auf seiner Vorgabe „Hin und zurück". Wer aus
+       * einer einfachen Fahrt heraus die Slide öffnet, fände dann ein leeres
+       * Rückfeld vor, und der erste Tipp auf „Preise vergleichen" quittierte mit
+       * einem roten Rand für etwas, das er nie angefasst hat.
+       */
+      if (trip) setTripType(trip);
+      /**
+       * Aus der Summe wieder eine Aufteilung — alle als Erwachsene.
+       *
+       * Mehr ist aus den Such-Parametern nicht zu holen; sie tragen nur
+       * `passengers`. Für die Suche ist es dasselbe (dort zählt wieder allein
+       * die Summe), sichtbar wird der Unterschied erst, wenn jemand das Blatt
+       * für Reisende öffnet. Das ist die ehrlichere Seite des Fehlers: lieber
+       * eine Aufteilung, die der Nutzer korrigieren kann, als eine erfundene.
+       */
+      setPax(nextPax);
+      setExtraOpt(nextIdx);
+      // Was vorbelegt ist, kann nicht fehlen.
+      setErrors(NO_ERRORS);
+    };
+
+    /**
+     * Sofort, sobald diese Fassung SICHTBAR ist — sonst erst in Ruhe.
+     *
+     * `active` ist genau die Angabe, ob dieses Formular gerade jemandem gezeigt
+     * wird. Ist es das, hat Warten keinen Sinn mehr: Die Slide fährt in diesem
+     * Moment auf, und die Felder trügen bis zum Ablauf des Weckers noch die
+     * VORIGE Suche — und würden sich danach unter den Augen des Nutzers
+     * umschreiben. Ein aufgeschobenes Anwenden wäre hier also nicht sparsam,
+     * sondern falsch.
+     *
+     * Teuer ist der Durchgang an dieser Stelle ohnehin nicht mehr als nötig:
+     * `active` wechselt beim Öffnen mit, dieser Baum rendert also sowieso — und
+     * die gemeinsame Fahrt legt zwischen Anmelden und Losfahren ausdrücklich
+     * ein Bild ein, in das der Commit fällt.
+     */
+    if (active || !isTransitionBusy()) {
+      apply();
+      return;
+    }
+
+    /**
+     * Wiederversuch statt EINEM Wecker — dieselbe Bauart wie die Freigabe der
+     * Ergebniskarten.
+     *
+     * Ein fester Wecker müsste die Dauer der Einfahrt kennen, und die ist hier
+     * nicht die einzige Bewegung: Auf sie folgen die Ausfahrt des
+     * Such-Bildschirms und das Ende der Übergabe, jede mit eigener Länge. Ein
+     * Wert, der alle abdeckt, wäre eine geratene Zahl — und ein zu kleiner
+     * setzte den Commit ausgerechnet in die nächste Bewegung, also genau dahin,
+     * wo er gerade herausgeholt wurde. Die Prüfung fragt stattdessen jedes Mal
+     * neu und schreibt erst, wenn wirklich nichts mehr fährt.
+     *
+     * Eine Obergrenze braucht es nicht: `isTransitionBusy` ist ein
+     * verfallender Zeitstempel, keine Zählung — er kann nicht hängenbleiben.
+     */
+    let id: ReturnType<typeof setTimeout>;
+    const attempt = () => {
+      if (isTransitionBusy()) {
+        id = setTimeout(attempt, 200);
+        return;
+      }
+      apply();
+    };
+    id = setTimeout(attempt, 200);
+    return () => clearTimeout(id);
+    /**
+     * `initial`, `mode` und `active` — und ausdrücklich NICHT der Formularstand.
+     *
+     * Der Vergleich oben liest ihn aus der Schließung dieses Durchgangs, also
+     * auf dem neuesten Stand, denn genau dieser Durchgang hat den Effekt
+     * eingehängt. Führte man ihn zusätzlich in der Liste, liefe die Vorbelegung
+     * bei JEDER Eingabe erneut an, statt nur bei einer neuen.
+     *
+     * `active` steht dagegen bewusst mit drin, und das ist der Haken für den
+     * Fall oben: Wird die Slide geöffnet, während ein Versuch noch aussteht,
+     * läuft dieser Effekt neu an, der Aufräum-Pfad nimmt den Wecker mit, und
+     * die Vorbelegung wird sofort angewandt — statt dem Nutzer erst die alte
+     * Suche zu zeigen.
+     */
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initial, mode, active]);
+
   const finishAnim = () => {
     if (!animFinished) setAnimFinished(true);
   };
@@ -380,7 +744,18 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
   useEffect(() => {
     if (!locationPickerResult) return;
     if (locationPickerResult.sessionKey === lastLocationSessionRef.current) return;
+    /**
+     * Die Sitzung wird VOR dem Ausstieg vermerkt — auch in der stummen Fassung.
+     *
+     * Es sind zwei Formulare gemountet, und der Wähler antwortet beiden über
+     * denselben globalen Zustand (siehe `active`). Nur eines darf eintragen.
+     * Das andere muss die Nummer trotzdem verbrauchen: Sonst wäre das Ergebnis
+     * für es weiterhin „neu", und in dem Moment, in dem es wieder aktiv wird,
+     * schlüge eine längst abgeschlossene Auswahl nachträglich in sein Formular
+     * ein — sichtbar als Ort, der von selbst erscheint.
+     */
     lastLocationSessionRef.current = locationPickerResult.sessionKey;
+    if (!active) return;
     /**
      * Das Ergebnis EINTRAGEN, aber nicht mitten in der Ausfahrt.
      *
@@ -409,7 +784,7 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
     const id = setTimeout(apply, PICKER_OUT.duration + 60);
     return () => clearTimeout(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [locationPickerResult]);
+  }, [locationPickerResult, active]);
 
   const openLocationPicker = useSearchStore((s) => s.openLocationPicker);
   /**
@@ -538,7 +913,10 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
   useEffect(() => {
     if (!datePickerResult) return;
     if (datePickerResult.sessionKey === lastAppliedSessionRef.current) return;
+    // Vermerken, aber nur in der aktiven Fassung eintragen — dieselbe
+    // Begründung wie beim Ortswähler eine Ebene darüber.
     lastAppliedSessionRef.current = datePickerResult.sessionKey;
+    if (!active) return;
     const picked = datePickerResult.date;
     // Gleiche Begründung wie beim Ort: nicht in die laufende Ausfahrt schreiben.
     const apply = () => {
@@ -558,7 +936,7 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
     const id = setTimeout(apply, PICKER_OUT.duration + 60);
     return () => clearTimeout(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [datePickerResult]);
+  }, [datePickerResult, active]);
 
   const openDatePicker = useSearchStore((s) => s.openDatePicker);
 
@@ -660,6 +1038,49 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
     // da sind. Ein zweiter Schreibvorgang hier weckt nur nochmal alle
     // Abonnenten — allen voran den Landingscreen, der dabei als Textur wandert.
     const travelClass = extraOpts[extraOpt] ?? "";
+    /**
+     * Die Such-Parameter entstehen EINMAL, vor der Weiche.
+     *
+     * Sie standen bisher unten im Block hinter `startResultsPush()`. Von dort
+     * aus hätte der eingebettete Weg sie ein zweites Mal bauen müssen — und
+     * zwei Stellen, die dasselbe Objekt zusammensetzen, laufen beim nächsten
+     * neuen Feld auseinander. Genau das ist an dieser Stelle schon einmal
+     * passiert — siehe ein paar Zeilen weiter oben die Uhrzeit, die eine Weile
+     * gewählt, aber nie mitgeschickt wurde.
+     */
+    const rp = {
+      mode,
+      origin: origin.code,
+      destination: destination.code,
+      originLabel: origin.label,
+      destLabel: destination.label,
+      departDate: departIso,
+      departTime: departTimeIso,
+      returnDate: returnIso,
+      tripType,
+      passengers: String(paxTotal(pax)),
+      currency,
+      travelClass,
+    } as Record<string, string>;
+
+    /**
+     * Eingebettet: hier ist Schluss — und zwar als AUSSTIEG, nicht als zweiter
+     * Zweig.
+     *
+     * Alles über dieser Zeile (Pflichtfelder, rote Ränder, Haptik,
+     * Doppeltipp-Sperre, die Parameter selbst) gilt für beide Fassungen. Alles
+     * darunter ist die Übergabe an den Ergebnis-Bildschirm: Sie hält den
+     * Such-Bildschirm offen (`beginSearchHandoff`), merkt seinen Beschnitt vor,
+     * startet die Bewegung der Liste und legt eine Route an. Ein eingebettetes
+     * Formular hat nichts davon — es liegt bereits ÜBER der Ergebnisliste, die
+     * es gleich ändern wird. Liefe die Kette dort mit, führe eine zweite Liste
+     * von rechts herein, und der Such-Bildschirm bliebe bis zur Notbremse
+     * dauerhaft geöffnet.
+     */
+    if (onSubmit) {
+      onSubmit(rp);
+      return;
+    }
     // Der Such-Screen wird NICHT vorher geschlossen: Die Ergebnis-Liste slidet
     // direkt über ihn drüber, so wie jedes andere Push-Overlay auch. Vorher lief
     // erst die Schließ-Animation und danach der Slide — dazwischen blitzte der
@@ -707,20 +1128,6 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
       // aber GLEICHMÄSSIG — und gleichmäßig liest sich als flüssig, während ein
       // einzelner Klotz am Anfang als Hängen gelesen wird. Der reinslidende
       // Bildschirm behält seine Textur; er ist der teurere von beiden.
-      const rp = {
-          mode,
-          origin: origin.code,
-          destination: destination.code,
-          originLabel: origin.label,
-          destLabel: destination.label,
-          departDate: departIso,
-          departTime: departTimeIso,
-          returnDate: returnIso,
-          tripType,
-          passengers: String(paxTotal(pax)),
-          currency,
-          travelClass,
-        } as Record<string, string>;
       // Ein Bild Abstand zwischen Textur-Flip und Öffnen.
       //
       // React fasst sonst beides in EINEN Commit: die Unterlage wird auf eine
@@ -769,8 +1176,19 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
   // Ende schlagartig im Bild und brauchte etwas, das ihn aufbaut. Bei einer
   // Slide baut die Bewegung ihn selbst auf.
   return (
-    <ScreenEntrance wave={false} trigger={entranceTrigger} resetTrigger={resetTrigger}>
-    <View style={[styles.container, { backgroundColor: appBg }]}>
+    <EntranceHull embedded={embedded} trigger={entranceTrigger} resetTrigger={resetTrigger}>
+    <View
+      style={[
+        styles.container,
+        { backgroundColor: appBg },
+        // Die eingebettete Fassung steht ZULETZT: Sie nimmt beides zurück, die
+        // Höhe wie die Farbe, und in einem Stil-Array gewinnt der spätere
+        // Eintrag.
+        embedded && styles.containerEmbedded,
+      ]}
+    >
+      {embedded ? null : (
+      <>
       {/**
         * Auf kurzen Bildschirmen zusammenrücken — siehe `useCompact`.
         *
@@ -779,6 +1197,13 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
         * Viertel, und darunter wird es eng: Genau das ist der Eindruck „wirkt
         * zu groß". Felder und Knopf folgen demselben Faktor, damit das
         * Verhältnis erhalten bleibt und nicht bloß eine Kante wandert.
+        */}
+      {/**
+        * Eingebettet gibt es KEINEN Himmel — siehe die Eigenschaft `embedded`.
+        *
+        * Übersprungen wird der ganze Block, nicht nur `BinchHero`: Der Verlauf
+        * darüber ist eine bildschirmbreite Fläche mit Alpha, und ohne Bild
+        * darunter dunkelt er nur noch das Formular ab.
         */}
       <View style={styles.hero}>
         {/* BinchHero mountet sofort beim Slide-In — Sky + Dünen sind also
@@ -809,13 +1234,30 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
 
 
       </View>
+      </>
+      )}
 
       {/* Das Sheet — Geometrie und Farbe 1:1 vom Auth-Screen. Es liegt mit
           -20 Rand ÜBER dem Band, die gerundete Oberkante schneidet also in die
           Dünen. */}
       <ScrollView
-        style={[styles.form, { backgroundColor: palette.s1 }]}
-        contentContainerStyle={[styles.formContent, { paddingBottom: insets.bottom + 90 }]}
+        // Die eingebettete Fassung steht BEWUSST hinter der Farbe: Sie nimmt
+        // sie zurück (siehe `formEmbedded`), und in einem Stil-Array gewinnt
+        // der spätere Eintrag.
+        style={[styles.form, { backgroundColor: palette.s1 }, embedded && styles.formEmbedded]}
+        contentContainerStyle={[
+          styles.formContent,
+          /**
+           * Eingebettet unten nur noch der Rand des Blattes.
+           *
+           * Die 90 plus sichere Fläche sind der Platz für die durchsichtige
+           * Tab-Leiste — die gibt es über einem Blatt nicht. Stehen gelassen
+           * wären sie über hundert Punkte Leere unter dem Knopf, und weil das
+           * Blatt seine Höhe aus dem Inhalt bezieht, wäre es genau so viel zu
+           * hoch.
+           */
+          embedded ? styles.formContentEmbedded : { paddingBottom: insets.bottom + 90 },
+        ]}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
         // Wird aus der Berührung doch ein Scrollen, ist die Textur sofort wieder
@@ -1016,7 +1458,17 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
               beim Aufsetzen, also genauso früh. */}
           <View
             onTouchStart={() => {
-              prepareHandoffLayer();
+              /**
+               * Die Textur gehört zur ÜBERGABE — eingebettet gibt es die nicht.
+               *
+               * Angefordert wird sie global, und der Verbraucher ist der
+               * Such-Bildschirm: Er hebt daraufhin seine bildschirmfüllende
+               * Fläche auf eine Hardware-Ebene. Aus der Slide heraus wäre das
+               * eine Rasterung des geschlossenen, unsichtbaren Such-Blattes —
+               * bezahlt genau in dem Fingerdruck, aus dem gleich die
+               * Ergebnisliste neu aufgebaut wird.
+               */
+              if (!embedded) prepareHandoffLayer();
               ctaBounce.onPressIn();
             }}
             onTouchEnd={ctaBounce.onPressOut}
@@ -1067,7 +1519,7 @@ function SearchHeroComponent({ mode, entranceTrigger, bgTrigger, resetTrigger }:
       {/* preserve unused-tripTypeIds reference for future analytics hooks */}
       {tripTypeIds.length === 0 ? <View /> : null}
     </View>
-    </ScreenEntrance>
+    </EntranceHull>
   );
 }
 
@@ -1075,6 +1527,42 @@ export const SearchHero = memo(SearchHeroComponent);
 
 const styles = scaledStyles({
   container: { flex: 1, backgroundColor: C.bg },
+  /**
+   * Eingebettet wächst das Formular mit seinem Inhalt — und malt nichts.
+   *
+   * `flex: 0` statt `flex: 1`: Der Bildschirm gibt seine Höhe vor, ein Blatt
+   * NIMMT sie sich aus dem Inhalt. Bliebe `flex: 1` stehen, hätte Yoga in einem
+   * Elternteil ohne feste Höhe nichts zu verteilen — die Basis ist dabei 0, und
+   * die Slide wäre ein leerer Streifen mit einem X darin.
+   *
+   * Keine Farbe, aus demselben Grund wie beim Formular darunter: Das Blatt
+   * darum ist bereits deckend eingefärbt und hat unten runde Ecken. Diese
+   * Fläche liegt genau darüber und malte sie eckig zu — und zwar in der Farbe
+   * des BILDSCHIRMS, die neben der des Formulars als heller Streifen zu sehen
+   * wäre.
+   */
+  containerEmbedded: {
+    /**
+     * `flexGrow: 0` mit `flexShrink: 1` — ausgeschrieben und nicht als `flex`.
+     *
+     * `flex: 0` setzt in React Native BEIDE auf null. Das wäre hier zu starr:
+     * Das Blatt darüber ist auf 78% der Fensterhöhe gedeckelt, und passt der
+     * Inhalt einmal nicht hinein (kurzes Gerät, große Systemschrift), ragt eine
+     * Fläche ohne Schrumpfen unten aus dem Blatt heraus — über die
+     * Ergebnisliste, unbeschnitten, weil das Blatt bewusst kein
+     * `overflow: hidden` trägt. Mit dem Schrumpfen wird der Deckel stattdessen
+     * an das Formular durchgereicht, und das ist eine Scroll-Fläche: Es scrollt
+     * dann, statt überzulaufen.
+     *
+     * Ausgeschrieben, weil `flex` und `flexShrink` im selben Stilobjekt zwei
+     * getrennte Angaben an Yoga sind und ihre Reihenfolge nicht zugesichert ist.
+     * Wer sich darauf verlässt, hat einen Fehler, der je nach Version kippt.
+     */
+    flexGrow: 0,
+    flexShrink: 1,
+    flexBasis: "auto",
+    backgroundColor: "transparent",
+  },
 
   // Höhe 220 und der Rest der Geometrie 1:1 vom Auth-Screen (dort `band`).
   // Ohne `insets.top`: Das Band ist reine Grafik, die Statusleiste darf darüber
@@ -1099,6 +1587,49 @@ const styles = scaledStyles({
     // stehen die Ecken der Kinder darüber hinaus.
     overflow: "hidden",
   },
+  /**
+   * Eingebettet: dieselbe Rechnung eine Ebene tiefer, plus der Rand zurück auf
+   * null.
+   *
+   * Die -20 ziehen das Formular ÜBER das Dünen-Band, damit die runde Oberkante
+   * hineinschneidet. Ohne Band schnitte sie in nichts — sichtbar wäre allein,
+   * dass die ersten 20 Punkte des Formulars über der Oberkante des Blattes
+   * liegen und dort abgeschnitten werden.
+   */
+  /**
+   * KEINE eigene Farbe.
+   *
+   * Das Blatt darum trägt dieselbe und hat unten runde Ecken. Eine deckende,
+   * eckige Fläche darin malte sie wieder zu — und zwar genau in den vier
+   * Punkten, an denen man ein Blatt als Blatt erkennt. Nebenbei fällt damit
+   * eine deckende Vollfläche weg, die sonst in jedem Bild der Fahrt über einer
+   * zweiten läge.
+   */
+  formEmbedded: {
+    // Schrumpfen wie beim Container darüber — erst dadurch wird aus dem Deckel
+    // des Blattes eine Scroll-Fläche statt eines Überlaufs. Begründung dort.
+    flexGrow: 0,
+    flexShrink: 1,
+    flexBasis: "auto",
+    marginTop: 0,
+    backgroundColor: "transparent",
+  },
+  /**
+   * Eingebettet gibt der Inhalt seinen oberen Innenabstand AB.
+   *
+   * Die 18 in `formContent` gehören zum eigenständigen Bildschirm: Dort
+   * schließt das Formular unmittelbar an das Dünen-Band an und liegt mit -20
+   * darüber, die 18 sind der Abstand von dessen Unterkante zum ersten Element.
+   * In einem fremden Blatt steht darüber stattdessen eine Kopfzeile mit dem
+   * Schließen-Zeichen, und die setzt ihren Abstand selbst — hergeleitet aus dem
+   * Rhythmus dieses Formulars, die Rechnung steht an
+   * `SearchEditPanel.styles.header`. Blieben die 18 stehen, kämen oben zwei
+   * Abstände zusammen; genau das war als „zu groß/hoch" gemeldet.
+   *
+   * Unten dagegen trägt der Inhalt seinen Rand weiter (siehe die Aufrufstelle):
+   * Dort ist nichts, was ihn setzen könnte.
+   */
+  formContentEmbedded: { paddingTop: 0, paddingBottom: SPACE.xl },
   // 20 statt 26 — GUTTER, dasselbe Maß wie im Landingscreen. Die 26 kamen aus
   // dem Anmelde-Screen; dort passen sie zu einem Blatt, das nur Formularfelder
   // trägt. Neben dem Landingscreen gelesen fiel der breitere Rand auf.

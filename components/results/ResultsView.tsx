@@ -19,39 +19,28 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { usePathname, useRouter } from "expo-router";
 
-import {
-  Train,
-  Bus,
-  ArrowLeftRight,
-  ArrowUpDown,
-  SlidersHorizontal,
-  RotateCcw,
-  WifiOff, Compass,
-  Plane,
-  PlaneTakeoff,
-  PlaneLanding,
-  MapPin,
-  Ship,
-  type LucideIcon,
-} from "lucide-react-native";
+import { RotateCcw, WifiOff, Compass } from "lucide-react-native";
 import { useQuery } from "@tanstack/react-query";
 import Animated, {
   FadeIn,
   FadeOut,
   LinearTransition,
-  cancelAnimation,
   useAnimatedStyle,
-  useSharedValue,
-  withRepeat,
-  withSpring,
   withTiming,
-  Easing,
   runOnJS,
   useAnimatedReaction,
 } from "react-native-reanimated";
 import { TravelMode, SearchResult, SearchResponse } from "@/types/search";
-import { searchByMode } from "@/lib/api/client";
+import { searchByMode, createPriceAlert } from "@/lib/api/client";
+import { ensurePushToken } from "@/lib/notifications/push";
+import { FilterChips } from "@/components/ui/FilterChips";
+import { showAlert } from "@/lib/alert";
 import { ResultCard } from "@/components/results/ResultCard";
+import { SearchSummaryBar } from "@/components/results/SearchSummaryBar";
+import { SearchProgressBar } from "@/components/results/SearchProgressBar";
+import { SearchEditPanel } from "@/components/results/SearchEditPanel";
+import { PriceAlertSheet } from "@/components/results/PriceAlertSheet";
+import type { SearchHeroInitial, TripType } from "@/components/search/SearchHero";
 import { RandomSearchLoader } from "@/components/results/search-loaders/RandomSearchLoader";
 import { Bo } from "@/components/assistant/Bo";
 import { useT } from "@/lib/i18n/useT";
@@ -66,12 +55,26 @@ import { tripSignature } from "@/lib/results/signature";
 import { useAccent } from "@/lib/theme/accent";
 import { MOTION, revealEntering } from "@/lib/motion";
 import { endSearchHandoff, isSearchHandoff } from "@/lib/nav/searchHandoff";
-import { FIELD_H, GUTTER } from "@/lib/theme/spacing";
+import { GUTTER, SPACE } from "@/lib/theme/spacing";
 import { prepareLayer, releaseLayer, subscribeLayer } from "@/lib/nav/transitionLayer";
 import { scaledStyles } from "@/lib/ui/compact";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 
 type SortKey = "cheapest" | "fastest" | "direct";
+
+/**
+ * Die Sortier-Reiter als MODUL-Konstante.
+ *
+ * Sie standen im Rumpf des Bildschirms und entstanden damit bei jedem
+ * Durchgang neu — und dieser Bildschirm rendert mehrfach pro Übergang. Seit die
+ * Reiter im Kopf der LISTE sitzen, ginge eine frische Kennung zusätzlich durch
+ * die Memo-Schranke des Kopfes hindurch. Ihr Inhalt hängt von nichts ab.
+ */
+const SORT_TABS: { key: SortKey; labelKey: string }[] = [
+  { key: "cheapest", labelKey: "results.sort.cheapest" },
+  { key: "fastest", labelKey: "results.sort.fastest" },
+  { key: "direct", labelKey: "results.sort.direct" },
+];
 
 const C = {
   bg: "#0D0D0D",
@@ -106,6 +109,29 @@ const PAGE_SIZE = 20;
 const priceForSort = (p: number) => (p > 0 ? p : Number.MAX_SAFE_INTEGER);
 
 /**
+ * Wann die Vorbelegung der Such-Slide frühestens veröffentlicht wird.
+ *
+ * Nicht so früh wie möglich, und das ist der ganze Witz dieser Zahl. Die
+ * Einfahrt meldet sich für 430ms als „fährt" an (`PUSH_SPRING.duration`) —
+ * danach ist aber noch nichts ruhig: `afterSlide` hängt drei Schritte in je ein
+ * eigenes Bild, und der letzte davon ist ein NAVIGATIONS-Commit samt nativem
+ * Container von react-native-screens. Wer 120ms nach dem Ende der Bewegung
+ * veröffentlicht, legt den Neuaufbau des Formularbaums also ausgerechnet
+ * daneben.
+ *
+ * 600ms liegen hinter dieser Kette und deutlich vor dem Vorbau des Formulars
+ * (der wartet nach dem Slide-Ende nochmal 700ms). Dazwischen ist die einzige
+ * wirklich ruhige Lücke.
+ *
+ * Verloren geht durch das Warten nichts: Gelesen wird die Vorbelegung erst,
+ * wenn jemand die Kopfzeile antippt, und dahin ist es von hier aus weit.
+ */
+const PREFILL_SETTLE_MS = 600;
+
+/** Nachfassen, falls in diesem Moment doch etwas fährt (Rückfahrt, Blatt). */
+const PREFILL_RETRY_MS = 200;
+
+/**
  * Schließt den Such-Screen, sobald die Ergebnis-Liste ihn wirklich verdeckt.
  * Tut nichts, wenn gar keine Übergabe lief (z.B. Aufruf aus dem Verlauf).
  */
@@ -119,6 +145,19 @@ const priceForSort = (p: number) => (p > 0 ? p : Number.MAX_SAFE_INTEGER);
  */
 function releaseResultsLayer(): void {
   releaseLayer("results");
+}
+
+/**
+ * Das Gegenstück — die Ebene der Liste ANFORDERN, beim Aufsetzen des Fingers
+ * auf den Zurück-Pfeil.
+ *
+ * Ebenfalls als Modul-Funktion und aus demselben Grund wie oben: Der Handler
+ * sitzt auf der Kopfzeile, die dauerhaft im bewegten Baum liegt. Eine neue
+ * Funktions-Kennung pro Durchgang wäre dort ein Fabric-Commit auf genau der
+ * Ansicht, die Reanimated Bild für Bild beschreibt.
+ */
+function prepareResultsLayer(): void {
+  prepareLayer("results");
 }
 
 function finishSearchHandoff(): void {
@@ -220,6 +259,19 @@ const PARKED = { transform: [{ translateX: 100000 }] } as const;
 /** Nur für „andere Route liegt oben" — siehe `shellStyle`. */
 const HIDDEN_FOR_ROUTE = { opacity: 0 } as const;
 
+/**
+ * Die Fläche der Lade-Szene — als MODUL-Konstante.
+ *
+ * Sie stand als Objektliteral im JSX (`style={{ flex: 1 }}`), und zwar auf genau
+ * dem Knoten, der die Ein- und Ausblend-Animation der Szene trägt. Ein frisches
+ * Objekt pro Durchgang ist dort auf Fabric ein Commit auf eine Ansicht, die
+ * Reanimated gerade Bild für Bild beschreibt — dieselbe Falle, die in dieser
+ * Datei am Wurzel-Stil (`shellStyle`) und am Rückgabewert des Slide-Worklets
+ * (`PARKED`) ausführlich begründet ist. Der Inhalt hängt von nichts ab, die
+ * Konstante kann also einmal existieren.
+ */
+const LOADER_FILL = { flex: 1 } as const;
+
 /** Schlüssel einer Ergebnis-Zeile — als Modul-Funktion, nicht pro Durchgang neu. */
 function resultKey(r: SearchResult): string {
   return `${r.direction ?? "OUTBOUND"}-${r.id}`;
@@ -320,29 +372,64 @@ export function ResultsView() {
   // nach Mount-Speed zu früh oder zu spät feuern könnte.
   const [contentReady, setContentReady] = useState(false);
   /**
-   * Leben die Karten der Liste gerade? — der Hebel gegen „nach einer Suche ist
-   * die ganze App langsamer".
+   * HIER STAND `listAlive` — „leben die Karten der Liste gerade?". Der Zustand
+   * ist weg, die AUFGABE bleibt und wird weiter unten erledigt. Beides gehört
+   * aufgeschrieben, sonst baut jemand den Umweg in einem halben Jahr wieder ein.
    *
-   * Dieser Bildschirm bleibt bewusst dauerhaft gemountet: Ihn pro Aufruf zu
+   * DIE AUFGABE, und warum sie eine ist:
+   *
+   * Dieser Bildschirm bleibt bewusst dauerhaft gemountet. Ihn pro Aufruf zu
    * bauen war teuer, und das Ab- und Wiederaufbauen des Detail-Blattes hat
    * nachweislich native Ansichten liegengelassen. An dieser Entscheidung ändert
-   * sich hier NICHTS — die Hülle, die Kopfzeile und die Liste selbst bleiben
-   * stehen.
+   * sich nichts — die Hülle, die Kopfzeile und die Liste selbst bleiben stehen.
    *
-   * Was nicht stehenbleiben muss, sind die KARTEN. Nach einer Suche hielt die
-   * Liste fünf Bildschirmhöhen davon gemountet, für den Rest des App-Laufs:
-   * jede mit Logo, Verlauf und einer Reanimated-Zuordnung. Und jede neu
-   * gemountete Zuordnung — auch die von Bos Zeilen beim Öffnen — verwirft die
-   * sortierte Reihenfolge ALLER Zuordnungen der App, die im nächsten Bild neu
-   * aufgebaut wird. Genau deshalb wurde jede spätere Bewegung schlechter,
-   * sobald man einmal gesucht hatte.
+   * Was nicht stehenbleiben DARF, sind die KARTEN. Ohne Freigabe hielte die
+   * Liste nach einer Suche fünf Bildschirmhöhen davon gemountet, für den Rest
+   * des App-Laufs: jede mit Logo, Verlauf und einer Reanimated-Zuordnung. Und
+   * jede neu gemountete Zuordnung — auch die von Bos Zeilen beim Öffnen —
+   * verwirft die sortierte Reihenfolge ALLER Zuordnungen der App, die im
+   * nächsten Bild neu aufgebaut wird. Genau deshalb wurde jede spätere Bewegung
+   * schlechter, sobald man einmal gesucht hatte. Die DATEN bleiben dabei im
+   * Abfrage-Speicher liegen; freigegeben werden nur die Ansichten.
    *
-   * Die Daten selbst bleiben im Abfrage-Speicher liegen; freigegeben werden nur
-   * die Ansichten. Beim Zurückkehren baut die Liste sie neu auf — nach der
-   * Fahrt, an derselben Stelle, an der auch eine frische Suche ihren Inhalt
-   * einblendet (`contentReady`).
+   * WER SIE HEUTE ERLEDIGT: der `!showResults`-Arm der Verzweigung unten.
+   * `showResults` wird beim Schließen WÄHREND DES RENDERS auf falsch gesetzt
+   * (der Reset-Block am Wechsel von `searchKey` — beim Schließen fallen die
+   * Parameter weg, der Schlüssel wechselt also immer). Dieser Arm gewinnt vor
+   * dem Listen-Arm und rendert `null`, sobald zusätzlich `searching` falsch ist.
+   * Die Karten sind damit im ERSTEN Commit nach dem Schließen abgebaut.
+   *
+   * WARUM DER ZWEITE ZUSTAND NIE ZUM ZUG KAM — die Erreichbarkeit, in beide
+   * Richtungen:
+   *
+   *  - Sein `null`-Arm lag HINTER `!showResults` und `isError`, war also nur
+   *    erreichbar, während Ergebnisse angezeigt werden. Wahr wird `showResults`
+   *    aber ausschließlich im Zyklus-Puls der Lade-Szene, und der setzt
+   *    `contentReady` voraus — nach dem der Zustand längst auf wahr stand, mit
+   *    Sekunden Vorlauf (ein voller Szenen-Zyklus dauert 3,4 bis 5,5s). Der Arm
+   *    war damit tot.
+   *  - In der Gegenrichtung fiel er nur, wenn `contentReady` falsch war — und da
+   *    hatte der Reset-Block oben schon `showResults` gekippt. Sein Wecker (1,5s
+   *    plus Wiederversuche) lief also über eine Liste, die es nicht mehr gab.
+   *
+   * Übrig blieben zwei zusätzliche Durchgänge dieses Bildschirms je Öffnen und
+   * Schließen und eine Wecker-Kette. Das ist der Grund für den Ausbau.
+   *
+   * WAS DAMIT NICHT GELÖST IST, und bewusst offen bleibt: Der Abbau liegt jetzt
+   * im Schließ-Commit, also ein bis zwei Bilder hinter der Rückfahrt — genau
+   * dort, wo der ausgebaute Zustand ihn wegholen wollte. Die Absicht war
+   * richtig, nur hat der Mechanismus sie nie erfüllt. Wer das angeht, braucht
+   * KEINEN zweiten Zustand: Es genügt, den Abbau des Inhalts vom Schließen zu
+   * entkoppeln, und er muss die drei Fälle treffen (normales Zurück, sofortiges
+   * Wiederöffnen DERSELBEN Suche, Wiederöffnen einer ANDEREN — dort müssen die
+   * alten Karten weg, sonst hängen sie unter den neuen).
+   *
+   * Und eine Falle, die der ausgebaute Arm bereits kannte: Die Liste mit leerem
+   * Datensatz stehenzulassen ist NICHT die billige Variante. Sie rendert dann
+   * ihren Leer-Zustand, und darin steckt ein Bo mit 138 Punkt Kantenlänge — ein
+   * schwerer SVG-Baum statt der Karten ist kein Gewinn. Freigeben heißt hier
+   * immer: gar nichts rendern.
    */
-  const [listAlive, setListAlive] = useState(false);
   /** Textur für die Zeit, in der ein Detail-Blatt über dieser Liste fährt. */
 
 
@@ -380,6 +467,21 @@ export function ResultsView() {
     [],
   );
   const afterSlide = useCallback(() => {
+    /**
+     * Die Kennungen der VORIGEN Öffnung abräumen, bevor neue dazukommen.
+     *
+     * Die Liste wuchs bei jedem Öffnen um drei Einträge und wurde nur beim Abbau
+     * geleert — den dieser Baum nie erlebt, er hängt dauerhaft an der Wurzel.
+     * Nach fünfzig Suchen lägen darin hundertfünfzig längst abgelaufene
+     * Kennungen. Sie kosten pro Bild nichts, aber sie sind ein Leck, und der
+     * Aufräum-Pfad beim Abbau lief über eine Liste, die zu 98% aus Müll bestand.
+     *
+     * Abbrechen ist dabei kein Selbstzweck: Wird eine neue Öffnung gestartet,
+     * während die drei Schritte der vorigen noch anstehen, gehören die alten
+     * ohnehin nicht mehr ausgeführt.
+     */
+    for (const id of afterRafRef.current) cancelAnimationFrame(id);
+    afterRafRef.current.length = 0;
     // Jeder Schritt bricht ab, wenn inzwischen zurückgegangen wird — sonst
     // nimmt Schritt 2 der Rückfahrt die Textur wieder weg, die sie sich gerade
     // besorgt hat, und Schritt 3 baut die Ladeszene auf einem Bildschirm auf,
@@ -599,27 +701,74 @@ export function ResultsView() {
   }, [router]);
   const goBack = closeResults;
 
-  const handleSwap = useCallback(() => {
-    // Haptik + Rotation + Spam-Lock macht die RouteHeader (doSwap) selbst; hier
-    // nur noch der eigentliche Routentausch. Läuft eine rAF später (siehe
-    // doSwap), damit die Rotation vor dem Query-Remount startet.
-    if (!origin || !destination) return;
-    const swapped = {
-      origin: destination,
-      destination: origin,
-      originLabel: destLabel,
-      destLabel: originLabel,
-    };
-    // Solange die Route noch aussteht, direkt im Store tauschen — `setParams`
-    // würde sonst die Parameter einer FREMDEN Route umschreiben.
-    const st = useSearchStore.getState();
-    if (st.pendingResultsRoute) {
-      st.setPendingResultsRoute({ ...st.pendingResultsRoute, ...swapped });
-      st.setResultsParams({ ...(st.resultsParams ?? {}), ...swapped });
-      return;
-    }
-    router.setParams(swapped);
-  }, [router, origin, destination, originLabel, destLabel]);
+  /**
+   * Eine GEÄNDERTE Suche übernehmen — der Ausgang der Such-Slide.
+   *
+   * Hier stand `handleSwap`, das genau eine Änderung konnte: Start und Ziel
+   * vertauschen. Das Formular in der Slide kann jede — andere Orte, anderes
+   * Datum, andere Reisende, andere Klasse — und liefert dafür denselben
+   * vollständigen Parametersatz, den auch der Such-Screen abschickt. Der Weg
+   * hinein ist deshalb derselbe geblieben, nur die Quelle ist eine andere.
+   *
+   * Der Sonderfall ebenfalls: Solange die Route noch AUSSTEHT (geöffnet wird
+   * über den Store, die Route wird erst nach der Bewegung nachgezogen), gibt es
+   * gar keine, deren Parameter man umschreiben könnte — `setParams` träfe die
+   * einer FREMDEN Route. Dann wird direkt im Store getauscht.
+   *
+   * `router.setParams` ist ein Zusammenführen, kein Ersetzen. Das ist hier
+   * unkritisch, weil der Satz aus dem Formular VOLLSTÄNDIG ist: Auch eine
+   * Rückreise, die es nicht mehr gibt, steht darin als leerer Wert und
+   * überschreibt damit die alte.
+   */
+  const applySearchEdit = useCallback(
+    (next: Record<string, string>) => {
+      const st = useSearchStore.getState();
+      if (st.pendingResultsRoute) {
+        st.setPendingResultsRoute({ ...st.pendingResultsRoute, ...next });
+        st.setResultsParams({ ...(st.resultsParams ?? {}), ...next });
+        return;
+      }
+      router.setParams(next);
+    },
+    [router],
+  );
+
+  /**
+   * Die Such-Slide — offen oder zu.
+   *
+   * Sie fährt von OBEN herein und trägt dasselbe Formular wie der Such-Screen.
+   * Ausgelöst wird sie durch einen Tipp auf die Kopfzeile: Was dort steht, ist
+   * genau das, was man ändern will, und deshalb ist die Anzeige zugleich der
+   * Knopf. Der frühere Weg dorthin war „Ändern" — der schloss diesen Bildschirm
+   * und baute den Such-Screen darunter wieder auf, mit voller Rückfahrt und
+   * neuer Einfahrt. Jetzt bleibt die Liste stehen.
+   */
+  const [searchEditOpen, setSearchEditOpen] = useState(false);
+  const openSearchEdit = useCallback(() => {
+    haptic("button");
+    setSearchEditOpen(true);
+  }, []);
+  const closeSearchEdit = useCallback(() => setSearchEditOpen(false), []);
+
+  /**
+   * Die Glocke öffnet den PREIS-ALARM, nicht die Benachrichtigungen.
+   *
+   * Hier stand das Benachrichtigungs-Blatt des Landingscreens, an dessen
+   * Unterkante angedockt. Das war die naheliegende Bedeutung einer Glocke, aber
+   * die falsche für diesen Bildschirm: Eine Liste vergangener Meldungen hat mit
+   * der Suche, die man gerade vor sich hat, nichts zu tun. Beobachten will man
+   * an dieser Stelle den PREIS dieser Strecke — und genau dafür steht die
+   * Glocke hier.
+   *
+   * Erreichbar bleibt die Meldungsliste über die Glocke im Landingscreen; sie
+   * ist dort dieselbe und unverändert.
+   */
+  const [alertOpen, setAlertOpen] = useState(false);
+  const openPriceAlert = useCallback(() => {
+    haptic("button");
+    setAlertOpen(true);
+  }, []);
+  const closePriceAlert = useCallback(() => setAlertOpen(false), []);
   const departDate = p.departDate ?? "";
   // Uhrzeit aus dem Datums-/Zeit-Picker (UTC-ISO). Muss in JEDEN Query-Key und
   // jeden Suchaufruf — sonst sucht der Server ab einer Default-Zeit statt ab
@@ -824,7 +973,28 @@ export function ResultsView() {
   // Flash und das „Animation A → Animation B"-Stottern verursachte.
   // React schmeißt diesen Render weg und macht sofort einen neuen mit dem
   // korrekten State — kein wasted paint, kein Flicker.
-  const searchKey = `${mode}|${origin}|${destination}|${departDate}`;
+  /**
+   * Was eine ANDERE Suche ausmacht — und hier standen bis zum Umbau vier von
+   * sieben Bestandteilen.
+   *
+   * Solange der einzige Weg, eine laufende Suche zu ändern, der Tausch-Knopf
+   * war, reichten Verkehrsmittel, Start, Ziel und Hinreise-Datum: Mehr konnte
+   * man von hier aus gar nicht ändern. Seit die Such-Slide das ganze Formular
+   * anbietet, kann man es — und wer nur die Reisenden oder die Klasse ändert,
+   * sah bisher NICHTS passieren: Die Abfrage lief neu (ihr Schlüssel enthält
+   * beides längst), aber `showResults` blieb stehen, also weder Lade-Szene noch
+   * Balken. Der Bildschirm zeigte minutenlang die Preise für die alte
+   * Personenzahl, ohne einen Hinweis darauf, dass etwas unterwegs ist.
+   *
+   * Jetzt dieselben Bestandteile wie im Abfrage-Schlüssel, plus die Uhrzeit —
+   * die wählt man im Kalender, sie geht in die Suche ein und war hier ebenfalls
+   * unsichtbar.
+   *
+   * Was daran hängt, ist damit ebenfalls richtig: Eine wirklich andere Suche
+   * beginnt wieder bei der Hinreise, ohne Umgebungs-Ausweichung und mit der
+   * Standard-Sortierung.
+   */
+  const searchKey = `${mode}|${origin}|${destination}|${departDate}|${departTime}|${returnDate}|${passengers}|${travelClass}`;
   /**
    * Der aktuelle Stand, auch für Rückrufe aus einem älteren Render.
    *
@@ -1066,7 +1236,24 @@ export function ResultsView() {
     // Nutzer getauscht, das Datum geändert oder die Umgebungssuche gestartet
     // haben. Ohne diesen Vergleich hingen die alten Treffer unten an der NEUEN
     // Liste, und der Blätter-Token gehörte zur falschen Strecke.
-    const loadKey = `${mode}|${origin}|${destination}|${departDate}`;
+    /**
+     * DIESELBEN Bestandteile wie `searchKey` — sonst schlägt der Vergleich
+     * unten IMMER fehl.
+     *
+     * Hier standen vier Teile, während `searchKey` seit der Erweiterung acht
+     * trägt (Uhrzeit, Rückreise, Reisende, Klasse kamen dazu, damit auch eine
+     * Änderung an ihnen die Suchanimation auslöst). Zwei Zeichenketten mit
+     * verschieden vielen Teilen sind nie gleich — der Wächter unten stieg also
+     * bei JEDEM Nachladen aus, noch VOR dem Eintragen.
+     *
+     * Sichtbar war das als Knopf, der nichts tut: Ein Tipp auf „Mehr" schickte
+     * eine vollständige Anbieter-Anfrage los (bei Flügen mit `nocache`, also
+     * eine frische und kostenpflichtige), wartete sie ab, zerlegte die Antwort
+     * — und verwarf sie. Deshalb aus derselben Vorlage gebaut wie `searchKey`
+     * und nicht noch einmal von Hand: Zwei Listen an zwei Orten laufen beim
+     * nächsten Feld wieder auseinander.
+     */
+    const loadKey = searchKeyRef.current;
     // Verglichen wird gegen den Ref, nicht gegen dieselben Closure-Werte — siehe
     // die Begründung an `searchKeyRef`.
     setIsLoadingMore(true);
@@ -1182,12 +1369,6 @@ export function ResultsView() {
     }
   };
 
-  const tabs: { key: SortKey; labelKey: string }[] = [
-    { key: "cheapest", labelKey: "results.sort.cheapest" },
-    { key: "fastest", labelKey: "results.sort.fastest" },
-    { key: "direct", labelKey: "results.sort.direct" },
-  ];
-
   /**
    * Der Stil der Wurzel EINMAL, nicht bei jedem Durchgang neu.
    *
@@ -1216,35 +1397,348 @@ export function ResultsView() {
   );
 
   /**
-   * Anschalten sofort, Abschalten mit Abstand und nur im Leerlauf.
+   * „Die Suche läuft gerade" — EINMAL abgeleitet, zweimal gebraucht.
    *
-   * `contentReady` kippt am ENDE der Einfahrt auf wahr und bleibt es über die
-   * ganze Ausfahrt — die Karten sind also da, solange man sie sehen kann, und
-   * die Rückfahrt trägt ihren vollen Inhalt.
+   * Der Ladebalken hängt daran und die Umschaltung auf die Lade-Szene ebenfalls.
+   * Zwei getrennt hingeschriebene Bedingungen laufen beim nächsten Feinschliff
+   * auseinander, und dann liefe der Balken über der fertigen Liste weiter.
    *
-   * Erst danach wird freigegeben, und zwar nicht bildgenau: Ein Abbau von
-   * zwanzig Karten ist der teuerste Commit dieses Bildschirms, und direkt hinter
-   * einer Bewegung ist er am schlechtesten aufgehoben — dort sieht man ihn als
-   * Nachklang. Dieselbe Behandlung wie Bos Abbau: Abstand plus Prüfung, ob
-   * gerade etwas fährt, mit Wiederversuch.
+   * GENAU DAS WAR PASSIERT, und es hat den teuersten Commit dieses Bildschirms
+   * ins Bewegungsfenster gelegt.
+   *
+   * Der Balken benutzte diesen Wert, die Lade-Szene schrieb ihre Bedingung
+   * daneben noch einmal von Hand hin — und ließ dabei `visible` weg. Was daraus
+   * folgt, sieht man erst, wenn man die Reihenfolge beim SCHLIESSEN aufschreibt:
+   *
+   *   1. Die Route-Hülle wird gepoppt und setzt die Parameter auf `null`.
+   *   2. Dieser Baum rendert. `storeParams` ist weg, also fällt alles auf seine
+   *      Vorgabe zurück, `searchKey` wechselt, und der Reset-Block WÄHREND DES
+   *      RENDERS setzt `showResults` auf falsch.
+   *   3. `contentReady` steht in genau diesem Commit noch auf WAHR — es wird
+   *      erst im Sichtbarkeits-Effekt zurückgenommen, und Effekte laufen nach
+   *      dem Commit.
+   *
+   * Damit galt für ein bis zwei Bilder `!showResults && contentReady`, und der
+   * Zweig unten baute eine vollständige Lade-Szene auf: Bo mit fünfzehn
+   * geteilten Werten, sechs Zuordnungen und bis zu vierzehn Endlos-Kurven, dazu
+   * der Szenen-SVG und ein Takt-Geber. Im nächsten Bild war alles wieder weg.
+   *
+   * Bezahlt wurde das an der schlechtesten Stelle: unmittelbar hinter der
+   * Rückfahrt — und wer dort gleich die nächste Verlaufskarte antippt (der
+   * Normalfall, an drei Stellen dieser Datei so beschrieben), bekommt das
+   * Aufblenden, das Ausblenden und das An- und Abschalten von Bos Schleifen in
+   * die ERSTEN Bilder der nächsten Einfahrt. Jede neu gemountete Zuordnung
+   * verwirft dabei die sortierte Reihenfolge aller Zuordnungen der App.
+   *
+   * Im selben Commit wird auch die LISTE abgebaut: Der `!showResults`-Zweig
+   * gewinnt vor dem Listen-Zweig, und `showResults` fällt beim Schließen schon
+   * während des Renders. Das ist seither der einzige Weg, auf dem die Karten
+   * freigegeben werden — der frühere Umweg über einen zweiten Zustand kam nie
+   * zum Zug und ist ausgebaut; der Grabstein dazu steht oben bei `contentReady`.
    */
+  const searching = visible && contentReady && !showResults;
+
+  /**
+   * Der günstigste Preis dieser Suche — die Bezugsgröße des Preis-Alarms.
+   *
+   * Aus ALLEN Treffern, nicht aus der angezeigten Richtung. Hier stand die
+   * gefilterte Liste, mit der Begründung, bei Rückreise sei deren Preis
+   * gemeint — und das war falsch, weil es die eine Seite ist, die der SERVER
+   * nicht sieht: Er prüft später über die vollständige Antwort einer Suche.
+   * Eine Schwelle, die aus einem Rückreise-Preis gesetzt wurde, läge damit über
+   * dem, was der Server als günstigsten Preis findet, und der Alarm feuerte
+   * sofort bei der nächsten Suche. Beide Seiten müssen dieselbe Zahl meinen.
+   *
+   * Nur echte Preise zählen — Zug-Treffer ohne Anreicherung tragen eine 0, und
+   * die wäre als „günstigster Preis" eine glatte Falschaussage. Bleibt nichts
+   * übrig, gibt es keinen Bezugspunkt; das Blatt sagt das dann selbst, statt
+   * eine Zahl zu erfinden.
+   */
+  const cheapestPrice = useMemo(() => {
+    let min = 0;
+    for (const r of allResults) {
+      if (r.price > 0 && (min === 0 || r.price < min)) min = r.price;
+    }
+    return min;
+  }, [allResults]);
+
+  /**
+   * Alarm anlegen.
+   *
+   * Die Strecke wird MIT Beschriftung gespeichert, nicht nur mit Codes: Ein
+   * Alarm wird später irgendwo aufgelistet, und „FRA → ZRH" sagt dort weniger
+   * als „Frankfurt (Main) Hbf". Die Codes bleiben trotzdem dabei — sie sind
+   * das, womit eine Prüfung später wirklich suchen kann.
+   */
+  const submitPriceAlert = useCallback(
+    (desiredPrice: number, notifyOnRise: boolean) => {
+      /**
+       * Erst der Zustellweg, dann der Alarm.
+       *
+       * Die Berechtigung wird GENAU HIER erfragt und nicht beim App-Start: An
+       * dieser Stelle ist der Zweck offensichtlich, und unter Android ist ein
+       * „Nie erlauben" endgültig. Ohne Kennung wird gar kein Alarm angelegt —
+       * ein gespeicherter Alarm, den niemand zustellen kann, wäre ein
+       * Versprechen ohne Deckung.
+       */
+      void (async () => {
+        const push = await ensurePushToken();
+        if (!push.ok) {
+          /**
+           * Die beiden Fälle AUSEINANDERHALTEN.
+           *
+           * „Erlaubnis verweigert" schickt den Nutzer sinnvoll in die
+           * Systemeinstellungen. „Kein Zustellweg" tut das nicht — dort findet
+           * er nichts, weil das Problem am Build hängt und nicht an ihm. Eine
+           * Meldung, die auf die falsche Ursache zeigt, ist schlimmer als gar
+           * keine; genau das war hier der Fall.
+           */
+          if (push.reason === "denied") {
+            showAlert(t("alert.nopush.title"), t("alert.nopush.body"));
+          } else {
+            showAlert(
+              t("alert.nochannel.title"),
+              `${t("alert.nochannel.body")}\n\n${push.detail}`,
+            );
+          }
+          return;
+        }
+        const pushToken = push.token;
+        try {
+          const created = await createPriceAlert(
+            {
+              pushToken,
+              mode,
+              origin,
+              destination,
+              originLabel,
+              destLabel,
+              departDate,
+              /**
+               * Die Rückreise gehört MIT — sonst ist der Alarm mehrdeutig.
+               *
+               * Eine Suche mit Rückreise liefert eine andere Trefferliste als
+               * dieselbe Strecke ohne, also einen anderen günstigsten Preis.
+               * Fehlte sie, verglich der Server die Schwelle einer Hin- und
+               * Rückreise später mit dem Preis einer einfachen Fahrt — und
+               * meldete beim nächsten Mal sofort einen Preissturz, den es nie
+               * gab.
+               */
+              returnDate: returnDate || undefined,
+              // Reisende und Klasse gehören zum Preis — siehe `PriceAlert`.
+              passengers,
+              travelClass,
+              currency,
+              /**
+               * GERUNDET — dieselbe Zahl, die das Blatt angezeigt hat.
+               *
+               * Das Blatt rechnet mit `Math.round(currentPrice)`, hier ging der
+               * Rohwert hinaus. Bei 9,99 € stand auf dem Bildschirm ein
+               * Grundpreis von 10, während der Server 9,99 bekam — und wies die
+               * Anfrage zurück, weil der Wunschpreis nicht darunter lag. Beim
+               * Nutzer kam nur „Alarm konnte nicht angelegt werden" an, ohne
+               * Grund. Maßgeblich ist die Zahl, die er gesehen hat.
+               */
+              basePrice: Math.round(cheapestPrice),
+              desiredPrice,
+              notifyOnRise,
+            },
+            // Angemeldet? Dann verknüpft der Server den Alarm zusätzlich mit dem
+            // Konto, und er überlebt einen Gerätewechsel. Ohne Anmeldung geht es
+            // trotzdem.
+            useSearchStore.getState().authToken,
+          );
+          /**
+           * Lokal spiegeln, NACHDEM der Server bestätigt hat.
+           *
+           * Die Reihenfolge ist der Punkt: Der Server ist die Wahrheit, weil
+           * dort geprüft wird. Der lokale Eintrag ist nur die Anzeige — ihn
+           * vorher zu setzen hieße, einen Alarm anzuzeigen, den es nicht gibt.
+           */
+          useSearchStore.getState().addPriceAlertNoted(
+            {
+              // Die Kennung vom Server MIT merken — ohne sie ließe sich der
+              // Alarm später nur aus der Anzeige entfernen, nicht vom Server.
+              serverId: created.id,
+              mode,
+              origin,
+              destination,
+              originLabel,
+              destLabel,
+              departDate,
+              returnDate,
+              passengers,
+              travelClass,
+              currency,
+              // Dieselbe gerundete Zahl wie beim Server — die Anzeige darf
+              // nicht behaupten, der Alarm hänge an einem anderen Preis.
+              basePrice: Math.round(cheapestPrice),
+              desiredPrice,
+              notifyOnRise,
+            },
+            /**
+             * Der Hinweis sagt, WAS entstanden ist, die Unterzeile WO es liegt.
+             *
+             * Ohne ihn passierte nach dem Anlegen sichtbar nichts: Das Blatt
+             * schloss sich, und der Alarm lag in einem Reiter, den man gerade
+             * nicht ansieht. Man musste annehmen, es sei nichts passiert. Der
+             * rote Punkt am Reiter kommt aus demselben Aufruf.
+             */
+            t("alert.saved.title"),
+            `${originLabel} – ${destLabel}`,
+          );
+          haptic("important");
+        } catch {
+          showAlert(t("alert.failed.title"), t("alert.failed.body"));
+        }
+      })();
+    },
+    /**
+     * `returnDate` gehört in die Liste — es wird im Rumpf zweimal benutzt.
+     *
+     * Es fehlte, und das ist keine Förmlichkeit: Über die Such-Slide lässt sich
+     * ein Rückdatum ergänzen, ohne den Bildschirm zu verlassen
+     * (`applySearchEdit` schreibt nur die Parameter um). Blieb der günstigste
+     * Preis dabei gleich — oder stand noch der alte, während die neue Suche
+     * lief —, wurde der Rückruf nicht neu gebaut, und der Alarm entstand mit
+     * dem ALTEN Rückdatum bei neuer Schwelle.
+     */
+    [
+      mode,
+      origin,
+      destination,
+      originLabel,
+      destLabel,
+      departDate,
+      returnDate,
+      passengers,
+      travelClass,
+      currency,
+      cheapestPrice,
+      t,
+    ],
+  );
+
+  /**
+   * Die Vorbelegung der Such-Slide — als Zustand, der NICHT in eine laufende
+   * Bewegung hinein wechselt.
+   *
+   * Hier stand ein `useMemo` über die Such-Parameter, und das war die zweite
+   * Hälfte eines gemeldeten Rucklers: „wenn ich aus dem Such-Screen heraus
+   * suche, ruckelt die Einfahrt der Liste, aus dem Verlauf genauso, auch der
+   * Parallax."
+   *
+   * Die Kette ist kurz und in beiden Einstiegen dieselbe. `startResultsPush()`
+   * lässt die Bewegung losfahren; die Parameter werden erst EIN BILD SPÄTER
+   * gesetzt (`requestAnimationFrame` in `SearchHero.handleSubmit` und in
+   * `RecentCard`). Dieser Bildschirm rendert daraufhin neu — mitten in Bild 2
+   * der Fahrt. Ein `useMemo` über die Parameter liefert dabei zwangsläufig eine
+   * neue Kennung, die Slide bekommt sie als Eigenschaft, und weil sich damit
+   * eine Eigenschaft geändert hat, läuft der eingebettete Formularbaum
+   * vollständig durch: ScrollView, fünf Einblend-Hüllen, vier Felder, Pillen,
+   * Knopf. Danach schlägt zusätzlich seine Vorbelegung zu.
+   *
+   * Beides ist überflüssig genau dann, wenn es am teuersten ist: Die Slide ist
+   * zu, niemand sieht das Formular, und die 430ms der Fahrt gehören der
+   * Bewegung. Deshalb wird der Wert HINTER die Bewegung veröffentlicht.
+   *
+   * Als Zustand und nicht als abgeleiteter Wert, weil genau das der Punkt ist:
+   * Der Zeitpunkt der Veröffentlichung soll frei wählbar sein. Die Kennung
+   * bleibt zwischen zwei Veröffentlichungen stabil — daran hängt drüben der
+   * Auslöser, der das Formular füllt.
+   *
+   * Der Wiederversuch ist dieselbe Bauart wie die Freigabe der Ergebniskarten
+   * weiter oben: kurzer Abstand, Prüfung, notfalls nochmal. Eine feste
+   * Wartezeit ginge auch, träfe aber die Rückfahrt nicht, die eine andere
+   * Dauer hat.
+   */
+  /**
+   * Verkehrsmittel UND Vorbelegung zusammen — als EIN Zustand.
+   *
+   * Das Verkehrsmittel gehört mit hierher, und das war der zweite Auslöser
+   * desselben Rucklers. Solange die Ergebnisse zu sind, liegen keine Parameter
+   * im Speicher, und `mode` fällt auf seinen Vorgabewert `FLIGHT` zurück. Beim
+   * Öffnen einer Zug-, Bus- oder Kreuzfahrt-Suche wechselt die Eigenschaft also
+   * von `FLIGHT` auf den echten Wert — in genau dem Commit, der die Bewegung
+   * blockiert. Und weil das Verkehrsmittel drüben die Reisearten und die
+   * Klassen-Liste bestimmt, rendert der komplette Formularbaum daraufhin neu.
+   *
+   * Zusammen in EINEM Zustand und nicht als zwei: Sie müssen im selben Durchgang
+   * wechseln. Getrennt käme unvermeidlich ein Bild vor, in dem eine Vorbelegung
+   * für Züge an einem Formular für Flüge hängt — und dessen Klassen-Liste ist
+   * eine andere, der Index zeigte ins Leere.
+   */
+  const [editPrefill, setEditPrefill] = useState<{
+    mode: TravelMode;
+    initial: SearchHeroInitial;
+  } | null>(null);
   useEffect(() => {
-    if (contentReady) {
-      if (!listAlive) setListAlive(true);
+    const next: SearchHeroInitial = {
+      origin: origin ? { code: origin, label: originLabel } : null,
+      destination: destination ? { code: destination, label: destLabel } : null,
+      /**
+       * Die UHRZEIT gehört mit — deshalb `departTime` zuerst.
+       *
+       * `departDate` ist ein reines Tagesdatum, `departTime` derselbe Zeitpunkt
+       * samt Uhrzeit (die man im Kalender wählt und die wirklich in die Suche
+       * eingeht). Mit dem Tagesdatum allein fiele die Vorbelegung auf
+       * Mitternacht zurück: Wer um 10 Uhr sucht, die Slide öffnet und ohne
+       * Änderung erneut sucht, hätte plötzlich eine andere Abfahrtszeit als
+       * eben — ohne sie angefasst zu haben.
+       */
+      departDate: departTime || departDate || null,
+      returnDate: returnDate || null,
+      passengers,
+      travelClassKey: travelClass || null,
+      /**
+       * `tripType` kommt aus den Parametern, WENN es welche gibt — und
+       * hergeleitet, wenn nicht.
+       *
+       * Vorrang hat der Parameter: Wer eine Hin- und Rückreise gesucht hat, bei
+       * der die Rückreise leer blieb, soll die Slide trotzdem auf Hin und
+       * zurück stehend vorfinden.
+       *
+       * Nur setzt ihn nicht jeder Einstieg. Die Spracheingabe schickt ihn gar
+       * nicht (`VoiceContent.tsx`), und im Verlauf steht er nur, wenn er beim
+       * Suchen dabei war (`RecentCard.tsx` fügt ihn bedingt an). Ohne
+       * Herleitung bliebe das Formular in diesen Fällen auf seiner Vorgabe „Hin
+       * und zurück": Wer aus einer per Sprache gesuchten einfachen Fahrt die
+       * Slide öffnet, sähe ein leeres Rückreise-Feld — und bekäme beim ersten
+       * Tipp auf „Preise vergleichen" einen roten Rand für ein Feld, das er nie
+       * angefasst hat. Das Rückreise-Datum ist die verlässliche Auskunft
+       * darüber.
+       */
+      tripType:
+        (p.tripType as TripType | undefined) ?? (returnDate ? "roundtrip" : "oneway"),
+    };
+    const publish = () => setEditPrefill({ mode, initial: next });
+    if (!isTransitionBusy()) {
+      publish();
       return;
     }
-    if (!listAlive) return;
     let id: ReturnType<typeof setTimeout>;
     const attempt = () => {
       if (isTransitionBusy()) {
-        id = setTimeout(attempt, 200);
+        id = setTimeout(attempt, PREFILL_RETRY_MS);
         return;
       }
-      setListAlive(false);
+      publish();
     };
-    id = setTimeout(attempt, 1500);
+    id = setTimeout(attempt, PREFILL_SETTLE_MS);
     return () => clearTimeout(id);
-  }, [contentReady, listAlive]);
+  }, [
+    mode,
+    origin,
+    originLabel,
+    destination,
+    destLabel,
+    departDate,
+    departTime,
+    returnDate,
+    passengers,
+    travelClass,
+    p.tripType,
+  ]);
 
   return (
     <>
@@ -1258,33 +1752,51 @@ export function ResultsView() {
           übereinander heißt, die GPU füllt den ganzen Bildschirm zweimal —
           jedes Bild, auch während der Bewegung. */}
       <SafeAreaView style={styles.root} edges={["top"]}>
-        <RouteHeader
+        <SearchSummaryBar
           mode={mode}
           fromLabel={stationLabel(originLabel)}
           toLabel={stationLabel(destLabel)}
-          // An !showResults, NICHT isLoading: showResults wird bei JEDEM
-          // Routenwechsel (auch Swap) auf false gesetzt und der Loader läuft
-          // mindestens einen Zyklus. isLoading dagegen ist beim Swap zu einer
-          // gecachten Gegenrichtung false — dann blieb der alte Zählerstand
-          // stehen statt der Lade-Welle. So läuft die Welle im Header genau,
-          // während unten der Such-Loader läuft.
-          // `visible` MIT prüfen: Ohne das gilt beim App-Start `!showResults`
-          // → true, und der Kopfbereich zeigt seinen Lade-Zustand — samt der
-          // Endlos-Animation der Punkte, die dann ab Sekunde eins dauerhaft auf
-          // dem UI-Thread mitläuft, obwohl nichts zu sehen ist. Seit dieser Baum
-          // nicht mehr pro Suche entsteht, wäre das ein Dauerzustand.
-          // `contentReady` MIT prüfen: Der Lade-Zustand war schon im ersten Render
-          // true — also bevor die Bewegung überhaupt startet. Damit pulsierten
-          // die drei Punkte über die volle Bewegung mit (Endlos-Schleife plus drei
-          // Mapper pro Bild), und der bewegte Baum war dadurch nicht statisch.
-          loading={visible && contentReady && !showResults}
-          busy={visible && contentReady && !showResults}
-          resultCount={sorted.length}
-          accentSolid={accent.solid}
-          accentSubtle={accent.subtle}
-          onSwap={handleSwap}
-          onChange={goBack}
+          departDate={departDate}
+          returnDate={returnDate}
+          passengers={passengers}
+          travelClassKey={travelClass}
+          onBack={goBack}
+          onBackTouchStart={prepareResultsLayer}
+          onPress={openSearchEdit}
+          onBellPress={openPriceAlert}
         />
+
+        {/**
+          * Der Ladebalken — und die Bedingung dafür ist unverändert die des
+          * alten Kopfbereichs. Sie ist teuer erarbeitet, deshalb steht ihre
+          * Begründung hier weiter:
+          *
+          * An `!showResults`, NICHT an `isLoading`: `showResults` wird bei JEDEM
+          * Routenwechsel auf falsch gesetzt und der Loader läuft mindestens
+          * einen Zyklus. `isLoading` ist beim Wechsel zu einer gecachten
+          * Gegenrichtung dagegen falsch — dann liefe der Balken gar nicht,
+          * während unten die Lade-Szene spielt.
+          *
+          * `visible` MIT prüfen: Ohne das gilt beim App-Start `!showResults` →
+          * wahr, und der Balken liefe ab Sekunde eins dauerhaft auf dem
+          * UI-Strang, obwohl nichts zu sehen ist. Seit dieser Baum nicht mehr
+          * pro Suche entsteht, wäre das ein Dauerzustand.
+          *
+          * `contentReady` MIT prüfen: Der Ladezustand ist schon im ersten Render
+          * wahr — also bevor die Einfahrt überhaupt startet. Sonst liefe die
+          * Schleife über die volle Bewegung mit, und der fahrende Baum wäre
+          * nicht statisch.
+          *
+          * Er reserviert seinen Platz NICHT, wenn er ruht: Was darunter steht,
+          * ist im Ladezustand die Szene und danach die Liste — zwei
+          * verschiedene Inhalte, die ohnehin überblenden. Ein leerer Streifen
+          * über der fertigen Liste wäre der schlechtere Tausch.
+          */}
+        {searching ? (
+          <View style={styles.progressWrap}>
+            <SearchProgressBar active />
+          </View>
+        ) : null}
 
       {showDirectionToggle ? (
         <View style={styles.dirToggleWrap}>
@@ -1299,42 +1811,24 @@ export function ResultsView() {
         </View>
       ) : null}
 
-      <View style={styles.tabsRow}>
-        {tabs.map((tab) => {
-          const active = sort === tab.key;
-          return (
-            <Pressable
-              key={tab.key}
-              onPress={() => {
-                haptic("button");
-                setSort(tab.key);
-              }}
-              // Hitbox vergrößern, ohne die visuellen Buttons aufzublasen.
-              // top/bottom großzügig (vertikaler Platz ist da), left/right
-              // moderat (sonst überlappen die Hitboxen den 22px-Gap).
-              hitSlop={{ top: 14, bottom: 14, left: 10, right: 10 }}
-              style={styles.tabBtn}
-            >
-              <Text style={[styles.tabText, active && [styles.tabTextActive, { color: accent.solid }]]}>
-                {t(tab.labelKey)}
-              </Text>
-              {active ? <View style={[styles.tabUnderline, { backgroundColor: accent.solid }]} /> : null}
-            </Pressable>
-          );
-        })}
-        <View style={styles.tabsSpacer} />
-        <RippleTouch hitSlop={6} borderless style={[styles.filterBtn, { backgroundColor: palette.s2 }]}>
-          <SlidersHorizontal color={C.text} size={16} />
-        </RippleTouch>
-      </View>
-
       {!showResults ? (
         // contentReady-Gate: Scene wird ERST nach Slide-End gemountet — kein
         // Mount-Cost konkurriert mit dem Slide-Worklet → buttersmoothes
         // Slide. FadeIn-Entering blendet die Scene danach sanft rein, kein
         // hartes Pop. Identisches Pattern wie DetailsOverlay's
         // contentReady-gated ScrollView.
-        !contentReady ? null : (
+        //
+        // `searching` statt `contentReady` — also DERSELBE abgeleitete Wert, an
+        // dem auch der Ladebalken darüber hängt. Er ist `visible && contentReady
+        // && !showResults`; hier drin ist `!showResults` bereits wahr, es kommt
+        // also allein `visible` hinzu. Ohne das mountete die Szene beim
+        // SCHLIESSEN noch einmal für ein Bild — die ausführliche Begründung
+        // steht an der Ableitung selbst.
+        //
+        // Am ÖFFNEN ändert sich nichts: `visible` ist wahr, sobald die
+        // Parameter anliegen, also lange bevor `contentReady` am Ende der
+        // Einfahrt kippt. Das Tor bleibt damit `contentReady`, genau wie bisher.
+        !searching ? null : (
         // exiting: Der Loader verschwand bisher HART — Boo war da, im nächsten
         // Frame stand die Liste. Genau dieser Schnitt liest sich als „Aufploppen",
         // egal wie sauber die Liste danach einblendet. Jetzt blendet er aus,
@@ -1342,7 +1836,7 @@ export function ResultsView() {
         <Animated.View
           entering={FadeIn.duration(220)}
           exiting={FadeOut.duration(MOTION.duration / 2)}
-          style={{ flex: 1 }}
+          style={LOADER_FILL}
         >
         <RandomSearchLoader
           originLabel={originLabel}
@@ -1379,16 +1873,6 @@ export function ResultsView() {
             <Text style={styles.retryBtnText}>{t("results.retry")}</Text>
           </RippleTouch>
         </View>
-      ) : !listAlive ? (
-        /**
-         * Freigegeben — hier steht bewusst NICHTS.
-         *
-         * Die Liste mit leerem Datensatz stehenzulassen wäre die naheliegende
-         * Variante, aber sie hätte ihren Leer-Zustand gerendert: darin steckt
-         * ein Bo mit 138 Punkt Kantenlänge. Ein schwerer SVG-Baum statt der
-         * Karten ist kein Gewinn.
-         */
-        null
       ) : showDirectionToggle ? (
         // Outbound + Return side-by-side im Pager — Hin/Rück-Toggle triggert
         // nur einen translateX, FlatLists bleiben gemountet → smoother
@@ -1401,6 +1885,7 @@ export function ResultsView() {
             fetchedAt={data?.fetchedAt ?? ""}
             listIdentity={listIdentity}
             sort={sort}
+            onSort={setSort}
             passengers={passengers}
             mode={mode}
             isRefetching={isRefetching}
@@ -1422,6 +1907,7 @@ export function ResultsView() {
             fetchedAt={data?.fetchedAt ?? ""}
             listIdentity={listIdentity}
             sort={sort}
+            onSort={setSort}
             passengers={passengers}
             mode={mode}
             isRefetching={isRefetching}
@@ -1445,6 +1931,7 @@ export function ResultsView() {
           fetchedAt={data?.fetchedAt ?? ""}
           listIdentity={listIdentity}
           sort={sort}
+          onSort={setSort}
           passengers={passengers}
           mode={mode}
           isRefetching={isRefetching}
@@ -1461,6 +1948,65 @@ export function ResultsView() {
         />
       )}
       </SafeAreaView>
+
+      {/**
+        * Die Such-Slide — INNERHALB der bewegten Hülle, nicht daneben.
+        *
+        * Sie gehört zu diesem Bildschirm: Sie fährt mit ihm herein und hinaus,
+        * und sie darf nur so weit reichen wie er. Am Wurzel-Layout gemountet
+        * (wie die Blätter, die von unten kommen) läge sie über allem, auch über
+        * dem Landingscreen, sobald man zurückgeht.
+        *
+        * NACH der sicheren Fläche, damit sie deren Inhalt verdeckt — ihre eigene
+        * Kopfzeile bringt den Abstand zur Statusleiste selbst mit.
+        *
+        * `armed` an `contentReady`: Das Formular ist der teuerste Baum, den
+        * dieser Bildschirm kennt, und es soll fertig stehen, bevor jemand die
+        * Kopfzeile antippt. `contentReady` kippt am ENDE der Einfahrt — also
+        * genau dann, wenn nichts mehr fährt und der Aufbau niemandem im Weg ist.
+        * Die Slide selbst wartet zusätzlich, bis wirklich Ruhe ist.
+        */}
+      <SearchEditPanel
+        visible={searchEditOpen}
+        armed={contentReady}
+        onClose={closeSearchEdit}
+        onApply={applySearchEdit}
+        /**
+         * Verkehrsmittel und Vorbelegung kommen BEIDE aus dem aufgeschobenen
+         * Zustand — siehe dort. Der Rückfall greift nur, bevor überhaupt einmal
+         * veröffentlicht wurde, und das ist der erste Durchgang beim App-Start:
+         * Dort liegt keine Bewegung an, der Effekt veröffentlicht sofort.
+         */
+        mode={editPrefill?.mode ?? mode}
+        initial={editPrefill?.initial ?? null}
+      />
+
+      {/**
+        * Das Preis-Alarm-Blatt — von unten, über die gemeinsame Hülle aller
+        * Blätter (`SheetModal`), und deshalb hier ohne eigene Bewegung.
+        *
+        * Dass es INNERHALB der bewegten Hülle steht, ist für die Darstellung
+        * ohne Bedeutung: `SheetModal` rendert in ein natives `Modal`, und das
+        * hängt in einem EIGENEN Fenster, nicht in diesem Baum. Es fährt also
+        * nicht mit, es wird nicht mit verschoben, und es liegt über allem.
+        *
+        * Hier steht es trotzdem, und zwar wegen der Zugehörigkeit: Es gehört zu
+        * dieser Suche, liest ihren günstigsten Preis und ihre Strecke. Am
+        * Wurzel-Layout müsste beides erst dorthin gereicht werden, und es wäre
+        * offen, wem es gehört, sobald ein zweiter Bildschirm einen Alarm
+        * anbietet. Solange es nur hier einen gibt, ist das die ehrlichere
+        * Stelle. `visible` sorgt dafür, dass das Fenster nur entsteht, wenn es
+        * gebraucht wird.
+        */}
+      <PriceAlertSheet
+        visible={alertOpen}
+        onClose={closePriceAlert}
+        currentPrice={cheapestPrice}
+        currency={currency}
+        fromLabel={stationLabel(originLabel)}
+        toLabel={stationLabel(destLabel)}
+        onCreate={submitPriceAlert}
+      />
     </ResultsShell>
     </>
   );
@@ -1522,272 +2068,130 @@ const ResultsShell = memo(function ResultsShell({
 });
 
 /**
- * Verbindungs-Header (vertikales Design): Abfahrt oben, Ziel darunter, eine
- * gestrichelte Route durch beide Felder, ein Akzent-Swap-Button, der die Route
- * dreht, plus Meta-Zeile mit Ergebniszahl und „Ändern".
+ * HIER STAND DER GROSSE VERBINDUNGS-KOPF — und warum er weg ist.
  *
- * Übernommen aus einer externen Design-Vorlage, aber an unsere Prinzipien
- * angepasst: Akzent-System statt Lime, fontWeight statt Inter-fontFamily, alle
- * Strings über useT, Tokens fürs Spacing — und die Swap-Rotation auf Reanimated,
- * weil klassisches RN-Animated (useNativeDriver) auf der New Architecture am
- * Startwert hängen bleibt.
+ * Er zeigte die Strecke in zwei Eingabefeld-Attrappen übereinander, mit einem
+ * Tausch-Knopf dazwischen und darunter einer Zeile aus Trefferzahl und
+ * „Ändern". Das kostete fast ein Drittel des ersten Bildschirms für Angaben,
+ * die man beim Suchen selbst gemacht hat.
+ *
+ * An seine Stelle treten drei Dinge, die vorher in ihm steckten:
+ *
+ *  - `SearchSummaryBar` zeigt dieselbe Strecke auf einer Zeile, dazu Datum,
+ *    Reisende und Klasse, die vorher gar nicht sichtbar waren.
+ *  - Die Trefferzahl wanderte in den Kopf der LISTE (`ResultsListHeader`) und
+ *    fährt beim Scrollen mit hinaus, statt fest oben zu kleben.
+ *  - Der Lade-Zustand — vorher drei pulsierende Punkte in der Zähler-Pille —
+ *    ist jetzt der Balken unter der Kopfzeile (`SearchProgressBar`).
+ *
+ * Mit ihm gingen `LoadingDots` und `pulse`, die nur er benutzt hat, sowie der
+ * Tausch-Knopf samt seiner Kette aus Sperre, Zeitgeber und Freigabe. Das
+ * Drehen der Strecke lebt in der Such-Slide, die beim Antippen der Zeile
+ * herunterfährt — dort ohne diese Kette, weil dort erst der Such-Knopf eine
+ * Anbieter-Anfrage auslöst und nicht schon der Tausch selbst.
  */
-// Marker-Mitte: Feld-paddingLeft (18) + halbe Marker-Spalte (6).
-/** Symbol je Verkehrsmittel für das Start-Feld. Flüge bekommen ein eigenes
- *  Paar (startend/landend), siehe unten. */
-const RH_MODE_ICON: Record<TravelMode, LucideIcon> = {
-  FLIGHT: Plane,
-  TRAIN: Train,
-  BUS: Bus,
-  CRUISE: Ship,
-};
-
-// Dauer der Swap-Icon-Drehung. Der eigentliche Routentausch startet danach,
-// damit die Drehung ungestört durchläuft (siehe doSwap).
-const SWAP_ROTATE_MS = 320;
 
 /**
- * memo: Der Kopfbereich hängt an wenigen Werten, der Bildschirm darunter ändert
- * seinen Zustand aber mehrfach pro Übergang (contentReady am Slide-Ende,
- * showResults beim Eintreffen der Daten, Sortierung, Richtung). Ohne memo lief
- * dieser Baum bei JEDEM dieser Wechsel komplett neu — einer davon fällt exakt
- * auf das Ende der Bewegung.
+ * Ergebniszahl und Sortier-Reiter — beides sitzt jetzt IM Kopf der Liste.
+ *
+ * Vorher standen sie an zwei verschiedenen Orten und beide fest: die Zahl als
+ * Pille oben in der Kriterien-Box, die Reiter als eigene Leiste darunter. Beim
+ * Scrollen blieb die Leiste stehen und belegte dauerhaft Platz, während die
+ * Zahl in einer Box klebte, die den halben Bildschirmkopf einnahm.
+ *
+ * Sie gehören zusammen — die Zahl sagt, wie viele Treffer die gewählte
+ * Sortierung gerade zeigt — und sie gehören zur Liste, nicht über sie. Als
+ * Kopf der Liste fahren sie mit hinaus, sobald man die Karten hochschiebt.
+ *
+ * MODULEBENE und `memo`, nicht als Inline-Baum im Render der Liste: Ein
+ * `ListHeaderComponent` bekommt bei jedem Durchgang ein frisches Element.
+ * Solange der TYP derselbe bleibt, gleicht React ab; ein im Rumpf definierter
+ * Baum wäre bei jedem Durchgang ein neuer Typ, und dann baut React den Kopf
+ * nativ neu auf. Exakt die Begründung, die unten schon am Trenner steht.
+ *
+ * `onSort` ist der Setzer aus `useState` — dessen Kennung ist stabil, die
+ * Memo-Schranke greift also wirklich.
  */
-const RouteHeader = memo(function RouteHeader({
-  mode,
-  fromLabel,
-  toLabel,
-  loading,
-  busy,
-  resultCount,
-  accentSolid,
-  accentSubtle,
-  onSwap,
-  onChange,
+const ResultsListHeader = memo(function ResultsListHeader({
+  count,
+  sort,
+  onSort,
 }: {
-  /** Bestimmt die Symbole in den beiden Feldern. */
-  mode: TravelMode;
-  fromLabel: string;
-  toLabel: string;
-  loading: boolean;
-  /** Suche läuft → Swap gesperrt (Abuse-Schutz) und Button gedimmt. */
-  busy: boolean;
-  resultCount: number;
-  accentSolid: string;
-  accentSubtle: string;
-  onSwap: () => void;
-  onChange: () => void;
+  /** Die VOLLE Trefferzahl der Richtung, nicht die gerade sichtbare Seite. */
+  count: number;
+  sort: SortKey;
+  onSort: (key: SortKey) => void;
 }) {
   const t = useT();
   const palette = usePalette();
-  // Dieselben Symbole wie im Such-Screen: startendes und landendes Flugzeug bei
-  // Flügen, sonst das Symbol des Verkehrsmittels und eine Ortsmarke.
-  const FromIcon = mode === "FLIGHT" ? PlaneTakeoff : RH_MODE_ICON[mode];
-  const ToIcon = mode === "FLIGHT" ? PlaneLanding : MapPin;
-  // Dreht bei jedem Tausch um 180°. Reanimated, nicht RN-Animated (siehe oben).
-  //
-  // Timing 1:1 vom Search-Hero (SearchHero.tsx handleSwap): 320 ms easeOutCubic.
-  //
-  // Target über einen Ref, NICHT spin.value + 180: Bei Doppelklick während der
-  // Drehung hätte spin.value einen interpolierten Zwischenwert (z.B. 90°), und
-  // +180 ergäbe 270 statt 360 — die zweite Drehung ruckelte. Der Ref
-  // inkrementiert immer sauber um 180.
-  const spin = useSharedValue(0);
-  const spinTarget = useRef(0);
-  const swapIconStyle = useAnimatedStyle(() => ({
-    transform: [{ rotate: `${spin.value}deg` }],
-  }));
-
-  // Spam-/Abuse-Schutz: Jeder Swap löst eine echte Suche aus (Netzwerk, DB-
-  // Kontingent). Ein synchrones Lock verhindert, dass man den Button schneller
-  // drückt, als die Suche fertig wird — inkl. Doppel-Tap im SELBEN Frame, den
-  // ein State-/Prop-Guard nicht abfängt (der aktualisiert sich erst nach dem
-  // Render). Freigegeben wird erst, wenn die laufende Suche durch ist (busy →
-  // false), also frühestens nach einem vollen Loader-Zyklus.
-  const swapLock = useRef(false);
   /**
-   * Bei JEDEM Render prüfen, nicht nur bei einem Wechsel von `busy`.
+   * Die Beschriftungen einmal je Sprache bauen, nicht bei jedem Bild.
    *
-   * Als Effekt mit `[busy]` lief die Freigabe nur, wenn sich der Wert ÄNDERT.
-   * Steigt `onSwap` früh aus (fehlende Strecke), wechselt `busy` nie — die
-   * Sperre blieb dann für immer gesetzt, und weil dieser Baum dauerhaft
-   * gemountet ist, half auch kein Bildschirmwechsel mehr: Der Tausch-Knopf war
-   * für den Rest der Sitzung tot. Eine Zuweisung im Render kostet nichts und hat
-   * diese Lücke nicht.
+   * Der Kopf der Liste hängt hinter einer Memo-Schranke, aber innerhalb eines
+   * Durchgangs entstünde sonst bei jedem Render eine neue Liste — und die
+   * ginge als frische Kennung an ein `memo`-Bauteil, das dann jedes Mal neu
+   * zeichnet.
    */
-  if (!busy) swapLock.current = false;
-
-  /**
-   * Der Zeitgeber der Drehung — abgeräumt beim SCHLIESSEN, nicht beim Abbau.
-   *
-   * Hier stand eine Aufräumfunktion für den Abbau, mit genau der richtigen
-   * Begründung („sonst feuert setParams auf einer schon verlassenen Route").
-   * Nur wird dieser Baum seit dem Umbau nie mehr abgebaut, er wird bloß aus dem
-   * Bild geschoben — die Funktion lief also nie. Wer den Tausch antippt und
-   * innerhalb der 320ms zurückgeht, löste damit `router.setParams` auf einem
-   * Bildschirm aus, der gerade hinausfährt: eine überflüssige, echte
-   * Anbieter-Suche, und im ungünstigen Fall landen die Parameter am Home-Reiter.
-   */
-  const swapTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const resultsOpen = useSearchStore((st) => st.resultsParams != null);
-  useEffect(() => {
-    if (resultsOpen) return;
-    if (swapTimer.current) {
-      clearTimeout(swapTimer.current);
-      swapTimer.current = null;
-    }
-  }, [resultsOpen]);
-
-  const doSwap = () => {
-    if (swapLock.current || busy) return;
-    swapLock.current = true;
-    haptic("button");
-    spinTarget.current += 180;
-    spin.value = withTiming(spinTarget.current, {
-      duration: SWAP_ROTATE_MS,
-      easing: Easing.out(Easing.cubic),
-    });
-    // Die schwere Kette (Params-Wechsel → Query-Refetch → Boo-Loader-Mount, 33
-    // Reanimated-Hooks) startet ERST NACH der Drehung. Feuert sie währenddessen,
-    // jankt der Mount mitten in die Rotation („smooth, dann stockt es") — genau
-    // das war das Problem. Ein rAF reichte nicht. So läuft die Rotation komplett
-    // unabhängig auf dem UI-Thread, wie im Hero (der beim Swap nur leichtes
-    // lokales State-Update macht). Der Preis: die Suche startet ~300 ms später —
-    // unmerklich, und die Drehung liest sich ohnehin als „löst den Tausch aus".
-    swapTimer.current = setTimeout(() => onSwap(), SWAP_ROTATE_MS);
-  };
-
-
+  const sortItems = useMemo(
+    () => SORT_TABS.map((tab) => ({ id: tab.key, label: t(tab.labelKey) })),
+    [t],
+  );
+  const onSortChip = useCallback((id: string) => onSort(id as SortKey), [onSort]);
   return (
-    <View style={[styles.routePanel, { backgroundColor: palette.s2 }]}>
-      <View style={styles.rhFieldsWrap}>
-        {/* Zuschnitt 1:1 wie im Such-Screen: zwei gleich hohe Felder (FIELD_H)
-            mit je einem Symbol und einer Zeile. Es ist dieselbe Strecke, einmal
-            zum Eingeben und einmal zum Anzeigen — sie darf nicht zweimal
-            verschieden aussehen. */}
-        <View style={styles.rhFields}>
-          {/* Abfahrt */}
-          <View style={[styles.rhField, { backgroundColor: palette.bg }]}>
-            <FromIcon size={20} color={C.sub} strokeWidth={1.9} />
-            <Text
-              style={styles.rhStation}
-              numberOfLines={1}
-              adjustsFontSizeToFit
-              minimumFontScale={0.65}
-            >
-              {fromLabel}
-            </Text>
-          </View>
-
-          {/* Ziel */}
-          <View style={[styles.rhField, { backgroundColor: palette.bg }]}>
-            <ToIcon size={20} color={C.sub} strokeWidth={1.9} />
-            <Text
-              style={styles.rhStation}
-              numberOfLines={1}
-              adjustsFontSizeToFit
-              minimumFontScale={0.65}
-            >
-              {toLabel}
-            </Text>
-          </View>
-        </View>
-
-        {/* Swap-Button — überlappt beide Felder rechts, Rand in Kartenfarbe für
-            die „ausgestanzt"-Optik. Es rotiert NUR das Icon, nicht der ganze
-            Button: Den umrandeten, overflow:hidden-geclippten Button pro Frame zu
-            drehen zwang Android zum Neurastern (wie beim Schatten) und ruckelte —
-            der Hero dreht ebenfalls nur das Icon. */}
-        <View style={[styles.rhSwapWrap, busy && styles.rhSwapWrapBusy]}>
-          <RippleTouch
-            borderless
-            onPress={doSwap}
-            style={[styles.rhSwapBtn, { backgroundColor: accentSolid }]}
-            accessibilityLabel={t("results.change")}
-          >
-            <Animated.View style={swapIconStyle}>
-              <ArrowUpDown color={C.black} size={17} strokeWidth={2.6} />
-            </Animated.View>
-          </RippleTouch>
-        </View>
+    <View style={styles.listHeader}>
+      {/**
+        * Filter und Sortierung als zwei gleich breite Knöpfe.
+        *
+        * Sie stehen ÜBER der Trefferzahl und nicht neben den Reitern, und das
+        * ist der Unterschied zwischen einem Knopf und einer Fußnote: Beide
+        * öffnen einen eigenen Auswahlbereich, während die Reiter darunter
+        * sofort umsortieren. Vorher steckte die Filter-Funktion in einem
+        * 36-Punkte-Symbolknopf am rechten Ende der Reiter-Zeile — als Symbol
+        * ohne Beschriftung, gedrängt neben drei Textreitern, und damit weder
+        * als Knopf erkennbar noch bequem zu treffen.
+        *
+        * Gleich breit über `flex: 1`: Zwei Knöpfe, die dasselbe Gewicht haben,
+        * sollen auch gleich aussehen — eine Breite nach Textlänge machte aus
+        * „Sort" den kleineren von beiden, ohne dass er weniger wichtig wäre.
+        */}
+      <View style={styles.actionRow}>
+        <RippleTouch style={[styles.actionBtn, { backgroundColor: palette.s2 }]}>
+          <Text style={styles.actionText}>{t("results.filter")}</Text>
+        </RippleTouch>
+        <RippleTouch style={[styles.actionBtn, { backgroundColor: palette.s2 }]}>
+          <Text style={styles.actionText}>{t("results.sort")}</Text>
+        </RippleTouch>
       </View>
 
-      {/* Meta-Zeile: Ergebniszahl links in einer Box, „Ändern" rechts — beide
-          dieselbe Pill-Optik. */}
-      <View style={styles.rhMetaRow}>
-        <View style={[styles.rhCountPill, { backgroundColor: palette.s3 }]}>
-          <Text style={styles.rhCountText} numberOfLines={1}>
-            {loading ? t("results.searching") : `${resultCount} ${t("results.count")}`}
-          </Text>
-          {loading ? <LoadingDots active={loading} /> : null}
-        </View>
-        {/**
-          * „Ändern" ist der Haupt-Ausgang dieser Liste — und der lief bisher
-          * OHNE Textur zurück.
-          *
-          * Der Schalter dafür ist längst verdrahtet (`subscribeLayer("results")`
-          * an der bewegten Wurzel), angefordert wurde die Fläche aber nur beim
-          * Berühren einer Ergebnis-Karte — also für den Fall, dass die Liste
-          * UNTERLAGE des Detail-Blattes wird. Für ihre eigene Rückfahrt hat sie
-          * nie jemand angefordert: Eine Liste voller Karten mit Logos und
-          * Verläufen wurde damit in jedem Bild der Ausfahrt neu gezeichnet.
-          *
-          * Angefordert wird beim AUFSETZEN, wie überall sonst: Der Aufbau ist im
-          * Projekt mit 66ms vermessen, bei 8,3ms Bildbudget, und gehört deshalb
-          * in die 80 bis 150ms des Fingers statt in die ersten Bilder der Kurve.
-          *
-          * Und `Pressable` statt `RippleTouch`: Die Material-Welle läuft beim
-          * Loslassen aus — mitten in die eben angelegte Textur hinein, die sie
-          * dann in jedem Bild ungültig machen würde. Mit Welle wäre die Ebene
-          * schlechter als gar keine. Dieselbe Begründung wie an den
-          * Schließ-Knöpfen von Detail-Blatt und Profil-Unterschirm.
-          */}
-        <Pressable
-          onTouchStart={() => prepareLayer("results")}
-          onPress={onChange}
-          style={[styles.rhChangeBtn, { backgroundColor: palette.s3 }]}
-        >
-          <Text style={styles.rhChangeText}>{t("results.change")}</Text>
-          <ArrowLeftRight color={C.text} size={14} />
-        </Pressable>
-      </View>
+      {/* Die Trefferzahl als reine Zeile — sie ist eine Auskunft, kein
+          Bedienelement. In einer Pille sah sie aus wie einer der Knöpfe
+          daneben, und man greift danach. */}
+      <Text style={styles.countText} numberOfLines={1}>
+        {`${count} ${t("results.count")}`}
+      </Text>
+
+      {/**
+        * Die Sortierung trägt jetzt DIESELBE Form wie die Kategorien unter
+        * „Gespeichert" — Konturen statt nacktem Text mit Unterstrich.
+        *
+        * Beides ist dieselbe Aufgabe: „wähle eines aus dieser kurzen Liste".
+        * Zwei Gestalten dafür hießen, dass der Nutzer zweimal lernen muss, was
+        * er anfassen kann — und der Unterstrich sah zudem eher nach einem
+        * Reiter aus, hinter dem sich eine ganze Ansicht wechselt.
+        *
+        * Linksbündig und mit demselben Rand wie die Karten darunter, damit die
+        * erste Kontur auf deren Kante steht.
+        */}
+      <FilterChips
+        items={sortItems}
+        value={sort}
+        onChange={onSortChip}
+        contentPadding={0}
+        style={styles.chipRow}
+      />
     </View>
   );
 });
-
-function LoadingDots({ active = true }: { active?: boolean }) {
-  const accent = useAccent();
-  const a = useSharedValue(0);
-  useEffect(() => {
-    // Zweiter Riegel: Auch wenn der Kopfbereich einmal ohne echten Ladezustand
-    // gerendert würde, läuft hier nichts los.
-    if (!active) {
-      cancelAnimation(a);
-      return;
-    }
-    a.value = withRepeat(withTiming(1, { duration: 900, easing: Easing.linear }), -1, false);
-    // Cleanup — sonst läuft das withRepeat-Loop weiter wenn die Component
-    // unmountet. Bei jedem Search-Reload mountet/unmountet LoadingDots,
-    // ohne Cancel würden die Worklets sich auf der UI-Thread stapeln.
-    return () => cancelAnimation(a);
-  }, [a, active]);
-  const s1 = useAnimatedStyle(() => ({ opacity: 0.3 + 0.7 * pulse(a.value, 0) }));
-  const s2 = useAnimatedStyle(() => ({ opacity: 0.3 + 0.7 * pulse(a.value, 0.33) }));
-  const s3 = useAnimatedStyle(() => ({ opacity: 0.3 + 0.7 * pulse(a.value, 0.66) }));
-  return (
-    <View style={styles.dotsRow}>
-      <Animated.View style={[styles.smallDot, { backgroundColor: accent.solid }, s1]} />
-      <Animated.View style={[styles.smallDot, { backgroundColor: accent.solid }, s2]} />
-      <Animated.View style={[styles.smallDot, { backgroundColor: accent.solid }, s3]} />
-    </View>
-  );
-}
-
-function pulse(t: number, phase: number): number {
-  "worklet";
-  const x = (t + phase) % 1;
-  return Math.max(0, Math.sin(x * Math.PI));
-}
 
 interface ResultsListViewProps {
   data: SearchResult[];
@@ -1795,8 +2199,13 @@ interface ResultsListViewProps {
   fetchedAt: string;
   /** Wechselt nur bei einer ANDEREN Suche, nicht beim Auffrischen derselben. */
   listIdentity: string;
-  /** Aktuelle Sortierung — steuert, WANN die Umsortier-Animation aktiv ist. */
+  /** Aktuelle Sortierung — steuert, WANN die Umsortier-Animation aktiv ist,
+   *  und welcher Reiter im Kopf der Liste hervorgehoben ist. */
   sort: SortKey;
+  /** Der Setzer aus `useState` — bewusst durchgereicht statt eines eigenen
+   *  Rückrufs: Seine Kennung ist stabil, der Kopf der Liste bleibt damit hinter
+   *  seiner Memo-Schranke. */
+  onSort: (key: SortKey) => void;
   passengers: number;
   mode: TravelMode;
   isRefetching: boolean;
@@ -1844,6 +2253,7 @@ function ResultsListView({
   fetchedAt,
   listIdentity,
   sort,
+  onSort,
   passengers,
   mode,
   isRefetching,
@@ -1988,6 +2398,22 @@ function ResultsListView({
       windowSize={5}
       updateCellsBatchingPeriod={80}
       ItemSeparatorComponent={ListSeparator}
+      /**
+       * Trefferzahl und Sortier-Reiter fahren MIT.
+       *
+       * Als feste Leiste über der Liste belegten sie dauerhaft Platz, obwohl
+       * man beim Scrollen die Karten sehen will. Als Kopf der Liste schieben
+       * sie sich mit hinaus — und kommen beim Zurückscrollen von selbst
+       * wieder.
+       *
+       * Ein frisches Element pro Durchgang ist hier unkritisch: `SORT_TABS` ist
+       * eine Modul-Konstante, `onSort` der stabile Setzer aus `useState`, und
+       * `ResultsListHeader` steht auf Modulebene unter `memo`. React gleicht
+       * über den Typ ab, die Schranke fängt den Rest.
+       */
+      ListHeaderComponent={
+        <ResultsListHeader count={totalCount} sort={sort} onSort={onSort} />
+      }
       contentContainerStyle={styles.listContent}
       itemLayoutAnimation={animateReorder ? LinearTransition.duration(320) : undefined}
       refreshControl={
@@ -2101,89 +2527,24 @@ const styles = scaledStyles({
   },
   root: { flex: 1 },
 
-  routePanel: {
-    backgroundColor: C.card,
-    borderRadius: 24,
-    marginHorizontal: GUTTER,
-    marginTop: 12,
-    // KEIN gap mehr: Der Abstand zur Meta-Zeile kommt allein aus deren
-    // marginTop. Vorher addierten sich gap (14) UND marginTop (12) zu 26 px
-    // oben, während unten nur die 16 px paddingBottom standen — der „Ändern"-
-    // Button klebte sichtbar näher am unteren Rand. Jetzt rundum 16.
-    padding: 16,
+  /**
+   * HIER LAGEN DIE STILE DES ALTEN VERBINDUNGS-KOPFES.
+   *
+   * Die Kriterien-Box mit ihren zwei Feld-Attrappen, dem Tausch-Knopf und der
+   * Meta-Zeile ist entfallen; ihre Maße leben in `SearchSummaryBar` weiter, wo
+   * die Höhe und der Radius der EINGABEFELDER bewusst übernommen wurden — es
+   * ist dieselbe Strecke, einmal zum Eingeben und einmal zum Anzeigen.
+   *
+   * Geblieben ist allein `rhCountText`: Die Trefferzahl steht jetzt im Kopf der
+   * Liste, soll dort aber nicht plötzlich anders aussehen als vorher in der Box.
+   */
+  countText: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: C.gray200,
+    // Abstand zu den Knöpfen darüber — derselbe Takt wie überall in diesem Kopf.
+    marginTop: SPACE.md,
   },
-  // ── RouteHeader (vertikales Design) ──────────────────────────────────────
-  rhFieldsWrap: { position: "relative" },
-  rhFields: { gap: 8 },
-  rhField: {
-    height: FIELD_H,
-    backgroundColor: C.bg,
-    borderRadius: 16,
-    paddingLeft: 18,
-    // Freiraum für den Tausch-Knopf rechts.
-    paddingRight: 62,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 14,
-    minWidth: 0,
-  },
-  rhStation: {
-    flex: 1,
-    fontSize: 22,
-    fontWeight: "800",
-    letterSpacing: -0.44,
-    color: C.text,
-    lineHeight: 26,
-  },
-  rhSwapWrap: {
-    position: "absolute",
-    right: 10,
-    top: "50%",
-    marginTop: -22,
-    zIndex: 3,
-  },
-  // Während eine Suche läuft: Swap gesperrt → sichtbar gedimmt, damit der
-  // no-op-Tap nicht wie ein toter Button wirkt.
-  rhSwapWrapBusy: { opacity: 0.5 },
-  // Flacher Akzent-Kreis wie im Hero: backgroundColor kommt inline (accentSolid),
-  // KEIN overflow:hidden und KEIN GradientFill-Kind. Genau die zwei sorgten dafür,
-  // dass Android den geclippten Container jedes Mal neu compositete, wenn das Icon
-  // darin rotierte — das war das Ruckeln. Der 5px-Rand in Kartenfarbe bleibt (die
-  // „ausgestanzt"-Optik) und stört die Rotation nicht, weil er nichts clippt.
-  rhSwapBtn: {
-    // Von 54 auf 44 — derselbe Knopf wie im Such-Screen. In der Vorlage des
-    // Nutzers ist er ein zurückhaltendes Element neben den Feldern, kein
-    // Blickfang darüber.
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    borderWidth: 4,
-    borderColor: C.card,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  rhMetaRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginTop: 16,
-    gap: 10,
-  },
-  // Ergebniszahl und „Ändern" teilen sich die Zeile hälftig: beide flex:1, also
-  // gleich breit bis zur Mitte, Inhalt zentriert. Der 10-px-gap der Zeile trennt
-  // sie, links und rechts hält das routePanel-Padding (16) den Rand.
-  rhCountPill: {
-    flex: 1,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 6,
-    minWidth: 0,
-    backgroundColor: C.surface3,
-    borderRadius: 9999,
-    paddingVertical: 9,
-    paddingHorizontal: 15,
-  },
-  rhCountText: { flexShrink: 1, fontSize: 13, fontWeight: "600", color: C.gray200 },
   rhChangeBtn: {
     flex: 1,
     flexDirection: "row",
@@ -2197,8 +2558,6 @@ const styles = scaledStyles({
   },
   rhChangeText: { fontSize: 12, fontWeight: "700", color: C.text },
 
-  dotsRow: { flexDirection: "row", gap: 3, marginLeft: 4 },
-  smallDot: { width: 4, height: 4, borderRadius: 2 },
 
   // Hin/Rück-Toggle — visuell wie im Saved-Tab (Reise/Tickets-Segment):
   // dunkler Pill-Container, aktive Pille mit Lime-Background.
@@ -2220,32 +2579,71 @@ const styles = scaledStyles({
   dirSegText: { color: "#8E8E93", fontSize: 13, fontWeight: "500" },
   dirSegTextActive: { color: "#000000", fontSize: 13, fontWeight: "700" },
 
-  tabsRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: GUTTER,
-    paddingTop: 18,
-    paddingBottom: 12,
-    gap: 22,
-  },
-  tabBtn: { paddingVertical: 4 },
-  tabText: { color: C.sub, fontSize: 14, fontWeight: "600" },
-  tabTextActive: { fontWeight: "700" },
-  tabUnderline: {
-    height: 2,
-    borderRadius: 2,
-
-    marginTop: 6,
-  },
-  tabsSpacer: { flex: 1 },
-  filterBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: C.card,
+  /**
+   * Der Kopf der Liste — Zahl oben, Reiter darunter.
+   *
+   * KEIN seitlicher Abstand: Er liegt im `contentContainerStyle` der Liste, und
+   * das bringt den GUTTER bereits mit. Ein eigener käme obendrauf, und der Kopf
+   * stünde um 20 Punkte eingerückt gegenüber den Karten.
+   *
+   * Die 12 unten sind derselbe Abstand, den auch zwei Karten untereinander
+   * haben (`ListSeparator`) — der Kopf ist damit ein Element der Liste wie jedes
+   * andere und nicht etwas, das darüber schwebt.
+   */
+  /**
+   * Der Abstand zwischen Kopfzeile und Ladebalken.
+   *
+   * Er sitzt an einer HÜLLE und nicht am Balken selbst, weil der Balken im
+   * Ruhezustand `null` liefert. Ein `marginTop` an ihm wäre dann zwar auch weg —
+   * aber die Hülle macht sichtbar, dass der Platz nur existiert, solange etwas
+   * darin steht. Derselbe Takt wie überall in diesem Kopf.
+   */
+  progressWrap: { marginTop: 12 },
+  /**
+   * Oben 8, nicht 12 — weil die Liste selbst schon 4 mitbringt.
+   *
+   * `listContent` setzt `paddingTop: 4`, und der Kopf liegt darin. Mit 12 hier
+   * stünden über der Trefferzahl 16 Punkte, über der Kopfzeile darüber aber 12:
+   * ein Versatz von vier Punkten zwischen zwei Abständen, die als derselbe
+   * gelesen werden. 4 + 8 ergibt genau den Takt, in dem der ganze Kopf steht.
+   */
+  listHeader: { paddingTop: SPACE.sm, paddingBottom: SPACE.md },
+  /**
+   * Filter und Sortierung — zwei gleich breite Knöpfe.
+   *
+   * Der Radius ist der der Eingabefelder und der Kopfzeile darüber (16), nicht
+   * die Pillenform der alten Zähler-Box: In dieser Zeile stehen zwei breite
+   * Flächen nebeneinander, und eine volle Rundung ließe sie wie zwei Tabletten
+   * wirken statt wie Knöpfe. Die Höhe ergibt sich aus Innenabstand und
+   * Zeilenhöhe zu rund 42 Punkten — knapp unter der Kopfzeile darüber und
+   * deutlich über der empfohlenen Mindestgröße für eine Tippfläche.
+   */
+  actionRow: { flexDirection: "row", gap: SPACE.md },
+  actionBtn: {
+    flex: 1,
     alignItems: "center",
     justifyContent: "center",
+    borderRadius: 16,
+    paddingVertical: SPACE.md,
   },
+  actionText: { fontSize: 14, fontWeight: "700", color: C.text },
+
+  /**
+   * Die Trefferzahl. Schriftgröße, Gewicht und Farbe unverändert aus der alten
+   * Zähler-Pille (`rhCountText`) — es ist dieselbe Angabe, sie darf nicht
+   * plötzlich anders aussehen. Weggefallen sind allein Fläche und Rundung: Als
+   * Pille sah sie aus wie ein Knopf, und in einer Zeile mit zwei echten Knöpfen
+   * darüber ist das eine falsche Einladung.
+   */
+  /**
+   * Der Abstand zur Trefferzahl darüber. Derselbe Takt wie zwischen den Karten;
+   * der frühere Wert (18) rechnete gegen die Kriterien-Box, die es an dieser
+   * Stelle nicht mehr gibt.
+   *
+   * Seitlich KEIN Polster: Der Kopf der Liste trägt es schon (`listHeader`),
+   * und die Knöpfe stehen damit auf derselben Kante wie die Karten darunter.
+   */
+  chipRow: { marginTop: 12 },
 
   listContent: { paddingHorizontal: GUTTER, paddingTop: 4, paddingBottom: 110 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },

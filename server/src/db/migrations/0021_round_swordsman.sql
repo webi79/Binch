@@ -1,0 +1,1 @@
+ALTER TABLE "push_tokens" ADD COLUMN "timezone" varchar(64) DEFAULT 'Europe/Berlin' NOT NULL;

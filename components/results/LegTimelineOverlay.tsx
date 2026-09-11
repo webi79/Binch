@@ -347,6 +347,11 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
 
   useEffect(() => {
     if (open) {
+      // Sicherung: Der Merker gehört zu GENAU einer Ausfahrt. Bliebe er aus
+      // irgendeinem Grund stehen, übersprünge die nächste Ausfahrt ihre
+      // Bewegung — das Blatt bliebe sichtbar stehen. Beim Öffnen ist er in
+      // jedem Fall gegenstandslos.
+      settlingRef.current = false;
       // Wie bei den anderen Push-Übergängen erst starten, wenn der JS-Thread
       // frei ist — sonst läuft die Bewegung gegen den Commit an, der den Inhalt
       // aufbaut (gemessen: das schlechteste Bild fiel dadurch von 25ms auf 8ms).

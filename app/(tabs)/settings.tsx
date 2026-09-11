@@ -17,7 +17,6 @@ import {
   ScrollView,
   StyleSheet,
   useWindowDimensions,
-  Switch,
   Linking,
   Image,
   ActivityIndicator,
@@ -61,6 +60,7 @@ import {
 } from "lucide-react-native";
 import { useSearchStore, Locale } from "@/stores/searchStore";
 import { useAccent, ACCENT_LIST, type AccentId } from "@/lib/theme/accent";
+import { BinchSwitch } from "@/components/ui/BinchSwitch";
 import { useAppBg, usePalette } from "@/lib/theme/appBg";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
@@ -1072,13 +1072,7 @@ function ToggleRow({
         <Text style={[styles.rowLabel, { fontWeight: "500" }]}>{label}</Text>
         {desc ? <Text style={styles.rowSub}>{desc}</Text> : null}
       </View>
-      <Switch
-        value={value}
-        onValueChange={onChange}
-        trackColor={{ false: C.s3, true: accent.solid }}
-        thumbColor="#FFFFFF"
-        ios_backgroundColor={C.s3}
-      />
+      <BinchSwitch value={value} onValueChange={onChange} accessibilityLabel={label} />
     </View>
   );
 }

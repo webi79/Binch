@@ -1,0 +1,1 @@
+ALTER TABLE "push_tokens" ADD COLUMN "locale" varchar(5) DEFAULT 'en' NOT NULL;
