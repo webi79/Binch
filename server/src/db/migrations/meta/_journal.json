@@ -169,6 +169,62 @@
       "when": 1789096704444,
       "tag": "0023_magenta_firedrake",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1789491843702,
+      "tag": "0024_locations_trgm",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1790530739646,
+      "tag": "0025_search_travel_class",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1790601799877,
+      "tag": "0026_search_unaccent",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1790601934875,
+      "tag": "0027_locations_fold_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1790725443399,
+      "tag": "0028_rail_station_geo",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1790725579151,
+      "tag": "0029_rail_station_geo_by_subtype",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1790777390617,
+      "tag": "0030_drop_unused_trgm",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1790811909918,
+      "tag": "0031_retention_and_privacy",
+      "breakpoints": true
     }
   ]
 }

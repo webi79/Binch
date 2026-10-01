@@ -34,7 +34,19 @@ export const searchRequests = pgTable(
     returnDate: date("return_date"),
     passengers: integer("passengers").notNull().default(1),
     currency: varchar("currency", { length: 8 }).notNull().default("EUR"),
-    ipHash: varchar("ip_hash", { length: 64 }),
+    /**
+     * Klasse bzw. Kabine der Suche (i18n-Schlüssel), leer = Standard.
+     *
+     * Gehört zur Cache-Identität: Ohne sie legte eine Suche in der 1. Klasse
+     * ihre Treffer unter demselben Schlüssel ab wie eine normale — die nächste
+     * normale Suche derselben Strecke bekam bis zu vier Stunden lang Preise der
+     * 1. Klasse. Die Standard-Klasse (2. Klasse, Economy, Standard-Sitz) wird
+     * als leer gespeichert, siehe `normalizeTravelClass` in searchService.ts.
+     */
+    travelClass: varchar("travel_class", { length: 64 }),
+    // `ip_hash` gibt es nicht mehr (Migration 0031): ein ungesalzener SHA-256
+    // der IP, bei IPv4 in Minuten umkehrbar — geschrieben, nie gelesen, nie
+    // gelöscht. Die Rate-Limits zählen im Speicher (util/rateLimit.ts).
     userId: uuid("user_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -108,6 +120,10 @@ export const searchResults = pgTable(
   (t) => ({
     request: index("idx_search_results_request").on(t.requestId),
     price: index("idx_search_results_price").on(t.price),
+    // Für die Kaskade beim Aufräumen (services/retention.ts): Löscht eine
+    // Suche ihre Anbieter-Antworten, setzt Postgres hier `provider_response_id`
+    // auf NULL — ohne Index las es dafür je Antwort die ganze Tabelle.
+    providerResponse: index("idx_search_results_provider_response").on(t.providerResponseId),
   }),
 );
 
@@ -132,6 +148,9 @@ export const redirectTokens = pgTable(
   },
   (t) => ({
     expires: index("idx_redirect_tokens_expires").on(t.expiresAt),
+    // Kaskade beim Löschen alter Ergebnisse (services/retention.ts) und die
+    // Prüfung „hängt hier noch ein gültiges Token?".
+    result: index("idx_redirect_tokens_result").on(t.resultId),
   }),
 );
 
@@ -352,6 +371,15 @@ export const locations = pgTable(
     label: text("label").notNull(),
     city: text("city"),
     country: text("country"),
+    /**
+     * `label` bzw. `city` ohne Akzente (`f_unaccent`, Migration 0026/0027) —
+     * die Ortssuche vergleicht auf diesen Spalten, damit „Munchen" München
+     * findet. Von Postgres berechnet und gespeichert; nie selbst schreiben.
+     * Gespeichert statt pro Abfrage gerechnet: Bei kurzen Eingaben („be")
+     * greift kein Trigramm-Index, und die Funktion lief dann über alle Zeilen.
+     */
+    labelFold: text("label_fold").generatedAlwaysAs(sql`f_unaccent(label)`),
+    cityFold: text("city_fold").generatedAlwaysAs(sql`f_unaccent(city)`),
     type: varchar("type", { length: 16 }).notNull().$type<LocationType>(),
     /** GPS-Koordinaten. Numeric mit Präzision 9 → ~1 m Genauigkeit. */
     latitude: numeric("latitude", { precision: 9, scale: 6 }),

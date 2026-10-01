@@ -1,0 +1,1 @@
+ALTER TABLE "search_requests" ADD COLUMN IF NOT EXISTS "travel_class" varchar(64);
