@@ -9,6 +9,9 @@ import { getFlightBoard } from "../services/flightInfoService.js";
 import { getScheduledStopBoard } from "../services/gtfsSchedule.js";
 import { getMotisStopBoard } from "../services/motisStops.js";
 import { ipLimiter } from "../util/rateLimit.js";
+import { AIRPORTS } from "../data/airports.js";
+import tzLookup from "tz-lookup";
+import { sameStopByName } from "../util/tripStopMatch.js";
 
 /**
  * Liefert die nächsten Abfahrten/Ankünfte einer Haltestelle. Wird vom
@@ -25,15 +28,74 @@ import { ipLimiter } from "../util/rateLimit.js";
 const paramsSchema = z.object({ code: z.string().min(1).max(96) });
 
 interface StopBoardApiResponse extends StopBoardResponse {
-  /** Wahrer Stationsname aus der DB — falls anders als der Code-suffix. */
-  stop: { code: string; label: string; hafasId: string | null };
+  /**
+   * Der Halt, wie die App ihn zeigt:
+   *   `label`  — der offizielle Name (`display_name`, sonst die Quelle) —
+   *              derselbe, den die Zeitleiste der Fahrt zeigt;
+   *   `detail` — Zusatz, nur bei gleichnamigem Nachbarn („Stop RA");
+   *   `tz`     — Ortszeit-Zone des Halts (IANA, aus seiner Lage). Die Zeiten
+   *              der Tafel sind UTC; angezeigt werden sie in DIESER Zone,
+   *              wie überall in der App — sonst stand in Oldham „16:33" auf
+   *              der Tafel und „15:33" in der Zeitleiste derselben Fahrt.
+   *   `servedBy` — die Zeiten stammen von einem ANDEREN, nahen Halt (siehe
+   *              `servedByOther`); die App sagt das über der Liste.
+   */
+  stop: {
+    code: string;
+    label: string;
+    hafasId: string | null;
+    detail?: string;
+    tz?: string;
+    servedBy?: { name: string; distanceM: number };
+  };
+}
+
+/** Zone aus der Lage — offline, ohne Abfrage. `undefined` ohne Lage. */
+function zoneAt(lat: number | null | undefined, lon: number | null | undefined): string | undefined {
+  if (lat == null || lon == null || !Number.isFinite(lat) || !Number.isFinite(lon)) return undefined;
+  try {
+    return tzLookup(lat, lon);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Bis hierhin ist der Halt der Quelle derselbe wie unserer, egal wie er heißt. */
+const SAME_SPOT_M = 30;
+
+/**
+ * Zeigt die Tafel die Zeiten eines ANDEREN Halts? Fahrplan und MOTIS nehmen
+ * ohne Namenstreffer den nächsten bedienten Halt in der Nähe. Die Vollprüfung
+ * aller Tafeln (scripts/audit-boards.ts, Okt. 2026) fand so 9 912 Haltestellen,
+ * deren Tafel 30–150 m entfernt einen Halt mit ganz anderem Namen zeigte —
+ * „Annesley Road" mit den Bussen von „Newstead Turn". Die Zeiten bleiben
+ * sichtbar (der Halt ist ja ganz nah), aber die App sagt, woher sie stammen.
+ */
+function servedByOther(
+  stop: { label: string; latitude: unknown; longitude: unknown },
+  source: StopBoardResponse["source"],
+): { name: string; distanceM: number } | undefined {
+  const lat = stop.latitude != null ? Number(stop.latitude) : NaN;
+  const lon = stop.longitude != null ? Number(stop.longitude) : NaN;
+  if (!source?.name || source.latitude == null || source.longitude == null) return undefined;
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return undefined;
+  const rad = Math.PI / 180;
+  const h = Math.sin(((source.latitude - lat) * rad) / 2) ** 2
+    + Math.cos(lat * rad) * Math.cos(source.latitude * rad) * Math.sin(((source.longitude - lon) * rad) / 2) ** 2;
+  const distanceM = Math.round(2 * 6_371_000 * Math.asin(Math.sqrt(h)));
+  if (distanceM <= SAME_SPOT_M || sameStopByName(stop.label, source.name)) return undefined;
+  return { name: source.name, distanceM };
 }
 
 async function loadStopRow(code: string) {
   const rows = await db
     .select({
       hafasId: locations.hafasId,
+      // `label` ist der volle Quellname — mit ihm gleichen Tafel, MOTIS und
+      // HAFAS ab. Angezeigt wird `displayName` (siehe `loadStopBoard`).
       label: locations.label,
+      displayName: locations.displayName,
+      displayDetail: locations.displayDetail,
       type: locations.type,
       // kinds = welche Verkehrsmittel an diesem Stop wirklich halten
       // (Frontend-Kategorien wie "tram"/"bus"/"subway"/"train"/"ferry").
@@ -70,6 +132,39 @@ function productToKind(product: string): string | null {
   )
     return "train";
   return null;
+}
+
+/**
+ * Nur Abfahrten der Verkehrsarten, die an DIESEM Halt verkehren (`kinds`).
+ *
+ * HAFAS-IDs und MOTIS-Halte bündeln oft mehrere benachbarte Halte — der
+ * Bus-Halt „Westtünnen Bahnhof" bekam die RB89 vom Bahnhof daneben, der
+ * Bahnhof Köln Hbf die Busse vom Breslauer Platz. Unbekanntes Produkt
+ * (taxi, leer, exotisches Produkt) bleibt drin — lieber zu inklusiv als
+ * sichtbare Lücken. Ohne `kinds` (Altbestand/StaDa): am Bahnhof keine Busse.
+ *
+ * Galt bisher nur für den HAFAS-Zweig. Seit deutsche Tafeln zuerst über MOTIS
+ * laufen (Kontingent, siehe unten), griff er dort praktisch nie mehr.
+ */
+function filterToStopKinds(
+  results: StopBoardResponse["results"],
+  stop: { kinds: unknown; type: string | null },
+): StopBoardResponse["results"] {
+  const stopKinds = (stop.kinds ?? []) as string[];
+  if (stopKinds.length > 0) {
+    return results.filter((r) => {
+      const k = productToKind(r.product ?? "");
+      if (k === null) return true;
+      return stopKinds.includes(k);
+    });
+  }
+  if (stop.type === "TRAIN") {
+    return results.filter((r) => {
+      const p = (r.product ?? "").toLowerCase();
+      return p !== "bus" && p !== "taxi";
+    });
+  }
+  return results;
 }
 
 /** Liefert die HAFAS-ID für einen Stop. Wenn unser DB-Eintrag schon eine hat
@@ -119,11 +214,12 @@ async function motisFallback(
   code: string,
   hafasId: string | null,
   board: StopBoard,
+  stop: { kinds: unknown; type: string | null },
 ): Promise<StopBoardApiResponse> {
   try {
     const motis = await getMotisStopBoard(code, label, board);
     if (motis && motis.results.length > 0) {
-      return { ...motis, stop: { code, label, hafasId } };
+      return { ...motis, results: filterToStopKinds(motis.results, stop), stop: { code, label, hafasId } };
     }
   } catch {
     /* fällt unten auf empty */
@@ -137,12 +233,18 @@ async function tryFlightBoard(code: string, board: StopBoard): Promise<StopBoard
   const match = /^airport:([A-Z0-9]{3,4})$/i.exec(code);
   if (!match) return null;
   const iata = match[1]!.toUpperCase();
+  const airport = AIRPORTS.find((a) => a.iata === iata);
+  const tz = zoneAt(airport?.latitude, airport?.longitude);
   try {
     const data = await getFlightBoard(iata, board);
-    return { ...data, stop: { code, label: `IATA ${iata}`, hafasId: null } } satisfies StopBoardApiResponse;
+    return {
+      ...data,
+      stop: { code, label: `IATA ${iata}`, hafasId: null, ...(tz ? { tz } : {}) },
+    } satisfies StopBoardApiResponse;
   } catch (err) {
     // Bei Provider-Fehler/Quota → leere Liste, kein 500.
-    return emptyResponse(`IATA ${iata}`, code);
+    const empty = emptyResponse(`IATA ${iata}`, code);
+    return { ...empty, stop: { ...empty.stop, ...(tz ? { tz } : {}) } };
   }
 }
 
@@ -173,7 +275,34 @@ export async function loadStopBoard(
 
   const stop = await loadStopRow(code);
   if (!stop) return null;
+  const { source, ...data } = await boardForStop(code, stop, board, log);
+  const tz = zoneAt(
+    stop.latitude != null ? Number(stop.latitude) : null,
+    stop.longitude != null ? Number(stop.longitude) : null,
+  );
+  const servedBy = servedByOther(stop, source);
+  return {
+    ...data,
+    stop: {
+      ...data.stop,
+      label: stop.displayName ?? stop.label,
+      ...(stop.displayDetail ? { detail: stop.displayDetail } : {}),
+      ...(tz ? { tz } : {}),
+      ...(servedBy ? { servedBy } : {}),
+    },
+  };
+}
 
+/**
+ * Die Tafel eines Halts aus der Tabelle — alle Abgleiche über den VOLLEN
+ * Quellnamen (`stop.label`); Anzeigename, Zusatz und Zone setzt der Aufrufer.
+ */
+async function boardForStop(
+  code: string,
+  stop: NonNullable<Awaited<ReturnType<typeof loadStopRow>>>,
+  board: StopBoard,
+  log?: { warn: (obj: unknown, msg: string) => void },
+): Promise<StopBoardApiResponse> {
   // FLIGHT-Typ-Locations sind Airports in der DB mit reinem IATA-Code
   // (z.B. „AMS", „BER", „CDG") — kein `airport:`-Prefix. tryFlightBoard
   // hat den nicht erkannt, jetzt wo wir den Stop-Typ kennen können wir
@@ -202,6 +331,12 @@ export async function loadStopBoard(
     board,
     latitude: stop.latitude != null ? Number(stop.latitude) : null,
     longitude: stop.longitude != null ? Number(stop.longitude) : null,
+    // Name und Verkehrsarten: Ohne sie nahm der Koordinaten-Abgleich den
+    // nächsten GTFS-Halt egal welcher Art — Bushaltestellen bekamen U-Bahn-,
+    // Bahnhöfe Bus-Tafeln (siehe gtfsSchedule.ts, `coordLookup`).
+    label: stop.label,
+    type: stop.type,
+    kinds: (stop.kinds ?? null) as string[] | null,
   });
   if (scheduled) {
     return {
@@ -226,7 +361,7 @@ export async function loadStopBoard(
   });
   if (!profile) {
     // Kein HAFAS-Profil (CH/NL/FR/…) → MOTIS deckt diese Länder via GTFS ab.
-    return motisFallback(stop.label, code, stop.hafasId, board);
+    return motisFallback(stop.label, code, stop.hafasId, board, stop);
   }
 
   // Deutsche Stops: MOTIS ZUERST, DB nur als Rückfall.
@@ -249,13 +384,21 @@ export async function loadStopBoard(
   if (profile === "db") {
     const motis = await getMotisStopBoard(code, stop.label, board).catch(() => null);
     if (motis && motis.results.length > 0) {
-      return { ...motis, stop: { code: code, label: stop.label, hafasId: stop.hafasId } };
+      // Gefiltert wie der HAFAS-Zweig. Bleibt danach NICHTS übrig, trotzdem
+      // hier enden (leere Tafel) und nicht zur DB weiterreichen: MOTIS hat den
+      // Halt gefunden, er hat nur gerade keine Abfahrt dieser Verkehrsart —
+      // eine DB-Anfrage ginge nur aufs Kontingent der Suche.
+      return {
+        ...motis,
+        results: filterToStopKinds(motis.results, stop),
+        stop: { code: code, label: stop.label, hafasId: stop.hafasId },
+      };
     }
   }
 
   const resolvedId = await resolveStopHafasId(stop, profile);
   if (!resolvedId) {
-    return motisFallback(stop.label, code, stop.hafasId, board);
+    return motisFallback(stop.label, code, stop.hafasId, board, stop);
   }
   try {
     const data = await getStopBoard(resolvedId, board, profile);
@@ -270,27 +413,10 @@ export async function loadStopBoard(
     // manchmal dieselbe Stop-ID). Wir wollen aber NUR die Departures
     // zeigen die zu DIESEM Stop-Eintrag passen — bei einer reinen Tram-
     // Station (kinds=["tram"]) keine Busse.
-    let results = data.results;
-    const stopKinds = (stop.kinds ?? []) as string[];
-    if (stopKinds.length > 0) {
-      results = results.filter((r) => {
-        const k = productToKind(r.product ?? "");
-        // Unbekanntes Product (taxi, leer, exotisches HAFAS-Produkt):
-        // durchlassen — lieber zu inklusiv als sichtbare Lücken.
-        if (k === null) return true;
-        return stopKinds.includes(k);
-      });
-    } else if (stop.type === "TRAIN") {
-      // Fallback für DB-Rows ohne kinds-Info (Legacy/StaDa-only): TRAIN-
-      // Stops haben sicher keine Bus/Taxi-Lines.
-      results = results.filter((r) => {
-        const p = (r.product ?? "").toLowerCase();
-        return p !== "bus" && p !== "taxi";
-      });
-    }
+    const results = filterToStopKinds(data.results, stop);
     // dbrest/HAFAS lieferte nichts (z.B. DB-OPS_BLOCK) → MOTIS-Fallback.
     if (results.length === 0) {
-      return motisFallback(stop.label, code, stop.hafasId, board);
+      return motisFallback(stop.label, code, stop.hafasId, board, stop);
     }
     return {
       ...data,
@@ -299,7 +425,7 @@ export async function loadStopBoard(
     } satisfies StopBoardApiResponse;
   } catch (err) {
     log?.warn({ err, code: code }, `${board} upstream failed → MOTIS-Fallback`);
-    return motisFallback(stop.label, code, stop.hafasId, board);
+    return motisFallback(stop.label, code, stop.hafasId, board, stop);
   }
   }
 

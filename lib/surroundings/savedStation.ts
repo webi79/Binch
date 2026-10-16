@@ -28,6 +28,7 @@ const KIND_TO_MODE: Record<MarkerKind, TravelMode> = {
 export function stopToLocation(stop: {
   code: string;
   label: string;
+  detail?: string;
   kinds?: MarkerKind[];
   latitude?: number;
   longitude?: number;
@@ -44,6 +45,7 @@ export function stopToLocation(stop: {
   return {
     code: normalizedCode,
     label: stop.label,
+    ...(stop.detail ? { detail: stop.detail } : {}),
     city: "",
     country: "",
     type,

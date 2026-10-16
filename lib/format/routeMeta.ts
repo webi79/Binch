@@ -41,6 +41,16 @@ const DATE_LOCALES: Record<string, DateLocale> = {
   es: esLocale,
 };
 
+/**
+ * Leerzeichen innerhalb eines Ortsnamens gegen geschützte tauschen.
+ *
+ * U+00A0 sieht aus wie ein Leerzeichen, ist aber keine Trennstelle. Damit hält
+ * der Textsatz „Paris Gare du Nord" zusammen.
+ */
+function nbsp(v: string): string {
+  return v.replace(/ /g, "\u00A0");
+}
+
 export function useRouteMeta() {
   const t = useT();
   const locale = useSearchStore((s) => s.locale);
@@ -87,7 +97,61 @@ export function useRouteMeta() {
     [fmtDate, t],
   );
 
-  const routeLine = useCallback((from: string, to: string) => `${from}${ROUTE_SEP}${to}`, []);
+  /**
+   * Die Strecke als Zeile — und sie bricht NUR am Trennstrich um.
+   *
+   * Läuft die Zeile über, soll der Umbruch hinter „Start –" fallen, damit das
+   * Ziel geschlossen darunter steht. Ohne Zutun sucht sich der Textsatz das
+   * nächstbeste Leerzeichen und zerreißt den Ortsnamen: „Frankfurt (Main) Hbf –
+   * Paris Gare du" / „Nord". Das liest sich wie ein abgeschnittener Satz, und
+   * die Strecke ist auf einen Blick nicht mehr zu erfassen.
+   *
+   * Erzwungen über GESCHÜTZTE Leerzeichen innerhalb der beiden Namen: Dort darf
+   * dann nicht mehr getrennt werden, am Trennstrich schon. Das ist der einzige
+   * Weg, der ohne Messung auskommt — eine Fallunterscheidung „passt es in eine
+   * Zeile?" bräuchte die Breite, und die steht erst nach dem Layout fest.
+   *
+   * Ist ein einzelner Name für sich zu lang, bricht Android ihn weiterhin
+   * zeichenweise um. Das ist der Notausgang und bleibt bewusst offen — ein
+   * abgeschnittener Name wäre schlechter als ein unschön umgebrochener.
+   */
+  const routeLine = useCallback(
+    (from: string, to: string) => `${nbsp(from)}${ROUTE_SEP}${nbsp(to)}`,
+    [],
+  );
 
   return useMemo(() => ({ fmtDate, metaLine, routeLine }), [fmtDate, metaLine, routeLine]);
+}
+
+/** Werden die „Stopps" einer Verbindung als Zwischenlandung gezählt (Flug, Schiff)? */
+function countsStops(mode: string): boolean {
+  return mode === "FLIGHT" || mode === "CRUISE";
+}
+
+/**
+ * Umstiege einer Verbindung als Text: „Direkt", „1 Umstieg", „2 Umstiege".
+ *
+ * `SearchResult.stops` zählt die UMSTIEGE (beim Flug die Zwischenlandungen) —
+ * nie die Halte unterwegs, die stehen am Leg. Bei Zug und Bus hieß es trotzdem
+ * „1 Stopp" („1 stop / STOPS" im Englischen), was sich wie ein Halt las; und der
+ * Kopf der Zeitleiste beschriftete denselben Wert mit „Umstieg". Beim Flug
+ * bleibt es beim üblichen „1 Stopp".
+ */
+export function changesText(mode: string, count: number, t: (key: string) => string): string {
+  const k = countsStops(mode) ? "details.stop" : "details.change";
+  if (count === 0) return t(`${k}.zero`);
+  if (count === 1) return t(`${k}.one`);
+  return t(`${k}.many`).replace("{count}", String(count));
+}
+
+/** Die passende Überschrift dazu: „Umstiege" bzw. beim Flug „Stopps". */
+export function changesCaption(mode: string, t: (key: string) => string): string {
+  return t(countsStops(mode) ? "details.summary.stops" : "details.summary.changes");
+}
+
+/** Kurzform für die Ergebniskarte: „1 Umstieg", „2 Umstiege" (beim Flug „1 Stopp"). */
+export function changesShort(mode: string, count: number, t: (key: string) => string): string {
+  const one = countsStops(mode) ? "results.stop" : "results.transfer";
+  const many = countsStops(mode) ? "results.stops" : "results.transfers";
+  return `${count} ${t(count === 1 ? one : many)}`;
 }

@@ -69,11 +69,14 @@ export interface PriceAlert {
   /**
    * Läuft der Alarm gerade? Fehlt das Feld, gilt er als aktiv.
    *
-   * Der Schalter auf der Karte schaltet ihn ab, ohne ihn wegzuwerfen: Auf dem
-   * Server wird er gelöscht — dort soll nichts stehen, was nicht zustellen
-   * soll —, in der App bleibt die Zeile stehen und lässt sich wieder
-   * einschalten. Ein Schalter, der beim Ausschalten die Karte mitnimmt, wäre
-   * kein Schalter, sondern ein Löschknopf mit falscher Beschriftung.
+   * Der Schalter auf der Karte PAUSIERT ihn: Auf dem Server wird nur ein Merker
+   * umgelegt (`PATCH /api/alerts/:id`), die Zeile bleibt mit Kennung, Schwelle
+   * und zuletzt gesehenem Preis stehen, und die Prüfung überspringt sie. In der
+   * App bleibt die Karte stehen und lässt sich wieder einschalten.
+   *
+   * Vorher wurde er dabei auf dem Server GELÖSCHT. Ein Schalter, der beim
+   * Ausschalten kündigt, ist kein Schalter, sondern ein Löschknopf mit falscher
+   * Beschriftung — gelöscht wird ausschließlich über das Herz, mit Rückfrage.
    *
    * Optional, weil ältere Einträge es nicht haben — und die liefen, also
    * bedeutet „fehlt" hier „an".

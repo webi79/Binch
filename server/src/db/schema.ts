@@ -11,6 +11,8 @@ import {
   jsonb,
   index,
   uniqueIndex,
+  bigint,
+  primaryKey,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
@@ -368,7 +370,27 @@ export const locations = pgTable(
      *  - "gtfs:<stop_id>" für GTFS-DE-Stops
      *  Länge auf 64 hochgesetzt, da GTFS-IDs lang sein können (z.B. "de:01:5100:1:1"). */
     code: varchar("code", { length: 64 }).primaryKey(),
+    /**
+     * Name aus der Quelle, VOLLSTÄNDIG — mit allem, was gleichnamige Halte
+     * auseinanderhält („Oldham, Rochdale Road / Oldham College (Stop RA)").
+     * Damit gleichen Tafel, Bahn-Ortssuche, Dubletten-Prüfung, Kartengruppierung
+     * und Suche ab. ANGEZEIGT wird es nicht direkt — siehe `displayName`.
+     */
     label: text("label").notNull(),
+    /**
+     * Der offizielle Name, so wie ihn der Nutzer sehen soll („Oldham College" —
+     * derselbe Name wie in der Zeitleiste der Fahrt). NULL = `label` ist es
+     * schon. Gesetzt von `scripts/fix-stop-names.ts` bzw. den Importen
+     * (Regeln in `scripts/lib/stopNames.ts`). Die API liefert ihn als `label`.
+     */
+    displayName: text("display_name"),
+    /**
+     * Unterscheidungs-Zusatz („Rochdale Road · Stop RA") — NUR gesetzt, wenn
+     * ein Halt derselben Art mit demselben Anzeigenamen in der Nähe steht. Die
+     * App zeigt ihn dezent neben dem Namen, nie im Namen. Die API liefert ihn
+     * als `detail`.
+     */
+    displayDetail: text("display_detail"),
     city: text("city"),
     country: text("country"),
     /**
@@ -836,5 +858,29 @@ export const priceAlerts = pgTable(
       t.travelClass,
       t.currency,
     ),
+  }),
+);
+
+/**
+ * Verbrauch von Luftbild-Anbietern mit Freikontingent (routes/imagery.ts) —
+ * heute nur Esri: 2 Mio. Kacheln je Abrechnungszeitraum frei, darüber kostet
+ * es. Der Server zählt jede durchgereichte Kachel und schaltet Esri ab, bevor
+ * das Kontingent (oder das Tagesbudget) erreicht ist.
+ */
+export const imageryUsage = pgTable(
+  "imagery_usage",
+  {
+    provider: varchar("provider", { length: 32 }).notNull(),
+    /**
+     * Der Zeitraum, „JJJJ-MM-TT" (UTC): beim Anbieter-Topf („esri") der Beginn
+     * des Abrechnungszeitraums, beim Tages-Topf („esri-day") der Tag. Der Name
+     * stammt aus der ersten Fassung, in der hier nur Monate standen.
+     */
+    month: varchar("month", { length: 10 }).notNull(),
+    tiles: bigint("tiles", { mode: "number" }).notNull().default(0),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.provider, t.month] }),
   }),
 );

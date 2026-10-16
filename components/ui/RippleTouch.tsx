@@ -31,6 +31,13 @@ interface Props {
   onTouchStart?: (e: GestureResponderEvent) => void;
   hitSlop?: PressableProps["hitSlop"];
   accessibilityLabel?: string;
+  /**
+   * Rolle und Zustand für die Sprachausgabe — etwa „gewählt" bei einer Pille.
+   * Fehlten hier, darum nahmen Knöpfe mit Auswahl bisher `Pressable` ohne Welle
+   * (siehe FilterChips.tsx).
+   */
+  accessibilityRole?: PressableProps["accessibilityRole"];
+  accessibilityState?: PressableProps["accessibilityState"];
   disabled?: boolean;
 
   /** Hintergrundfarbe des Buttons. Bestimmt Ripple-Tönung (default: passend für Dark-UI). */
@@ -76,6 +83,8 @@ export function RippleTouch({
   onTouchStart,
   hitSlop,
   accessibilityLabel,
+  accessibilityRole,
+  accessibilityState,
   disabled,
   rippleColor,
   borderless = false,
@@ -104,6 +113,8 @@ export function RippleTouch({
         onPressOut={onPressOut}
         hitSlop={hitSlop}
         accessibilityLabel={accessibilityLabel}
+        accessibilityRole={accessibilityRole}
+        accessibilityState={accessibilityState}
         disabled={disabled}
         background={TouchableNativeFeedback.Ripple(color, borderless)}
         useForeground={true}
@@ -140,6 +151,8 @@ export function RippleTouch({
       onTouchStart={onTouchStart}
       hitSlop={hitSlop}
       accessibilityLabel={accessibilityLabel}
+      accessibilityRole={accessibilityRole}
+      accessibilityState={accessibilityState}
       disabled={disabled}
       delayLongPress={500}
       // unstable_pressDelay ebenfalls raus, siehe Android-Zweig oben.

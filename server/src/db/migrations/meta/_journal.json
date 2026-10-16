@@ -225,6 +225,27 @@
       "when": 1790811909918,
       "tag": "0031_retention_and_privacy",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1791146941602,
+      "tag": "0032_imagery_usage",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1791164393254,
+      "tag": "0033_imagery_usage_period",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1792000463697,
+      "tag": "0034_locations_display_name",
+      "breakpoints": true
     }
   ]
 }

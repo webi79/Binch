@@ -274,6 +274,8 @@ const RESULT_KEEP = [
   "baggageIncluded",
   "flightNumber",
   "operatedBy",
+  // Gefährdet/fällt aus — ohne legs wäre sie aus dem Rest nicht mehr ableitbar.
+  "warning",
 ] as const;
 
 function slimResult(result: unknown): Record<string, unknown> {
@@ -835,6 +837,24 @@ export async function chatRoutes(app: FastifyInstance) {
                 content: null,
                 payload: { action: event.action, payload: event.payload },
               });
+              break;
+            case "usage":
+              // Je API-Aufruf eine Zeile: Damit lassen sich Bos echte Kosten
+              // (Modell, Cache-Treffer, Länge) aus dem Log nachrechnen, statt
+              // sie zu schätzen. Der Client bekommt das Ereignis ohnehin.
+              req.log.info(
+                {
+                  boUsage: {
+                    model: event.model,
+                    input: event.input,
+                    output: event.output,
+                    cacheRead: event.cacheRead,
+                    cacheWrite: event.cacheWrite,
+                    ...(event.trimmed ? { trimmed: event.trimmed } : {}),
+                  },
+                },
+                "bo usage",
+              );
               break;
             default:
               break;

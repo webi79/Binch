@@ -1,0 +1,1398 @@
+From 8cf51cd1b500d8f3c7d9d31ae6101e77ccd41f9b Mon Sep 17 00:00:00 2001
+From: local build <build@localhost>
+Date: Tue, 6 Oct 2026 17:11:31 +0200
+Subject: [PATCH] =?UTF-8?q?binch:=20Himmel=20und=20Milchstra=C3=9Fe=20(Hin?=
+ =?UTF-8?q?tergrund=20+=20=C3=9Cberzug),=20weiche=20Polkappen,=20gehobene?=
+ =?UTF-8?q?=20Bogen-Linien,=20Mip-Stufen,=20Stencil-=20und=20Zoom-Nachlauf?=
+ =?UTF-8?q?-Fehler,=20leere=20Kachelwahl=20von=20oben?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ include/mln/gl/texture2d.hpp                  |   2 +
+ include/mln/shaders/gl/atmosphere.hpp         | 132 +++++++++++++++++-
+ include/mln/shaders/gl/line.hpp               |  81 ++++++++++-
+ include/mln/shaders/gl/raster.hpp             |  48 +++++++
+ include/mln/shaders/shader_defines.hpp        |   9 +-
+ .../android/maps/MapGestureDetector.java      |  13 +-
+ shaders/atmosphere.fragment.glsl              | 132 +++++++++++++++++-
+ shaders/line.fragment.glsl                    |   2 +-
+ shaders/line.vertex.glsl                      |  77 +++++++++-
+ shaders/raster.fragment.glsl                  |  45 ++++++
+ shaders/raster.vertex.glsl                    |   3 +
+ src/mln/gl/layer_group_gl.cpp                 |   8 ++
+ src/mln/gl/texture2d.cpp                      |  29 +++-
+ .../renderer/layers/line_layer_tweaker.cpp    |   3 +-
+ src/mln/renderer/layers/render_line_layer.cpp |   6 +-
+ .../renderer/layers/render_raster_layer.cpp   |   9 +-
+ src/mln/renderer/render_orchestrator.hpp      |   1 +
+ src/mln/renderer/renderer_impl.cpp            |  14 ++
+ src/mln/renderer/sky_pass.cpp                 |  86 +++++++++++-
+ src/mln/renderer/sky_pass.hpp                 |  19 +++
+ src/mln/shaders/gl/shader_info.cpp            |   4 +-
+ src/mln/shaders/shader_source.cpp             |  77 +++++-----
+ src/mln/util/bounding_volumes.cpp             |  34 ++---
+ test/util/tile_cover.test.cpp                 |  14 ++
+ 24 files changed, 759 insertions(+), 89 deletions(-)
+
+diff --git a/include/mln/gl/texture2d.hpp b/include/mln/gl/texture2d.hpp
+index 24508d83..e98c1060 100644
+--- a/include/mln/gl/texture2d.hpp
++++ b/include/mln/gl/texture2d.hpp
+@@ -77,6 +77,8 @@ private:
+     Size size{0, 0};
+     bool samplerStateDirty{false};
+     bool storageDirty{false};
++    /// Binch: ob die Mip-Stufen zum aktuellen Bild passen (siehe `updateSamplerConfiguration`).
++    bool mipmapsGenerated{false};
+ 
+     int32_t boundTextureUnit{-1};
+     int32_t boundLocation{-1};
+diff --git a/include/mln/shaders/gl/atmosphere.hpp b/include/mln/shaders/gl/atmosphere.hpp
+index 1da1b82c..3994de49 100644
+--- a/include/mln/shaders/gl/atmosphere.hpp
++++ b/include/mln/shaders/gl/atmosphere.hpp
+@@ -39,8 +39,10 @@ layout(std140) uniform AtmospherePropsUBO {
+ } atmosphere;
+ 
+ const float PI = 3.141592653589793;
+-const int PRIMARY_STEPS = 5;
+-const int LIGHT_STEPS = 3;
++// Binch: 4 × 2 statt 5 × 3 Schritte — kaum ein Unterschied im Bild, gut die Hälfte der
++// Rechenarbeit je Bildpunkt (der Durchgang deckt den ganzen Schirm).
++const int PRIMARY_STEPS = 4;
++const int LIGHT_STEPS = 2;
+ const float EARTH_RADIUS = 6371000.0;
+ const float ATMOSPHERE_RADIUS = 6471000.0;
+ 
+@@ -127,12 +129,134 @@ vec4 scatter(vec3 direction, vec3 origin, vec3 sun) {
+     return vec4(color, opacity);
+ }
+ 
++// --- Binch: Weltraum, Sterne, Milchstraße und Tag-und-Nacht-Schatten -------
++// Alles im selben Vollbild-Durchgang wie die Atmosphäre: Der Shader weiß hier
++// ohnehin, ob ein Sichtstrahl die Erde trifft oder ins All geht.
++
++float binch_hash13(vec3 p) {
++    p = fract(p * 0.1031);
++    p += dot(p, p.zyx + 31.32);
++    return fract((p.x + p.y) * p.z);
++}
++
++vec3 binch_hash33(vec3 p) {
++    p = fract(p * vec3(0.1031, 0.1030, 0.0973));
++    p += dot(p, p.yxz + 33.33);
++    return fract((p.xxy + p.yxx) * p.zyx);
++}
++
++// Eine Sternenschicht: je Zelle eines Gitters höchstens ein Stern, fest im Raum.
++vec3 binch_star_layer(vec3 d, float cells, float density, float size, float bright, float pixel) {
++    vec3 p = d * cells;
++    vec3 cell = floor(p);
++    vec3 h = binch_hash33(cell);
++    if (h.x > density) return vec3(0.0);
++    // Mitten in der Zelle, damit kein Stern an der Zellgrenze abgeschnitten wird.
++    vec3 star = normalize(cell + 0.3 + 0.4 * binch_hash33(cell + 7.7));
++    float dist = length(d - star);
++    float radius = max(pixel * size, 1e-6);
++    // Viele schwache, wenige helle — wie am echten Himmel.
++    float magnitude = pow(h.y, 9.0) * bright + 0.07 * bright;
++    vec3 tint = mix(vec3(0.72, 0.82, 1.0), vec3(1.0, 0.88, 0.72), h.z);
++    return tint * magnitude * exp(-(dist * dist) / (radius * radius));
++}
++
++// Die Milchstraße: ein echtes Foto (ESO/S. Brunier, CC BY 4.0) in galaktischen
++// Koordinaten, ±50° um die galaktische Ebene (`binch_milkyway.hpp`). Der Himmel
++// steht fest zur Erde — wer die Kugel dreht, sieht ihn mitwandern, wie in Google
++// Earth. Ausgerichtet wie der echte Himmel zur Sternzeit 5,1 h (galaktischer
++// Nordpol bei RA 192,86° / Dek +27,13°, Zentrum bei RA 266,40° / Dek −28,94°):
++// Dann steht das helle Zentrum der Milchstraße schräg hinter der Kugel, wenn man
++// auf Europa schaut.
++uniform sampler2D u_sky;
++// Helligkeit des Fotos: zurückhaltend wie in Google Earth.
++const float BINCH_MILKY_WAY_GAIN = 0.55;
++const vec3 BINCH_GALACTIC_NORTH = vec3(0.7968, 0.4560, -0.3965);
++const vec3 BINCH_GALACTIC_CENTER = vec3(-0.1520, -0.4838, -0.8618);
++const vec3 BINCH_GALACTIC_EAST = vec3(-0.5849, 0.7470, -0.3162);
++// 50°: so weit reicht das Foto über und unter die Ebene.
++const float BINCH_SKY_HALF_HEIGHT = 0.8726646;
++
++vec3 binch_milky_way(vec3 d) {
++    float b = asin(clamp(dot(d, BINCH_GALACTIC_NORTH), -1.0, 1.0));
++    float l = atan(dot(d, BINCH_GALACTIC_EAST), dot(d, BINCH_GALACTIC_CENTER));
++    vec2 uv = vec2(0.5 - l / (2.0 * PI), 0.5 - 0.5 * b / BINCH_SKY_HALF_HEIGHT);
++    // Ohne Mip-Stufen: LOD 0 fest, dann stört die Naht bei l = ±180° nicht.
++    vec3 photo = textureLod(u_sky, uv, 0.0).rgb;
++    // Den Himmelshintergrund des Fotos abziehen (Median 8/255) — Schwarz bleibt schwarz.
++    photo = max(photo - 0.035, 0.0);
++    // Zum Rand des Ausschnitts weich auslaufen; dort ist das Foto ohnehin fast schwarz.
++    return photo * (1.0 - smoothstep(0.80, 1.0, abs(b) / BINCH_SKY_HALF_HEIGHT));
++}
++
++vec3 binch_space(vec3 d, float pixel) {
++    vec3 photo = binch_milky_way(d);
++    // Im Band stehen mehr Sterne, wie am echten Himmel.
++    float boost = 1.0 + 6.0 * dot(photo, vec3(0.2126, 0.7152, 0.0722));
++    vec3 stars = binch_star_layer(d, 420.0, 0.10 * boost, 0.75, 0.45, pixel)
++               + binch_star_layer(d, 150.0, 0.12 * boost, 0.95, 0.70, pixel)
++               + binch_star_layer(d, 45.0, 0.10, 1.25, 1.30, pixel);
++    // Nicht reines Schwarz: ein Hauch Nachtblau.
++    return vec3(0.004, 0.006, 0.013) + photo * BINCH_MILKY_WAY_GAIN + stars;
++}
++
+ void main() {
+     vec3 camera = atmosphere.camera_position.xyz * EARTH_RADIUS;
+-    vec4 color = scatter(v_view_direction, camera, atmosphere.sun_position.xyz);
++    vec3 direction = normalize(v_view_direction);
++    // Vor jeder Verzweigung: Ableitungen nur im gleichförmigen Ablauf.
++    float pixel = length(fwidth(direction));
++
++    // Binch: Der Durchgang läuft ZWEIMAL (`SkyPass`). Als HINTERGRUND vor allen Ebenen
++    // (camera_position.w = 1) zeichnet er nur, was ins All geht — Sterne, Milchstraße,
++    // Schein —, als ÜBERZUG nach den Ebenen (w = 0) nur Dunst und Nachtschatten über der
++    // Kugel. In einem einzigen Durchgang nach den Ebenen übermalte das deckende All alles,
++    // was über den Erdrand hinausragt: Die Flugbögen in der Luft verschwanden dort,
++    // besonders bei geneigter Karte. Jeder Bildpunkt rechnet den teuren Teil nur einmal.
++    vec2 ground = ray_sphere_intersection(camera, direction, EARTH_RADIUS);
++    bool hitsGround = ground.x <= ground.y && ground.x > 0.0;
++    if (hitsGround == (atmosphere.camera_position.w > 0.5)) {
++        fragColor = vec4(0.0);
++        return;
++    }
++
++    // Die Sonne steht relativ zur KAMERA — links vorne, etwas oben —, damit die
++    // Erde aussieht wie aus dem Fenster einer Raumstation: Licht von links, die
++    // Nachtseite am rechten Rand. Rechts/oben aus der inversen Projektion.
++    vec4 c0 = atmosphere.inv_view_projection * vec4(0.0, 0.0, 0.0, 1.0);
++    vec4 cr = atmosphere.inv_view_projection * vec4(1.0, 0.0, 0.0, 1.0);
++    vec4 cu = atmosphere.inv_view_projection * vec4(0.0, 1.0, 0.0, 1.0);
++    vec3 right = normalize(cr.xyz / cr.w - c0.xyz / c0.w);
++    vec3 up = normalize(cu.xyz / cu.w - c0.xyz / c0.w);
++    vec3 toward = normalize(atmosphere.camera_position.xyz);
++    vec3 sun = normalize(-0.78 * right + 0.30 * up + 0.55 * toward);
++
++    vec4 color = scatter(direction, camera, sun);
+     color.rgb = 1.0 - exp(-color.rgb);
+     color = pow(color, vec4(1.0 / 2.2));
+-    fragColor = vec4(color.rgb, 1.0 - color.a) * atmosphere.sun_position.w;
++
++    float coverage = 1.0 - color.a;
++    vec3 rgb = color.rgb;
++    if (hitsGround) {
++        // Tag und Nacht: weicher Übergang, die Nachtseite dunkel, nicht schwarz.
++        vec3 normal = normalize(camera + direction * ground.x);
++        float light = dot(normal, sun);
++        float night = (1.0 - smoothstep(-0.35, 0.40, light)) * 0.82;
++        // Der Dunst über dem Boden nur gedämpft — sonst wirkt die ganze Kugel
++        // milchig; am Rand (lange Wege durch die Luft) bleibt er kräftig.
++        rgb *= 0.55 * (1.0 - night * 0.7);
++        coverage = 1.0 - (1.0 - coverage * 0.5) * (1.0 - night);
++    } else {
++        // Ins All: der eigene Nachthimmel, durch die Atmosphäre gedämpft.
++        rgb += binch_space(direction, pixel) * color.a;
++        // Ein weicher blauer Schein knapp außerhalb des Erdrands — die dünne
++        // Lufthülle allein ist auf diese Entfernung nur ein Strich.
++        float along = max(-dot(camera, direction), 0.0);
++        float nearest = length(camera + direction * along) / EARTH_RADIUS;
++        float halo = exp(-(nearest - 1.0) / 0.03) * step(1.0, nearest);
++        rgb += vec3(0.32, 0.55, 1.0) * halo * 0.2;
++        coverage = 1.0;
++    }
++    fragColor = vec4(rgb, coverage) * atmosphere.sun_position.w;
+ }
+ )";
+ };
+diff --git a/include/mln/shaders/gl/line.hpp b/include/mln/shaders/gl/line.hpp
+index c2d06bd4..a0c264ef 100644
+--- a/include/mln/shaders/gl/line.hpp
++++ b/include/mln/shaders/gl/line.hpp
+@@ -49,7 +49,7 @@ layout (std140) uniform LineEvaluatedPropsUBO {
+     lowp float u_blur;
+     lowp float u_opacity;
+     mediump float u_gapwidth;
+-    lowp float u_offset;
++    highp float u_offset;
+     mediump float u_width;
+     lowp float u_floorwidth;
+     lowp float props_pad1;
+@@ -77,7 +77,7 @@ out lowp float opacity;
+ layout (location = 5) in mediump vec2 a_gapwidth;
+ #endif
+ #ifndef HAS_UNIFORM_u_offset
+-layout (location = 6) in lowp vec2 a_offset;
++layout (location = 6) in highp vec2 a_offset;
+ #endif
+ #ifndef HAS_UNIFORM_u_width
+ layout (location = 7) in mediump vec2 a_width;
+@@ -85,6 +85,19 @@ layout (location = 7) in mediump vec2 a_width;
+ 
+ #ifdef PROJECTION_GLOBE
+ out float v_tile_x;
++
++// Binch: Sichtbarkeit eines GEHOBENEN Bogenpunkts. Die Horizontebene des Globus gilt nur für Punkte am
++// Boden; ein Punkt in der Luft ist sichtbar, solange die Sichtlinie von der Kamera die Kugel verfehlt —
++// sonst endete ein Bogen hart am Kugelrand, statt über ihn hinauszuragen. Gibt wie
++// `globeComputeClippingZ` unter 1 für sichtbar, über 1 für verdeckt zurück, stetig an der Grenze.
++float binchArcClipZ(vec3 p) {
++    // Die Ebene ist (n, -1/|Kamera|) mit n zur Kamera: daraus die Kamera in Kugelradien.
++    vec3 camera = -u_projection_clipping_plane.xyz / u_projection_clipping_plane.w;
++    vec3 sight = p - camera;
++    float t = clamp(-dot(camera, sight) / dot(sight, sight), 0.0, 1.0);
++    float miss = length(camera + sight * t) - 1.0;
++    return clamp(1.0 - (miss + 0.002) * 8.0, 0.0, 2.0);
++}
+ #endif
+ 
+ void main() {
+@@ -109,9 +122,9 @@ mediump float gapwidth = unpack_mix_vec2(a_gapwidth, u_gapwidth_t);
+ mediump float gapwidth = u_gapwidth;
+ #endif
+     #ifndef HAS_UNIFORM_u_offset
+-lowp float offset = unpack_mix_vec2(a_offset, u_offset_t);
++highp float offset = unpack_mix_vec2(a_offset, u_offset_t);
+ #else
+-lowp float offset = u_offset;
++highp float offset = u_offset;
+ #endif
+     #ifndef HAS_UNIFORM_u_width
+ mediump float width = unpack_mix_vec2(a_width, u_width_t);
+@@ -119,6 +132,30 @@ mediump float width = unpack_mix_vec2(a_width, u_width_t);
+ mediump float width = u_width;
+ #endif
+ 
++    // Binch: ein FLUGBOGEN IN DER LUFT — nur in Ebenen, deren ID mit „binch-arc"
++    // beginnt (`LineLayerTweaker` setzt dann `props_pad2`). Die Höhe des Scheitels
++    // kommt in Kilometern über `line-gap-width` (ein Bogen hat keine Lücke; so ist
++    // sie datengetrieben und zoomabhängig), der Fortschritt entlang des ganzen
++    // Fluges aus der Linien-Metrik der Quelle (`lineMetrics`): Höhe · sin(π · t).
++    // Die Linie bleibt eine Linie — glatt und geglättet wie am Boden, nur gehoben.
++    // Dazu die Mercator-Länge des ganzen Fluges über `line-offset` (ein Bogen ist nicht
++    // versetzt): Sie braucht das Band im Bildschirmraum für die Richtung samt Steigung.
++    const highp float BINCH_PI = 3.141592653589793;
++    bool binchArc = props_pad2 > 0.5;
++    highp float binchElevation = 0.0;
++    highp float binchApexKm = 0.0;
++    highp float binchProgress = 0.0;
++    highp float binchMercatorLength = 0.0;
++    if (binchArc) {
++        binchProgress = clamp((floor(a_data.z / 4.0) + a_data.w * 64.0) * 2.0 / 32767.0, 0.0, 1.0);
++        // Erst in highp hinüber: Kilometer · 1000 sprengten sonst mediump (bis 65504).
++        binchApexKm = gapwidth;
++        binchMercatorLength = offset;
++        binchElevation = binchApexKm * 1000.0 * sin(BINCH_PI * binchProgress);
++        gapwidth = 0.0;
++        offset = 0.0;
++    }
++
+     // the distance over which the line edge fades out.
+     // Retina devices need a smaller distance to avoid aliasing.
+     float ANTIALIASING = 1.0 / DEVICE_PIXEL_RATIO / 2.0;
+@@ -160,9 +197,39 @@ mediump float width = u_width;
+ 
+ #ifdef PROJECTION_GLOBE
+     float adjustedThickness = projectLineThickness(pos.y);
+-    vec4 projected_no_extrude = projectTile(pos + offset2 / u_ratio * adjustedThickness);
++    vec4 projected_no_extrude = projectTileWithElevation(pos + offset2 / u_ratio * adjustedThickness, binchElevation);
+     vec2 extrudedPos = pos + (offset2 + dist) / u_ratio * adjustedThickness;
+-    gl_Position = projectTile(extrudedPos);
++    gl_Position = projectTileWithElevation(extrudedPos, binchElevation);
++    if (binchArc && binchElevation > 0.0 && u_projection_transition > 0.999) {
++        // Binch: das Band des Bogens im BILDSCHIRMRAUM, quer zur projizierten Richtung samt
++        // Steigung, so breit wie die Linie in Pixeln. Waagerecht im Kachelraum (wie am Boden)
++        // sähe man ein hohes Band im geneigten Blick fast von der Kante — es schrumpfte auf
++        // unter einen Bildpunkt, und Stücke des Bogens verschwanden.
++        vec2 across = normalize(a_extrude) * normal.y; // für beide Punkte des Querschnitts gleich
++        vec2 along = vec2(-across.y, across.x);        // vorwärts, in Richtung wachsenden Fortschritts
++        float stepTile = 8.0 / u_ratio;                // etwa 8 Pixel weiter auf der Linie
++        highp float aheadProgress = binchMercatorLength > 0.0
++                                        ? clamp(binchProgress + stepTile * u_projection_tile_mercator_coords.z /
++                                                                    binchMercatorLength,
++                                                0.0,
++                                                1.0)
++                                        : binchProgress;
++        highp float aheadElevation = binchApexKm * 1000.0 * sin(BINCH_PI * aheadProgress);
++        vec4 here = projected_no_extrude;
++        vec4 ahead = projectTileWithElevation(pos + along * stepTile, aheadElevation);
++        vec2 directionPx = (ahead.xy / ahead.w - here.xy / here.w) * u_units_to_pixels;
++        float lengthPx = length(directionPx);
++        if (lengthPx > 1e-4) {
++            vec2 sidePx = vec2(-directionPx.y, directionPx.x) / lengthPx * outset * normal.y;
++            vec4 ribbon = here + vec4(sidePx / u_units_to_pixels * here.w, 0.0, 0.0);
++            // Am Boden (Flughafen) bleibt die gewöhnliche Linie — dort stimmen beide überein,
++            // und die Enden der Linie (Kappen, Anschlüsse) brauchen die Kachel-Ausrichtung.
++            gl_Position = mix(gl_Position, ribbon, smoothstep(1000.0, 15000.0, binchElevation));
++        }
++        vec3 lifted = projectToSphere(pos + u_projection_translate, vec2(0.0, 0.0)) *
++                      (1.0 + binchElevation / GLOBE_RADIUS);
++        gl_Position.z = binchArcClipZ(lifted) * gl_Position.w - u_projection_depth_offset;
++    }
+     v_tile_x = antimeridianClipX(extrudedPos);
+     vec4 projected_extrude = gl_Position - projected_no_extrude;
+ #else
+@@ -183,7 +250,7 @@ mediump float width = u_width;
+     lowp float u_blur;
+     lowp float u_opacity;
+     mediump float u_gapwidth;
+-    lowp float u_offset;
++    highp float u_offset;
+     mediump float u_width;
+     lowp float u_floorwidth;
+     lowp float props_pad1;
+diff --git a/include/mln/shaders/gl/raster.hpp b/include/mln/shaders/gl/raster.hpp
+index fd936ec0..e1bd1763 100644
+--- a/include/mln/shaders/gl/raster.hpp
++++ b/include/mln/shaders/gl/raster.hpp
+@@ -31,9 +31,12 @@ layout (location = 1) in vec2 a_texture_pos;
+ 
+ out vec2 v_pos0;
+ out vec2 v_pos1;
++// Binch: 1 an den Pol-Ecken der Polkappe des Globus, 0 an der Kachelkante (85,05°).
++out float v_pole;
+ 
+ void main() {
+     gl_Position = projectTile(a_pos, a_pos);
++    v_pole = (a_pos.y < GLOBE_POLE_NORTH_Y || a_pos.y > GLOBE_POLE_SOUTH_Y) ? 1.0 : 0.0;
+     // We are using Int16 for texture position coordinates to give us enough precision for
+     // fractional coordinates. We use 8192 to scale the texture coordinates in the buffer
+     // as an arbitrarily high number to preserve adequate precision when rendering.
+@@ -62,6 +65,32 @@ uniform sampler2D u_image1;
+ 
+ in vec2 v_pos0;
+ in vec2 v_pos1;
++in float v_pole;
++
++// Binch: die Polkappe des Globus. Mercator-Kacheln enden bei 85,05°; den Rest bis
++// zum Pol füllt der Globus, indem er die oberste Pixelzeile jeder Kachel bis zum
++// Pol zieht — jedes Pixel ein Strahl, zusammen ein Fächer. Stattdessen wird die
++// Zeile nach innen zunehmend verwischt und läuft dann in EINE feste Polfarbe aus:
++// für alle Kacheln dieselbe, sonst träfen sich am Pol Tortenstücke (die Kanten
++// der Kacheln sind am Nordpol unterschiedlich dunkel). Nord: Polarmeer, wie es
++// Blue Marble und EOX an der Kante zeigen; Süd: Eis.
++const vec3 BINCH_NORTH_POLE = vec3(0.063, 0.141, 0.275);
++const vec3 BINCH_SOUTH_POLE = vec3(0.94, 0.945, 0.945);
++
++vec4 binch_pole_row(sampler2D image, vec2 pos, float lo, float hi, float halfWidth) {
++    // Dicht genug, dass jede Stichprobe an die nächste grenzt (sonst flimmern die
++    // Lücken als neue Speichen).
++    vec4 sum = vec4(0.0);
++    for (int i = 0; i < 16; i++) {
++        float x = clamp(pos.x + halfWidth * (float(i) / 7.5 - 1.0), lo, hi);
++        sum += textureLod(image, vec2(x, pos.y), 0.0);
++    }
++    sum /= 16.0;
++    if (sum.a > 0.0) {
++        sum.rgb /= sum.a;
++    }
++    return sum;
++}
+ 
+ void main() {
+ 
+@@ -74,6 +103,25 @@ void main() {
+     if (color1.a > 0.0) {
+         color1.rgb = color1.rgb / color1.a;
+     }
++    if (v_pole > 0.0) {
++        float lo0 = 0.5 - 0.5 / u_buffer_scale;
++        float hi0 = 0.5 + 0.5 / u_buffer_scale;
++        // Gleich ab der Kante kräftig verwischen (bis ~16 Pixel je Seite bei
++        // 256er-Kacheln, dicht abgetastet) — schmaler blieben Speichen stehen.
++        float halfWidth = 0.004 + 0.06 * smoothstep(0.0, 0.15, v_pole);
++        float smear = smoothstep(0.0, 0.08, v_pole);
++        color0 = mix(color0, binch_pole_row(u_image0, v_pos0, lo0, hi0, halfWidth), smear);
++        color1 = mix(color1,
++                     binch_pole_row(u_image1, v_pos1,
++                                    lo0 * u_scale_parent + u_tl_parent.x,
++                                    hi0 * u_scale_parent + u_tl_parent.x,
++                                    halfWidth * u_scale_parent),
++                     smear);
++        vec3 pole = v_pos0.y < 0.5 ? BINCH_NORTH_POLE : BINCH_SOUTH_POLE;
++        float toPole = smoothstep(0.05, 0.5, v_pole);
++        color0.rgb = mix(color0.rgb, pole, toPole);
++        color1.rgb = mix(color1.rgb, pole, toPole);
++    }
+     vec4 color = mix(color0, color1, u_fade_t);
+     float alpha = color.a * u_opacity;
+     vec3 rgb = color.rgb;
+diff --git a/include/mln/shaders/shader_defines.hpp b/include/mln/shaders/shader_defines.hpp
+index 23585fb9..f1cec76e 100644
+--- a/include/mln/shaders/shader_defines.hpp
++++ b/include/mln/shaders/shader_defines.hpp
+@@ -304,6 +304,12 @@ static constexpr uint32_t maxSSBOCountPerDrawable = drawableUBOStartId - drawabl
+ static constexpr uint32_t maxUBOCountPerDrawable = maxUBOCountPerShader - drawableUBOStartId;
+ 
+ // Texture defines
++// Binch: die Milchstraße hinter dem Globus (`SkyPass`).
++enum {
++    idAtmosphereSkyTexture,
++    atmosphereTextureCount
++};
++
+ enum {
+     idBackgroundImageTexture,
+     backgroundTextureCount
+@@ -376,7 +382,8 @@ enum {
+     symbolTextureCount
+ };
+ 
+-static constexpr uint32_t maxTextureCountPerShader = std::max({static_cast<uint32_t>(backgroundTextureCount),
++static constexpr uint32_t maxTextureCountPerShader = std::max({static_cast<uint32_t>(atmosphereTextureCount),
++                                                               static_cast<uint32_t>(backgroundTextureCount),
+                                                                static_cast<uint32_t>(circleTextureCount),
+                                                                static_cast<uint32_t>(clippingMaskTextureCount),
+                                                                static_cast<uint32_t>(collisionTextureCount),
+diff --git a/platform/android/MapLibreAndroid/src/main/java/org/maplibre/android/maps/MapGestureDetector.java b/platform/android/MapLibreAndroid/src/main/java/org/maplibre/android/maps/MapGestureDetector.java
+index 4d04e18b..41bbce78 100644
+--- a/platform/android/MapLibreAndroid/src/main/java/org/maplibre/android/maps/MapGestureDetector.java
++++ b/platform/android/MapLibreAndroid/src/main/java/org/maplibre/android/maps/MapGestureDetector.java
+@@ -913,14 +913,23 @@ final class MapGestureDetector {
+ 
+   private Animator createScaleAnimator(double currentZoom, double zoomAddition,
+                                        @NonNull final PointF animationFocalPoint, long animationTime) {
+-    ValueAnimator animator = ValueAnimator.ofFloat((float) currentZoom, (float) (currentZoom + zoomAddition));
++    // Binch: in SCHRITTEN statt auf feste Werte (Anfang + Anteil). Auf dem Globus verschiebt jeder
++    // Zoom um den Fingerpunkt die Mitte und gleicht den Zoom für die neue Breite aus, damit die Kugel
++    // ihre Größe behält (VerticalPerspectiveProjection::zoomAroundPoint). Ein fester Wert je Bild
++    // machte diesen Ausgleich jedes Mal rückgängig: Beim Nachlaufen nach dem Loslassen wuchs die
++    // Kugel in einem Bild auf das Anderthalb- bis Dreifache (nachgerechnet, Transform-Test). Auf der
++    // flachen Karte ist beides dasselbe.
++    ValueAnimator animator = ValueAnimator.ofFloat(0f, (float) zoomAddition);
+     animator.setDuration(animationTime);
+     animator.setInterpolator(new DecelerateInterpolator());
+     animator.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
++      private float applied = 0f;
+ 
+       @Override
+       public void onAnimationUpdate(@NonNull ValueAnimator animation) {
+-        transform.setZoom((Float) animation.getAnimatedValue(), animationFocalPoint);
++        float value = (Float) animation.getAnimatedValue();
++        transform.zoomBy(value - applied, animationFocalPoint);
++        applied = value;
+       }
+     });
+ 
+diff --git a/shaders/atmosphere.fragment.glsl b/shaders/atmosphere.fragment.glsl
+index 56453e4e..5251a03b 100644
+--- a/shaders/atmosphere.fragment.glsl
++++ b/shaders/atmosphere.fragment.glsl
+@@ -11,8 +11,10 @@ layout(std140) uniform AtmospherePropsUBO {
+ } atmosphere;
+ 
+ const float PI = 3.141592653589793;
+-const int PRIMARY_STEPS = 5;
+-const int LIGHT_STEPS = 3;
++// Binch: 4 × 2 statt 5 × 3 Schritte — kaum ein Unterschied im Bild, gut die Hälfte der
++// Rechenarbeit je Bildpunkt (der Durchgang deckt den ganzen Schirm).
++const int PRIMARY_STEPS = 4;
++const int LIGHT_STEPS = 2;
+ const float EARTH_RADIUS = 6371000.0;
+ const float ATMOSPHERE_RADIUS = 6471000.0;
+ 
+@@ -99,10 +101,132 @@ vec4 scatter(vec3 direction, vec3 origin, vec3 sun) {
+     return vec4(color, opacity);
+ }
+ 
++// --- Binch: Weltraum, Sterne, Milchstraße und Tag-und-Nacht-Schatten -------
++// Alles im selben Vollbild-Durchgang wie die Atmosphäre: Der Shader weiß hier
++// ohnehin, ob ein Sichtstrahl die Erde trifft oder ins All geht.
++
++float binch_hash13(vec3 p) {
++    p = fract(p * 0.1031);
++    p += dot(p, p.zyx + 31.32);
++    return fract((p.x + p.y) * p.z);
++}
++
++vec3 binch_hash33(vec3 p) {
++    p = fract(p * vec3(0.1031, 0.1030, 0.0973));
++    p += dot(p, p.yxz + 33.33);
++    return fract((p.xxy + p.yxx) * p.zyx);
++}
++
++// Eine Sternenschicht: je Zelle eines Gitters höchstens ein Stern, fest im Raum.
++vec3 binch_star_layer(vec3 d, float cells, float density, float size, float bright, float pixel) {
++    vec3 p = d * cells;
++    vec3 cell = floor(p);
++    vec3 h = binch_hash33(cell);
++    if (h.x > density) return vec3(0.0);
++    // Mitten in der Zelle, damit kein Stern an der Zellgrenze abgeschnitten wird.
++    vec3 star = normalize(cell + 0.3 + 0.4 * binch_hash33(cell + 7.7));
++    float dist = length(d - star);
++    float radius = max(pixel * size, 1e-6);
++    // Viele schwache, wenige helle — wie am echten Himmel.
++    float magnitude = pow(h.y, 9.0) * bright + 0.07 * bright;
++    vec3 tint = mix(vec3(0.72, 0.82, 1.0), vec3(1.0, 0.88, 0.72), h.z);
++    return tint * magnitude * exp(-(dist * dist) / (radius * radius));
++}
++
++// Die Milchstraße: ein echtes Foto (ESO/S. Brunier, CC BY 4.0) in galaktischen
++// Koordinaten, ±50° um die galaktische Ebene (`binch_milkyway.hpp`). Der Himmel
++// steht fest zur Erde — wer die Kugel dreht, sieht ihn mitwandern, wie in Google
++// Earth. Ausgerichtet wie der echte Himmel zur Sternzeit 5,1 h (galaktischer
++// Nordpol bei RA 192,86° / Dek +27,13°, Zentrum bei RA 266,40° / Dek −28,94°):
++// Dann steht das helle Zentrum der Milchstraße schräg hinter der Kugel, wenn man
++// auf Europa schaut.
++uniform sampler2D u_sky;
++// Helligkeit des Fotos: zurückhaltend wie in Google Earth.
++const float BINCH_MILKY_WAY_GAIN = 0.55;
++const vec3 BINCH_GALACTIC_NORTH = vec3(0.7968, 0.4560, -0.3965);
++const vec3 BINCH_GALACTIC_CENTER = vec3(-0.1520, -0.4838, -0.8618);
++const vec3 BINCH_GALACTIC_EAST = vec3(-0.5849, 0.7470, -0.3162);
++// 50°: so weit reicht das Foto über und unter die Ebene.
++const float BINCH_SKY_HALF_HEIGHT = 0.8726646;
++
++vec3 binch_milky_way(vec3 d) {
++    float b = asin(clamp(dot(d, BINCH_GALACTIC_NORTH), -1.0, 1.0));
++    float l = atan(dot(d, BINCH_GALACTIC_EAST), dot(d, BINCH_GALACTIC_CENTER));
++    vec2 uv = vec2(0.5 - l / (2.0 * PI), 0.5 - 0.5 * b / BINCH_SKY_HALF_HEIGHT);
++    // Ohne Mip-Stufen: LOD 0 fest, dann stört die Naht bei l = ±180° nicht.
++    vec3 photo = textureLod(u_sky, uv, 0.0).rgb;
++    // Den Himmelshintergrund des Fotos abziehen (Median 8/255) — Schwarz bleibt schwarz.
++    photo = max(photo - 0.035, 0.0);
++    // Zum Rand des Ausschnitts weich auslaufen; dort ist das Foto ohnehin fast schwarz.
++    return photo * (1.0 - smoothstep(0.80, 1.0, abs(b) / BINCH_SKY_HALF_HEIGHT));
++}
++
++vec3 binch_space(vec3 d, float pixel) {
++    vec3 photo = binch_milky_way(d);
++    // Im Band stehen mehr Sterne, wie am echten Himmel.
++    float boost = 1.0 + 6.0 * dot(photo, vec3(0.2126, 0.7152, 0.0722));
++    vec3 stars = binch_star_layer(d, 420.0, 0.10 * boost, 0.75, 0.45, pixel)
++               + binch_star_layer(d, 150.0, 0.12 * boost, 0.95, 0.70, pixel)
++               + binch_star_layer(d, 45.0, 0.10, 1.25, 1.30, pixel);
++    // Nicht reines Schwarz: ein Hauch Nachtblau.
++    return vec3(0.004, 0.006, 0.013) + photo * BINCH_MILKY_WAY_GAIN + stars;
++}
++
+ void main() {
+     vec3 camera = atmosphere.camera_position.xyz * EARTH_RADIUS;
+-    vec4 color = scatter(v_view_direction, camera, atmosphere.sun_position.xyz);
++    vec3 direction = normalize(v_view_direction);
++    // Vor jeder Verzweigung: Ableitungen nur im gleichförmigen Ablauf.
++    float pixel = length(fwidth(direction));
++
++    // Binch: Der Durchgang läuft ZWEIMAL (`SkyPass`). Als HINTERGRUND vor allen Ebenen
++    // (camera_position.w = 1) zeichnet er nur, was ins All geht — Sterne, Milchstraße,
++    // Schein —, als ÜBERZUG nach den Ebenen (w = 0) nur Dunst und Nachtschatten über der
++    // Kugel. In einem einzigen Durchgang nach den Ebenen übermalte das deckende All alles,
++    // was über den Erdrand hinausragt: Die Flugbögen in der Luft verschwanden dort,
++    // besonders bei geneigter Karte. Jeder Bildpunkt rechnet den teuren Teil nur einmal.
++    vec2 ground = ray_sphere_intersection(camera, direction, EARTH_RADIUS);
++    bool hitsGround = ground.x <= ground.y && ground.x > 0.0;
++    if (hitsGround == (atmosphere.camera_position.w > 0.5)) {
++        fragColor = vec4(0.0);
++        return;
++    }
++
++    // Die Sonne steht relativ zur KAMERA — links vorne, etwas oben —, damit die
++    // Erde aussieht wie aus dem Fenster einer Raumstation: Licht von links, die
++    // Nachtseite am rechten Rand. Rechts/oben aus der inversen Projektion.
++    vec4 c0 = atmosphere.inv_view_projection * vec4(0.0, 0.0, 0.0, 1.0);
++    vec4 cr = atmosphere.inv_view_projection * vec4(1.0, 0.0, 0.0, 1.0);
++    vec4 cu = atmosphere.inv_view_projection * vec4(0.0, 1.0, 0.0, 1.0);
++    vec3 right = normalize(cr.xyz / cr.w - c0.xyz / c0.w);
++    vec3 up = normalize(cu.xyz / cu.w - c0.xyz / c0.w);
++    vec3 toward = normalize(atmosphere.camera_position.xyz);
++    vec3 sun = normalize(-0.78 * right + 0.30 * up + 0.55 * toward);
++
++    vec4 color = scatter(direction, camera, sun);
+     color.rgb = 1.0 - exp(-color.rgb);
+     color = pow(color, vec4(1.0 / 2.2));
+-    fragColor = vec4(color.rgb, 1.0 - color.a) * atmosphere.sun_position.w;
++
++    float coverage = 1.0 - color.a;
++    vec3 rgb = color.rgb;
++    if (hitsGround) {
++        // Tag und Nacht: weicher Übergang, die Nachtseite dunkel, nicht schwarz.
++        vec3 normal = normalize(camera + direction * ground.x);
++        float light = dot(normal, sun);
++        float night = (1.0 - smoothstep(-0.35, 0.40, light)) * 0.82;
++        // Der Dunst über dem Boden nur gedämpft — sonst wirkt die ganze Kugel
++        // milchig; am Rand (lange Wege durch die Luft) bleibt er kräftig.
++        rgb *= 0.55 * (1.0 - night * 0.7);
++        coverage = 1.0 - (1.0 - coverage * 0.5) * (1.0 - night);
++    } else {
++        // Ins All: der eigene Nachthimmel, durch die Atmosphäre gedämpft.
++        rgb += binch_space(direction, pixel) * color.a;
++        // Ein weicher blauer Schein knapp außerhalb des Erdrands — die dünne
++        // Lufthülle allein ist auf diese Entfernung nur ein Strich.
++        float along = max(-dot(camera, direction), 0.0);
++        float nearest = length(camera + direction * along) / EARTH_RADIUS;
++        float halo = exp(-(nearest - 1.0) / 0.03) * step(1.0, nearest);
++        rgb += vec3(0.32, 0.55, 1.0) * halo * 0.2;
++        coverage = 1.0;
++    }
++    fragColor = vec4(rgb, coverage) * atmosphere.sun_position.w;
+ }
+diff --git a/shaders/line.fragment.glsl b/shaders/line.fragment.glsl
+index eff799a7..641b1f55 100644
+--- a/shaders/line.fragment.glsl
++++ b/shaders/line.fragment.glsl
+@@ -3,7 +3,7 @@ layout (std140) uniform LineEvaluatedPropsUBO {
+     lowp float u_blur;
+     lowp float u_opacity;
+     mediump float u_gapwidth;
+-    lowp float u_offset;
++    highp float u_offset;
+     mediump float u_width;
+     lowp float u_floorwidth;
+     lowp float props_pad1;
+diff --git a/shaders/line.vertex.glsl b/shaders/line.vertex.glsl
+index 82bdd8c4..f52206d8 100644
+--- a/shaders/line.vertex.glsl
++++ b/shaders/line.vertex.glsl
+@@ -39,7 +39,7 @@ layout (std140) uniform LineEvaluatedPropsUBO {
+     lowp float u_blur;
+     lowp float u_opacity;
+     mediump float u_gapwidth;
+-    lowp float u_offset;
++    highp float u_offset;
+     mediump float u_width;
+     lowp float u_floorwidth;
+     lowp float props_pad1;
+@@ -55,11 +55,24 @@ out highp float v_linesofar;
+ #pragma mapbox: define lowp float blur
+ #pragma mapbox: define lowp float opacity
+ #pragma mapbox: define mediump float gapwidth
+-#pragma mapbox: define lowp float offset
++#pragma mapbox: define highp float offset
+ #pragma mapbox: define mediump float width
+ 
+ #ifdef PROJECTION_GLOBE
+ out float v_tile_x;
++
++// Binch: Sichtbarkeit eines GEHOBENEN Bogenpunkts. Die Horizontebene des Globus gilt nur für Punkte am
++// Boden; ein Punkt in der Luft ist sichtbar, solange die Sichtlinie von der Kamera die Kugel verfehlt —
++// sonst endete ein Bogen hart am Kugelrand, statt über ihn hinauszuragen. Gibt wie
++// `globeComputeClippingZ` unter 1 für sichtbar, über 1 für verdeckt zurück, stetig an der Grenze.
++float binchArcClipZ(vec3 p) {
++    // Die Ebene ist (n, -1/|Kamera|) mit n zur Kamera: daraus die Kamera in Kugelradien.
++    vec3 camera = -u_projection_clipping_plane.xyz / u_projection_clipping_plane.w;
++    vec3 sight = p - camera;
++    float t = clamp(-dot(camera, sight) / dot(sight, sight), 0.0, 1.0);
++    float miss = length(camera + sight * t) - 1.0;
++    return clamp(1.0 - (miss + 0.002) * 8.0, 0.0, 2.0);
++}
+ #endif
+ 
+ void main() {
+@@ -67,9 +80,33 @@ void main() {
+     #pragma mapbox: initialize lowp float blur
+     #pragma mapbox: initialize lowp float opacity
+     #pragma mapbox: initialize mediump float gapwidth
+-    #pragma mapbox: initialize lowp float offset
++    #pragma mapbox: initialize highp float offset
+     #pragma mapbox: initialize mediump float width
+ 
++    // Binch: ein FLUGBOGEN IN DER LUFT — nur in Ebenen, deren ID mit „binch-arc"
++    // beginnt (`LineLayerTweaker` setzt dann `props_pad2`). Die Höhe des Scheitels
++    // kommt in Kilometern über `line-gap-width` (ein Bogen hat keine Lücke; so ist
++    // sie datengetrieben und zoomabhängig), der Fortschritt entlang des ganzen
++    // Fluges aus der Linien-Metrik der Quelle (`lineMetrics`): Höhe · sin(π · t).
++    // Die Linie bleibt eine Linie — glatt und geglättet wie am Boden, nur gehoben.
++    // Dazu die Mercator-Länge des ganzen Fluges über `line-offset` (ein Bogen ist nicht
++    // versetzt): Sie braucht das Band im Bildschirmraum für die Richtung samt Steigung.
++    const highp float BINCH_PI = 3.141592653589793;
++    bool binchArc = props_pad2 > 0.5;
++    highp float binchElevation = 0.0;
++    highp float binchApexKm = 0.0;
++    highp float binchProgress = 0.0;
++    highp float binchMercatorLength = 0.0;
++    if (binchArc) {
++        binchProgress = clamp((floor(a_data.z / 4.0) + a_data.w * 64.0) * 2.0 / 32767.0, 0.0, 1.0);
++        // Erst in highp hinüber: Kilometer · 1000 sprengten sonst mediump (bis 65504).
++        binchApexKm = gapwidth;
++        binchMercatorLength = offset;
++        binchElevation = binchApexKm * 1000.0 * sin(BINCH_PI * binchProgress);
++        gapwidth = 0.0;
++        offset = 0.0;
++    }
++
+     // the distance over which the line edge fades out.
+     // Retina devices need a smaller distance to avoid aliasing.
+     float ANTIALIASING = 1.0 / DEVICE_PIXEL_RATIO / 2.0;
+@@ -111,9 +148,39 @@ void main() {
+ 
+ #ifdef PROJECTION_GLOBE
+     float adjustedThickness = projectLineThickness(pos.y);
+-    vec4 projected_no_extrude = projectTile(pos + offset2 / u_ratio * adjustedThickness);
++    vec4 projected_no_extrude = projectTileWithElevation(pos + offset2 / u_ratio * adjustedThickness, binchElevation);
+     vec2 extrudedPos = pos + (offset2 + dist) / u_ratio * adjustedThickness;
+-    gl_Position = projectTile(extrudedPos);
++    gl_Position = projectTileWithElevation(extrudedPos, binchElevation);
++    if (binchArc && binchElevation > 0.0 && u_projection_transition > 0.999) {
++        // Binch: das Band des Bogens im BILDSCHIRMRAUM, quer zur projizierten Richtung samt
++        // Steigung, so breit wie die Linie in Pixeln. Waagerecht im Kachelraum (wie am Boden)
++        // sähe man ein hohes Band im geneigten Blick fast von der Kante — es schrumpfte auf
++        // unter einen Bildpunkt, und Stücke des Bogens verschwanden.
++        vec2 across = normalize(a_extrude) * normal.y; // für beide Punkte des Querschnitts gleich
++        vec2 along = vec2(-across.y, across.x);        // vorwärts, in Richtung wachsenden Fortschritts
++        float stepTile = 8.0 / u_ratio;                // etwa 8 Pixel weiter auf der Linie
++        highp float aheadProgress = binchMercatorLength > 0.0
++                                        ? clamp(binchProgress + stepTile * u_projection_tile_mercator_coords.z /
++                                                                    binchMercatorLength,
++                                                0.0,
++                                                1.0)
++                                        : binchProgress;
++        highp float aheadElevation = binchApexKm * 1000.0 * sin(BINCH_PI * aheadProgress);
++        vec4 here = projected_no_extrude;
++        vec4 ahead = projectTileWithElevation(pos + along * stepTile, aheadElevation);
++        vec2 directionPx = (ahead.xy / ahead.w - here.xy / here.w) * u_units_to_pixels;
++        float lengthPx = length(directionPx);
++        if (lengthPx > 1e-4) {
++            vec2 sidePx = vec2(-directionPx.y, directionPx.x) / lengthPx * outset * normal.y;
++            vec4 ribbon = here + vec4(sidePx / u_units_to_pixels * here.w, 0.0, 0.0);
++            // Am Boden (Flughafen) bleibt die gewöhnliche Linie — dort stimmen beide überein,
++            // und die Enden der Linie (Kappen, Anschlüsse) brauchen die Kachel-Ausrichtung.
++            gl_Position = mix(gl_Position, ribbon, smoothstep(1000.0, 15000.0, binchElevation));
++        }
++        vec3 lifted = projectToSphere(pos + u_projection_translate, vec2(0.0, 0.0)) *
++                      (1.0 + binchElevation / GLOBE_RADIUS);
++        gl_Position.z = binchArcClipZ(lifted) * gl_Position.w - u_projection_depth_offset;
++    }
+     v_tile_x = antimeridianClipX(extrudedPos);
+     vec4 projected_extrude = gl_Position - projected_no_extrude;
+ #else
+diff --git a/shaders/raster.fragment.glsl b/shaders/raster.fragment.glsl
+index 7e833546..2044aa96 100644
+--- a/shaders/raster.fragment.glsl
++++ b/shaders/raster.fragment.glsl
+@@ -17,6 +17,32 @@ uniform sampler2D u_image1;
+ 
+ in vec2 v_pos0;
+ in vec2 v_pos1;
++in float v_pole;
++
++// Binch: die Polkappe des Globus. Mercator-Kacheln enden bei 85,05°; den Rest bis
++// zum Pol füllt der Globus, indem er die oberste Pixelzeile jeder Kachel bis zum
++// Pol zieht — jedes Pixel ein Strahl, zusammen ein Fächer. Stattdessen wird die
++// Zeile nach innen zunehmend verwischt und läuft dann in EINE feste Polfarbe aus:
++// für alle Kacheln dieselbe, sonst träfen sich am Pol Tortenstücke (die Kanten
++// der Kacheln sind am Nordpol unterschiedlich dunkel). Nord: Polarmeer, wie es
++// Blue Marble und EOX an der Kante zeigen; Süd: Eis.
++const vec3 BINCH_NORTH_POLE = vec3(0.063, 0.141, 0.275);
++const vec3 BINCH_SOUTH_POLE = vec3(0.94, 0.945, 0.945);
++
++vec4 binch_pole_row(sampler2D image, vec2 pos, float lo, float hi, float halfWidth) {
++    // Dicht genug, dass jede Stichprobe an die nächste grenzt (sonst flimmern die
++    // Lücken als neue Speichen).
++    vec4 sum = vec4(0.0);
++    for (int i = 0; i < 16; i++) {
++        float x = clamp(pos.x + halfWidth * (float(i) / 7.5 - 1.0), lo, hi);
++        sum += textureLod(image, vec2(x, pos.y), 0.0);
++    }
++    sum /= 16.0;
++    if (sum.a > 0.0) {
++        sum.rgb /= sum.a;
++    }
++    return sum;
++}
+ 
+ void main() {
+ 
+@@ -29,6 +55,25 @@ void main() {
+     if (color1.a > 0.0) {
+         color1.rgb = color1.rgb / color1.a;
+     }
++    if (v_pole > 0.0) {
++        float lo0 = 0.5 - 0.5 / u_buffer_scale;
++        float hi0 = 0.5 + 0.5 / u_buffer_scale;
++        // Gleich ab der Kante kräftig verwischen (bis ~16 Pixel je Seite bei
++        // 256er-Kacheln, dicht abgetastet) — schmaler blieben Speichen stehen.
++        float halfWidth = 0.004 + 0.06 * smoothstep(0.0, 0.15, v_pole);
++        float smear = smoothstep(0.0, 0.08, v_pole);
++        color0 = mix(color0, binch_pole_row(u_image0, v_pos0, lo0, hi0, halfWidth), smear);
++        color1 = mix(color1,
++                     binch_pole_row(u_image1, v_pos1,
++                                    lo0 * u_scale_parent + u_tl_parent.x,
++                                    hi0 * u_scale_parent + u_tl_parent.x,
++                                    halfWidth * u_scale_parent),
++                     smear);
++        vec3 pole = v_pos0.y < 0.5 ? BINCH_NORTH_POLE : BINCH_SOUTH_POLE;
++        float toPole = smoothstep(0.05, 0.5, v_pole);
++        color0.rgb = mix(color0.rgb, pole, toPole);
++        color1.rgb = mix(color1.rgb, pole, toPole);
++    }
+     vec4 color = mix(color0, color1, u_fade_t);
+     float alpha = color.a * u_opacity;
+     vec3 rgb = color.rgb;
+diff --git a/shaders/raster.vertex.glsl b/shaders/raster.vertex.glsl
+index b50bcf4f..2e50faa8 100644
+--- a/shaders/raster.vertex.glsl
++++ b/shaders/raster.vertex.glsl
+@@ -21,9 +21,12 @@ layout (location = 1) in vec2 a_texture_pos;
+ 
+ out vec2 v_pos0;
+ out vec2 v_pos1;
++// Binch: 1 an den Pol-Ecken der Polkappe des Globus, 0 an der Kachelkante (85,05°).
++out float v_pole;
+ 
+ void main() {
+     gl_Position = projectTile(a_pos, a_pos);
++    v_pole = (a_pos.y < GLOBE_POLE_NORTH_Y || a_pos.y > GLOBE_POLE_SOUTH_Y) ? 1.0 : 0.0;
+     // We are using Int16 for texture position coordinates to give us enough precision for
+     // fractional coordinates. We use 8192 to scale the texture coordinates in the buffer
+     // as an arbitrarily high number to preserve adequate precision when rendering.
+diff --git a/src/mln/gl/layer_group_gl.cpp b/src/mln/gl/layer_group_gl.cpp
+index bd2dcafb..209405c8 100644
+--- a/src/mln/gl/layer_group_gl.cpp
++++ b/src/mln/gl/layer_group_gl.cpp
+@@ -199,6 +199,14 @@ void LayerGroupGL::render(RenderOrchestrator&, PaintParameters& parameters) {
+             tweaker->execute(drawable, parameters);
+         }
+ 
++        // Binch: 3D-Drawables setzen den Stencil nicht selbst (`DrawableGL::draw`: „macht die
++        // Ebenengruppe"), und diese Gruppe — ohne Kachel-Masken — tat es auch nicht. Die Atmosphäre
++        // erbte so den Kachel-Stenciltest der zuvor gezeichneten Ebene; war das eine Linie, fiel
++        // sie überall durch: kein Himmel, kein Erdschatten, kein Schein.
++        if (drawable.getIs3D() && !drawable.getEnableStencil()) {
++            context.setStencilMode(gfx::StencilMode::disabled());
++        }
++
+         drawable.draw(parameters);
+     });
+ 
+diff --git a/src/mln/gl/texture2d.cpp b/src/mln/gl/texture2d.cpp
+index 6864529c..f5c87e2b 100644
+--- a/src/mln/gl/texture2d.cpp
++++ b/src/mln/gl/texture2d.cpp
+@@ -103,9 +103,19 @@ void Texture2D::updateSamplerConfiguration() noexcept {
+     using namespace platform;
+     samplerStateDirty = false;
+ 
++    // Binch: `mipmapped` wurde hier bisher übergangen. Verkleinert gezeichnete Texturen (Kacheln
++    // am Rand des Globus, weit draußen) flimmerten dadurch als Grisseln; mit Mip-Stufen nimmt die
++    // GPU dort die passend verkleinerte Fassung. Vergrößert gezeichnet ändert sich nichts.
++    const bool mipmaps = samplerState.mipmapped && samplerState.filter != gfx::TextureFilterType::Nearest;
++    if (mipmaps && !mipmapsGenerated) {
++        MBGL_CHECK_ERROR(glGenerateMipmap(GL_TEXTURE_2D));
++        mipmapsGenerated = true;
++    }
+     MBGL_CHECK_ERROR(glTexParameteri(GL_TEXTURE_2D,
+                                      GL_TEXTURE_MIN_FILTER,
+-                                     samplerState.filter == gfx::TextureFilterType::Nearest ? GL_NEAREST : GL_LINEAR));
++                                     samplerState.filter == gfx::TextureFilterType::Nearest
++                                         ? GL_NEAREST
++                                         : (mipmaps ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR)));
+     MBGL_CHECK_ERROR(glTexParameteri(GL_TEXTURE_2D,
+                                      GL_TEXTURE_MAG_FILTER,
+                                      samplerState.filter == gfx::TextureFilterType::Nearest ? GL_NEAREST : GL_LINEAR));
+@@ -171,15 +181,17 @@ void Texture2D::uploadSubRegion(const void* pixelData, const Size& size_, uint16
+ 
+     assert(texture);
+ 
++    // Bind to TU 0 and upload. Binch: ERST binden, dann den Filter setzen — vorher ging die
++    // Einstellung an die gerade gebundene, also womöglich eine fremde Textur.
++    context.activeTextureUnit = 0;
++    context.texture[0] = getTextureID();
++    context.pixelStoreUnpack = {1};
++
+     // update sampler configuration if needed
+     if (samplerStateDirty) {
+         updateSamplerConfiguration();
+     }
+ 
+-    // Bind to TU 0 and upload
+-    context.activeTextureUnit = 0;
+-    context.texture[0] = getTextureID();
+-    context.pixelStoreUnpack = {1};
+     MBGL_CHECK_ERROR(glTexSubImage2D(GL_TEXTURE_2D,
+                                      0,
+                                      xOffset,
+@@ -192,6 +204,13 @@ void Texture2D::uploadSubRegion(const void* pixelData, const Size& size_, uint16
+ 
+     context.renderingStats().numTextureUpdates++;
+     context.renderingStats().textureUpdateBytes += static_cast<size_t>(getPixelStride() * size_.width * size_.height);
++
++    // Binch: neues Bild, also neue Mip-Stufen (die Textur ist hier noch gebunden).
++    mipmapsGenerated = false;
++    if (samplerState.mipmapped && samplerState.filter != gfx::TextureFilterType::Nearest) {
++        MBGL_CHECK_ERROR(glGenerateMipmap(GL_TEXTURE_2D));
++        mipmapsGenerated = true;
++    }
+ }
+ 
+ void Texture2D::upload() {
+diff --git a/src/mln/renderer/layers/line_layer_tweaker.cpp b/src/mln/renderer/layers/line_layer_tweaker.cpp
+index 36003e8b..99fcaf21 100644
+--- a/src/mln/renderer/layers/line_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/line_layer_tweaker.cpp
+@@ -184,7 +184,8 @@ void LineLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParameters
+                                              /*width =*/evaluate<LineWidth>(parameters),
+                                              /*floorwidth =*/evaluate<LineFloorWidth>(parameters),
+                                              LineExpressionMask::None,
+-                                             0};
++                                             // Binch: Flugbogen in der Luft — siehe `line.vertex.glsl`.
++                                             getID().rfind("binch-arc", 0) == 0 ? 1.0f : 0.0f};
+ #endif // MLN_RENDER_BACKEND_METAL
+ 
+         context.emplaceOrUpdateUniformBuffer(evaluatedPropsUniformBuffer, &propsUBO);
+diff --git a/src/mln/renderer/layers/render_line_layer.cpp b/src/mln/renderer/layers/render_line_layer.cpp
+index c9a15676..87f1744e 100644
+--- a/src/mln/renderer/layers/render_line_layer.cpp
++++ b/src/mln/renderer/layers/render_line_layer.cpp
+@@ -372,7 +372,11 @@ void RenderLineLayer::update(gfx::ShaderRegistry& shaders,
+         builder->setColorMode(renderPass == RenderPass::Translucent ? gfx::ColorMode::alphaBlended()
+                                                                     : gfx::ColorMode::unblended());
+         builder->setCullFaceMode(gfx::CullFaceMode::disabled());
+-        builder->setEnableStencil(true);
++        // Binch: Flugbögen in der Luft („binch-arc…", siehe `line.vertex.glsl`) NICHT auf die
++        // Kachel beschneiden. Der Stencil hält eine Linie in der Bodenfläche ihrer Kachel; ein
++        // gehobener Bogen erscheint aber perspektivisch versetzt über fremden Kacheln — je höher
++        // und je stärker geneigt, desto mehr — und fiel dort durch: Stücke des Bogens fehlten.
++        builder->setEnableStencil(getID().rfind("binch-arc", 0) != 0);
+ 
+         return builder;
+     };
+diff --git a/src/mln/renderer/layers/render_raster_layer.cpp b/src/mln/renderer/layers/render_raster_layer.cpp
+index c55d5870..7179d70a 100644
+--- a/src/mln/renderer/layers/render_raster_layer.cpp
++++ b/src/mln/renderer/layers/render_raster_layer.cpp
+@@ -177,8 +177,15 @@ void RenderRasterLayer::update(gfx::ShaderRegistry& shaders,
+                 const bool nearest = evaluated.get<RasterResampling>() == RasterResamplingType::Nearest;
+                 const auto filter = nearest ? gfx::TextureFilterType::Nearest : gfx::TextureFilterType::Linear;
+ 
++                // Binch: mit Mip-Stufen, aber nur für Kacheln, die auf dem Globus weit draußen
++                // angelegt werden (gesetzt wird das nur hier, beim Anlegen) — dort werden Kacheln am
++                // Rand stark verkleinert gezeichnet und grisselten ohne sie. In der Nähe kosteten sie
++                // bei jeder neuen Kachel nur Zeit.
+                 bucket.texture2d->setSamplerConfiguration(
+-                    {.filter = filter, .wrapU = gfx::TextureWrapType::Clamp, .wrapV = gfx::TextureWrapType::Clamp});
++                    {.filter = filter,
++                     .wrapU = gfx::TextureWrapType::Clamp,
++                     .wrapV = gfx::TextureWrapType::Clamp,
++                     .mipmapped = state.isGlobeRendering() && state.getZoom() < 7.0});
+ 
+                 builder->setTexture(bucket.texture2d, idRasterImage0Texture);
+                 builder->setTexture(bucket.texture2d, idRasterImage1Texture);
+diff --git a/src/mln/renderer/render_orchestrator.hpp b/src/mln/renderer/render_orchestrator.hpp
+index 6d915057..4bd3be62 100644
+--- a/src/mln/renderer/render_orchestrator.hpp
++++ b/src/mln/renderer/render_orchestrator.hpp
+@@ -114,6 +114,7 @@ public:
+     LayerGroupBase* getGlobeDepthLayerGroup() const { return globeDepthPass.getLayerGroup(); }
+     LayerGroupBase* getSkyLayerGroup() const { return skyPass.getSkyLayerGroup(); }
+     LayerGroupBase* getAtmosphereLayerGroup() const { return skyPass.getAtmosphereLayerGroup(); }
++    LayerGroupBase* getSpaceLayerGroup() const { return skyPass.getSpaceLayerGroup(); }
+ 
+     template <typename Func /* void(LayerGroupBase&) */>
+     void visitLayerGroups(Func f) {
+diff --git a/src/mln/renderer/renderer_impl.cpp b/src/mln/renderer/renderer_impl.cpp
+index 402c965d..b4fe1e4c 100644
+--- a/src/mln/renderer/renderer_impl.cpp
++++ b/src/mln/renderer/renderer_impl.cpp
+@@ -300,6 +300,9 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
+         if (auto* atmosphere = orchestrator.getAtmosphereLayerGroup()) {
+             atmosphere->upload(*uploadPass);
+         }
++        if (auto* space = orchestrator.getSpaceLayerGroup()) {
++            space->upload(*uploadPass);
++        }
+ 
+         // Give the render targets a chance to upload
+         orchestrator.visitRenderTargets([&](RenderTarget& renderTarget) { renderTarget.upload(*uploadPass); });
+@@ -427,6 +430,17 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
+             parameters.currentLayer = static_cast<uint32_t>(orchestrator.numLayerGroups()) + 1;
+             sky->render(orchestrator, parameters);
+         }
++        // Binch: das All des Globus als Hintergrund — Ebenen, die darüber hinausragen (die
++        // Flugbögen in der Luft), bleiben so sichtbar. Den Dunst über der Kugel zeichnet der
++        // Atmosphären-Durchgang nach den Ebenen.
++        if (auto* space = orchestrator.getSpaceLayerGroup()) {
++            const auto debugGroup(parameters.renderPass->createDebugGroup("atmosphere-space"));
++            parameters.pass = RenderPass::Translucent;
++            parameters.depthRangeSize = 1 - (orchestrator.numLayerGroups() + 2) * PaintParameters::numSublayers *
++                                                PaintParameters::depthEpsilon;
++            parameters.currentLayer = static_cast<uint32_t>(orchestrator.numLayerGroups()) + 1;
++            space->render(orchestrator, parameters);
++        }
+     };
+ 
+     const auto drawableTranslucentPass = [&] {
+diff --git a/src/mln/renderer/sky_pass.cpp b/src/mln/renderer/sky_pass.cpp
+index 7e34a724..b3bb2e7e 100644
+--- a/src/mln/renderer/sky_pass.cpp
++++ b/src/mln/renderer/sky_pass.cpp
+@@ -5,8 +5,11 @@
+ #include <mln/gfx/cull_face_mode.hpp>
+ #include <mln/gfx/drawable_builder.hpp>
+ #include <mln/gfx/projection_variant.hpp>
++#include <mln/gfx/texture2d.hpp>
+ #include <mln/gfx/shader_registry.hpp>
+ #include <mln/map/transform_state.hpp>
++#include <mln/renderer/binch_milkyway.hpp>
++#include <mln/renderer/layer_group.hpp>
+ #include <mln/renderer/render_pass.hpp>
+ #include <mln/shaders/shader_defines.hpp>
+ #include <mln/shaders/sky_ubo.hpp>
+@@ -17,10 +20,17 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cmath>
+ #include <numbers>
+ #include <string_view>
+ 
++// Wie lange das Zeichnen auf die Milchstraße wartet: im Betrieb gar nicht (sie kommt
++// ein paar Bilder später), für Einzelbilder (mbgl-render) mit -DBINCH_SKY_WAIT_MS=5000.
++#ifndef BINCH_SKY_WAIT_MS
++#define BINCH_SKY_WAIT_MS 0
++#endif
++
+ namespace mln {
+ 
+ namespace {
+@@ -82,6 +92,42 @@ std::array<float, 4> sunPosition(const EvaluatedLight& light, const TransformSta
+ 
+ } // namespace
+ 
++const std::shared_ptr<gfx::Texture2D>& SkyPass::milkyWay(gfx::Context& context) {
++    if (!blankTexture) {
++        std::array<uint8_t, 4> black{{0, 0, 0, 255}};
++        blankTexture = context.createTexture2D();
++        blankTexture->setImage(std::make_shared<PremultipliedImage>(Size(1, 1), black.data(), black.size()));
++        blankTexture->setSamplerConfiguration({.filter = gfx::TextureFilterType::Linear,
++                                               .wrapU = gfx::TextureWrapType::Clamp,
++                                               .wrapV = gfx::TextureWrapType::Clamp});
++    }
++    if (!milkyWayDone) {
++        if (!milkyWayImage.valid()) {
++            milkyWayImage = std::async(std::launch::async, []() -> std::shared_ptr<PremultipliedImage> {
++                try {
++                    auto image = std::make_shared<PremultipliedImage>(decodeImage(
++                        std::string(reinterpret_cast<const char*>(binch::milkyWayJpeg), binch::milkyWayJpegSize)));
++                    return image->valid() ? image : nullptr;
++                } catch (...) {
++                    return nullptr;
++                }
++            });
++        }
++        if (milkyWayImage.wait_for(std::chrono::milliseconds(BINCH_SKY_WAIT_MS)) == std::future_status::ready) {
++            milkyWayDone = true;
++            if (auto image = milkyWayImage.get()) {
++                milkyWayTexture = context.createTexture2D();
++                milkyWayTexture->setImage(std::move(image));
++                // Rundherum (l = ±180° stoßen aneinander), oben und unten Schluss.
++                milkyWayTexture->setSamplerConfiguration({.filter = gfx::TextureFilterType::Linear,
++                                                          .wrapU = gfx::TextureWrapType::Repeat,
++                                                          .wrapV = gfx::TextureWrapType::Clamp});
++            }
++        }
++    }
++    return milkyWayTexture ? milkyWayTexture : blankTexture;
++}
++
+ void SkyPass::update(gfx::ShaderRegistry& shaders,
+                      gfx::Context& context,
+                      const TransformState& state,
+@@ -96,9 +142,17 @@ void SkyPass::update(gfx::ShaderRegistry& shaders,
+         if (atmosphereLayerGroup) {
+             atmosphereLayerGroup->clearDrawables();
+         }
++        if (spaceLayerGroup) {
++            spaceLayerGroup->clearDrawables();
++        }
+         return;
+     }
+ 
++    // Binch: die Milchstraße schon jetzt anstoßen — lange bevor jemand zum Globus
++    // hinauszoomt, ist sie dann fertig. Kam sie erst, wenn die Karte schon stand,
++    // fehlte sie bis zur nächsten Bewegung (gezeichnet wird nur auf Änderung).
++    milkyWay(context);
++
+     const double projectionTransition = std::clamp(state.getProjectionTransition(), 0.0, 1.0);
+     if (projectionTransition < 1.0) {
+         if (!skyShader) {
+@@ -143,6 +197,9 @@ void SkyPass::update(gfx::ShaderRegistry& shaders,
+         if (atmosphereLayerGroup) {
+             atmosphereLayerGroup->clearDrawables();
+         }
++        if (spaceLayerGroup) {
++            spaceLayerGroup->clearDrawables();
++        }
+         return;
+     }
+ 
+@@ -157,10 +214,33 @@ void SkyPass::update(gfx::ShaderRegistry& shaders,
+                                                         shaders::idAtmospherePosVertexAttribute,
+                                                         true,
+                                                         gfx::DepthMaskType::ReadOnly);
++        attachedSky = nullptr;
+     }
+-    if (!atmosphereLayerGroup) {
++    if (!spaceLayerGroup || spaceLayerGroup->empty()) {
++        spaceLayerGroup = makeFullscreenLayerGroup(context,
++                                                   atmosphereShader,
++                                                   "atmosphere-space",
++                                                   shaders::idAtmospherePosVertexAttribute,
++                                                   true,
++                                                   gfx::DepthMaskType::ReadOnly);
++        attachedSpaceSky = nullptr;
++    }
++    if (!atmosphereLayerGroup || !spaceLayerGroup) {
+         return;
+     }
++    const auto& sky = milkyWay(context);
++    if (sky.get() != attachedSky) {
++        static_cast<LayerGroup&>(*atmosphereLayerGroup).visitDrawables([&](gfx::Drawable& drawable) {
++            drawable.setTexture(sky, shaders::idAtmosphereSkyTexture);
++        });
++        attachedSky = sky.get();
++    }
++    if (sky.get() != attachedSpaceSky) {
++        static_cast<LayerGroup&>(*spaceLayerGroup).visitDrawables([&](gfx::Drawable& drawable) {
++            drawable.setTexture(sky, shaders::idAtmosphereSkyTexture);
++        });
++        attachedSpaceSky = sky.get();
++    }
+ 
+     const auto& camera = state.getGlobeCameraPosition();
+     const shaders::AtmospherePropsUBO props = {
+@@ -170,6 +250,10 @@ void SkyPass::update(gfx::ShaderRegistry& shaders,
+         .sun_position = sunPosition(light, state, atmosphereBlend),
+     };
+     atmosphereLayerGroup->mutableUniformBuffers().createOrUpdate(shaders::idAtmospherePropsUBO, &props, context);
++    // Derselbe Block für den Hintergrund, nur mit dem Kennzeichen „All" in camera_position.w.
++    shaders::AtmospherePropsUBO spaceProps = props;
++    spaceProps.camera_position[3] = 1.0f;
++    spaceLayerGroup->mutableUniformBuffers().createOrUpdate(shaders::idAtmospherePropsUBO, &spaceProps, context);
+ }
+ 
+ } // namespace mln
+diff --git a/src/mln/renderer/sky_pass.hpp b/src/mln/renderer/sky_pass.hpp
+index 7e634b29..fe873ed8 100644
+--- a/src/mln/renderer/sky_pass.hpp
++++ b/src/mln/renderer/sky_pass.hpp
+@@ -4,8 +4,11 @@
+ #include <mln/renderer/render_light.hpp>
+ #include <mln/renderer/render_sky.hpp>
+ #include <mln/shaders/shader_program_base.hpp>
++#include <mln/util/image.hpp>
+ #include <mln/util/size.hpp>
+ 
++#include <future>
++#include <memory>
+ #include <optional>
+ 
+ namespace mln {
+@@ -15,6 +18,7 @@ class TransformState;
+ namespace gfx {
+ class Context;
+ class ShaderRegistry;
++class Texture2D;
+ } // namespace gfx
+ 
+ /// Owns the source-independent fullscreen passes used by the root `sky` style property.
+@@ -33,13 +37,28 @@ public:
+ 
+     LayerGroupBase* getSkyLayerGroup() const { return skyLayerGroup.get(); }
+     LayerGroupBase* getAtmosphereLayerGroup() const { return atmosphereLayerGroup.get(); }
++    /// Binch: das All (Sterne, Milchstraße, Schein) als Hintergrund VOR den Ebenen — siehe
++    /// `atmosphere.fragment.glsl`.
++    LayerGroupBase* getSpaceLayerGroup() const { return spaceLayerGroup.get(); }
+     bool hasAtmosphere() const { return atmosphereLayerGroup && !atmosphereLayerGroup->empty(); }
+ 
+ private:
+     LayerGroupPtr skyLayerGroup;
+     LayerGroupPtr atmosphereLayerGroup;
++    LayerGroupPtr spaceLayerGroup;
+     gfx::ShaderProgramBasePtr skyShader;
+     gfx::ShaderProgramBasePtr atmosphereShader;
++
++    /// Binch: die Milchstraße hinter dem Globus (`binch_milkyway.hpp`). Das JPEG wird
++    /// EINMAL im Hintergrund dekodiert, auf dem Zeichen-Thread wäre das beim ersten
++    /// Herauszoomen ein Ruckler. Bis dahin steht eine schwarze Textur da.
++    const std::shared_ptr<gfx::Texture2D>& milkyWay(gfx::Context&);
++    std::future<std::shared_ptr<PremultipliedImage>> milkyWayImage;
++    std::shared_ptr<gfx::Texture2D> milkyWayTexture;
++    std::shared_ptr<gfx::Texture2D> blankTexture;
++    bool milkyWayDone = false;
++    const gfx::Texture2D* attachedSky = nullptr;
++    const gfx::Texture2D* attachedSpaceSky = nullptr;
+ };
+ 
+ } // namespace mln
+diff --git a/src/mln/shaders/gl/shader_info.cpp b/src/mln/shaders/gl/shader_info.cpp
+index e56876bb..2eb20912 100644
+--- a/src/mln/shaders/gl/shader_info.cpp
++++ b/src/mln/shaders/gl/shader_info.cpp
+@@ -66,7 +66,9 @@ const std::vector<UniformBlockInfo> AtmosphereShaderInfo::uniformBlocks = {
+ const std::vector<AttributeInfo> AtmosphereShaderInfo::attributes = {
+     AttributeInfo{"a_pos", idAtmospherePosVertexAttribute},
+ };
+-const std::vector<TextureInfo> AtmosphereShaderInfo::textures = {};
++const std::vector<TextureInfo> AtmosphereShaderInfo::textures = {
++    TextureInfo{"u_sky", idAtmosphereSkyTexture},
++};
+ 
+ // Circle
+ using CircleShaderInfo = ShaderInfo<BuiltIn::CircleShader, gfx::Backend::Type::OpenGL>;
+diff --git a/src/mln/shaders/shader_source.cpp b/src/mln/shaders/shader_source.cpp
+index 378134d4..0f10b917 100644
+--- a/src/mln/shaders/shader_source.cpp
++++ b/src/mln/shaders/shader_source.cpp
+@@ -6,43 +6,44 @@ namespace mln {
+ 
+ using namespace shaders;
+ 
+-MBGL_DEFINE_ENUM(BuiltIn,
+-                 {{BuiltIn::None, "None"},
+-                  {BuiltIn::Prelude, "Prelude"},
+-                  {BuiltIn::ClippingMaskProgram, "ClippingMaskProgram"},
+-                  {BuiltIn::BackgroundShader, "BackgroundShader"},
+-                  {BuiltIn::BackgroundPatternShader, "BackgroundPatternShader"},
+-                  {BuiltIn::SkyShader, "SkyShader"},
+-                  {BuiltIn::AtmosphereShader, "AtmosphereShader"},
+-                  {BuiltIn::CircleShader, "CircleShader"},
+-                  {BuiltIn::CollisionBoxShader, "CollisionBoxShader"},
+-                  {BuiltIn::CollisionCircleShader, "CollisionCircleShader"},
+-                  {BuiltIn::DebugShader, "DebugShader"},
+-                  {BuiltIn::FillShader, "FillShader"},
+-                  {BuiltIn::FillOutlineShader, "FillOutlineShader"},
+-                  {BuiltIn::FillPatternShader, "FillPatternShader"},
+-                  {BuiltIn::FillOutlinePatternShader, "FillOutlinePatternShader"},
+-                  {BuiltIn::FillOutlineTriangulatedShader, "FillOutlineTriangulatedShader"},
+-                  {BuiltIn::FillExtrusionShader, "FillExtrusionShader"},
+-                  {BuiltIn::FillExtrusionInstancedShader, "FillExtrusionInstancedShader"},
+-                  {BuiltIn::FillExtrusionPatternShader, "FillExtrusionPatternShader"},
+-                  {BuiltIn::FillExtrusionPatternInstancedShader, "FillExtrusionPatternInstancedShader"},
+-                  {BuiltIn::GlobeDepthShader, "GlobeDepthShader"},
+-                  {BuiltIn::HeatmapShader, "HeatmapShader"},
+-                  {BuiltIn::HeatmapTextureShader, "HeatmapTextureShader"},
+-                  {BuiltIn::HillshadePrepareShader, "HillshadePrepareShader"},
+-                  {BuiltIn::ColorReliefShader, "ColorReliefShader"},
+-                  {BuiltIn::HillshadeShader, "HillshadeShader"},
+-                  {BuiltIn::LineShader, "LineShader"},
+-                  {BuiltIn::LineGradientShader, "LineGradientShader"},
+-                  {BuiltIn::LinePatternShader, "LinePatternShader"},
+-                  {BuiltIn::LocationIndicatorShader, "LocationIndicatorShader"},
+-                  {BuiltIn::LocationIndicatorTexturedShader, "LocationIndicatorTexturedShader"},
+-                  {BuiltIn::LineSDFShader, "LineSDFShader"},
+-                  {BuiltIn::RasterShader, "RasterShader"},
+-                  {BuiltIn::SymbolIconShader, "SymbolIconShader"},
+-                  {BuiltIn::SymbolSDFShader, "SymbolSDFShader"},
+-                  {BuiltIn::SymbolTextAndIconShader, "SymbolTextAndIconShader"},
+-                  {BuiltIn::WideVectorShader, "WideVectorShader"}});
++MBGL_DEFINE_ENUM(BuiltIn, {
++{BuiltIn::None, "None"},
++{BuiltIn::Prelude, "Prelude"},
++{BuiltIn::ClippingMaskProgram, "ClippingMaskProgram"},
++{BuiltIn::BackgroundShader, "BackgroundShader"},
++{BuiltIn::BackgroundPatternShader, "BackgroundPatternShader"},
++{BuiltIn::SkyShader, "SkyShader"},
++{BuiltIn::AtmosphereShader, "AtmosphereShader"},
++{BuiltIn::CircleShader, "CircleShader"},
++{BuiltIn::CollisionBoxShader, "CollisionBoxShader"},
++{BuiltIn::CollisionCircleShader, "CollisionCircleShader"},
++{BuiltIn::DebugShader, "DebugShader"},
++{BuiltIn::FillShader, "FillShader"},
++{BuiltIn::FillOutlineShader, "FillOutlineShader"},
++{BuiltIn::FillPatternShader, "FillPatternShader"},
++{BuiltIn::FillOutlinePatternShader, "FillOutlinePatternShader"},
++{BuiltIn::FillOutlineTriangulatedShader, "FillOutlineTriangulatedShader"},
++{BuiltIn::FillExtrusionShader, "FillExtrusionShader"},
++{BuiltIn::FillExtrusionInstancedShader, "FillExtrusionInstancedShader"},
++{BuiltIn::FillExtrusionPatternShader, "FillExtrusionPatternShader"},
++{BuiltIn::FillExtrusionPatternInstancedShader, "FillExtrusionPatternInstancedShader"},
++{BuiltIn::GlobeDepthShader, "GlobeDepthShader"},
++{BuiltIn::HeatmapShader, "HeatmapShader"},
++{BuiltIn::HeatmapTextureShader, "HeatmapTextureShader"},
++{BuiltIn::HillshadePrepareShader, "HillshadePrepareShader"},
++{BuiltIn::ColorReliefShader, "ColorReliefShader"},
++{BuiltIn::HillshadeShader, "HillshadeShader"},
++{BuiltIn::LineShader, "LineShader"},
++{BuiltIn::LineGradientShader, "LineGradientShader"},
++{BuiltIn::LinePatternShader, "LinePatternShader"},
++{BuiltIn::LocationIndicatorShader, "LocationIndicatorShader"},
++{BuiltIn::LocationIndicatorTexturedShader, "LocationIndicatorTexturedShader"},
++{BuiltIn::LineSDFShader, "LineSDFShader"},
++{BuiltIn::RasterShader, "RasterShader"},
++{BuiltIn::SymbolIconShader, "SymbolIconShader"},
++{BuiltIn::SymbolSDFShader, "SymbolSDFShader"},
++{BuiltIn::SymbolTextAndIconShader, "SymbolTextAndIconShader"},
++{BuiltIn::WideVectorShader, "WideVectorShader"}
++});
+ 
+ } // namespace mln
+diff --git a/src/mln/util/bounding_volumes.cpp b/src/mln/util/bounding_volumes.cpp
+index bc5c5dba..ff01772e 100644
+--- a/src/mln/util/bounding_volumes.cpp
++++ b/src/mln/util/bounding_volumes.cpp
+@@ -29,22 +29,23 @@ vec4 planeThrough(const vec3& p0, const vec3& p1, const vec3& p2) noexcept {
+     return {{n[0], n[1], n[2], -vec3Dot(n, p1)}};
+ }
+ 
+-// The distance from the near plane to the point of the horizon circle farthest along the view direction, if the
+-// camera is not looking straight down.
+-std::optional<double> idealNearFarPlaneDistance(const vec4& horizonPlane, const vec4& nearPlane) noexcept {
++// The distance from the near plane to the point of the horizon circle farthest along the view direction.
++//
++// Binch: in geschlossener Form. Der fernste Punkt ist der Kreismittelpunkt, um den Radius verschoben in Richtung
++// des Blick-Anteils in der Horizontebene; entlang des Blicks bringt das Radius · |Anteil|. Vorher wurde dieser
++// Anteil auf Länge 1 gebracht — beim Blick senkrecht nach unten ist er aber nur Rundungsrauschen (|Anteil| ~ 1e-16)
++// mit beliebiger Richtung, auch aus der Ebene heraus. Die Fernebene landete dann bis zu einen Kreisradius zu nah,
++// vor der Kugel: Keine Kachel galt als sichtbar, die Karte blieb schwarz, bis sich die Kamera wieder bewegte.
++double idealNearFarPlaneDistance(const vec4& horizonPlane, const vec4& nearPlane) noexcept {
+     const vec3 view = {{nearPlane[0], nearPlane[1], nearPlane[2]}};
+     const double horizonLength = vec3Length({{horizonPlane[0], horizonPlane[1], horizonPlane[2]}});
+     const vec3 horizonNormal = vec3Scale({{horizonPlane[0], horizonPlane[1], horizonPlane[2]}}, 1.0 / horizonLength);
+     const double horizonDistance = horizonPlane[3] / horizonLength;
+-    const vec3 projectedView = vec3Sub(view, vec3Scale(horizonNormal, vec3Dot(view, horizonNormal)));
+-    const double projectedLength = vec3Length(projectedView);
+-    if (projectedLength <= 0) {
+-        return std::nullopt;
+-    }
+-    const double circleRadius = std::sqrt(1.0 - horizonDistance * horizonDistance);
+-    const vec3 circleCenter = vec3Scale(horizonNormal, -horizonDistance);
+-    const vec3 farthest = vec3Add(circleCenter, vec3Scale(projectedView, circleRadius / projectedLength));
+-    return vec3Dot(view, farthest) + nearPlane[3];
++    const double viewAlongNormal = vec3Dot(view, horizonNormal);
++    const double projectedLength = vec3Length(vec3Sub(view, vec3Scale(horizonNormal, viewAlongNormal)));
++    const double circleRadius = std::sqrt(std::max(0.0, 1.0 - horizonDistance * horizonDistance));
++    // vec3Dot(view, circleCenter) mit circleCenter = horizonNormal · -horizonDistance.
++    return -horizonDistance * viewAlongNormal + circleRadius * projectedLength + nearPlane[3];
+ }
+ 
+ // Moves the far corners in along the frustum's edges until the far plane reaches no further than the horizon;
+@@ -70,11 +71,10 @@ void adjustFarPlaneByHorizonPlane(std::array<vec4, 8>& corners,
+     const vec4 nearPlane = planeThrough(toVec3(corners[nearPlaneIndices[0]]),
+                                         toVec3(corners[nearPlaneIndices[1]]),
+                                         toVec3(corners[nearPlaneIndices[2]]));
+-    if (const auto ideal = idealNearFarPlaneDistance(horizonPlane, nearPlane)) {
+-        // The rays make the same angle with the near plane at all four corners.
+-        maxDistance = std::min(maxDistance,
+-                               *ideal / vec3Dot(rayDirections[0], {{nearPlane[0], nearPlane[1], nearPlane[2]}}));
+-    }
++    // The rays make the same angle with the near plane at all four corners.
++    maxDistance = std::min(maxDistance,
++                           idealNearFarPlaneDistance(horizonPlane, nearPlane) /
++                               vec3Dot(rayDirections[0], {{nearPlane[0], nearPlane[1], nearPlane[2]}}));
+     for (std::size_t i = 0; i < 4; i++) {
+         const vec3 far = vec3Add(toVec3(corners[i + nearOffset]),
+                                  vec3Scale(rayDirections[i], std::min(maxDistance, rayLengths[i])));
+diff --git a/test/util/tile_cover.test.cpp b/test/util/tile_cover.test.cpp
+index c4b01c49..993b3017 100644
+--- a/test/util/tile_cover.test.cpp
++++ b/test/util/tile_cover.test.cpp
+@@ -757,3 +757,17 @@ TEST(TileCover, GlobeCoverSurvivesTheAntimeridian) {
+     EXPECT_EQ(before, after);
+     EXPECT_EQ(4u, after.size());
+ }
++
++// Binch: Von oben gesehen gab die Kachelwahl bei manchen Kamerastellungen GAR NICHTS zurück — die Karte blieb
++// schwarz, bis sich die Kamera wieder bewegte (siehe `idealNearFarPlaneDistance` in `bounding_volumes.cpp`).
++TEST(TileCover, GlobeTopDownCoverIsNeverEmpty) {
++    Transform transform;
++    transform.resize({412, 860});
++    transform.setProjectionDefinition(ProjectionDefinition("vertical-perspective"));
++    for (double zoom = 3.0; zoom <= 20.0; zoom += 0.05) {
++        transform.jumpTo(CameraOptions().withCenter(LatLng{-50.0, 0.0}).withZoom(zoom).withPitch(0).withBearing(0));
++        const auto z = static_cast<uint8_t>(
++            std::min(13, util::coveringZoomLevel(transform.getState().getZoom(), style::SourceType::Raster, 256)));
++        EXPECT_FALSE(util::tileCover({transform.getState()}, z, Range<uint8_t>(0, 13), z).empty()) << "zoom " << zoom;
++    }
++}
+-- 
+2.43.0
+

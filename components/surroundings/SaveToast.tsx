@@ -99,7 +99,12 @@ export function SaveToast({
 }
 
 const styles = scaledStyles({
-  wrap: { position: "absolute", left: 14, right: 14, zIndex: 50 },
+  /**
+   * Höhe 30 (ohne eigenen Schatten — die Hülle hat keine Fläche): Android
+   * sortiert nach Höhe vor `zIndex`, und das Haltestellen-Blatt (20), aus dem
+   * dieser Hinweis kommt, lag sonst ganz aufgezogen über ihm.
+   */
+  wrap: { position: "absolute", left: 14, right: 14, zIndex: 150, elevation: 30 },
   card: {
     flexDirection: "row",
     alignItems: "center",

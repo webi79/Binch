@@ -22,6 +22,9 @@
 	}
 
 	# Zugriffslog auf stdout (docker logs caddy).
+	# Kachel-Anfragen nicht protokollieren: Ihre Adressen ergeben je Gerät eine
+	# Ortsspur (die Esri-Kacheln tragen zudem Installations-Kennung und Schein).
+	log_skip /api/tiles/*
 	log {
 		output stdout
 		format console

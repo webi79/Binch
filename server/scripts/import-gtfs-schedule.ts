@@ -303,8 +303,10 @@ async function importStopTimes(tx: Tx): Promise<void> {
     const tripId = r["trip_id"];
     const stopId = r["stop_id"];
     const seq = Number(r["stop_sequence"] ?? "");
-    const dep = timeToSeconds(r["departure_time"] ?? r["arrival_time"] ?? "");
-    const arr = timeToSeconds(r["arrival_time"] ?? r["departure_time"] ?? "");
+    // `||` statt `??`: Ein leeres CSV-Feld ist "", nicht undefined — mit `??`
+    // fiel ein Halt ohne Abfahrtszeit (nur Ankunft, z.B. Endhalt) ganz heraus.
+    const dep = timeToSeconds(r["departure_time"] || r["arrival_time"] || "");
+    const arr = timeToSeconds(r["arrival_time"] || r["departure_time"] || "");
     if (!tripId || !stopId || !Number.isFinite(seq) || dep < 0 || arr < 0) return;
     batch.push({
       feedId: FEED_ID,

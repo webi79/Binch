@@ -5,7 +5,7 @@ import { haptic } from "@/lib/haptics";
 import { showAlert } from "@/lib/alert";
 import { useRouteMeta } from "@/lib/format/routeMeta";
 import { useT } from "@/lib/i18n/useT";
-import { setAlertActiveOnServer } from "@/lib/notifications/alertToggle";
+import { deleteAlertOnServer, setAlertActiveOnServer } from "@/lib/notifications/alertToggle";
 import { usePalette } from "@/lib/theme/appBg";
 import { SPACE } from "@/lib/theme/spacing";
 import { scaledStyles } from "@/lib/ui/compact";
@@ -97,16 +97,50 @@ export const PriceAlertCard = memo(function PriceAlertCard({ alert }: { alert: P
       const res = await setAlertActiveOnServer(alert, next);
       setBusy(false);
       if (res.ok) {
-        // Beim Einschalten kommt eine NEUE Server-Kennung zurück — ohne sie
-        // ließe sich der Alarm später nicht mehr löschen.
-        if (res.serverId) setPriceAlertActive(alert.id, true, res.serverId);
+        /**
+         * Eine NEUE Server-Kennung kommt nur, wenn der Alarm dort neu angelegt
+         * werden musste (seine Zeile war weg) — ohne sie ließe er sich später
+         * nicht mehr löschen. Der Regelfall ist heute die Pause, und die gibt
+         * keine zurück: Die Zeile bleibt ja dieselbe.
+         *
+         * `next` statt eines festen `true`: Der Zustand steht schon oben, hier
+         * wird nur die Kennung nachgetragen. Ein hartes `true` wäre eine zweite
+         * Wahrheit über den Schalter — und eine, die ihn umlegte.
+         */
+        if (res.serverId) setPriceAlertActive(alert.id, next, res.serverId);
         return;
       }
-      setPriceAlertActive(alert.id, on);
-      showAlert(
-        t(res.reason === "nopush" ? "alert.nopush.title" : "alert.delete.failed.title"),
-        t(res.reason === "nopush" ? "alert.nopush.body" : "alert.delete.failed.body"),
-      );
+      /**
+       * Zurücknehmen — die Server-Kennung ausdrücklich MIT.
+       *
+       * Seit das Abschalten nur pausiert, bleibt sie ohnehin stehen; nötig ist
+       * der zweite Wert trotzdem, denn der Fehlschlag kann auch das
+       * EINSCHALTEN treffen. Dann wurde vielleicht schon eine neue Zeile
+       * angelegt und wieder verworfen, und die Karte muss auf dem Stand landen,
+       * den sie vor dem Tipp hatte.
+       *
+       * `alert.serverId` ist hier der Wert VOR dem Umschalten — die
+       * Eigenschaft stammt aus dem Durchgang, in dem noch nichts geändert war.
+       */
+      setPriceAlertActive(alert.id, on, alert.serverId);
+      /**
+       * Die Meldung nennt, was NICHT passiert ist — und das ist seit der Pause
+       * etwas anderes als „gelöscht": Hier stand „Alarm konnte nicht gelöscht
+       * werden", obwohl niemand löschen wollte. Wer den Schalter umlegt, will
+       * ihn stummschalten; scheitert das, muss die Meldung sagen, dass er
+       * weitermeldet.
+       *
+       * Ausgeschrieben statt zusammengesetzt: Die Schlüssel sind ein Typ, ein
+       * zusammengebauter wäre nur noch eine Zeichenkette — genau die Stelle, an
+       * der ein Tippfehler später als leerer Text auf dem Gerät landet.
+       */
+      if (res.reason === "nopush") {
+        showAlert(t("alert.nopush.title"), t("alert.nopush.body"));
+      } else if (next) {
+        showAlert(t("alert.resume.failed.title"), t("alert.resume.failed.body"));
+      } else {
+        showAlert(t("alert.pause.failed.title"), t("alert.pause.failed.body"));
+      }
     })();
   }, [alert, busy, on, setPriceAlertActive, t]);
 
@@ -127,27 +161,53 @@ export const PriceAlertCard = memo(function PriceAlertCard({ alert }: { alert: P
   }, [busy]);
 
   /**
-   * Der Löschweg selbst, unverändert.
+   * Der Löschweg selbst — das EINZIGE, was einen Alarm wirklich beendet.
    *
-   * Die Rückfrage sitzt DAVOR, nicht mittendrin: Server-Löschung und lokales
-   * Entfernen sind ein Ablauf, in den sich kein Dialog schieben darf.
+   * Der Schalter daneben pausiert nur; wer die Beobachtung loswerden will,
+   * kommt über das Herz und diese Rückfrage. Sie sitzt DAVOR, nicht mittendrin:
+   * Server-Löschung und lokales Entfernen sind ein Ablauf, in den sich kein
+   * Dialog schieben darf.
    */
   const remove = useCallback(() => {
     if (busy) return;
     setConfirmOpen(false);
     setBusy(true);
     void (async () => {
-      // Erst abschalten (also serverseitig löschen), dann die Karte wegnehmen.
-      // Andersherum bliebe der Alarm auf dem Server und wäre unauffindbar.
-      const res = on ? await setAlertActiveOnServer(alert, false) : ({ ok: true } as const);
+      /**
+       * Erst auf dem Server löschen, dann die Karte wegnehmen — und zwar IMMER.
+       *
+       * Hier stand `on ? … : { ok: true }`: Ein bereits abgeschalteter Alarm
+       * wurde ohne jeden Server-Aufruf aus der Liste geworfen. Das ging auf,
+       * solange „aus" schon gelöscht hieß. Seit es eine Pause ist, war es die
+       * schlimmste Sorte Fehler — die Karte verschwand auch OHNE Verbindung,
+       * und der Alarm blieb in der Datenbank zurück, ohne dass ihn danach noch
+       * irgendetwas erreichen konnte. Genau so wurde es gemeldet.
+       *
+       * Scheitert der Aufruf, bleibt die Karte stehen. Ein Löschen, das nur so
+       * tut, ist schlimmer als eines, das scheitert: Beim Scheitern kann man es
+       * erneut versuchen.
+       */
+      const res = await deleteAlertOnServer(alert);
       setBusy(false);
       if (!res.ok) {
+        /**
+         * Hier IMMER die Lösch-Meldung, auch wenn keine Push-Kennung zu holen
+         * war.
+         *
+         * Die Erlaubnis-Meldung schickt in die Systemeinstellungen — beim
+         * Löschen zeigte sie auf die falsche Ursache: Ohne Netz kommt man an
+         * die Kennung ebenfalls nicht heran, und dort ist nichts einzustellen.
+         * Was der Nutzer wissen muss, ist in beiden Fällen dasselbe: Der Alarm
+         * liegt noch da, und ein zweiter Versuch lohnt sich.
+         */
         showAlert(t("alert.delete.failed.title"), t("alert.delete.failed.body"));
         return;
       }
       removePriceAlert(alert.id);
     })();
-  }, [alert, busy, on, removePriceAlert, t]);
+    // `on` gehört hier NICHT mehr hinein — gelöscht wird unabhängig davon, ob
+    // der Alarm gerade läuft oder pausiert ist.
+  }, [alert, busy, removePriceAlert, t]);
 
   return (
     /**

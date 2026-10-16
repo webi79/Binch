@@ -146,3 +146,28 @@ export function useNavbarSpace(): number {
 
 /** Sicherer Höchstwert für Stile, die außerhalb einer Komponente stehen. */
 export const NAVBAR_SPACE_MAX = ms(TAB_BAR_H) + 48;
+
+/**
+ * Der obere Abstand in der Kopfzeile eines bildschirmfüllenden WÄHLERS.
+ *
+ * Orts- und Datumswähler beginnen beide bei null und tragen die Statusleiste
+ * selbst. Der Ortswähler führte dafür seit jeher ein festes `pt-14` (56), der
+ * Datumswähler rechnete `insets.top + 24` — auf einem Gerät mit hoher
+ * Statusleiste sind das über siebzig, und seine Überschrift stand damit
+ * sichtbar tiefer als die des Ortswählers. Zwei Wähler, die sich
+ * abwechselnd öffnen, dürfen ihre Aufschrift nicht auf verschiedenen Höhen
+ * tragen.
+ *
+ * Die 56 sind reichlich für jede gängige Statusleiste (sie liegt zwischen 24
+ * und 48) und lassen darüber hinaus Luft, damit die Aufschrift nicht an der
+ * Uhr klebt.
+ *
+ * ACHTUNG, die Zahl steht an ZWEI Stellen, und das ist eine bewusste Ausnahme:
+ * Der Ortswähler trägt sie als NativeWind-Klasse `pt-14`. Sie dort auf diese
+ * Konstante umzustellen hieße, ein `style`-Prop neben ein `className` zu
+ * setzen — und genau daran hat NativeWinds JSX-Umschreibung in diesem Projekt
+ * schon Stile verschluckt (`SearchBar.tsx`). Auf einem Bildschirm, der
+ * funktioniert, ist das Risiko den geteilten Wert nicht wert. Wer hier ändert,
+ * ändert `pt-14` dort mit.
+ */
+export const PICKER_HEADER_TOP = 56;

@@ -7,6 +7,7 @@
  *   - dbRestLiveLocations   → TRAIN (db-rest, public, no auth)
  */
 import { config } from "../config.js";
+import { reportIfBlocked, type DbLane } from "./dbQuota.js";
 import { flixbusAutocomplete, type AutocompleteItem } from "../providers/bus/flixbus.js";
 import type { LocationType } from "../db/schema.js";
 
@@ -112,6 +113,8 @@ export async function flixbusLiveLocations(
 export async function dbRestLiveLocations(
   query: string,
   signal?: AbortSignal,
+  /** Die zugeteilte Spur des Bahn-Kontingents (siehe `searchLocations`). */
+  lane?: DbLane,
 ): Promise<LiveLocation[]> {
   const trimmed = query.trim();
   if (trimmed.length < 1) return [];
@@ -119,21 +122,30 @@ export async function dbRestLiveLocations(
   // /locations (HAFAS POI-Suche, inkl. internationale Bahnhöfe) statt /stations
   // (DB-Stationsdaten, nur deutsche Bahnhöfe). Damit findet die App auch
   // Amsterdam Centraal, Paris Gare du Nord, Wien Hbf, Brussel-Zuid usw.
-  const url = new URL(`${config.DBREST_BASE_URL}/locations`);
+  const url = new URL(`${(lane?.dbrestUrl ?? config.DBREST_BASE_URL)}/locations`);
   url.searchParams.set("query", trimmed);
   url.searchParams.set("results", "25");
   url.searchParams.set("stops", "true");
   url.searchParams.set("addresses", "false");
   url.searchParams.set("poi", "false");
+  // `language=de` wie überall: Die Vorgabe „en" sperrt Akamai auf Teilen von
+  // int.bahn.de mit 403 (siehe `fetchTripPolyline` in trips.ts).
+  url.searchParams.set("language", "de");
 
-  let res: Response;
-  try {
-    res = await fetch(url, { signal, headers: { Accept: "application/json" } });
-  } catch {
-    return [];
-  }
-  if (!res.ok) return [];
-  const data = (await res.json().catch(() => null)) as DbRestStation[] | Record<string, DbRestStation> | null;
+  /**
+   * Fehler WERFEN statt eine leere Liste zu liefern — der Aufrufer
+   * (`searchLocations`) hält eine Liste ohne Live-Teil dann nur eine Minute
+   * statt einer halben Stunde. Mit „leer" sah ein Ausfall aus wie „nichts
+   * gefunden". Und nie länger als acht Sekunden: Die Ortssuche läuft pro
+   * Tastendruck.
+   */
+  const res = await fetch(url, {
+    signal: signal ?? AbortSignal.timeout(8000),
+    headers: { Accept: "application/json" },
+  });
+  if (lane) await reportIfBlocked(lane, res);
+  if (!res.ok) throw new Error(`dbrest /locations ${res.status}`);
+  const data = (await res.json()) as DbRestStation[] | Record<string, DbRestStation> | null;
   if (!data) return [];
 
   const list = Array.isArray(data) ? data : Object.values(data);

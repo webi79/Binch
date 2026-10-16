@@ -499,6 +499,25 @@ head("3. Streckentrennung — jedes Schlüsselfeld einzeln verändert");
   await db.update(priceAlerts).set({ active: false }).where(eq(priceAlerts.id, off));
   const m = await search({ origin: "SELFTEST-3XO", destination: "SELFTEST-3XD" }, [1]);
   check("inaktiver Alarm → keine Meldung", m.length === 0);
+
+  /**
+   * PAUSE IST REVERSIBEL — der ganze Unterschied zum Löschen.
+   *
+   * Der Schalter auf der Karte löschte den Alarm früher auf dem Server; heute
+   * legt er nur `active` um (`PATCH /api/alerts/:id`). Was das wert ist, hängt
+   * an genau dieser Zusage: Dieselbe Zeile, dieselbe Schwelle, derselbe
+   * Grundpreis — nach dem Wiedereinschalten meldet sie weiter, als wäre nichts
+   * gewesen. Gebaut wird das oben im Endpunkt, geprüft wird es hier.
+   */
+  await db.update(priceAlerts).set({ active: true }).where(eq(priceAlerts.id, off));
+  const again = await search({ origin: "SELFTEST-3XO", destination: "SELFTEST-3XD" }, [1]);
+  check("wieder eingeschalteter Alarm → meldet erneut", again.length === 1);
+  const revived = await alertRow(off);
+  check(
+    "… mit unveränderter Schwelle und unverändertem Grundpreis",
+    Number(revived?.desiredPrice) === 90 && Number(revived?.basePrice) === 100,
+    `desired=${revived?.desiredPrice ?? "?"} base=${revived?.basePrice ?? "?"}`,
+  );
 }
 
 /* ── 4. Schwellenlogik ─────────────────────────────────────────────────────── */
@@ -1042,6 +1061,63 @@ head("8b. Eindeutigkeit je Gerät und Strecke (POST /api/alerts, laufender Serve
     );
     check("DELETE mit der EIGENEN Kennung → 204", delOk.status === 204, `HTTP ${delOk.status}`);
     check("… und der Alarm ist weg", (await alertRow(other.json.id!)) == null);
+
+    /**
+     * (5b) PAUSIEREN statt löschen — der neue Weg des Schalters.
+     *
+     * Der Schalter auf der Alarm-Karte rief bis eben `DELETE`. Für den Nutzer
+     * war das keine Pause, sondern eine Kündigung: neue Kennung, zurückgesetzte
+     * Entprellung, verlorener `lastSeenPrice` — und scheiterte das
+     * Wiederanlegen, stand in der App ein Alarm, den es nirgends gab.
+     *
+     * Geprüft wird hier beides: dass der Merker wirklich umspringt, und dass
+     * die Berechtigung dieselbe ist wie beim Löschen. Ein fremdes Gerät darf
+     * einen Alarm nicht stummschalten können — das wäre lautloser als jedes
+     * Löschen und fiele niemandem auf.
+     */
+    const patch = async (id: string, tok: string, active: boolean) =>
+      http(`${base}/api/alerts/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "X-Push-Token": tok },
+        body: JSON.stringify({ active }),
+      });
+
+    const pOff = await patch(one3.json.id!, token, false);
+    check("PATCH active=false → 204", pOff.status === 204, `HTTP ${pOff.status}`);
+    check("… und der Alarm ist stumm gestellt", (await alertRow(one3.json.id!))?.active === false);
+    check("… aber die Zeile lebt weiter", (await alertRow(one3.json.id!)) != null);
+
+    const pFremd = await patch(one3.json.id!, token2, true);
+    check("PATCH mit FREMDER Push-Kennung → 404", pFremd.status === 404, `HTTP ${pFremd.status}`);
+    check("… und der Alarm bleibt stumm", (await alertRow(one3.json.id!))?.active === false);
+
+    const pOn = await patch(one3.json.id!, token, true);
+    check("PATCH active=true → 204", pOn.status === 204, `HTTP ${pOn.status}`);
+    check("… und der Alarm läuft wieder", (await alertRow(one3.json.id!))?.active === true);
+    check(
+      "… mit unveränderter Schwelle (die Pause hat nichts angefasst)",
+      Number((await alertRow(one3.json.id!))?.desiredPrice) === 30,
+      `${(await alertRow(one3.json.id!))?.desiredPrice}`,
+    );
+
+    /**
+     * Eine Zeile, die es nicht gibt, muss 404 „Unknown alert" sagen — die App
+     * liest das als Anweisung, den Alarm beim Einschalten NEU anzulegen. Ein
+     * stilles 204 hieße dort: „pausiert", und der Alarm wäre für immer fort.
+     */
+    const pWeg = await patch("11111111-2222-3333-4444-555555555555", token, true);
+    const pWegBody = (await pWeg.json().catch(() => ({}))) as { error?: string };
+    check(
+      "PATCH auf unbekannte Alarm-Kennung → 404 Unknown alert",
+      pWeg.status === 404 && pWegBody.error === "Unknown alert",
+      `HTTP ${pWeg.status} ${pWegBody.error ?? ""}`,
+    );
+    const pBad = await http(`${base}/api/alerts/${one3.json.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "X-Push-Token": token },
+      body: JSON.stringify({ active: "nein" }),
+    });
+    check("PATCH mit unsinnigem Rumpf → 400", pBad.status === 400, `HTTP ${pBad.status}`);
 
     /* ── Die Änderungen dieser Runde, im Prüfgebiet ── */
 

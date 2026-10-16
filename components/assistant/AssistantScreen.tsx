@@ -426,6 +426,13 @@ let persistedMood: BoMood = "waving";
 let persistedKeyboardHeight = 0;
 
 /**
+ * Nummer des Öffnens (`assistantOpenSeq`), dessen Mikrofon-Auslöser schon
+ * eingelöst ist — modulweit wie die Ablagen darüber, damit er auch über einen
+ * Neuaufbau des Bildschirms hinweg verbraucht bleibt.
+ */
+let autoVoiceDoneSeq = 0;
+
+/**
  * Deckel für den In-Memory-Chatverlauf.
  *
  * Ohne Deckel wächst `messages` (und sein Modul-Mirror `persistedMessages`)
@@ -657,6 +664,20 @@ export function AssistantScreen() {
    * landete als `then` in einem Aufruf.
    */
   const closeDrawer = useCallback(() => closeDrawerThen(), [closeDrawerThen]);
+  /**
+   * Die Schublade gibt es nur, solange Bo im Bild ist — siehe beim Rendern.
+   * Geparkt zusätzlich aus dem Bild geschoben: Hinge ihr Offen-Zustand, nähme
+   * sie sonst unsichtbar jeden Tipp auf die App darunter an (Android prüft
+   * Berührungen gegen die verschobene Lage).
+   */
+  const drawerGateStyle = useAnimatedStyle(() => {
+    const shown = assistantPush.value > 0.001;
+    return {
+      ...StyleSheet.absoluteFillObject,
+      opacity: shown ? 1 : 0,
+      transform: [{ translateX: shown ? 0 : PARK_X * 2 }],
+    };
+  });
 
   /**
    * Abschluss der Wisch-Geste — die BEWEGUNG läuft schon.
@@ -1093,10 +1114,6 @@ export function AssistantScreen() {
 
   const currency = useSearchStore((s) => s.currency);
   const openAuthOverlay = useSearchStore((s) => s.openAuthOverlay);
-
-  // ?autoVoice=1 wird vom Home-Mic-Tap mitgeschickt → wir starten Voice direkt.
-  // Kam der Aufruf über das Mikrofon? Früher ein Routen-Parameter.
-  const params = { autoVoice: useSearchStore.getState().assistantAutoVoice ? "1" : undefined };
 
   // Initial-Werte aus dem Module-Level-State: erste Mount = leere Liste,
   // jedes spätere Re-Mount kriegt die vorhin geführte Konversation zurück.
@@ -2773,27 +2790,107 @@ export function AssistantScreen() {
     setListening(false);
   }, []);
 
-  // autoVoice=1 vom Home-Mic-Tap: einmalig nach Mount starten.
-  const autoVoiceFiredRef = useRef(false);
-  useEffect(() => {
-    if (params.autoVoice !== "1" || autoVoiceFiredRef.current) return;
-    autoVoiceFiredRef.current = true;
+  /**
+   * Mikrofon-Kasten öffnen und aufnehmen — EIN Weg für den Knopf in der
+   * Eingabezeile und für den Start nach der Einfahrt.
+   *
+   * Es waren zwei, und der zweite war der Fehler: Der Auto-Start rief nur
+   * `startVoice` und ließ den Kasten zu. `startVoice` prüft nach der
+   * Berechtigung aber, ob der Kasten noch offen ist (sonst gilt die Aufnahme
+   * als verworfen) — und stieg deshalb jedes Mal still aus.
+   */
+  const openVoiceBox = useCallback(() => {
     /**
-     * ERST NACH der Fahrt, nicht sofort.
+     * Erst die Tastatur wegräumen, DANN den Kasten zeigen.
      *
-     * `startVoice` fragt die Berechtigung ab und startet die native
-     * Erkennungs-Session — Dienst-Anbindung, Audio-Fokus, dazu ein
-     * `setListening(true)`, also ein voller Neu-Render. Das lief bislang rund
-     * ein Bild in die laufende Einfahrt hinein.
+     * Beides im selben Bild sah aus, als spränge der Kasten aus dem Nichts über
+     * die noch fahrende Tastatur. Mit dem kurzen Abstand fährt zuerst die
+     * Tastatur hinunter, die Eingabezeile geht mit — und erst auf den freien
+     * Platz kommt der Kasten.
      *
-     * Derselbe Abstand wie beim Wecker, der Bo wieder anlaufen lässt. Der
-     * Unterschied ist für den Nutzer nicht zu bemerken: Das Mikrofon geht
-     * dreiviertel Sekunden nach dem Tipp an, und bis dahin fährt der
-     * Bildschirm ohnehin noch.
+     * Ohne offene Tastatur gibt es nichts zu warten: dann sofort.
      */
-    const id = setTimeout(() => void startVoice(), ASSISTANT_IN.duration + 320);
-    return () => clearTimeout(id);
-  }, [params.autoVoice, startVoice]);
+    const hadKeyboard = Keyboard.isVisible();
+    Keyboard.dismiss();
+    const begin = () => {
+      // Wer in der Wartezeit schließt, bekommt keinen Kasten in die Ausfahrt.
+      if (closingRef.current) return;
+      setVoiceMode(true);
+      /**
+       * Die Ablage SOFORT mitziehen, nicht erst beim nächsten Durchgang.
+       *
+       * `startVoice` prüft nach der Berechtigungs-Abfrage gegen sie. Aus einem
+       * Tipp heraus rendert React vorher synchron; aus einem Zeitgeber (Tastatur
+       * offen) oder dem Ankunfts-Rückruf nur mit normaler Priorität — die
+       * Antwort eines nativen Moduls wird dagegen mit höchster eingereiht
+       * (`RuntimeScheduler_Modern::scheduleWork`). Bei schon erteilter
+       * Berechtigung kann sie den Durchgang überholen: `startVoice` sähe noch
+       * `false` und stiege still aus, der Kasten stünde ohne Aufnahme da.
+       */
+      voiceModeRef.current = true;
+      if (!MODULE_RECORDS_AUDIO) void startRecording();
+      setMicRecording(true);
+      // Immer: Diese Sitzung IST die Aufnahme, auch ohne Erkenner.
+      void startVoice();
+    };
+    if (hadKeyboard) setTimeout(begin, 220);
+    else begin();
+  }, [startRecording, startVoice]);
+
+  /**
+   * Spracheingabe nach der Einfahrt, wenn Bo über das Mikrofon der Suchleiste
+   * kam (`assistantAutoVoice`).
+   *
+   * Gerufen vom Ankunfts-Verteiler (`arm` im Öffnungs-Effekt), also wenn Bos
+   * Kurve WIRKLICH steht. Vorher lief hier eine Stoppuhr ab dem Effekt — sie
+   * misst nicht ab dem Start der Kurve. Mitten in der Fahrt wäre der Start ein
+   * Neu-Durchlauf des ganzen Bildschirms, und der Berechtigungsdialog fiele in
+   * die Bewegung.
+   *
+   * Gelesen wird aus Speicher und Ablagen, nicht aus Zustandsgrößen eines
+   * Durchgangs: Der Aufruf kommt später, aus dem Abschluss der Kurve.
+   */
+  const autoVoiceOnArrival = useCallback(() => {
+    const st = useSearchStore.getState();
+    /**
+     * Je Öffnen höchstens EINMAL — gemerkt an dessen Nummer.
+     *
+     * Der alte Merker galt für den ganzen App-Lauf: Bo bleibt gemountet
+     * (`AssistantHost`), die Aufnahme startete also nur beim ersten Öffnen über
+     * das Mikrofon. Zweimal darf derselbe Auslöser aber auch nicht greifen — Bo
+     * fährt nach der Ergebnisliste erneut ein, und `assistantAutoVoice` steht
+     * bis zum Schließen.
+     */
+    if (autoVoiceDoneSeq === st.assistantOpenSeq) return;
+    autoVoiceDoneSeq = st.assistantOpenSeq;
+    if (!st.assistantAutoVoice) return;
+    /**
+     * Ein Bild später — und erst DANN prüfen.
+     *
+     * Die Zurück-Taste schließt mit einem Bild Vorlauf
+     * (`requestAnimationFrame(closeScreen)`). Fällt sie in die letzten Bilder
+     * der Einfahrt, steht `closingRef` bei der Ankunft noch auf falsch, und die
+     * Aufnahme liefe in die Ausfahrt.
+     */
+    requestAnimationFrame(() => {
+      // Schon beim Schließen (der Notausgang ruft auch nach einer abgebrochenen
+      // Einfahrt), verdeckt, oder der Kasten steht längst, weil im Chat selbst
+      // getippt wurde.
+      if (closingRef.current || !isFocusedRef.current || voiceModeRef.current) return;
+      if (!ExpoSpeechRecognitionModule) {
+        // Ohne natives Modul keine Aufnahme — sagen statt schweigen.
+        setMessages((prev) => [
+          ...prev,
+          { id: idGen(), kind: "error", message: t("assistant.voice.unsupported") },
+        ]);
+        return;
+      }
+      openVoiceBox();
+    });
+  }, [openVoiceBox, t]);
+  /** Zeiger für den Verteiler — dessen Effekt hängt nicht an `startVoice`. */
+  const autoVoiceOnArrivalRef = useRef(autoVoiceOnArrival);
+  autoVoiceOnArrivalRef.current = autoVoiceOnArrival;
 
   // Wenn der Tab den Focus verliert (User wechselt zu Home etc.): laufende
   // Stream-XHRs abbrechen + Voice-Recognition stoppen. Sonst läuft die
@@ -4818,6 +4915,9 @@ export function AssistantScreen() {
       if (armed) return;
       armed = true;
       startEntryTimers();
+      // Und die Aufnahme, falls Bo über das Mikrofon kam — an derselben
+      // Ankunft. Prüfungen und Gründe: `autoVoiceOnArrival`.
+      autoVoiceOnArrivalRef.current();
     };
     const startEntryTimers = () => {
     windowTimerRef.current = setTimeout(() => {
@@ -5203,13 +5303,32 @@ export function AssistantScreen() {
       {/* Erst im Baum, wenn der Finger auf dem Zeichen liegt — der Aufbau
           gehört in die 80 bis 150ms des Fingers, nicht in die Fahrt. */}
       {drawerUp ? (
-        <DrawerGate
-          activeId={conversationId}
-          onSelect={openConversation}
-          onNewChat={startNewConversation}
-          onClose={closeDrawer}
-          onOpenProfile={openProfileTab}
-        />
+        /**
+         * NUR SICHTBAR, SOLANGE BO IM BILD IST — an seiner Lage, nicht an
+         * React-Zustand.
+         *
+         * Die Schublade ist eine DECKENDE Fläche über den ganzen Bildschirm; sie
+         * liegt auf der Bühne HINTER Bos Bildschirm und wird erst sichtbar,
+         * wenn der schrumpft. Abgebaut wird sie über Rückrufe am Ende ihrer
+         * Animation bzw. beim Fokusverlust. Blieb sie dabei einmal stehen,
+         * während Bo selbst hinausfuhr, lag sie als Vollbild über der Karte —
+         * gemeldet als „ich lande aus der Umgebung plötzlich in Chats". Da sie
+         * geschlossen keine Berührung annimmt, ging jeder Tipp durch sie
+         * hindurch auf die App darunter, und das Blatt darüber blieb bedienbar.
+         *
+         * Gekoppelt an `assistantPush` (0 = geparkt) kann das nicht mehr
+         * passieren, egal welcher Zustand hängt: Ist Bo draußen, wird sie gar
+         * nicht gezeichnet. Solange er im Bild ist, ändert sich nichts.
+         */
+        <Animated.View style={drawerGateStyle} pointerEvents="box-none">
+          <DrawerGate
+            activeId={conversationId}
+            onSelect={openConversation}
+            onNewChat={startNewConversation}
+            onClose={closeDrawer}
+            onOpenProfile={openProfileTab}
+          />
+        </Animated.View>
       ) : null}
       <Animated.View
         style={rootStyle}
@@ -5497,28 +5616,8 @@ export function AssistantScreen() {
             onPress={() => {
               haptic("button");
               // Tastatur zuerst schließen: Der Kasten sitzt über der Eingabezeile,
-              // und die wandert mit der Tastatur.
-              /**
-               * Erst die Tastatur wegräumen, DANN den Kasten zeigen.
-               *
-               * Beides im selben Bild sah aus, als spränge der Kasten aus dem
-               * Nichts über die noch fahrende Tastatur. Mit dem kurzen Abstand
-               * fährt zuerst die Tastatur hinunter, die Eingabezeile geht mit —
-               * und erst auf den freien Platz kommt der Kasten.
-               *
-               * Ohne offene Tastatur gibt es nichts zu warten: dann sofort.
-               */
-              const hadKeyboard = Keyboard.isVisible();
-              Keyboard.dismiss();
-              const begin = () => {
-                setVoiceMode(true);
-                if (!MODULE_RECORDS_AUDIO) void startRecording();
-                setMicRecording(true);
-                // Immer: Diese Sitzung IST die Aufnahme, auch ohne Erkenner.
-                void startVoice();
-              };
-              if (hadKeyboard) setTimeout(begin, 220);
-              else begin();
+              // und die wandert mit der Tastatur. Ablauf und Gründe: `openVoiceBox`.
+              openVoiceBox();
             }}
             accessibilityLabel="Voice"
           >

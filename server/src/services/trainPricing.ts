@@ -1,10 +1,12 @@
 import { eq } from "drizzle-orm";
+import { acquireDb, currentDbPriority, reportIfBlocked } from "./dbQuota.js";
 import { config } from "../config.js";
 import { cleanPlatform } from "../util/platform.js";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import { BoundedTtlCache } from "../util/boundedCache.js";
-import type { LegInfo, NormalizedResult, StopoverInfo } from "../providers/types.js";
+import { effectiveDurationMinutes, journeyWarningFromLegs, markAtRiskTransfer } from "../util/journeyTimeline.js";
+import type { JourneyWarning, LegInfo, NormalizedResult, StopoverInfo } from "../providers/types.js";
 
 /**
  * Zug-Preis-Enrichment + Direkt-Buchungslink über int.bahn.de (dbweb-Profil,
@@ -65,12 +67,14 @@ interface DbwebLeg {
   direction?: string;
   tripId?: string;
   walking?: boolean;
+  cancelled?: boolean;
   stopovers?: DbwebStopover[];
 }
 interface DbwebJourney {
   legs?: DbwebLeg[];
   price?: { amount?: number; currency?: string } | null;
   refreshToken?: string;
+  remarks?: Array<{ code?: string }>;
 }
 
 /** Minuten-im-Tag aus "HH:MM" (mit Mitternachts-Wrap fürs Diff). */
@@ -123,18 +127,39 @@ async function fetchDbwebJourneys(
   const cached = journeyCache.get(key);
   if (cached) return cached;
 
-  // dbweb will Lokalzeit-ISO ohne Offset.
-  const dep = new Date(departure).toISOString().slice(0, 16);
+  // Als eindeutiger Zeitpunkt MIT „Z". Hier stand die UTC-Uhrzeit ohne Offset
+  // („dbweb will Lokalzeit") — der Sidecar liest Zeiten ohne Offset aber in
+  // seiner eigenen Zone. Das ging nur gut, weil der Container auf UTC läuft;
+  // dieselbe Mehrdeutigkeit hat die Suche um zwei Stunden verschoben (dbVendo.ts).
+  const dep = new Date(departure).toISOString();
   // results=10 statt 6: unsere MOTIS-Treffer spannen ein Zeitfenster auf (mehrere
   // Abfahrten). Liefert dbweb weniger Verbindungen als das Fenster breit ist,
   // bleiben die späteren Treffer ohne Preis/Route. Kostet trotzdem nur EINEN Call.
+  // Ein Platz aus dem Bahn-Kontingent — Preise gehören zur Suche, warten aber
+  // nur kurz: Ohne Platz gibt es für diese Verbindung keinen Preis (geschätzt
+  // wird nie), statt die Antwort der Suche aufzuhalten.
+  const lane = await acquireDb(currentDbPriority(), 3_000);
+  if (!lane) throw new Error("dbweb: kein Platz im Bahn-Kontingent");
   const url =
-    `${config.DBWEB_BASE_URL}/journeys?from=${encodeURIComponent(fromEva)}` +
+    `${lane.dbwebUrl}/journeys?from=${encodeURIComponent(fromEva)}` +
     `&to=${encodeURIComponent(toEva)}&departure=${encodeURIComponent(dep)}&results=10` +
     // stopovers=true: wir zeigen die dbweb-Route inkl. Zwischenhalten in der
     // Timeline an (nicht mehr nur Preis-Enrichment).
-    `&stopovers=true`;
-  const res = await fetch(url, { headers: { accept: "application/json" } });
+    `&stopovers=true` +
+    // `language=de` wie in der Suche (dbVendo.ts): Mit der Vorgabe „en" sperrt
+    // Akamai Teile von int.bahn.de (403 OPS_BLOCKED, siehe routes/trips.ts).
+    `&language=de`;
+  /**
+   * Mit Zeitgrenze: Ohne sie gilt undicis Vorgabe von 300 s — und diese
+   * Anfrage läuft im Auffrischen einer Zugsuche, das die Warteschlange
+   * (`dbVendoQueue`) Aufgabe für Aufgabe abarbeitet. Ein hängender `dbweb`
+   * hielt damit fünf Minuten lang jedes andere Auffrischen an.
+   */
+  const res = await fetch(url, {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(10_000),
+  });
+  await reportIfBlocked(lane, res);
   if (!res.ok) throw new Error(`dbweb ${res.status}`);
   const data = (await res.json()) as { journeys?: DbwebJourney[] };
   const journeys = data.journeys ?? [];
@@ -198,6 +223,7 @@ interface DbwebRoute {
   operatedBy?: string;
   departDelayMinutes?: number;
   arriveDelayMinutes?: number;
+  warning?: JourneyWarning;
 }
 
 /** Baut aus einer dbweb-Journey die vollständige Anzeige-Route. Fußwege gehören
@@ -268,6 +294,7 @@ function buildDbwebRoute(j: DbwebJourney): DbwebRoute | null {
       arrivePlatform: cleanPlatform(seg.plannedArrivalPlatform ?? seg.arrivalPlatform),
       line: cleanLineLabel(seg.line),
       product: dbwebProductToMode(seg.line?.product),
+      warning: !seg.walking && seg.cancelled ? "cancelled" : undefined,
       fahrtNr: seg.line?.fahrtNr,
       direction: seg.direction,
       walking: !!seg.walking,
@@ -288,6 +315,22 @@ function buildDbwebRoute(j: DbwebJourney): DbwebRoute | null {
       ? "DB Fernverkehr"
       : first.line?.productName);
 
+  // Startet die Reise mit einem Fußweg, ist die Abfahrt am Ursprung nicht
+  // verspätet — die Zug-Verspätung steht am jeweiligen Leg (wie in motis.ts).
+  const departDelayMinutes = jFirst?.walking
+    ? undefined
+    : legDelay(first.plannedDeparture, first.departure);
+  const arriveDelayMinutes = legDelay(last.plannedArrival, last.arrival);
+
+  // DBs Warnungen wie in dbVendo.ts (dbRemarkFlags) — die Route trägt sie mit,
+  // ersetzt aber nur einen Treffer mit DERSELBEN Warnung (siehe Zuordnung unten).
+  const codes = new Set((j.remarks ?? []).map((r) => r?.code));
+  if (codes.has("text.realtime.connection.brokentrip")) markAtRiskTransfer(legs);
+  if (codes.has("text.realtime.connection.cancelled") && !legs.some((l) => l.warning === "cancelled")) {
+    const firstTransit = legs.find((l) => !l.walking);
+    if (firstTransit) firstTransit.warning = "cancelled";
+  }
+
   return {
     legs,
     stops: Math.max(0, transit.length - 1),
@@ -296,15 +339,15 @@ function buildDbwebRoute(j: DbwebJourney): DbwebRoute | null {
     arriveTime,
     trainDepartTime,
     trainArriveTime,
-    durationMinutes: Math.max(1, Math.round((Date.parse(arriveTime) - Date.parse(departTime)) / 60_000)),
+    // In Ist-Zeit, wie in dbVendo.ts: Eine nur dank Verspätung bestehende
+    // Verbindung hätte sonst eine Soll-Dauer, die es nie gibt (Werl → Greven:
+    // „17 min" statt 64).
+    durationMinutes: effectiveDurationMinutes({ departTime, arriveTime, departDelayMinutes, arriveDelayMinutes }),
     flightNumber: cleanLineLabel(first.line),
     operatedBy,
-    // Startet die Reise mit einem Fußweg, ist die Abfahrt am Ursprung nicht
-    // verspätet — die Zug-Verspätung steht am jeweiligen Leg (wie in motis.ts).
-    departDelayMinutes: jFirst?.walking
-      ? undefined
-      : legDelay(first.plannedDeparture, first.departure),
-    arriveDelayMinutes: legDelay(last.plannedArrival, last.arrival),
+    departDelayMinutes,
+    arriveDelayMinutes,
+    warning: journeyWarningFromLegs(legs),
   };
 }
 
@@ -364,19 +407,28 @@ export async function enrichTrainResults(
   // dbweb-Route je ZUG-Abfahrts-HH:MM (NICHT über Label matchen — das weicht ab;
   // und NICHT über den Reisebeginn — der hängt am Fußweg-Routing, das bei MOTIS
   // und bahn.de auseinandergeht).
-  const byDep = new Map<string, { route: DbwebRoute; price?: number; currency: string; recon?: string }>();
+  // ALLE Routen je Minute, nicht nur die erste: Zur selben Abfahrt liefert DB
+  // oft zwei Varianten — eine funktionierende und eine mit geplatztem Anschluss
+  // (Werl → Greven, RB 59 20:16). Welche passt, entscheiden Ankunft und Warnung.
+  type Entry = { route: DbwebRoute; price?: number; currency: string; recon?: string };
+  const byDep = new Map<string, Entry[]>();
   for (const j of journeys) {
     const route = buildDbwebRoute(j);
     if (!route) continue;
     const k = hhmm(route.trainDepartTime);
-    if (byDep.has(k)) continue;
     const amount = j.price?.amount;
-    byDep.set(k, {
+    const list = byDep.get(k) ?? [];
+    list.push({
       route,
-      price: typeof amount === "number" && amount > 0 ? Math.round(amount * pax * 100) / 100 : undefined,
+      // Fällt sie aus, gibt es nichts zu kaufen (wie in dbVendo.ts).
+      price:
+        typeof amount === "number" && amount > 0 && route.warning !== "cancelled"
+          ? Math.round(amount * pax * 100) / 100
+          : undefined,
       currency: j.price?.currency ?? "EUR",
       recon: j.refreshToken,
     });
+    byDep.set(k, list);
   }
   if (byDep.size === 0) return;
 
@@ -386,13 +438,14 @@ export async function enrichTrainResults(
     // formatieren. Nähme man hier die originTz/destinationTz des Ergebnisses,
     // verglichen wir bei abweichendem Offset Äpfel mit Birnen und das Matching
     // liefe still ins Leere.
-    const m = byDep.get(hhmm(anchors.dep));
+    const m = (byDep.get(hhmm(anchors.dep)) ?? []).find((e) => {
+      // Ankunfts-Gegencheck: gleicher Zug (schützt vor identischer Abfahrtsminute).
+      const rd = Math.abs(hhmmToMin(hhmm(e.route.trainArriveTime)) - hhmmToMin(hhmm(anchors.arr)));
+      // Und dieselbe Warnung: Eine gefährdete Route darf einen funktionierenden
+      // Treffer nie ersetzen (und umgekehrt keine Warnung verschlucken).
+      return Math.min(rd, 1440 - rd) <= 25 && (e.route.warning ?? null) === (r.warning ?? null);
+    });
     if (!m) continue;
-    // Ankunfts-Gegencheck: gleicher Zug (schützt vor identischer Abfahrtsminute).
-    const rd = Math.abs(
-      hhmmToMin(hhmm(m.route.trainArriveTime)) - hhmmToMin(hhmm(anchors.arr)),
-    );
-    if (Math.min(rd, 1440 - rd) > 25) continue;
 
     // Route KOMPLETT durch bahn.de ersetzen — Identität (id/redirectToken) und
     // deepLink (bahn.de-Suche, gleiche Zeit) bleiben.
@@ -406,6 +459,7 @@ export async function enrichTrainResults(
     if (m.route.operatedBy) r.operatedBy = m.route.operatedBy;
     r.departDelayMinutes = m.route.departDelayMinutes;
     r.arriveDelayMinutes = m.route.arriveDelayMinutes;
+    r.warning = m.route.warning;
     if (m.price != null) {
       r.price = m.price;
       r.currency = m.currency;

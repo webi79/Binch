@@ -32,3 +32,36 @@ export function markTransitionBusy(durationMs: number): void {
 export function isTransitionBusy(): boolean {
   return Date.now() < busyUntil;
 }
+
+/**
+ * „Ein Finger zieht gerade ein Blatt" — der Fall, den `markTransitionBusy`
+ * NICHT abdeckt.
+ *
+ * Der Zeitstempel oben will eine DAUER, und die kennt man bei einer
+ * programmierten Fahrt. Bei einem Ziehen kennt sie niemand: Es dauert, solange
+ * der Finger liegt. Ihn pro Bild anzumelden hieße einen Sprung auf den
+ * JS-Strang je Bild — genau das, was die Bewegung flüssig hält, indem es
+ * unterbleibt.
+ *
+ * Also zwei Meldungen je Ziehen, beim Aufsetzen und beim Loslassen. Damit ein
+ * verpasstes Loslassen nicht alles für immer lahmlegt, verfällt auch dieser
+ * Zustand von selbst — dieselbe Vorsicht wie beim Zeitstempel oben, nur mit
+ * einer großzügigen Grenze: Ein Ziehen von über einer Viertelminute gibt es
+ * nicht.
+ *
+ * WOZU: Im Haltestellen-Blatt läuft ein Sekundentakt für die Abfahrtszeiten.
+ * Er zeichnet die ganze Liste neu, samt eines SVG-Rings je Zeile — und
+ * animierte SVG-Eigenschaften machen die ganze Fläche ungültig. Trifft dieser
+ * Takt in ein laufendes Ziehen, springt der Inhalt sichtbar, während man das
+ * Blatt in der Hand hat.
+ */
+let dragSince = 0;
+const DRAG_MAX_MS = 15_000;
+
+export function setSheetDragging(on: boolean): void {
+  dragSince = on ? Date.now() : 0;
+}
+
+export function isSheetDragging(): boolean {
+  return dragSince > 0 && Date.now() - dragSince < DRAG_MAX_MS;
+}

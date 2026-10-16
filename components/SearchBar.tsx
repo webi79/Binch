@@ -1,12 +1,17 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { Text, TextInput, StyleSheet, View, type StyleProp, type ViewStyle, Pressable } from "react-native";
 import { useRouter } from "expo-router";
-import { Search as SearchIcon } from "lucide-react-native";
-import Svg, { Path, Circle } from "react-native-svg";
+import { Mic, Search as SearchIcon } from "lucide-react-native";
 import { useT } from "@/lib/i18n/useT";
 import { usePalette } from "@/lib/theme/appBg";
+import { useAccent } from "@/lib/theme/accent";
 import { useSearchStore } from "@/stores/searchStore";
 import { GradientFill } from "@/components/ui/GradientFill";
+import {
+  RotatingPlaceholder,
+  type RotatingPlaceholderHandle,
+} from "@/components/home/RotatingPlaceholder";
+import { MiniBo, type MiniBoHandle } from "@/components/home/MiniBo";
 import { scaledStyles } from "@/lib/ui/compact";
 
 /**
@@ -62,6 +67,18 @@ interface PressProps extends CommonProps {
    * fallen darf.
    */
   onTouchStart?: () => void;
+  /**
+   * Wechselnde Sprüche statt des festen Platzhalters — nur der Landingscreen
+   * schaltet das ein. Karte und Ortswähler bleiben bei der festen Zeile.
+   * Wie und warum: `components/home/RotatingPlaceholder.tsx`.
+   */
+  rotatePlaceholder?: boolean;
+  /**
+   * Der kleine, lebendige Bo statt der Lupe — wie die Sprüche nur auf dem
+   * Landingscreen. Karte, Ortswähler und der Eingabe-Modus behalten die Lupe.
+   * Wie und warum: `components/home/MiniBo.tsx`.
+   */
+  mascot?: boolean;
   value?: undefined;
   onChangeText?: undefined;
   autoFocus?: undefined;
@@ -79,48 +96,37 @@ interface InputProps extends CommonProps {
    *  Slide. */
   autoFocusDelay?: number;
   onPress?: undefined;
+  rotatePlaceholder?: undefined;
+  mascot?: undefined;
 }
 
 type Props = PressProps | InputProps;
 
-/**
- * Bo, klein und statisch.
- *
- * Die Silhouette ist NICHT nachgezeichnet, sondern exakt dieselben Pfaddaten wie
- * die große Figur in `components/assistant/Bo.tsx` — Kuppe mit Radius 72, vier
- * Zipfel am Saum. Ein selbst gezeichneter Geist sah daneben immer etwas anders
- * aus; so ist es dieselbe Figur, nur kleiner.
- *
- * Statt die Zahlen auf ein 24er-Raster umzurechnen (und dabei Rundungsfehler
- * einzubauen), steht Bos eigener Bildausschnitt im `viewBox`. Die Augen sind
- * runde Kreise statt der hohen Ellipsen der großen Figur: Auf 18px lesen sich
- * Ellipsen als Schlitze, Kreise als freundlicher Blick.
- *
- * Bewusst NICHT die echte `Bo`-Komponente: Die ist eine vollständige, animierte
- * Figur mit mehreren Endlos-Worklets — für einen Knopf, der dauerhaft im
- * Landingscreen steht, wäre das grotesk teuer.
- *
- * Auf MODULEBENE, nicht in der Komponente: Dort entstünde bei jedem Render ein
- * neuer Komponententyp, und React baut den Teilbaum darunter dann jedes Mal neu
- * auf statt ihn abzugleichen.
+/*
+ * Die statische Vorlage `BoMark`, die hier stand, ist in `MiniBo` aufgegangen
+ * (`components/home/MiniBo.tsx`): dieselben Pfaddaten aus Bo.tsx, jetzt
+ * lebendig. Ihre Umkehr-Farben (dunkler Körper, helles Gesicht) gelten dort für
+ * helle Leisten. Die Augen sind dort wieder Bos hohe Ellipsen — in der
+ * Vorschau auf 17 dp lesen sie sich nicht als Schlitze, sondern als Bo.
  */
-function BoMark() {
-  return (
-    <Svg width={19} height={19} viewBox="20 42 160 188">
-      {/* Körper — 1:1 aus Bo.tsx: Kuppe (A 72 72) und vier Zipfel (Q). */}
-      <Path
-        d="M28 120 A72 72 0 0 1 172 120 L172 197 Q154 221 136 197 Q118 221 100 197 Q82 221 64 197 Q46 221 28 197 Z"
-        fill={COLORS.black}
-      />
-      {/* Augen: an Bos Position (cx 76/124), rund statt hoch-oval. */}
-      <Circle cx="76" cy="120" r="15" fill="#F4F4F5" />
-      <Circle cx="124" cy="120" r="15" fill="#F4F4F5" />
-      {/* Die kleinen Glanzpunkte machen den Blick weich — dieselbe Idee wie bei
-          der großen Figur, nur größer im Verhältnis, damit sie hier trägt. */}
-      <Circle cx="82" cy="113" r="5" fill={COLORS.black} opacity={0.55} />
-      <Circle cx="130" cy="113" r="5" fill={COLORS.black} opacity={0.55} />
-    </Svg>
-  );
+
+/**
+ * Das Mikrofon im Akzent-Knopf.
+ *
+ * Größe und Strich wie die Lupe derselben Leiste (18, Strich 2): Zwei Symbole
+ * einer Zeile in verschiedenen Stärken sehen nach zwei Quellen aus.
+ *
+ * Tinte `textOnSolid` statt fest Schwarz — die Palette legt fest, was auf ihrer
+ * Fläche lesbar bleibt. Heute ist das Schwarz: 13,8:1 auf Lime, 12,4:1 auf Mint;
+ * Weiß käme auf beiden nicht über 1,7:1. Ein späterer dunkler Akzent bringt so
+ * seine eigene Tinte mit.
+ *
+ * Eigene Komponente, damit ein Akzent-Wechsel nur sie neu zeichnet und nicht
+ * die ganze Leiste — dieselbe Aufteilung wie bei `GradientFill`.
+ */
+function MicGlyph() {
+  const accent = useAccent();
+  return <Mic size={18} color={accent.textOnSolid} strokeWidth={2} />;
 }
 
 export function SearchBar(props: Props) {
@@ -129,6 +135,10 @@ export function SearchBar(props: Props) {
   const router = useRouter();
   const openVoiceOverlay = useSearchStore((s) => s.openVoiceOverlay);
   const inputRef = useRef<TextInput>(null);
+  const rotatorRef = useRef<RotatingPlaceholderHandle>(null);
+  const boRef = useRef<MiniBoHandle>(null);
+  /** Ein Spruch steht und die Leiste ist still — Bos Fenster (siehe MiniBo). */
+  const cueBo = useCallback((key: string) => boRef.current?.cue(key), []);
 
   // Verzögertes autoFocus: wenn autoFocusDelay gesetzt ist, fokussieren
   // wir manuell via setTimeout statt mit nativem autoFocus-Prop. Damit
@@ -181,12 +191,10 @@ export function SearchBar(props: Props) {
       accessibilityLabel={t("mode.voice")}
     >
       <GradientFill />
-      {/* Bo als Symbol — kein Standard-Geist aus dem Symbolsatz.
-          Der hatte die Strichstärke und die nüchterne Form aller anderen Symbole
-          und las sich damit als „irgendein Piktogramm". Dieser hier ist eine
-          gefüllte Silhouette mit Zipfelsaum und großen Augen, also erkennbar
-          dieselbe Figur, die im Chat antwortet. */}
-      <BoMark />
+      {/* Wieder das Mikrofon statt Bo: Der Knopf führt zur Spracheingabe — auf
+          dem Landingscreen über Bo, der nach seiner Einfahrt die Aufnahme
+          startet. Genau das soll man ihm ansehen. */}
+      <MicGlyph />
     </Pressable>
   ) : null;
 
@@ -211,6 +219,29 @@ export function SearchBar(props: Props) {
       </View>
     );
   }
+
+  const touchStart = "onTouchStart" in props ? props.onTouchStart : undefined;
+  /**
+   * Wechselnder Platzhalter: Solange ein Finger auf der Leiste liegt, startet
+   * kein Wechsel — aus der Berührung wird meist Bos Einfahrt. Rohe
+   * Berührungs-Ereignisse statt `onPressIn`: Sie kommen sofort und auch, wenn
+   * der Finger auf dem Mikrofon-Knopf landet.
+   *
+   * Das Label steht dann fest an der Leiste: Die Sprüche wechseln, und die
+   * beiden Ebenen trügen zwei Sätze auf einmal.
+   *
+   * Der kleine Bo links (`mascot`) hört auf dieselben Berührungen: Kein neuer
+   * Moment, solange der Finger liegt — und ein laufender gleitet in die Ruhe,
+   * bevor seine große Fassung hereinfährt.
+   */
+  const rotate = props.rotatePlaceholder === true;
+  const mascot = props.mascot === true;
+  const watchTouch = rotate || mascot;
+  /**
+   * Bos Farbe folgt der Fläche, auf der er TATSÄCHLICH steht — samt einer
+   * Hintergrundfarbe, die der Aufrufer über `style` setzt.
+   */
+  const barColor = mascot ? (StyleSheet.flatten(style)?.backgroundColor ?? palette.s2) : undefined;
 
   /**
    * Schlichtes `Pressable` statt `RippleTouch` — wie die vier Launch-Kacheln
@@ -242,17 +273,68 @@ export function SearchBar(props: Props) {
        */
       style={[styles.bar, { backgroundColor: palette.s2 }, style]}
       onPress={props.onPress ?? (() => router.navigate("/search"))}
-      onTouchStart={"onTouchStart" in props ? props.onTouchStart : undefined}
+      onTouchStart={
+        watchTouch
+          ? () => {
+              rotatorRef.current?.hold();
+              boRef.current?.hold();
+              touchStart?.();
+            }
+          : touchStart
+      }
+      onTouchEnd={
+        watchTouch
+          ? () => {
+              rotatorRef.current?.release();
+              boRef.current?.release();
+            }
+          : undefined
+      }
+      onTouchCancel={
+        watchTouch
+          ? () => {
+              rotatorRef.current?.release();
+              boRef.current?.release();
+            }
+          : undefined
+      }
+      accessibilityRole={rotate ? "button" : undefined}
+      accessibilityLabel={rotate ? placeholder : undefined}
     >
-      <SearchIcon size={18} color={COLORS.gray2} />
+      {mascot ? (
+        <MiniBo ref={boRef} surface={barColor} textGap={BAR_GAP} />
+      ) : (
+        <SearchIcon size={18} color={COLORS.gray2} />
+      )}
       {leadingLabel && <Text style={styles.leadingLabel}>{leadingLabel}</Text>}
-      <Text style={styles.placeholder} numberOfLines={1}>
-        {placeholder}
-      </Text>
+      {rotate ? (
+        <RotatingPlaceholder
+          ref={rotatorRef}
+          firstKey={placeholderKey}
+          textStyle={styles.placeholderText}
+          onLineShown={mascot ? cueBo : undefined}
+        />
+      ) : (
+        <Text style={styles.placeholder} numberOfLines={1}>
+          {placeholder}
+        </Text>
+      )}
       {mic}
     </Pressable>
   );
 }
+
+/**
+ * Schrift des Platzhalters — EINMAL, für die feste Zeile und die wechselnden
+ * Sprüche. Die wechselnden bekommen sie ohne `flex`: Den trägt dort der
+ * Ausschnitt, und an absolut gesetzten Ebenen hätte er nichts verloren.
+ */
+const PLACEHOLDER_TEXT = {
+  fontSize: 14,
+  color: COLORS.gray2,
+  fontWeight: "400",
+  paddingVertical: 10,
+} as const;
 
 const styles = scaledStyles({
   bar: {
@@ -276,7 +358,8 @@ const styles = scaledStyles({
     borderColor: "rgba(255,255,255,0.14)",
   },
   leadingLabel: { fontSize: 14, color: COLORS.white, fontWeight: "500" },
-  placeholder: { flex: 1, fontSize: 14, color: COLORS.gray2, fontWeight: "400", paddingVertical: 10 },
+  placeholder: { flex: 1, ...PLACEHOLDER_TEXT },
+  placeholderText: PLACEHOLDER_TEXT,
   input: { flex: 1, fontSize: 14, color: COLORS.white, fontWeight: "400", paddingVertical: 10 },
   micButton: {
     width: 38,
@@ -287,3 +370,13 @@ const styles = scaledStyles({
     overflow: "hidden",
   },
 });
+
+/**
+ * Abstand zwischen Symbol und Platzhalter, wie er auf diesem Gerät gilt
+ * (`gap` der Leiste, auf kurzen Geräten kleiner). Der kleine Bo hält seine
+ * rechte Kante auf allen Wegen mit Abstand davor — siehe `MiniBo`.
+ */
+const BAR_GAP = (() => {
+  const gap = StyleSheet.flatten(styles.bar).gap;
+  return typeof gap === "number" ? gap : 10;
+})();

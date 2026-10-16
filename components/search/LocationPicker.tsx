@@ -31,6 +31,7 @@ import { SaveStarButton } from "@/components/surroundings/SaveStarButton";
 import { haptic } from "@/lib/haptics";
 import { SHEET_TITLE } from "@/components/ui/SheetModal";
 import { scaledStyles } from "@/lib/ui/compact";
+import { FadePress } from "@/components/ui/FadePress";
 
 type Field = "from" | "to";
 
@@ -739,6 +740,13 @@ const LocationPickerInner = function LocationPicker({
         >
         {mounted && (
         <>
+        {/* `pt-14` sind 56 — dieselbe Zahl, die `PICKER_HEADER_TOP` trägt und die
+            der Datumswähler von hier übernimmt. Sie steht hier BEWUSST weiter als
+            Klasse und nicht als `style`: Ein `style`-Prop neben `className` ist
+            genau die Konstruktion, an der NativeWinds JSX-Umschreibung in diesem
+            Projekt schon Stile verschluckt hat (siehe `SearchBar.tsx`). Auf einem
+            Bildschirm, der funktioniert, ist das Risiko den geteilten Wert nicht
+            wert — wer die Konstante ändert, ändert diese Klasse mit. */}
         <View className="flex-row items-center gap-3 px-5 pt-14 pb-4">
           {/**
             * `Pressable` statt `RippleTouch` — dieselbe Begründung wie bei den
@@ -749,7 +757,7 @@ const LocationPickerInner = function LocationPicker({
             * Inhalt sich ändert, muss in jedem Bild neu gerastert werden. Die
             * Welle lief also über die volle Dauer der Rückfahrt gegen sie an.
             */}
-          <Pressable
+          <FadePress
             hitSlop={12}
             /**
              * Die Ebene schon beim AUFSETZEN des Fingers anlegen.
@@ -781,10 +789,9 @@ const LocationPickerInner = function LocationPicker({
             }}
             onPress={onClose}
             accessibilityLabel={t("search.close")}
-            style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
           >
             <X color="#E5E7EB" size={26} />
-          </Pressable>
+          </FadePress>
           {/* Aus dem gemeinsamen Stil statt aus Klassen: Die Werte waren
               dieselben (24/600), aber Klassen laufen NICHT durch `scaledStyles`
               — auf einem kurzen Bildschirm schrumpfte hier als Einzigem der
@@ -1012,8 +1019,10 @@ const PickerRow = memo(function PickerRow({
   suggested?: boolean;
 }) {
   const Icon = iconFor(loc);
-  const subtitle =
-    suggested && loc.type === "ALL" ? "Country" : loc.country || loc.city;
+  const place = suggested && loc.type === "ALL" ? "Country" : loc.country || loc.city;
+  // Steht ein gleichnamiger Halt daneben, kommt der Zusatz („Rochdale Road ·
+  // Stop RA") in die leise Zeile darunter — nie in den Namen.
+  const subtitle = [loc.detail, place].filter(Boolean).join(" · ");
   return (
     /**
      * `Pressable` statt `RippleTouch` — der native Ripple lief IN die Fahrt.
@@ -1068,7 +1077,7 @@ const PickerRow = memo(function PickerRow({
       <Icon color="#E5E7EB" size={20} />
       <View className="flex-1">
         <Text className="text-base font-semibold text-white">{loc.label}</Text>
-        <Text className="text-sm text-gray-500 mt-0.5">{subtitle}</Text>
+        <Text className="text-sm text-gray-500 mt-0.5" numberOfLines={1}>{subtitle}</Text>
       </View>
       <SaveStar loc={loc} />
     </Pressable>

@@ -15,7 +15,9 @@ import { SearchResult, TravelMode } from "@/types/search";
 import { useSearchStore } from "@/stores/searchStore";
 import { useT } from "@/lib/i18n/useT";
 import { formatTimeInZone, formatDateInZone, shiftIsoByMinutes } from "@/lib/time-format";
+import { changesShort } from "@/lib/format/routeMeta";
 import { DelayedTime } from "@/components/results/DelayedTime";
+import { JourneyWarningBadge } from "@/components/results/JourneyWarningBadge";
 import { redirectUrl, fetchTripPolylines, fetchFlightBookingOptions } from "@/lib/api/client";
 import { useAccent } from "@/lib/theme/accent";
 import { useQueryClient } from "@tanstack/react-query";
@@ -45,6 +47,18 @@ interface Props {
    * nichts (Bos Liste hat keine eigene Ebene).
    */
   underlay?: LayerKey;
+  /**
+   * Was der Routen-Knopf tut. Ohne Angabe öffnet er die Route bildschirmfüllend
+   * (`/search/route-map`) — so in der Ergebnisliste. Im Stadt-Blatt liegt die
+   * Karte schon offen dahinter; dort wählt er stattdessen diese Verbindung auf
+   * ihr aus.
+   */
+  onShowRoute?: () => void;
+  /**
+   * Diese Verbindung ist gerade auf der Karte gewählt — ein Rand im Akzent,
+   * damit man die Linie der Karte in der Liste wiederfindet.
+   */
+  highlighted?: boolean;
 }
 
 const C = {
@@ -80,7 +94,13 @@ function currencyCode(code: string): string {
   return code.toUpperCase();
 }
 
-function ResultCardInner({ result, passengers = 1, underlay }: Props) {
+function ResultCardInner({
+  result,
+  passengers = 1,
+  underlay,
+  onShowRoute: onShowRouteOverride,
+  highlighted,
+}: Props) {
   const palette = usePalette();
   const accent = useAccent();
   const t = useT();
@@ -390,10 +410,12 @@ function ResultCardInner({ result, passengers = 1, underlay }: Props) {
       : undefined;
   const isDirect = result.stops === 0;
   const stopVia = !isDirect && result.stopLabels?.length ? result.stopLabels[0] : null;
+  // „1 Umstieg" bei Zug und Bus, „1 Stopp" beim Flug — siehe `changesShort`.
   const stopLabel = isDirect
     ? t("results.direct")
-    : `${result.stops} ${result.stops === 1 ? t("results.stop") : t("results.stops")}${stopVia ? ` · ${stopVia}` : ""}`;
+    : `${changesShort(result.mode, result.stops, t)}${stopVia ? ` · ${stopVia}` : ""}`;
   const flightCode = result.flightNumber ?? "";
+  const cancelled = result.warning === "cancelled";
 
   return (
     // Die Hardware-Textur ist RAUS.
@@ -410,7 +432,15 @@ function ResultCardInner({ result, passengers = 1, underlay }: Props) {
     // gegenseitig aufheben — und eine Ansicht pro Karte, die Fabric bei jedem
     // Listen-Nachschub mit anlegen muss.
     <View style={styles.cardShadow}>
-    <Animated.View style={[styles.card, { backgroundColor: palette.s2 }, cardAnim]}>
+    <Animated.View
+      style={[
+        styles.card,
+        { backgroundColor: palette.s2 },
+        highlighted === undefined ? null : styles.cardMarkable,
+        highlighted ? { borderColor: accent.solid } : null,
+        cardAnim,
+      ]}
+    >
       <View style={styles.headerRow}>
         <View style={styles.providerWrap}>
           {/* Logo-Box: bei vorhandenem Carrier-Logo transparent, damit das
@@ -449,7 +479,12 @@ function ResultCardInner({ result, passengers = 1, underlay }: Props) {
           <RippleTouch onPress={onShare} hitSlop={8} borderless style={styles.iconBtn}>
             <Share2 color={C.text} size={18} />
           </RippleTouch>
-          <RippleTouch onPress={onShowRoute} hitSlop={8} borderless style={styles.iconBtn}>
+          <RippleTouch
+            onPress={onShowRouteOverride ?? onShowRoute}
+            hitSlop={8}
+            borderless
+            style={styles.iconBtn}
+          >
             <RouteIcon color={C.text} size={18} />
           </RippleTouch>
           <RippleTouch onPress={onToggleFav} hitSlop={8} borderless style={styles.iconBtn}>
@@ -467,7 +502,11 @@ function ResultCardInner({ result, passengers = 1, underlay }: Props) {
           {result.dateOnly ? (
             <Text style={styles.timeBig}>—</Text>
           ) : (
-            <DelayedTime scheduled={departStr} delayed={departDelayedStr} style={styles.timeBig} />
+            <DelayedTime
+              scheduled={departStr}
+              delayed={cancelled ? undefined : departDelayedStr}
+              style={[styles.timeBig, cancelled && styles.timeCancelled]}
+            />
           )}
         </View>
         <View style={styles.timeCenter}>
@@ -485,7 +524,12 @@ function ResultCardInner({ result, passengers = 1, underlay }: Props) {
           {result.dateOnly ? (
             <Text style={styles.timeBig}>—</Text>
           ) : (
-            <DelayedTime scheduled={arriveStr} delayed={arriveDelayedStr} style={styles.timeBig} align="flex-end" />
+            <DelayedTime
+              scheduled={arriveStr}
+              delayed={cancelled ? undefined : arriveDelayedStr}
+              style={[styles.timeBig, cancelled && styles.timeCancelled]}
+              align="flex-end"
+            />
           )}
         </View>
       </View>
@@ -493,7 +537,8 @@ function ResultCardInner({ result, passengers = 1, underlay }: Props) {
       <View style={styles.metaRow}>
         {(() => {
           const code = result.mode === "FLIGHT" ? displayCode(result.origin) : "";
-          const label = code || (result.originLabel?.split(",")[0]?.trim() ?? "");
+          // Der ganze Name — „Enschede, Lindestraat" ist der Halt, nicht „Enschede".
+          const label = code || (result.originLabel?.trim() ?? "");
           return (
             <View style={styles.metaCol}>
               <Text style={styles.metaCode} numberOfLines={1}>{label}</Text>
@@ -503,7 +548,7 @@ function ResultCardInner({ result, passengers = 1, underlay }: Props) {
         })()}
         {(() => {
           const code = result.mode === "FLIGHT" ? displayCode(result.destination) : "";
-          const label = code || (result.destLabel?.split(",")[0]?.trim() ?? "");
+          const label = code || (result.destLabel?.trim() ?? "");
           return (
             <View style={[styles.metaCol, { alignItems: "flex-end" }]}>
               <Text style={[styles.metaCode, { textAlign: "right" }]} numberOfLines={1}>
@@ -517,11 +562,24 @@ function ResultCardInner({ result, passengers = 1, underlay }: Props) {
         })()}
       </View>
 
+      {/* Anschluss laut Bahn gefährdet: Die Verbindung bleibt buchbar (DB
+          verkauft sie weiter), steht aber hinter den funktionierenden und sagt
+          es hier deutlich. Ausgefallene zeigen ihren Hinweis statt des Preises. */}
+      {result.warning === "connectionAtRisk" ? (
+        <View style={styles.warningRow}>
+          <JourneyWarningBadge warning="connectionAtRisk" label={t("results.warning.connectionAtRisk")} />
+        </View>
+      ) : null}
+
       <View style={styles.divider} />
 
       <View style={styles.footerRow}>
         <View style={styles.priceCol}>
-          {result.price > 0 ? (
+          {cancelled ? (
+            // Kein Preis und kein „Tarif beim Anbieter": Eine ausgefallene
+            // Verbindung kann man nirgends kaufen.
+            <JourneyWarningBadge warning="cancelled" label={t("results.warning.cancelled")} />
+          ) : result.price > 0 ? (
             <Text style={[styles.priceText, { color: accent.solid }]}>
               <Text style={styles.priceLabelInline}>{t("results.from")} </Text>
               {result.price.toFixed(0)}
@@ -583,7 +641,9 @@ export const ResultCard = memo(
   (prev, next) =>
     prev.result.id === next.result.id &&
     prev.passengers === next.passengers &&
-    prev.underlay === next.underlay,
+    prev.underlay === next.underlay &&
+    prev.highlighted === next.highlighted &&
+    prev.onShowRoute === next.onShowRoute,
 );
 
 const styles = scaledStyles({
@@ -605,6 +665,13 @@ const styles = scaledStyles({
     paddingVertical: 14,
     paddingHorizontal: 16,
   },
+  /**
+   * Nur, wo überhaupt markiert wird (Stadt-Blatt): immer ein Rand, sonst
+   * durchsichtig — mit der Auswahl wechselt allein die Farbe, die Karte springt
+   * nicht um die Randbreite. In der Ergebnisliste bleibt die Karte randlos wie
+   * bisher.
+   */
+  cardMarkable: { borderWidth: 1.5, borderColor: "transparent" },
   headerRow: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -636,6 +703,8 @@ const styles = scaledStyles({
   timeRow: { flexDirection: "row", alignItems: "center", gap: 10 },
   timeCol: { minWidth: 70, flexShrink: 0 },
   timeBig: { color: C.text, fontSize: 24, fontWeight: "800", letterSpacing: -0.6 },
+  // Ausgefallen: wie die durchgestrichene Fahrplanzeit in DelayedTime.
+  timeCancelled: { color: "#8E8E93", textDecorationLine: "line-through" },
   timeCenter: { flex: 1, alignItems: "center", gap: 4 },
   durationText: { color: C.sub, fontSize: 11, fontWeight: "600" },
   dottedLineWrap: {
@@ -669,6 +738,7 @@ const styles = scaledStyles({
   metaDate: { color: C.subDim, fontSize: 11, fontWeight: "500", marginTop: 2 },
 
   divider: { height: 1, backgroundColor: C.border, marginVertical: 14 },
+  warningRow: { marginTop: 10 },
 
   footerRow: {
     flexDirection: "row",

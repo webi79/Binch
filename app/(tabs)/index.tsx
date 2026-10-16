@@ -2388,6 +2388,20 @@ export default function HomeScreen() {
 
             <SearchBar
               style={styles.searchBarSpacing}
+              /**
+               * Wechselnde Sprüche im Platzhalter — NUR hier. Der Wechsel rendert
+               * ausschließlich die kleine Platzhalter-Komponente, nie diesen
+               * Baum, und pausiert selbst: Fokus, Hintergrund, Bo und die
+               * übrigen Überlagerungen, jede Fahrt, Finger auf der Leiste.
+               */
+              rotatePlaceholder
+              /**
+               * Der kleine Bo statt der Lupe — ebenfalls NUR hier. Auch er
+               * rendert diesen Baum nie: Er bewegt sich allein auf dem UI-Strang
+               * und pausiert nach denselben Regeln wie die Sprüche
+               * (`components/home/MiniBo.tsx`).
+               */
+              mascot
               onTouchStart={() => {
                 /**
                  * KEINE Textur für Bos EINfahrt — ausprobiert und verworfen.
@@ -2460,6 +2474,8 @@ export default function HomeScreen() {
                 requestAnimationFrame(startAssistantPush);
               }}
               onMicPress={() => {
+                // Derselbe Weg wie oben; `true` lässt Bo die Aufnahme starten,
+                // sobald seine Einfahrt steht (`autoVoiceOnArrival`).
                 armAssistantPush();
                 useSearchStore.getState().openAssistant(true);
                 requestAnimationFrame(() => startAssistantPush());

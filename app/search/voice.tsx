@@ -176,7 +176,9 @@ export default function VoiceScreen() {
           onPress={listening ? stop : start}
           disabled={busy}
           className="w-24 h-24 rounded-full items-center justify-center shadow-lg"
-          style={({ pressed }) => ({ backgroundColor: accent.solid, opacity: pressed ? 0.85 : 1 })}
+          /* ARRAY statt Funktion — siehe `SearchBar.tsx`. Mit der Funktions-Form
+             stand der Mikrofon-Knopf ganz OHNE Hintergrund da. */
+          style={{ backgroundColor: accent.solid }}
         >
           {busy ? <ActivityIndicator color="#000" /> : <Mic color="#000000" size={40} />}
         </Pressable>

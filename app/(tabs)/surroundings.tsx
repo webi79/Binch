@@ -1,9 +1,22 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { prepareLayer } from "@/lib/nav/transitionLayer";
 import { preloadLocationPicker } from "@/lib/nav/pickerPreload";
-import { PICKER_IN } from "@/lib/nav/overlayCover";
-import { View, StyleSheet, type LayoutChangeEvent } from "react-native";
-import Animated, { FadeOut } from "react-native-reanimated";
+import { PICKER_IN, SHEET_OUT } from "@/lib/nav/overlayCover";
+import {
+  View,
+  StyleSheet,
+  BackHandler,
+  useWindowDimensions,
+  type LayoutChangeEvent,
+  type GestureResponderEvent,
+} from "react-native";
+import Animated, {
+  FadeOut,
+  runOnJS,
+  useAnimatedStyle,
+  useSharedValue,
+} from "react-native-reanimated";
+import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useQuery } from "@tanstack/react-query";
 import { router } from "expo-router";
@@ -12,16 +25,38 @@ import { Freeze } from "react-freeze";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import {
   MapSurface,
-  type MapLayerType,
   type MapSurfaceHandle,
   type RegionInfo,
+  type MapCityPress,
+  type CameraPadding,
 } from "@/components/surroundings/MapSurface";
+import {
+  isMapMoving,
+  setMapMoving,
+  sheetTargets,
+  subscribeViewport,
+  whenMapQuiet,
+} from "@/lib/surroundings/mapViewport";
 import { UserPin } from "@/components/surroundings/MapMarkers";
 import { MarkerLayer } from "@/components/surroundings/MarkerLayer";
-import { openStopSheet } from "@/components/surroundings/stopSheetAnimation";
+import { MapTypeSheet } from "@/components/surroundings/MapTypeSheet";
+import { Buildings3DLayer } from "@/components/surroundings/Buildings3DLayer";
+import { EsriImageryLayer } from "@/components/surroundings/EsriImageryLayer";
+import { refreshEsriImagery, useEsriImagery } from "@/lib/imagery/esriImagery";
+import { haptic } from "@/lib/haptics";
+import { useResolvedMapStyle } from "@/lib/theme/mapStyleChoice";
+import { openStopSheet, stopSheetSnap } from "@/components/surroundings/stopSheetAnimation";
+import { CityRouteLayers } from "@/components/surroundings/CityRouteLayers";
+import { WalkPathLayer } from "@/components/surroundings/WalkPathLayer";
 import { RouteLayer } from "@/components/surroundings/RouteLayer";
+import { LiveVehicleLayer } from "@/components/live/LiveVehicleLayer";
+import { LiveOverlay } from "@/components/live/LiveOverlay";
+import { useAppActive, useLiveModel } from "@/lib/live/useLiveModel";
+import { PLANE_MAX_ZOOM } from "@/lib/live/camera";
+import { createZoomTrack } from "@/lib/live/zoomTrack";
 import { RouteBanner } from "@/components/surroundings/RouteBanner";
-import { MapFabs } from "@/components/surroundings/MapFabs";
+import { LocateFab, MapFabs } from "@/components/surroundings/MapFabs";
+import { CitySearchMorph, SEARCH_BAR_BARE } from "@/components/surroundings/CitySearchMorph";
 import { MapSkeleton } from "@/components/surroundings/MapSkeleton";
 import { SurroundingsSheet } from "@/components/surroundings/SurroundingsSheet";
 import { SearchBar } from "@/components/SearchBar";
@@ -38,10 +73,24 @@ import {
   type StopListItem,
 } from "@/lib/surroundings/mockData";
 import { useUserLocation } from "@/lib/surroundings/useUserLocation";
+import { setDeviceHeadingActive } from "@/lib/surroundings/useDeviceHeading";
+import {
+  HIDE_AT,
+  HIDE_VELOCITY,
+  chromeShift,
+  isMapChromeHidden,
+  markMapChromeHidden,
+  maxTravel,
+  settle,
+  showMapChrome,
+  travelSearch,
+} from "@/lib/surroundings/mapChrome";
 import { AIRPORT_PINS } from "@/lib/surroundings/airportCoords";
 import { CRUISE_PORT_PINS } from "@/lib/surroundings/cruisePortCoords";
-import { fetchSurroundings } from "@/lib/api/client";
-import { scaledStyles } from "@/lib/ui/compact";
+import { fetchAerialCoverage, fetchSurroundings } from "@/lib/api/client";
+import { ms, scaledStyles } from "@/lib/ui/compact";
+import { SPACE } from "@/lib/theme/spacing";
+import { TAB_BAR_H } from "@/components/ui/BinchTabBar";
 
 /** Viewport-Daten die wir an /api/surroundings schicken. */
 interface Viewport {
@@ -90,11 +139,252 @@ function resolveLocationCoord(loc: Location): { latitude: number; longitude: num
   return null;
 }
 
+/**
+ * Die Zoom-STUFEN, die der Server wirklich unterscheidet — und nur die gehören
+ * in den Abfrage-Schlüssel.
+ *
+ * DAS WAR EINE ECHTE RUCKLER-QUELLE: Bisher stand der gerundete Zoom im
+ * Schlüssel, also 14, 15, 16, 17, 18 — fünf verschiedene Abfragen für denselben
+ * Fleck. Wer von der Stadtansicht bis auf die Hausnummer hineinzoomt,
+ * überquert vier Ganzzahl-Grenzen, und jede löste eine Abfrage aus, deren
+ * Antwort die komplette Nadel-Quelle der Karte ersetzt (samt Neuaufbau des
+ * Cluster-Index). Das passierte MITTEN in der Zoom-Geste, also genau dann, wenn
+ * jedes Bild zählt. Und es wurde mit jeder weiteren Zoomstufe wieder fällig —
+ * „schlimmer, je weiter ich hineinzoome".
+ *
+ * Der Server unterscheidet aber gar nicht fünf Stufen, sondern vier Bereiche
+ * (`typesForZoom` und `limitForZoom` in `routes/surroundings.ts`): ab 13
+ * Bahn+Bus, ab 11 nur Bahn mit mehr Treffern fürs Clustern, ab 9 dasselbe mit
+ * noch mehr, darunter gar nichts. Innerhalb eines Bereichs ist die Antwort für
+ * denselben Ort IDENTISCH — die Abfragen dazwischen waren also nicht nur teuer,
+ * sie waren umsonst.
+ *
+ * Geschickt wird die untere Kante des Bereichs. Damit bekommt der Server
+ * denselben Wert, den er ohnehin zu einem Bereich zusammenfasst.
+ */
+function zoomBand(zoom: number): number {
+  if (zoom >= 13) return 13;
+  if (zoom >= 11) return 11;
+  if (zoom >= 9) return 9;
+  return 0;
+}
+
+/**
+ * So lange muss die Karte stillstehen, bevor die Umgebung neu abgefragt wird —
+ * siehe `onRegionChange`. Länger als eine Pause beim Hin- und Herwischen (die
+ * gemessenen Lücken lagen bei 60 bis 360 ms), kurz genug, dass die Liste nach
+ * dem Loslassen spürbar sofort nachzieht.
+ */
+const VIEWPORT_SETTLE_MS = 600;
+
 export default function SurroundingsScreen() {
   const t = useT();
   const [mode, setMode] = useState<SheetMode>("transit");
-  const [mapType, setMapType] = useState<MapLayerType>("standard");
-  const [trafficOn, setTrafficOn] = useState(false);
+  /** Steht das Kartentyp-Blatt offen? */
+  const [mapTypeOpen, setMapTypeOpen] = useState(false);
+  /**
+   * Drehung und Neigung der Karte — Bild für Bild, für den Kompass.
+   *
+   * Hier stand ein Zustand „steht die Karte schief?", gesetzt am ENDE jeder
+   * Bewegung. Damit konnte sich der Kompass nicht mitdrehen, und er erschien
+   * erst, wenn die Drehgeste vorbei war. Jetzt kommen die Werte aus jedem
+   * Kamerabild (`onCameraFrame`), und zwar als animierte Werte: Der Kompass
+   * liest sie auf dem UI-Strang, und dieser Bildschirm rendert dafür kein
+   * einziges Mal — auch nicht beim Erscheinen und Verschwinden des Knopfes,
+   * das entscheidet `MapFabs` selbst.
+   */
+  /** Der noch wartende Ausschnitt — siehe `VIEWPORT_SETTLE_MS` in `onRegionChange`. */
+  const pendingViewportRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearPendingViewport = useCallback(() => {
+    if (pendingViewportRef.current) {
+      clearTimeout(pendingViewportRef.current);
+      pendingViewportRef.current = null;
+    }
+  }, []);
+  useEffect(() => clearPendingViewport, [clearPendingViewport]);
+  /**
+   * Liegt gerade ein Finger auf der Karte? Dann ist eine beginnende Bewegung
+   * die des Nutzers — und das Nachführen auf den Standort endet.
+   *
+   * Über die Berührung und nicht über die Meldung der Karte: Die zählt ihre
+   * eigenen Kamerafahrten (`setStop`) ebenfalls als „Nutzer-Interaktion"
+   * (`CameraChangeTracker.isUserInteraction` in MLRN) und taugt dafür nicht.
+   */
+  const mapTouchRef = useRef(false);
+  /**
+   * LIVE-ANSICHT — ein Fahrzeug verfolgen (Knopf an der Tafel-Zeile). Sie
+   * übernimmt die Karte wie der Routen-Modus: keine Haltestellen, kein Blatt,
+   * eigene Kamera (`LiveOverlay`). Als Ablage daneben, weil die Rückrufe der
+   * Karte (Bewegung, Ausschnitt) sie lesen, ohne neu zu entstehen.
+   */
+  const liveSession = useSearchStore((s) => s.liveSession);
+  const liveActive = liveSession != null;
+  const liveActiveRef = useRef(liveActive);
+  liveActiveRef.current = liveActive;
+  /**
+   * Der Zoom, für den das Live-Fahrzeug gebaut wird — die Karte meldet ihn
+   * (immer, nicht nur live: Beim Start muss er schon stimmen), die Live-Kamera
+   * kündigt ihre Fahrten an. Siehe `lib/live/zoomTrack.ts`.
+   */
+  const liveZoom = useMemo(() => createZoomTrack(15), []);
+  const onMapTouchStart = useCallback(() => {
+    mapTouchRef.current = true;
+  }, []);
+  const onMapTouchEnd = useCallback((e: GestureResponderEvent) => {
+    // Erst, wenn der LETZTE Finger weg ist — `onTouchEnd` kommt je Finger, und
+    // beim Zoomen mit zweien war die Karte sonst schon „losgelassen".
+    if ((e.nativeEvent.touches?.length ?? 0) === 0) mapTouchRef.current = false;
+  }, []);
+  const onMapTouchCancel = useCallback(() => {
+    mapTouchRef.current = false;
+  }, []);
+  const onMapCameraMoveStart = useCallback(() => {
+    clearPendingViewport();
+    setMapMoving(true);
+    if (mapTouchRef.current) {
+      followUserRef.current = false;
+      // Selbst verschoben: Die letzte Rahmen-Fahrt zählt nicht mehr als das,
+      // was man sieht (siehe `lastCityFitRef`).
+      lastCityFitRef.current = null;
+      // Live: Wer die Karte anfasst, will selbst schauen — die Kamera folgt
+      // nicht mehr (der Knopf „Fahrzeug folgen" holt sie zurück).
+      if (liveActiveRef.current) useSearchStore.getState().setLiveFollow(false);
+    }
+  }, [clearPendingViewport]);
+  const cameraBearing = useSharedValue(0);
+  const cameraPitch = useSharedValue(0);
+  /**
+   * NUR schreiben, was sich geändert hat.
+   *
+   * Beim Verschieben meldet die Karte jedes Bild, Drehung und Neigung bleiben
+   * dabei aber gleich. Jeder Schreibvorgang in einen animierten Wert weckt den
+   * UI-Strang — und das ist genau der Strang, auf dem MapLibre die Wischgeste
+   * auswertet und die Kartenfläche (eine `TextureView`) ins Bild setzt. Sechzig
+   * bis hundertzwanzig wirkungslose Aufträge pro Sekunde mitten in der Geste
+   * sind Arbeit, die dort nichts zu suchen hat. Der zuletzt geschriebene Wert
+   * steht deshalb in einem Ref daneben.
+   */
+  const lastCameraRef = useRef({ bearing: 0, pitch: 0 });
+  const onCameraFrame = useCallback(
+    (bearing: number, pitch: number, zoom: number) => {
+      // Die Kamera bewegt sich noch — ein wartender Ausschnitt wäre verfrüht.
+      // (Auch beim Stillstand kommt dieser Aufruf, aber VOR `onRegionChange`,
+      // das die Wartezeit dann neu startet.)
+      clearPendingViewport();
+      liveZoom.report(zoom, false);
+      const last = lastCameraRef.current;
+      if (Math.abs(bearing - last.bearing) > 0.05) {
+        last.bearing = bearing;
+        cameraBearing.value = bearing;
+      }
+      if (Math.abs(pitch - last.pitch) > 0.05) {
+        last.pitch = pitch;
+        cameraPitch.value = pitch;
+      }
+    },
+    [cameraBearing, cameraPitch, clearPendingViewport, liveZoom],
+  );
+  /**
+   * Wie tief die Satellitenkarte hier zoomen darf — 18, über einem amtlichen
+   * Orthofoto bis 20. Die Antwort kommt vom Server (siehe `onRegionChange`),
+   * gemerkt je Feld von rund 500 Metern, damit ein Schwenk innerhalb desselben
+   * Viertels nicht jedes Mal fragt.
+   */
+  const [aerialMaxZoom, setAerialMaxZoom] = useState(18);
+  /**
+   * Liegt hier ein amtliches Luftbild? `null` = noch unbekannt. Davon hängt ab,
+   * ob Esri gezeigt wird (nur in den Lücken, siehe lib/imagery/esriImagery.ts).
+   */
+  const [aerialOfficial, setAerialOfficial] = useState<boolean | null>(null);
+  const coverageCacheRef = useRef(new Map<string, { maxZoom: number; amtlich: boolean }>());
+  const coverageAskRef = useRef<string | null>(null);
+  /**
+   * Der LETZTE Ausschnitt, bei jeder Bewegung mitgeschrieben — ohne Durchgang.
+   *
+   * Nicht dasselbe wie `viewport`: Jener wird absichtlich nur gesetzt, wenn
+   * sich das Abfrage-Raster ändert (siehe `onRegionChange`), und sein Zoom ist
+   * deshalb veraltet, sobald jemand an Ort und Stelle hineinzoomt — Stufe 17
+   * und 22 liegen im selben Raster. Genau dieser alte Wert würde beim
+   * Neuaufbau der Karte als Startzoom gesetzt und risse den Nutzer um fünf
+   * Stufen heraus.
+   *
+   * Als Ref, weil es nichts zeichnet: Er darf bei jeder Bewegung mitlaufen,
+   * ohne einen einzigen React-Durchgang zu kosten.
+   */
+  const lastRegionRef = useRef<{
+    latitude: number;
+    longitude: number;
+    zoom: number;
+    bearing?: number;
+    pitch?: number;
+  } | null>(null);
+  /**
+   * Welcher Stil auf der Karte liegt — „auto" ist hier schon zum Thema
+   * aufgelöst (siehe `mapStyleChoice.ts`). Reaktiv: Wer in den Einstellungen
+   * das Thema wechselt, sieht die Karte mitgehen, solange er nicht selbst
+   * gewählt hat.
+   */
+  const resolvedMapStyle = useResolvedMapStyle();
+  /**
+   * Der Kartentyp, den die Karte ZEIGT — er läuft dem gewählten um einen Schritt
+   * nach: Vor dem Neuaufbau (siehe `key` an der Kartenfläche) friert die alte
+   * Karte ihr Bild ein, die neue blendet es aus, sobald sie fertig ist
+   * (`freezeForStyleSwitch`). Ohne das war die neue Karte bis zu ihrem ersten
+   * vollständigen Bild leer — der Wechsel blitzte. Höchstens 120 ms Verzug,
+   * dann wird ohnehin umgeschaltet.
+   */
+  const [mapStyleName, setMapStyleName] = useState(resolvedMapStyle);
+  /**
+   * Die Sprache, in der die Karte beschriftet IST — sie läuft der App-Sprache
+   * genauso nach wie der Kartentyp dem gewählten. Für MapLibre ist eine andere
+   * Sprache ein anderer Stil, und der wird nie an der offenen Karte getauscht,
+   * sondern über denselben Neuaufbau samt eingefrorenem Bild (siehe `key`).
+   */
+  const appLocale = useSearchStore((s) => s.locale);
+  const [mapLocale, setMapLocale] = useState(appLocale);
+  useEffect(() => {
+    if (resolvedMapStyle === mapStyleName && appLocale === mapLocale) return;
+    let cancelled = false;
+    const switchNow = () => {
+      if (cancelled) return;
+      setMapStyleName(resolvedMapStyle);
+      setMapLocale(appLocale);
+    };
+    const map = mapRef.current;
+    if (!map) {
+      switchNow();
+      return;
+    }
+    void Promise.race([map.freezeForStyleSwitch(), new Promise((r) => setTimeout(r, 120))]).then(switchNow);
+    return () => {
+      cancelled = true;
+    };
+  }, [resolvedMapStyle, mapStyleName, appLocale, mapLocale]);
+  // Kartentyp oder Sprache gewechselt = neue Karte (siehe `key` an der
+  // Kartenfläche); eine Bewegung der alten meldet ihr Ende nie mehr.
+  useEffect(() => {
+    setMapMoving(false);
+  }, [mapStyleName, mapLocale]);
+  // Für `onRegionChange`, das bewusst ohne Abhängigkeiten auskommt.
+  const mapStyleNameRef = useRef(mapStyleName);
+  mapStyleNameRef.current = mapStyleName;
+
+  /**
+   * ESRI IN DEN LÜCKEN — nur in der Satellitenansicht, nur wo der Server „kein
+   * amtliches Luftbild" meldet (`aerialOfficial === false`), und nur solange er
+   * Esri freigibt (Tagesdeckel, Sperren, Monatsdeckel — siehe
+   * lib/imagery/esriImagery.ts). Die Freigabe wird beim Wechsel in die
+   * Satellitenansicht und danach alle 10 Minuten geholt.
+   */
+  const esriLayer = useEsriImagery((st) => st.layer);
+  useEffect(() => {
+    if (mapStyleName !== "satellite") return;
+    void refreshEsriImagery();
+    const id = setInterval(() => void refreshEsriImagery(), 10 * 60_000);
+    return () => clearInterval(id);
+  }, [mapStyleName]);
+  const esriVisible = mapStyleName === "satellite" && !!esriLayer && aerialOfficial === false;
+  const buildings3d = useSearchStore((st) => st.mapBuildings3d);
   const insets = useSafeAreaInsets();
   const mapRef = useRef<MapSurfaceHandle | null>(null);
   const openLocationPicker = useSearchStore((s) => s.openLocationPicker);
@@ -136,7 +426,265 @@ export default function SurroundingsScreen() {
   }, [clearRoute]);
   const routeActive = pendingRoute !== null && pendingRoute.waypoints.length >= 2;
 
+  /**
+   * DAS STADT-BLATT — Tipp auf den Namen einer Stadt: Zug, Bus und Flug vom
+   * eigenen Standort dorthin (Inhalt: `CityTripBody`, im Haltestellen-Blatt).
+   *
+   * Solange es offen ist, zeigt die Karte statt der Haltestellen-Symbole die
+   * Verbindungen (`CityRouteLayers`) — die Symbole lägen sonst über den Linien,
+   * und um die geht es in diesem Moment.
+   */
+  const selectedCity = useSearchStore((s) => s.selectedCity);
+  const cityRoutes = useSearchStore((s) => s.cityRoutes);
+  const selectedStopForWalk = useSearchStore((s) => s.selectedStop);
+  /**
+   * Wohin der gepunktete Fußweg führt: im Stadt-Blatt zur Startstation der
+   * gewählten Verbindung, sonst zur angetippten Haltestelle. Ohne eigenen
+   * Standort gibt es keinen — dann bliebe nur ein Weg von irgendwo.
+   */
+  const walkTarget = useMemo(() => {
+    if (selectedCity) {
+      const start = cityRoutes?.plans[cityRoutes.selected]?.waypoints[0];
+      return start ? { latitude: start.latitude, longitude: start.longitude } : null;
+    }
+    const st = selectedStopForWalk;
+    return st?.latitude != null && st.longitude != null
+      ? { latitude: st.latitude, longitude: st.longitude }
+      : null;
+  }, [selectedCity, cityRoutes, selectedStopForWalk]);
+  const selectCityRoute = useSearchStore((s) => s.selectCityRoute);
+  const userCoordRef = useRef(userCoord);
+  userCoordRef.current = userCoord;
+  const routeActiveRef = useRef(routeActive);
+  routeActiveRef.current = routeActive;
+  const { height: screenHeight } = useWindowDimensions();
+  /**
+   * Wo die Karte frei ist, wenn das Stadt-Blatt in der Mitte steht: oben unter
+   * der Suchleiste, unten über dem Blatt. Dieselbe Rechnung wie im Blatt selbst
+   * (`stopSheetSnap`), sonst läge die Route halb darunter.
+   */
+  const cityPadding = useMemo(
+    () => ({
+      top: insets.top + 88,
+      bottom: stopSheetSnap(screenHeight, insets.top, insets.bottom).midVisible + 24,
+      left: 48,
+      right: 48,
+    }),
+    [insets.top, insets.bottom, screenHeight],
+  );
+  const cityPaddingRef = useRef(cityPadding);
+  cityPaddingRef.current = cityPadding;
+  /**
+   * Unterkante der Leiste oben (Suchleiste bzw. Kasten, im Routen-Modus das
+   * Banner) — gemessen, siehe `topBarBottom` weiter unten. Als Ablage, weil die
+   * Kamera-Rechnung sie in Rückrufen liest.
+   */
+  const topBarBottomRef = useRef<number | null>(null);
+  /**
+   * DER FREIE AUSSCHNITT — der verdeckte Rand oben und unten, für die Kamera.
+   *
+   * Oben die Leiste, unten das Blatt, das gerade höher reicht (Auswahlfenster
+   * oder Haltestellen-/Stadt-Blatt), gerechnet aus dem ZIEL ihrer Bewegung
+   * (lib/surroundings/mapViewport.ts). Ein Punkt, zu dem die Kamera mit diesem
+   * Rand fährt, steht genau in der Mitte dazwischen.
+   *
+   * Vorher zielte „zu meinem Standort" auf die Bildschirmmitte. Mit dem
+   * Stadt-Blatt in halber Höhe ist das dessen Oberkante — der Standort-Punkt
+   * lag zur Hälfte darunter.
+   *
+   * Im Nur-Karte-Modus gibt es weder Leiste noch Auswahlfenster; ein offenes
+   * Haltestellen-Blatt bleibt (es gehört zum Inhalt). Im Routen-Modus steht
+   * unten die Tab-Leiste. Ist ein Blatt ganz aufgezogen, bleibt kaum Karte —
+   * dann gar kein Rand statt eines Streifens.
+   */
+  const visiblePadding = useCallback((): CameraPadding | undefined => {
+    const hidden = isMapChromeHidden();
+    const fullTop = Math.max(60, insets.top + 12);
+    const top = hidden ? 0 : (topBarBottomRef.current ?? 0);
+    let bottomEdge = screenHeight;
+    const targets = sheetTargets();
+    if (!hidden) {
+      if (routeActiveRef.current) {
+        bottomEdge = screenHeight - (ms(TAB_BAR_H) + insets.bottom);
+      } else if (targets.surroundings != null) {
+        bottomEdge = fullTop + targets.surroundings;
+      }
+    }
+    if (targets.stop != null) bottomEdge = Math.min(bottomEdge, fullTop + targets.stop);
+    if (bottomEdge - top < 160) return undefined;
+    return { top, bottom: Math.max(0, screenHeight - bottomEdge), left: 0, right: 0 };
+  }, [insets.top, insets.bottom, screenHeight]);
+  /**
+   * Steht die Kamera auf dem eigenen Standort — Knopf gedrückt und seitdem
+   * nichts anderes angesteuert? Dann führt sie nach, wenn ein Blatt sich
+   * öffnet, schließt oder einrastet (siehe `subscribeViewport` weiter unten).
+   *
+   * Aus ist sie, sobald man die Karte selbst bewegt oder etwas anderes
+   * ansteuert (Haltestelle, Stadt, Suche) — dann wäre ein Zurückschwenken auf
+   * den eigenen Punkt ein Wegreißen.
+   */
+  const followUserRef = useRef(false);
+  /** Rahmen um Punkte — für `fitBounds`. */
+  /**
+   * Die letzte Rahmen-Fahrt der Stadt — wann und auf welches Rechteck. Siehe
+   * den Effekt zu `cityRouteKey`: Er entscheidet damit, ob eine ZWEITE Fahrt
+   * nötig ist und wann sie starten darf. Ein Finger auf der Karte löscht sie
+   * (`onMapCameraMoveStart`) — danach zeigt die Karte, was der Nutzer will.
+   */
+  const lastCityFitRef = useRef<{
+    at: number;
+    /** Wie lange diese Fahrt dauert (hängt am Weg, siehe `fitBounds`). */
+    ms: number;
+    w: number;
+    s: number;
+    e: number;
+    n: number;
+  } | null>(null);
+  const fitPoints = useCallback((pts: Array<{ latitude: number; longitude: number }>) => {
+    if (pts.length === 0) return;
+    let w = Infinity;
+    let sLat = Infinity;
+    let e = -Infinity;
+    let n = -Infinity;
+    for (const p of pts) {
+      w = Math.min(w, p.longitude);
+      e = Math.max(e, p.longitude);
+      sLat = Math.min(sLat, p.latitude);
+      n = Math.max(n, p.latitude);
+    }
+    const fit = { at: Date.now(), ms: CITY_FIT_MS, w, s: sLat, e, n };
+    lastCityFitRef.current = fit;
+    // Eine Rahmen-Fahrt ist kein „auf meinem Standort" mehr (siehe `followUserRef`).
+    followUserRef.current = false;
+    /**
+     * EIN Punkt (kein Standort bekannt, nur die Stadt): ein Rechteck der
+     * Fläche null — MapLibre zoomte dafür bis auf die Höchststufe, man stand
+     * auf Hausnummer-Ebene über dem Namen. Dann die Stadt in Stadt-Zoom.
+     */
+    /**
+     * Oben die GEMESSENE Unterkante der Leiste bzw. des Kastens (plus Luft)
+     * statt geschätzter 88 Punkte — derselbe Wert wie für den Standort
+     * (`visiblePadding`).
+     */
+    const barBottom = topBarBottomRef.current;
+    const pad =
+      barBottom != null
+        ? { ...cityPaddingRef.current, top: barBottom + CITY_FIT_TOP_GAP }
+        : cityPaddingRef.current;
+    if (Math.abs(e - w) < 1e-4 && Math.abs(n - sLat) < 1e-4) {
+      fit.ms = mapRef.current?.flyTo(sLat, w, SINGLE_POINT_ZOOM, pad) ?? CITY_FIT_MS;
+      return;
+    }
+    fit.ms = mapRef.current?.fitBounds([w, sLat], [e, n], pad) ?? CITY_FIT_MS;
+  }, []);
+  /**
+   * Tipp auf eine Stadt. Start ist IMMER der eigene Standort, Ziel IMMER die
+   * Stadt. Im Routen-Modus (Route aus der Ergebnisliste) bleibt ein Tipp ein
+   * Karten-Tipp — dort steht schon eine Route, und die gehört einer anderen
+   * Suche.
+   *
+   * Die Kamera zeigt sofort beides, Standort und Stadt; sobald Verbindungen da
+   * sind, rückt sie auf die gewählte (Effekt darunter).
+   */
+  const onCityPress = useCallback((c: MapCityPress) => {
+    // Kein Zurückholen der Oberfläche — ein Stadtname ist ein Element der
+    // Karte, nicht die freie Fläche (siehe `selectStopFromMap`).
+    if (routeActiveRef.current || liveActiveRef.current) return;
+    haptic("button");
+    followUserRef.current = false;
+    const from = userCoordRef.current;
+    const st = useSearchStore.getState();
+    /**
+     * Steht das Blatt schon offen (andere Stadt, oder eine Haltestelle — beide
+     * haben dieselben Rastpunkte), bleibt es, wo es ist: Nur der Inhalt wechselt.
+     * Ein erneutes Hereinfahren wäre eine Bewegung ohne Anlass, und wer es auf
+     * ganz oben gezogen hatte, fände es wieder in der Mitte.
+     *
+     * „Offen" heißt: das Blatt fährt bzw. steht im Bild (`sheetTargets`) — nicht
+     * bloß „im Store gesetzt". Beides lief schon auseinander (Zurück aus „Auf
+     * Karte anzeigen"), und dann öffnete kein Tipp mehr ein Blatt.
+     */
+    const alreadyOpen = sheetTargets().stop != null;
+    /**
+     * DIESELBE Stadt noch einmal angetippt: nichts neu anlegen, nur wieder
+     * einrahmen.
+     *
+     * Ein neues `selectCity` setzte die Suche der Stadt zurück (Routen,
+     * Kasten, Preis) — ihr Inhalt blieb aber derselbe, und seine Effekte
+     * liefen deshalb nicht erneut: Linien weg, Glocke und „Suchen" taub.
+     */
+    const cur = st.selectedCity;
+    const sameCityOpen =
+      cur != null &&
+      cur.name === c.name &&
+      Math.abs(cur.latitude - c.latitude) < 1e-4 &&
+      Math.abs(cur.longitude - c.longitude) < 1e-4;
+    if (!sameCityOpen) {
+      st.selectCity({
+        ...c,
+        from: from ? { latitude: from.latitude, longitude: from.longitude } : null,
+      });
+    }
+    if (!alreadyOpen) openStopSheet();
+    fitPoints(from ? [from, c] : [c]);
+  }, [fitPoints]);
+  /** Neue Verbindungen oder eine andere gewählt → die Karte zeigt deren Strecke. */
+  const cityRouteKey = cityRoutes ? `${cityRoutes.key}#${cityRoutes.selected}` : null;
+  /**
+   * NUR EINE Kamerafahrt, wo eine reicht — und nie zwei ineinander.
+   *
+   * Beim Tipp auf eine Stadt fährt die Kamera sofort auf Standort + Stadt.
+   * Kommen die Verbindungen schnell (oft aus dem Zwischenspeicher), setzte
+   * dieser Effekt mitten in dieser Fahrt eine zweite an: Richtungswechsel
+   * mitten in der Bewegung, gemeldet als „die Karte zittert kurz, wenn ich auf
+   * einen Namen tippe".
+   *
+   * Jetzt: Liegt die Strecke ohnehin im Rahmen der ersten Fahrt (mit etwas
+   * Rand), bleibt es bei ihr. Sonst wartet die zweite, bis die erste
+   * angekommen ist, und schließt dann weich an.
+   */
+  useEffect(() => {
+    const r = useSearchStore.getState().cityRoutes;
+    if (!r) return;
+    const plan = r.plans[r.selected];
+    if (!plan) return;
+    // Mit dem eigenen Standort — sonst läge der Fußweg zur Station am Rand.
+    const here = userCoordRef.current;
+    const pts = here ? [here, ...plan.waypoints] : plan.waypoints;
+    const last = lastCityFitRef.current;
+    if (last) {
+      const mx = (last.e - last.w) * 0.1;
+      const my = (last.n - last.s) * 0.1;
+      const inside = pts.every(
+        (p) =>
+          p.longitude >= last.w - mx &&
+          p.longitude <= last.e + mx &&
+          p.latitude >= last.s - my &&
+          p.latitude <= last.n + my,
+      );
+      if (inside) return;
+      // Bis die erste angekommen ist — ihre Dauer hängt am Weg — plus ein Bild.
+      const wait = last.ms + 20 - (Date.now() - last.at);
+      if (wait > 0) {
+        const id = setTimeout(() => {
+          // Inzwischen selbst verschoben oder woanders hingefahren? Dann nicht
+          // mehr — die Fahrt liefe gegen den Finger bzw. die neue Fahrt.
+          if (lastCityFitRef.current !== last || mapTouchRef.current) return;
+          fitPoints(pts);
+        }, wait);
+        return () => clearTimeout(id);
+      }
+    }
+    fitPoints(pts);
+  }, [cityRouteKey, fitPoints]);
+
   const [viewport, setViewport] = useState<Viewport | null>(null);
+  /**
+   * Das zuletzt GEMELDETE Rasterfeld — Wächter gegen Durchgänge ohne Wirkung.
+   * Begründung an `onRegionChange`, die Rundung gehört mit dem Abfrage-Schlüssel
+   * zusammen (siehe `keyLat` weiter unten).
+   */
+  const viewportBucketRef = useRef<string | null>(null);
 
   // StopDetailSheet wird global in app/_layout.tsx gerendert (damit's ÜBER
   // der FloatingTabBar liegt). Wir setzen hier nur den Store-State beim
@@ -271,6 +819,189 @@ export default function SurroundingsScreen() {
     assistantOverMap ||
     historyOverMap;
 
+  /**
+   * Der Kompass für den Blickrichtungs-Kegel läuft nur, solange die Karte zu
+   * sehen und nicht eingefroren ist — geschaltet von HIER, weil ein Prop den
+   * eingefrorenen Kegel nicht mehr erreicht (siehe `useDeviceHeading`).
+   */
+  /**
+   * Auch nicht unter einem deckenden Blatt — Detail-Blatt, Zeitleiste,
+   * Ergebnisliste. Die halten die Karte nicht an (`frozen`), sie liegt aber
+   * vollständig darunter, und der Kegel rechnete dort ungesehen weiter.
+   */
+  const coveredByOverlay = useSearchStore(
+    (st) =>
+      st.selectedResult != null ||
+      st.legTimelineOverlayOpen ||
+      st.directTripResult != null ||
+      st.resultsParams != null,
+  );
+  useEffect(() => {
+    setDeviceHeadingActive(isFocused && !frozen && !coveredByOverlay);
+  }, [isFocused, frozen, coveredByOverlay]);
+  useEffect(() => () => setDeviceHeadingActive(false), []);
+
+  /**
+   * NUR DIE KARTE — Hochwischen an der Suchleiste schiebt die Oberfläche aus
+   * dem Bild, ein Tipp auf die Karte holt sie zurück. Der Wert und die Regeln
+   * stehen in `lib/surroundings/mapChrome.ts`.
+   *
+   * Beim Verlassen des Tabs SOFORT zurück, ohne Bewegung: Die Tab-Leiste hängt
+   * am Wurzel-Layout und liest denselben Wert — auf dem nächsten Tab muss sie
+   * stehen. Sieht dort ohnehin niemand die Karte.
+   */
+  useEffect(() => {
+    if (!isFocused) showMapChrome(false);
+  }, [isFocused]);
+  /**
+   * Die Zurück-Taste holt zuerst die Oberfläche zurück — so, wie sie ein
+   * offenes Blatt schließt, bevor sie den Bildschirm verlässt. Nur solange der
+   * Tab vorn ist; sonst gehört sie anderen.
+   */
+  useEffect(() => {
+    if (!isFocused) return;
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      if (!isMapChromeHidden()) return false;
+      showMapChrome();
+      return true;
+    });
+    return () => sub.remove();
+  }, [isFocused]);
+  const onMapPress = useCallback(() => {
+    if (isMapChromeHidden()) showMapChrome();
+  }, []);
+  /**
+   * Live: Takt und Kamera nur, solange man hinsieht — Tab vorn, App vorn.
+   * Die Fahrt lädt der Server (Halte, Zeiten, Verlauf), den Rest rechnet die App.
+   */
+  const appActive = useAppActive();
+  const liveRunning = liveActive && isFocused && appActive;
+  const { model: liveModel, status: liveStatus } = useLiveModel(liveSession, liveRunning);
+  useEffect(() => {
+    if (!liveActive) return;
+    // Die Kamera gehört jetzt dem Fahrzeug, nicht mehr dem eigenen Standort.
+    followUserRef.current = false;
+    // Im Nur-Karte-Modus gestartet (Tafel über Bo): Banner und Karte zeigen.
+    if (isMapChromeHidden()) showMapChrome();
+  }, [liveActive]);
+  /**
+   * Zurück aus der Live-Ansicht — wie aus dem Routen-Modus: die geparkte
+   * Oberfläche zurücklegen und das Blatt wieder hereinfahren. Die Karte wird
+   * wieder flach und nach Norden ausgerichtet und kehrt zur Haltestelle zurück:
+   * Das Fahrzeug kann weit weg gefahren sein, und die Tafel gehört über ihren
+   * Halt, nicht über die letzte Stelle des Zuges. Reihenfolge wie beim Tipp auf
+   * eine Haltestelle (`focusStop`): erst das Blatt, dann die Kamera — so kennt
+   * der freie Ausschnitt schon dessen Höhe.
+   *
+   * KEIN FLUG ZURÜCK, wenn der Halt weit weg ist (meist: Das Fahrzeug ist
+   * längst ein paar Kilometer weiter). Das war ein Bogenflug bis 2,6 s, mit 58°
+   * Neigung durch Kacheln, die keiner im Speicher hatte, Bild für Bild auf dem
+   * UI-Strang — zugleich mit dem Umbau der Oberfläche. Gemeldet als „laggt zwei
+   * Sekunden lang". Jetzt ein Schnitt: altes Bild einfrieren, Kamera springt
+   * darunter zum Halt (dessen Kacheln kennt die Karte noch), Überblendung.
+   * Die Kamera geht VOR dem Zurücklegen des Zustands los — eingefroren wird das
+   * Bild, bevor Ebenen wechseln.
+   */
+  const closeLive = useCallback(() => {
+    haptic("button");
+    const st = useSearchStore.getState();
+    const stash = st.stashedSurroundings;
+    if (stash && (stash.selectedStop || stash.city)) openStopSheet();
+    const at = stash?.selectedStop;
+    const map = mapRef.current;
+    if (at?.latitude != null && at.longitude != null) {
+      const zoom = mode === "transit" ? 15 : 11;
+      map?.followTo({
+        latitude: at.latitude,
+        longitude: at.longitude,
+        zoom,
+        bearing: 0,
+        pitch: 0,
+        // Immer einen Rand mitgeben: Ohne behielte MapLibre den der Live-Ansicht
+        // (Banner + Karte unten), und der Halt säße außerhalb der Mitte.
+        padding: visiblePadding() ?? { top: 0, bottom: 0, left: 0, right: 0 },
+        cut: map.isFar(at.latitude, at.longitude, zoom),
+      });
+    } else {
+      map?.resetNorth();
+    }
+    st.stopLive();
+  }, [mode, visiblePadding]);
+  useEffect(() => {
+    if (!isFocused || !liveActive) return;
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      closeLive();
+      return true;
+    });
+    return () => sub.remove();
+  }, [isFocused, liveActive, closeLive]);
+  /**
+   * Die Unterkante dessen, was oben steht — Suchleiste oder, im Routen-Modus,
+   * das Routen-Banner. Die Knopfreihe beginnt darunter im selben Abstand, den
+   * der Standort-Knopf unten zum Blatt hat (`SPACE.md`).
+   *
+   * Gemessen statt geschätzt: Hier stand ein fester Wert (`insets.top + 70`),
+   * geraten aus der Höhe der Leiste. Die hängt aber an Schriftgröße und
+   * Skalierung — die Knopfreihe klebte fast an der Leiste, während unten der
+   * Standort-Knopf sichtbar Luft zum Blatt hatte.
+   */
+  const [topBarBottom, setTopBarBottom] = useState<number | null>(null);
+  /**
+   * Wie weit die Suchleiste bis hinter den oberen Rand hat — gemessen, nicht
+   * geschätzt (Statusleiste, Schriftgröße und Schatten gehen alle ein).
+   */
+  const onSearchWrapLayout = useCallback((e: LayoutChangeEvent) => {
+    const { y, height } = e.nativeEvent.layout;
+    // Plus Luft für den Schatten, der über die Kante hinausreicht.
+    travelSearch.value = y + height + 16;
+    topBarBottomRef.current = y + height;
+    setTopBarBottom(y + height);
+  }, []);
+  const onRouteBannerLayout = useCallback((e: LayoutChangeEvent) => {
+    const { y, height } = e.nativeEvent.layout;
+    topBarBottomRef.current = y + height;
+    setTopBarBottom(y + height);
+  }, []);
+  const searchChromeStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: -Math.min(chromeShift.value, travelSearch.value) }],
+  }));
+  /**
+   * Die Geste — NUR an der Suchleiste, nur nach OBEN.
+   *
+   * Sie springt erst nach zehn Punkten Weg aufwärts an; bis dahin gehört die
+   * Berührung der Leiste, ein Tipp öffnet also weiter die Suche. Springt sie an,
+   * bricht RNGH den Tipp der Leiste ab. Nach unten oder quer scheitert sie
+   * sofort — ein Wisch auf der Karte kann sie gar nicht erst auslösen, er
+   * beginnt ja nicht auf der Leiste.
+   *
+   * Die Verschiebung ist der Weg des Fingers, eins zu eins: Die Leiste klebt am
+   * Finger, und alle anderen Teile fahren genau dieselbe Strecke mit (siehe
+   * `chromeShift`). Der Nullpunkt ist die Stelle, an der die Geste anspringt —
+   * sonst sprängen alle um die zehn Punkte Anlauf auf einmal los.
+   */
+  const chromeBase = useSharedValue(0);
+  const chromePan = useMemo(
+    () =>
+      Gesture.Pan()
+        .activeOffsetY(-10)
+        .failOffsetY(10)
+        .failOffsetX([-30, 30])
+        .onStart((e) => {
+          chromeBase.value = e.translationY;
+        })
+        .onUpdate((e) => {
+          const shift = -(e.translationY - chromeBase.value);
+          chromeShift.value = Math.min(maxTravel(), Math.max(0, shift));
+        })
+        .onEnd((e) => {
+          const hide =
+            chromeShift.value > HIDE_AT * travelSearch.value || e.velocityY < HIDE_VELOCITY;
+          settle(hide ? maxTravel() : 0, e.velocityY);
+          runOnJS(markMapChromeHidden)(hide);
+        }),
+    [chromeBase],
+  );
+
   const [mapMounted, setMapMounted] = useState(false);
   /**
    * Einwegs war falsch — beim Einfrieren gehört das Skelett zurück.
@@ -341,6 +1072,9 @@ export default function SurroundingsScreen() {
     if (isFocused) return;
     if (!mapMounted) return;
     wasFullyLoadedRef.current = false;
+    // Eine Karte, die mitten in einer Bewegung abgebaut wird, meldet deren Ende
+    // nie — ohne das hielte jede `whenMapQuiet`-Arbeit ihre volle Wartezeit.
+    setMapMoving(false);
     setMapMounted(false);
   }, [frozen, isFocused, mapMounted]);
 
@@ -518,12 +1252,20 @@ export default function SurroundingsScreen() {
   // Query-Key in grobe Buckets runden — Center auf ~500 m, Distanz auf 1 km.
   // Damit triggern kleine Pans (User wischt durch die Karte) keinen Refetch
   // mehr; erst nach signifikanter Bewegung kommt frische Daten.
+  //
+  // DIESELBEN vier Zahlen prüft `onRegionChange` weiter unten, bevor es
+  // überhaupt einen Zustand setzt — über `viewportBucket`. Liefen die beiden
+  // Rundungen auseinander, gäbe es entweder Abfragen ohne Anlass oder, schlimmer,
+  // einen verschobenen Ausschnitt ohne Nachfrage.
   const keyLat = effectiveViewport ? Math.round(effectiveViewport.latitude * 200) / 200 : 0; // ~500m
   const keyLng = effectiveViewport ? Math.round(effectiveViewport.longitude * 200) / 200 : 0;
   const keyDistance = effectiveViewport
     ? Math.round(effectiveViewport.distance / 1000) * 1000
     : DEFAULT_VIEWPORT_DISTANCE;
-  const keyZoom = effectiveViewport ? Math.round(effectiveViewport.zoom) : DEFAULT_ZOOM;
+  // Die STUFE, nicht der Zoom — siehe `zoomBand`. Der Vorgabewert geht denselben
+  // Weg, sonst fragte der erste Aufruf mit einem Wert, den kein späterer je
+  // wieder trifft.
+  const keyZoom = zoomBand(effectiveViewport ? effectiveViewport.zoom : DEFAULT_ZOOM);
 
   // Zoom-abhängiges Marker-Limit: bei rausgezoomter Karte wollen wir viele
   // Train-Stationen für Clustering; unter zoom 9 zeigt der Server eh nichts.
@@ -595,6 +1337,7 @@ export default function SurroundingsScreen() {
         kinds: m.kinds,
         coord: { latitude: m.latitude, longitude: m.longitude },
         label: m.label,
+        detail: m.detail,
         selected: m.selected,
       }));
     }
@@ -615,6 +1358,9 @@ export default function SurroundingsScreen() {
         kinds: l.kinds,
         distance: l.distance,
         lines: l.lines,
+        // Zusatz nur bei gleichnamigem Halt daneben („Stop RA") — als die
+        // vorhandene leise Plakette der Zeile, nicht im Namen.
+        badge: l.detail,
         selected: l.selected,
       }));
     }
@@ -641,11 +1387,25 @@ export default function SurroundingsScreen() {
     (id: string, fly: boolean) => {
       const m = markers.find((mm) => mm.id === id);
       if (!m) return;
+      followUserRef.current = false;
+      if (fly) lastCityFitRef.current = null;
+      /**
+       * Steht das Blatt schon offen, bleibt es, wo es ist — nur der Inhalt
+       * wechselt, wie beim Tipp auf eine Stadt (`onCityPress`). Das kommt jetzt
+       * oft vor: Das Blatt deckt die Karte nicht mehr ab, man tippt bei offenem
+       * Blatt die nächste Haltestelle an.
+       */
+      // „Offen" = im Bild, nicht bloß im Store (siehe `onCityPress`).
+      if (sheetTargets().stop == null) openStopSheet();
+      /**
+       * Erst das Blatt, dann der Flug: So kennt der freie Ausschnitt schon die
+       * Höhe, auf die das Blatt fährt, und die Station landet in der Mitte
+       * darüber statt an dessen Oberkante.
+       */
       if (fly) {
         const zoom = mode === "transit" ? 15 : 11;
-        mapRef.current?.flyTo(m.coord.latitude, m.coord.longitude, zoom);
+        mapRef.current?.flyTo(m.coord.latitude, m.coord.longitude, zoom, visiblePadding());
       }
-      openStopSheet();
       // Ohne eigenen Standort gibt es keine Entfernung — dann lieber keine
       // Angabe als eine, die von einem fremden Ort aus gerechnet ist.
       const here = latestCoordRef.current;
@@ -653,11 +1413,15 @@ export default function SurroundingsScreen() {
       selectStop({
         code: m.id,
         label: m.label ?? "",
+        detail: m.detail,
         distanceMeters: dist == null ? undefined : Math.round(dist),
         kinds: m.kinds && m.kinds.length > 0 ? m.kinds : [m.type],
+        // Für den Fußweg vom Standort dorthin (WalkPathLayer).
+        latitude: m.coord.latitude,
+        longitude: m.coord.longitude,
       });
     },
-    [markers, mode, openStopSheet, selectStop],
+    [markers, mode, openStopSheet, selectStop, visiblePadding],
   );
   focusStopRef.current = focusStop;
 
@@ -676,6 +1440,11 @@ export default function SurroundingsScreen() {
    * Kennung wieder bei jeder Antwort neu, und wir hätten nichts gewonnen.
    */
   const selectStopFromList = useCallback((id: string) => focusStopRef.current(id, true), []);
+  /**
+   * Ein Tipp auf eine Haltestelle öffnet ihr Blatt. Die Oberfläche bleibt im
+   * Nur-Karte-Modus weg: Zurück holt sie NUR ein Tipp auf die freie Karte —
+   * jedes Element auf der Karte (Haltestelle, Route, Stadt) ist kein solcher.
+   */
   const selectStopFromMap = useCallback((id: string) => focusStopRef.current(id, false), []);
   /**
    * Die Freigabe des Skeletts liegt HIER, nicht im Kartenbauteil.
@@ -723,20 +1492,24 @@ export default function SurroundingsScreen() {
    */
   const pendingFlyRef = useRef<{ lat: number; lng: number; zoom: number } | null>(null);
   const flyToOrRemember = useCallback((lat: number, lng: number, zoom: number) => {
+    followUserRef.current = false;
+    lastCityFitRef.current = null;
     if (!frozenRef.current) {
       pendingFlyRef.current = null;
-      mapRef.current?.flyTo(lat, lng, zoom);
+      mapRef.current?.flyTo(lat, lng, zoom, visiblePadding());
       return;
     }
     pendingFlyRef.current = { lat, lng, zoom };
-  }, []);
+  }, [visiblePadding]);
   useEffect(() => {
     if (frozen || !mapTilesRendered) return;
     const target = pendingFlyRef.current;
     if (!target) return;
     pendingFlyRef.current = null;
-    mapRef.current?.flyTo(target.lat, target.lng, target.zoom);
-  }, [frozen, mapTilesRendered]);
+    // Die Fahrt setzt den Rand ohnehin neu — eine offene Angleichung entfällt.
+    pendingRealignRef.current = false;
+    mapRef.current?.flyTo(target.lat, target.lng, target.zoom, visiblePadding());
+  }, [frozen, mapTilesRendered, visiblePadding]);
 
   // Beim ersten GPS-Fix auf den Standort fliegen — Zoom je nach Modus.
   // Wird übersprungen wenn eine Route aktiv ist (dann fitten wir auf die Route).
@@ -756,7 +1529,7 @@ export default function SurroundingsScreen() {
   const latestCoordRef = useRef(userCoord);
   latestCoordRef.current = userCoord;
   useEffect(() => {
-    if (routeActive) return;
+    if (routeActive || liveActive) return;
     if (locationStatus === "loading") return;
     /**
      * ERST prüfen, ob die Karte überhaupt existiert — dann die Sperre setzen.
@@ -796,8 +1569,9 @@ export default function SurroundingsScreen() {
     flownToRef.current = userCoord;
     didInitialFlyRef.current = true;
     const zoom = mode === "transit" ? 13 : mode === "airport" ? 5 : 4;
-    mapRef.current.flyTo(userCoord.latitude, userCoord.longitude, zoom);
-  }, [userCoord, routeActive, locationStatus, mode, mapMounted]);
+    // In die Mitte des freien Ausschnitts, wie der Standort-Knopf.
+    mapRef.current.flyTo(userCoord.latitude, userCoord.longitude, zoom, visiblePadding());
+  }, [userCoord, routeActive, liveActive, locationStatus, mode, mapMounted, visiblePadding]);
 
   // Wenn eine Route gesetzt wird → Bounds berechnen und Karte darauf fitten.
   useEffect(() => {
@@ -823,9 +1597,10 @@ export default function SurroundingsScreen() {
       setMode(m);
       if (!userCoord) return;
       const zoom = m === "transit" ? 13 : m === "airport" ? 5 : 4;
-      mapRef.current?.flyTo(userCoord.latitude, userCoord.longitude, zoom);
+      lastCityFitRef.current = null;
+      mapRef.current?.flyTo(userCoord.latitude, userCoord.longitude, zoom, visiblePadding());
     },
-    [userCoord],
+    [userCoord, visiblePadding],
   );
 
   /**
@@ -862,8 +1637,30 @@ export default function SurroundingsScreen() {
        * Messung zieht danach nach, aber nur, wenn sie nennenswert woanders
        * liegt; ein zweiter Flug über wenige Meter sähe wie ein Wackler aus.
        */
+      /**
+       * `glideTo` statt `flyTo`: Die Fahrt richtet sich jetzt nach dem Weg und
+       * behält die Zoomstufe, wenn man schon nah dran war — siehe dort.
+       */
+      /**
+       * Erst warten, bis die Karte wieder läuft. „Aktueller Standort" im
+       * Suchfeld der Karte ruft hierher, während der Ortswähler die Karte noch
+       * deckt — eingefroren kommt ein Kamerabefehl nicht an (derselbe Verlust,
+       * gegen den `flyToOrRemember` Suchtreffer vormerkt). Höchstens anderthalb
+       * Sekunden; danach wird trotzdem gefahren.
+       */
+      for (let waited = 0; frozenRef.current && waited < 1500; waited += 50) {
+        await new Promise((done) => setTimeout(done, 50));
+      }
       const known = latestCoordRef.current;
-      if (known) mapRef.current?.flyTo(known.latitude, known.longitude, 14);
+      let arrivesAt = Date.now();
+      // Ab jetzt steht die Kamera auf dem Standort — siehe `followUserRef`.
+      followUserRef.current = true;
+      // Und der Rahmen einer Stadt gilt nicht mehr als das, was man sieht.
+      lastCityFitRef.current = null;
+      if (known) {
+        arrivesAt +=
+          mapRef.current?.glideTo(known.latitude, known.longitude, 14, visiblePadding()) ?? 0;
+      }
       await refreshLocation();
       // Nach dem await steht in `userCoord` noch der ALTE Wert aus der Closure
       // des Renders, in dem dieser Rückruf entstand. Frisch aus dem Hook lesen.
@@ -873,19 +1670,160 @@ export default function SurroundingsScreen() {
         !known ||
         Math.abs(known.latitude - fresh.latitude) > 0.0008 ||
         Math.abs(known.longitude - fresh.longitude) > 0.0008;
-      if (moved) mapRef.current?.flyTo(fresh.latitude, fresh.longitude, 14);
+      if (!moved) return;
+      /**
+       * Die Nachkorrektur erst, wenn die erste Fahrt ANGEKOMMEN ist.
+       *
+       * Die frische Messung kommt oft schon nach wenigen hundert Millisekunden
+       * — also mitten in die laufende Fahrt. Ein neuer Kamerabefehl bricht die
+       * alte dort ab, wo sie gerade ist, und startet mit neuer Kurve: Aus einer
+       * ausrollenden Bewegung wurde ein Ruck. Jetzt rollt die erste zu Ende,
+       * und die zweite ist ein kurzes, eigenes Nachgleiten über die paar
+       * hundert Meter.
+       */
+      const wait = arrivesAt - Date.now();
+      if (wait > 0) await new Promise((done) => setTimeout(done, wait));
+      // Inzwischen selbst woandershin geschaut? Dann nicht zurückreißen.
+      if (!followUserRef.current) return;
+      mapRef.current?.glideTo(fresh.latitude, fresh.longitude, 14, visiblePadding());
     } finally {
       locatingRef.current = false;
       setLocating(false);
     }
-  }, [refreshLocation]);
+  }, [refreshLocation, visiblePadding]);
 
-  const onToggleLayers = useCallback(() => {
-    setMapType((t) => (t === "standard" ? "satellite" : "standard"));
+  // Fest gehalten — das Auswahlfenster ist `memo` (siehe dort).
+  const locateAccessory = useMemo(
+    () => <LocateFab onPress={onLocate} locating={locating} />,
+    [onLocate, locating],
+  );
+
+  /**
+   * NACHFÜHREN — der Standort bleibt in der Mitte des freien Ausschnitts.
+   *
+   * Öffnet, schließt oder rastet ein Blatt ein (oder geht die Oberfläche in
+   * den Nur-Karte-Modus und zurück), ändert sich der freie Ausschnitt. Steht
+   * die Kamera auf dem eigenen Standort, gleitet sie mit — ausgelöst vom ZIEL
+   * der Blatt-Bewegung, also im selben Moment, in dem das Blatt losfährt.
+   * Gemeldet: „schließe ich die Slide, soll die Kamera weich nachkorrigieren".
+   *
+   * Nicht, solange die Karte eingefroren ist (anderer Tab) — dort zeichnet
+   * nichts, und eine Fahrt käme beim Zurückkehren als Sprung an.
+   *
+   * Steht die Kamera NICHT auf dem Standort und schließt das Haltestellen-
+   * bzw. Stadt-Blatt, bleibt die Karte stehen — aber ihr Rand wird auf den
+   * jetzt freien Ausschnitt gesetzt (`realignPadding`, ohne Bewegung). Sonst
+   * galt weiter die Höhe des Blattes: Der gemeldete Mittelpunkt lag oben im
+   * Bild, und die Haltestellen am unteren Rand wurden nicht geladen.
+   */
+  const lastStopTargetRef = useRef<number | null>(null);
+  /** Rand-Angleichung fällig geworden, während die Karte eingefroren war (anderer Tab). */
+  const pendingRealignRef = useRef(false);
+  /**
+   * Den Rand angleichen — erst wenn Karte und Blatt ruhen, und mit Gegenprobe
+   * im Moment, in dem die Karte antwortet (`realignPadding` fragt sie
+   * asynchron): kein Finger auf der Karte, keine Bewegung, kein Blatt offen.
+   */
+  const realignWhenQuiet = useCallback(() => {
+    const ok = () =>
+      !liveActiveRef.current &&
+      !isMapMoving() &&
+      !mapTouchRef.current &&
+      !frozenRef.current &&
+      sheetTargets().stop == null &&
+      !followUserRef.current;
+    whenMapQuiet(() => {
+      // Nie in eine Bewegung oder unter einen Finger hinein — lieber bleibt
+      // der alte Rand bis zur nächsten Fahrt.
+      if (!ok()) return;
+      mapRef.current?.realignPadding(visiblePadding() ?? { top: 0, bottom: 0, left: 0, right: 0 }, ok);
+    });
+  }, [visiblePadding]);
+  useEffect(
+    () =>
+      subscribeViewport(() => {
+        const stopNow = sheetTargets().stop;
+        const stopClosed = lastStopTargetRef.current != null && stopNow == null;
+        lastStopTargetRef.current = stopNow;
+        // Live führt die Kamera selbst — das Blatt, das beim Start hinausfährt,
+        // darf sie nicht anschließend zurechtrücken.
+        if (liveActiveRef.current) return;
+        if (frozenRef.current) {
+          // Nachholen, sobald die Karte wieder läuft (siehe unten) — sonst
+          // bliebe der Rand des Blattes stehen, und die Haltestellen am
+          // unteren Bildrand würden nicht geladen.
+          // Folgt die Kamera dem Standort, holt sie dort die Gleitfahrt nach.
+          if (stopClosed || followUserRef.current) pendingRealignRef.current = true;
+          return;
+        }
+        if (followUserRef.current) {
+          const here = latestCoordRef.current;
+          const pad = visiblePadding();
+          if (!here || !pad) return;
+          // Zoom 0 als Untergrenze: die Stufe bleibt, wie sie ist.
+          mapRef.current?.glideTo(here.latitude, here.longitude, 0, pad);
+          return;
+        }
+        if (!stopClosed) return;
+        /**
+         * Erst NACH der Ausfahrt: Die Kamera meldet danach einen neuen
+         * Ausschnitt, und der lädt Haltestellen nach — ein React-Durchgang, der
+         * mitten in der Ausfahrt des Blattes als Ruck zu sehen wäre.
+         */
+        setTimeout(realignWhenQuiet, SHEET_OUT.duration + 40);
+      }),
+    [visiblePadding, realignWhenQuiet],
+  );
+  /**
+   * Die im eingefrorenen Zustand fällig gewordene Angleichung nachholen.
+   *
+   * Die Marke fällt erst IM Zeitgeber: Friert die Karte innerhalb der 300 ms
+   * wieder ein, räumt React den Zeitgeber ab — und die Angleichung bleibt für
+   * das nächste Auftauen vorgemerkt, statt verloren zu gehen.
+   */
+  useEffect(() => {
+    if (frozen || !mapTilesRendered || !pendingRealignRef.current) return;
+    const id = setTimeout(() => {
+      pendingRealignRef.current = false;
+      if (followUserRef.current) {
+        const here = latestCoordRef.current;
+        const pad = visiblePadding();
+        if (here && pad) mapRef.current?.glideTo(here.latitude, here.longitude, 0, pad);
+        return;
+      }
+      realignWhenQuiet();
+    }, 300);
+    return () => clearTimeout(id);
+  }, [frozen, mapTilesRendered, realignWhenQuiet, visiblePadding]);
+
+  /**
+   * Der obere Knopf öffnet jetzt das KARTENTYP-BLATT statt binär umzuschalten.
+   *
+   * Vorher legte er `mapType` zwischen „standard" und „satellite" um — eine
+   * Variable, die die Kartenfläche gar nicht las. Der Knopf tat also sichtbar
+   * nichts außer sein eigenes Zeichen einzufärben.
+   *
+   * Fest (`useCallback` ohne Abhängigkeiten): Die Hülle des Blattes richtet an
+   * dieser Funktion ihre Wisch-Geste und den Merker für die Zurück-Taste ein —
+   * eine neue Funktion pro Durchgang täte das mitten in der Bewegung.
+   */
+  const openMapType = useCallback(() => {
+    haptic("button");
+    setMapTypeOpen(true);
   }, []);
+  const closeMapType = useCallback(() => setMapTypeOpen(false), []);
 
-  const onToggleTraffic = useCallback(() => {
-    setTrafficOn((v) => !v);
+
+  /**
+   * Geraderücken. Der Knopf verschwindet NICHT von hier aus — er verschwindet,
+   * weil die Karte danach „bin bei Norden" meldet und der Wächter oben den
+   * Zustand umlegt. Ihn hier vorsorglich auszublenden wäre eine zweite
+   * Wahrheit über dieselbe Sache; liefe die Bewegung ins Leere, wäre der Knopf
+   * weg und die Karte weiter schief.
+   */
+  const onResetNorth = useCallback(() => {
+    haptic("button");
+    mapRef.current?.resetNorth();
   }, []);
 
   /**
@@ -893,23 +1831,191 @@ export default function SurroundingsScreen() {
    * Such-Radius (Center → NE-Ecke = halbe Diagonale in Metern). Den geben wir
    * zusammen mit dem Zoom-Level ans Backend, das daraus passend filtert.
    */
+  /**
+   * Gibt es hier ein amtliches Luftbild? Fragt den Server (je Feld einmal) und
+   * setzt `aerialMaxZoom` und `aerialOfficial` — Letzteres entscheidet, ob Esri
+   * gezeigt wird. Aufgerufen am Ende jeder Bewegung und beim Umschalten auf die
+   * Satellitenansicht (sonst bliebe Esri aus, bis man die Karte verschiebt).
+   */
+  const checkAerialCoverage = useCallback((r: { latitude: number; longitude: number; zoom: number }) => {
+    if (mapStyleNameRef.current === "satellite" && r.zoom >= 13) {
+      const fein = r.zoom >= 15 ? 200 : 50;
+      const cell = `${fein}:${Math.round(r.latitude * fein)}:${Math.round(r.longitude * fein)}`;
+      const known = coverageCacheRef.current.get(cell);
+      if (known !== undefined) {
+        setAerialMaxZoom((prev) => (prev === known.maxZoom ? prev : known.maxZoom));
+        setAerialOfficial((prev) => (prev === known.amtlich ? prev : known.amtlich));
+      } else if (coverageAskRef.current !== cell) {
+        coverageAskRef.current = cell;
+        /*
+         * Bis die Antwort da ist, bleibt der bisherige Stand. Hier stand
+         * einmal ein Zurücksetzen auf „unbekannt" — das blendete Esri bei
+         * JEDEM neuen Feld aus und gleich wieder ein: Beim Verschieben und
+         * beim Zoomen über Stufe 15 (dort wechselt die Feldgröße) flackerte
+         * es. Über ein amtliches Bild legt sich Esri trotzdem nicht: Der Server
+         * liefert dort je Kachel kein Esri aus (routes/imagery.ts), darunter
+         * bleibt das bessere Bild sichtbar, und es kostet nichts.
+         */
+        fetchAerialCoverage(r.latitude, r.longitude)
+          .then((c) => {
+            // Eine unsichere Antwort (Landesquelle gerade nicht erreichbar) wird
+            // nicht gemerkt und schaltet Esri nicht ein — beim nächsten Halt
+            // wird neu gefragt.
+            if (c.vorlaeufig) {
+              if (coverageAskRef.current === cell) coverageAskRef.current = null;
+              return;
+            }
+            const cache = coverageCacheRef.current;
+            if (cache.size > 300) cache.clear();
+            cache.set(cell, { maxZoom: c.maxZoom, amtlich: c.amtlich });
+            if (coverageAskRef.current === cell) {
+              setAerialMaxZoom((prev) => (prev === c.maxZoom ? prev : c.maxZoom));
+              setAerialOfficial((prev) => (prev === c.amtlich ? prev : c.amtlich));
+            }
+          })
+          .catch(() => {
+            // Keine Antwort — dann bleibt die Grenze, wie sie war. Beim nächsten
+            // Stillstand in diesem Feld wird neu gefragt.
+            if (coverageAskRef.current === cell) coverageAskRef.current = null;
+          });
+      }
+    }
+  }, []);
+  useEffect(() => {
+    if (mapStyleName !== "satellite") return;
+    // Der Stand von vorher gilt nicht mehr — neu fragen, ohne auf eine Bewegung zu warten.
+    setAerialOfficial(null);
+    coverageAskRef.current = null;
+    const r = lastRegionRef.current;
+    if (r) checkAerialCoverage(r);
+  }, [mapStyleName, checkAerialCoverage]);
+
   const onRegionChange = useCallback((r: RegionInfo) => {
-    const [, , east, north] = r.bounds;
-    const radius = distanceMeters(
-      { latitude: r.latitude, longitude: r.longitude },
-      { latitude: north, longitude: east },
+    // Die Bewegung ist zu Ende — wartende Kartendaten dürfen jetzt (`whenMapQuiet`).
+    setMapMoving(false);
+    liveZoom.report(r.zoom, true);
+    /**
+     * Bis zur FERNSTEN Ecke. Der gemeldete Mittelpunkt ist der des freien
+     * Ausschnitts (Kamera-Rand für Leiste und Blatt), nicht der des Bildes —
+     * bis zur Nordost-Ecke allein reichte der Umkreis dann nicht bis an den
+     * unteren Bildrand.
+     */
+    const [west, south, east, north] = r.bounds;
+    const center = { latitude: r.latitude, longitude: r.longitude };
+    const radius = Math.max(
+      distanceMeters(center, { latitude: north, longitude: east }),
+      distanceMeters(center, { latitude: north, longitude: west }),
+      distanceMeters(center, { latitude: south, longitude: east }),
+      distanceMeters(center, { latitude: south, longitude: west }),
     );
     // Distanz-Cap zoom-abhängig: Stadt-Zoom (13+) eng, Train-only-Bereich
     // (zoom 9-12) etwas weiter für Clustering. Unter zoom 9 zeigen wir eh
     // nichts mehr (siehe typesForZoom), also kein größerer Cap nötig.
     const cap = r.zoom >= 13 ? 20_000 : r.zoom >= 11 ? 50_000 : 120_000;
-    setViewport({
+    // Immer mitschreiben — auch wenn unten nichts weiter passiert.
+    lastRegionRef.current = {
+      latitude: r.latitude,
+      longitude: r.longitude,
+      zoom: r.zoom,
+      bearing: r.bearing,
+      pitch: r.pitch,
+    };
+
+    /**
+     * Zoomgrenze der Satellitenkarte — erst ab Stufe 15 gefragt.
+     *
+     * VOR dem Raster-Wächter weiter unten: Wer an Ort und Stelle hineinzoomt,
+     * bleibt im selben Abfrage-Raster, und genau dann wird die Grenze gebraucht.
+     * (Der Kompass stand früher aus demselben Grund hier; er hängt jetzt an
+     * `onCameraFrame`.)
+     *
+     * Darunter ist die Grenze ohnehin weit weg, und ein Schwenk über ein Land
+     * hinweg bräuchte sonst Dutzende Antworten, die niemand nutzt. Die Frage
+     * geht je Feld nur einmal hinaus; eine Antwort, die zu spät kommt (man ist
+     * längst woanders), wird verworfen. Gesetzt wird nur, wenn sich der Wert
+     * ändert — ein gleicher Wert wäre ein Durchgang ohne Wirkung.
+     */
+    /*
+     * Ab Stufe 13 statt 15: Dort beginnt die Esri-Ebene, und sie darf nur in
+     * den Lücken laufen. Unter 15 genügt ein gröberes Feld (rund 2 km) — beim
+     * Schwenken über eine Gegend sind es sonst zu viele Fragen.
+     */
+    checkAerialCoverage(r);
+
+    /**
+     * Live: keine Haltestellen-Abfragen. Die Folge-Kamera meldet jede Sekunde
+     * einen neuen Ausschnitt; jede Abfrage baute Liste und Marker neu auf, die
+     * gerade gar nicht zu sehen sind. Nur der Zoom zählt (Größe des Fahrzeugs).
+     */
+    if (liveActiveRef.current) {
+      clearPendingViewport();
+      return;
+    }
+
+    const next: Viewport = {
       latitude: r.latitude,
       longitude: r.longitude,
       distance: Math.min(cap, Math.max(200, Math.round(radius))),
       zoom: r.zoom,
-    });
-  }, []);
+    };
+    /**
+     * NUR setzen, wenn sich das Abfrage-Raster wirklich ändert.
+     *
+     * Vorher lief hier bei JEDER beendeten Kartenbewegung ein `setState` — und
+     * damit ein Durchgang des ganzen Bildschirms samt Liste, Knöpfen und
+     * Markierungs-Ableitung. Gebracht hat der in den meisten Fällen nichts: Der
+     * Abfrage-Schlüssel ist auf ein ~500m-Raster gerundet, ein kurzer Wisch
+     * bleibt also im selben Feld und holt ohnehin dieselben Daten.
+     *
+     * Der Durchgang fiel dabei in den unangenehmsten Moment — genau dann, wenn
+     * die Karte gerade zum Stehen kommt und der Finger noch auf dem Glas liegt.
+     * Das ist die Sorte Arbeit, die sich als Mikroruckler zeigt: kein Bild
+     * fehlt ganz, aber eines kommt zu spät.
+     *
+     * Die Ecke, in der der Zustand stehen bleibt, ist unschädlich — sie liegt
+     * definitionsgemäß im selben Rasterfeld und rundet auf denselben Schlüssel.
+     */
+    const bucket = `${Math.round(next.latitude * 200)}|${Math.round(next.longitude * 200)}|${Math.round(next.distance / 1000)}|${zoomBand(next.zoom)}`;
+    if (bucket === viewportBucketRef.current) {
+      // Zurück im Feld, das schon gilt — eine noch wartende Abfrage für ein
+      // anderes Feld ist damit hinfällig.
+      clearPendingViewport();
+      return;
+    }
+    /**
+     * ERST ABFRAGEN, WENN DIE KARTE WIRKLICH STEHT — 600 ms ohne Bewegung.
+     *
+     * „Bewegung beendet" meldet MapLibre nicht erst, wenn man aufhört, sondern
+     * bei jeder kurzen Pause der Kamera — beim Hin- und Herwischen also etwa
+     * einmal pro Sekunde, MITTEN in der Geste. Jede dieser Meldungen setzte hier
+     * sofort den Ausschnitt, die Umgebungsabfrage lief, und mit den neuen Daten
+     * baute das Blatt seine Haltestellenliste neu auf — rund dreißig Zeilen mit
+     * SVG-Zeichen, auch wenn das Blatt eingeklappt ist. Mit Perfetto gemessen:
+     * bis zu 444 neu angelegte Ansichten pro Sekunde, und genau in diesen
+     * Sekunden Bilder von 25, 35 und 60 ms statt 8,3 — die großen Ruckler beim
+     * Wischen.
+     *
+     * Jetzt wartet der Ausschnitt, bis 600 ms lang keine Kamerabewegung mehr
+     * kam; jede neue bricht die Wartezeit ab (`onCameraMoveStart` an der
+     * Karte). Beim Ausrollen nach einem Wisch kommt „Bewegung beendet" erst,
+     * wenn die Karte steht, nicht schon beim Loslassen (Patch an
+     * `MLRNMapView.kt`) — die Wartezeit beginnt also dort. Beim
+     * Wischen wird damit gar nichts umgebaut, Liste und Haltestellen kommen
+     * kurz nach dem Stillstand. Der allererste Ausschnitt geht sofort durch —
+     * sonst stünde die Karte beim Öffnen eine halbe Sekunde ohne Haltestellen.
+     */
+    clearPendingViewport();
+    if (viewportBucketRef.current === null) {
+      viewportBucketRef.current = bucket;
+      setViewport(next);
+      return;
+    }
+    pendingViewportRef.current = setTimeout(() => {
+      pendingViewportRef.current = null;
+      viewportBucketRef.current = bucket;
+      setViewport(next);
+    }, VIEWPORT_SETTLE_MS);
+  }, [clearPendingViewport, checkAerialCoverage, liveZoom]);
 
   return (
     <Freeze freeze={frozen}>
@@ -932,33 +2038,171 @@ export default function SurroundingsScreen() {
           erst raus wenn MapLibre seine Tiles tatsächlich gerendert hat.
           So sieht der User nie blanke Tiles. */}
       {mapMounted && (
-        <MapSurface
-          ref={mapRef}
-          mapType={mapType}
-          showsTraffic={trafficOn}
-          onRegionChange={onRegionChange}
-          onMapRendered={onMapRendered}
-          // Die Karte startet dort, wo der Nutzer ist — siehe `initialCenter`.
-          initialCenter={userCoord ?? undefined}
+        /* Nur Mitschreiben, ob ein Finger auf der Karte liegt (siehe
+           `mapTouchRef`) — die Hülle nimmt keine Berührung weg. */
+        <View
+          style={StyleSheet.absoluteFill}
+          onTouchStart={onMapTouchStart}
+          onTouchEnd={onMapTouchEnd}
+          onTouchCancel={onMapTouchCancel}
         >
-          {/* Route-Modus: nur RouteLayer + UserPin, sonst MarkerLayer + POIs */}
-          {routeActive ? (
+        <MapSurface
+          /**
+           * NEU AUFBAUEN statt den Stil unter der laufenden Karte austauschen —
+           * und das ist kein Vorsichts-, sondern ein Absturz-Fix.
+           *
+           * MapLibre wirft beim Stilwechsel alle Ebenen des alten Stils weg.
+           * Die Java-Hüllen der Kind-Ebenen (Nadeln, Standort, Häuser) bleiben
+           * dabei bestehen und zeigen danach ins Leere; der nächste Abbau ruft
+           * `Style.removeLayer` auf einem toten Zeiger auf und nimmt den Prozess
+           * mit. Im Quelltext der Bibliothek ist das gut zu sehen:
+           *
+           *     override fun removeFromMap(mapView: MLRNMapView) {
+           *         val layer = mLayer ?: return     // nur auf null geprüft
+           *         this.style?.removeLayer(layer)   // Zeiger schon tot
+           *     }
+           *
+           * Genau das zeigte der Absturzbericht: `removeViewAt` →
+           * `removeFromMap` → `Style.removeLayer` → `Layer::get()` → SIGSEGV.
+           *
+           * Mit dem `key` erlebt keine Karte je einen Stilwechsel: Die alte wird
+           * samt ihren Kindern abgebaut, solange ihr Stil noch gültig ist, und
+           * die neue kommt mit dem neuen Stil zur Welt. Der Preis ist ein kurzer
+           * Neuaufbau beim Umschalten des Kartentyps — für eine bewusste
+           * Auswahl der richtige Tausch.
+           */
+          // Die Sprache gehört mit in den Schlüssel: Auch sie ist ein neuer Stil.
+          key={`${mapStyleName}:${mapLocale}`}
+          styleName={mapStyleName}
+          locale={mapLocale}
+          ref={mapRef}
+          onRegionChange={onRegionChange}
+          onCameraFrame={onCameraFrame}
+          // Neue Bewegung — ein wartender Ausschnitt wäre verfrüht (siehe
+          // `VIEWPORT_SETTLE_MS`).
+          onCameraMoveStart={onMapCameraMoveStart}
+          // Nur-Karte-Modus: ein Tipp auf die freie Karte holt die Oberfläche
+          // zurück (siehe `onMapPress`).
+          onMapPress={onMapPress}
+          onCityPress={onCityPress}
+          /**
+           * Die Vektorkarte darf überall bis 20: Sie wird gezeichnet, nicht
+           * gestreckt, und bleibt auf jeder Stufe scharf. Nur das Luftbild hat
+           * eine Auflösung, an der die Grenze hängt.
+           */
+          maxZoom={Math.min(
+            mapStyleName === "satellite"
+              ? // In den Lücken trägt Esri bis zu seiner Grenze (meist 19).
+                esriVisible
+                ? Math.max(aerialMaxZoom, esriLayer?.maxzoom ?? 19)
+                : aerialMaxZoom
+              : 20,
+            // Live-Flug: nicht über den Globus-Übergang hinaus — dort hebt der
+            // Bogen-Shader die Fluglinie nicht mehr (lib/live/camera.ts).
+            liveActive && liveModel?.kind === "plane" ? PLANE_MAX_ZOOM : 20,
+          )}
+          onMapRendered={onMapRendered}
+          /**
+           * Beim Neuaufbau NICHT wegspringen.
+           *
+           * `initialCenter` gilt pro Karten-Instanz, und durch den `key` oben
+           * entsteht beim Wechsel des Kartentyps eine neue. Stünde hier nur der
+           * Nutzer-Standort, führe die Karte bei jedem Umschalten dorthin
+           * zurück — man verlöre die Stelle, die man sich gerade ansieht.
+           * Deshalb zuerst der aktuelle Ausschnitt.
+           */
+          // Mit Drehung, Neigung und Rand der vorigen Karte — sonst spränge die
+          // Ansicht um den halben Unterschied der Ränder (siehe `initialCenter`).
+          initialCenter={
+            lastRegionRef.current
+              ? { ...lastRegionRef.current, padding: mapRef.current?.getPadding() }
+              : (userCoord ?? undefined)
+          }
+        >
+          {/**
+            * IMMER GEMOUNTET, nur nicht immer SICHTBAR — der Schalter legt eine
+            * Eigenschaft um, er baut keine Ebene ab.
+            *
+            * Auch das ist ein Absturz-Fix (siehe `key` an der Kartenfläche
+            * oben): Jedes Abbauen einer Kind-Ebene führt in `removeFromMap`,
+            * und das ist der Weg, auf dem die App gestorben ist. Eine Ebene,
+            * die auf „unsichtbar" steht, kostet nichts und kann nicht abstürzen.
+            *
+            * Die Bedingung auf den Kartentyp bleibt trotzdem — sie ändert sich
+            * nur gemeinsam mit dem `key`, also nie innerhalb einer Karte.
+            *
+            * IM LUFTBILD GAR NICHT — und die Bedingung steht hier, nicht nur im
+            * Blatt.
+            *
+            * Die App stürzte ab, wenn Satellit und Häuser zusammen anstanden.
+            * Der Schalter im Blatt ist dort zwar gesperrt, aber er ist nur die
+            * Bedienung: Der gespeicherte Wert kann aus einer früheren Sitzung
+            * stammen, in der Satellit noch nicht gewählt war. Die Ebene darf
+            * deshalb an der Stelle nicht entstehen, an der sie gezeichnet wird.
+            *
+            * Inhaltlich verliert dabei nichts: Auf einem Luftbild stehen die
+            * Häuser bereits im Bild. Graue Klötze darüber wären eine zweite,
+            * schlechtere Darstellung derselben Sache.
+            *
+            * Häuser mit Höhe liegen VOR den Nadeln im Baum — und das ist keine
+            * Formsache: Die Bibliothek hängt Kind-Ebenen in der Reihenfolge des
+            * Baums in den Stil, die spätere liegt also OBEN. Stünde das hier
+            * unten, wüchsen die Häuser ab Zoom 14 über die Haltestellen-Nadeln
+            * und verdeckten genau das, wofür die Karte da ist.
+            */}
+          {/* Ganz unten unter den Kind-Ebenen: Esri in den Lücken (liegt per
+              `afterId` direkt über den eigenen Luftbildern, unter allem anderen). */}
+          {mapStyleName === "satellite" && esriLayer ? (
+            <EsriImageryLayer
+              key={esriLayer.ticket}
+              ticket={esriLayer.ticket}
+              tiles={esriLayer.tiles}
+              minzoom={esriLayer.minzoom}
+              maxzoom={esriLayer.maxzoom}
+              attribution={esriLayer.attribution}
+              visible={esriVisible}
+            />
+          ) : null}
+          {mapStyleName !== "satellite" ? (
+            <Buildings3DLayer styleName={mapStyleName} visible={buildings3d} />
+          ) : null}
+
+          {/* Unter allem anderen: der gepunktete Fußweg vom Standort. */}
+          {walkTarget && userCoord && !routeActive && !liveActive ? (
+            <WalkPathLayer from={userCoord} to={walkTarget} />
+          ) : null}
+          {/* Route-Modus: nur RouteLayer + UserPin; Stadt-Blatt: dessen
+              Verbindungen; sonst MarkerLayer + POIs. Die Live-Ansicht zeigt
+              nur ihr Fahrzeug — die Haltestellen bleiben dabei EINGEHÄNGT,
+              nur unsichtbar (`hidden`): Sie ab- und beim Zurück wieder
+              aufzubauen, lief auf dem UI-Strang genau während Blatt und
+              Kamera fuhren. */}
+          {routeActive && !liveActive ? (
             <RouteLayer
               waypoints={pendingRoute!.waypoints}
               legs={pendingRoute!.legs}
               mode={pendingRoute!.mode}
             />
-          ) : (
+          ) : selectedCity && !liveActive ? (
+            cityRoutes ? (
+              <CityRouteLayers routes={cityRoutes} onSelect={selectCityRoute} />
+            ) : null
+          ) : routeActive || selectedCity ? null : (
             <>
               <MarkerLayer
                 key={deferredMode}
                 markers={markers}
                 onMarkerPress={selectStopFromMap}
+                hidden={liveActive}
               />
             </>
           )}
+          {liveActive && liveModel ? (
+            <LiveVehicleLayer model={liveModel} zoom={liveZoom} running={liveRunning} />
+          ) : null}
           {userCoord ? <UserPin coord={userCoord} /> : null}
         </MapSurface>
+        </View>
       )}
       {/* Skelett liegt OBEN bis die Tiles wirklich gerendert sind, dann
           fadet es weg. Vorher sah der User "blanke Tiles" während MapLibre
@@ -973,7 +2217,20 @@ export default function SurroundingsScreen() {
         </Animated.View>
       )}
 
-      {routeActive ? (
+      {liveActive ? (
+        <LiveOverlay
+          session={liveSession!}
+          model={liveModel}
+          status={liveStatus}
+          mapRef={mapRef}
+          zoom={liveZoom}
+          running={liveRunning}
+          topInset={insets.top}
+          bottomInset={insets.bottom}
+          onBannerLayout={onRouteBannerLayout}
+          onClose={closeLive}
+        />
+      ) : routeActive ? (
         <RouteBanner
           title={pendingRoute!.title ?? "Route"}
           waypointCount={pendingRoute!.waypoints.length}
@@ -987,6 +2244,14 @@ export default function SurroundingsScreen() {
             const stash = useSearchStore.getState().stashedSurroundings;
             if (stash) {
               useSearchStore.getState().restoreSurroundings();
+              /**
+               * Das Blatt auch wieder HEREINFAHREN. Die Einfahrt startet nur
+               * noch `openStopSheet()` (im Tipp-Moment, siehe dort) — das
+               * Zurücklegen des Zustands allein ließ das Blatt unsichtbar
+               * unter dem Rand stehen. Danach öffnete auch kein Tipp mehr eins:
+               * Für den Store war es ja offen.
+               */
+              if (stash.selectedStop || stash.city) openStopSheet();
               clearRouteSoon();
               return;
             }
@@ -1011,15 +2276,23 @@ export default function SurroundingsScreen() {
             clearRouteSoon();
           }}
           topInset={insets.top}
+          onLayout={onRouteBannerLayout}
         />
       ) : (
-        <View
-          style={[styles.searchWrap, { top: insets.top + 8 }]}
+        <GestureDetector gesture={chromePan}>
+        <Animated.View
+          style={[styles.searchWrap, { top: insets.top + 8 }, searchChromeStyle]}
           pointerEvents="box-none"
+          onLayout={onSearchWrapLayout}
         >
+          {/* Mit offener Stadt wird die Leiste zum Kasten der Ergebnisliste
+              (Strecke, Datum, Reisende) — siehe CitySearchMorph.tsx. */}
+          <CitySearchMorph>
           <SearchBar
             placeholderKey="surroundings.search.placeholder"
             showMic={false}
+            // Fläche und Umrandung zeichnet die Verwandlung darunter.
+            style={SEARCH_BAR_BARE}
             // Öffnet den GLOBALEN LocationPicker (Root-Host, app/_layout) —
             // der liegt visuell ÜBER der nativen Bottom-Tab-Bar. Vorher war
             // der Picker hier lokal im Tab gemountet: die Tab-Bar blieb
@@ -1102,32 +2375,71 @@ export default function SurroundingsScreen() {
               })
             }
           />
-        </View>
+          </CitySearchMorph>
+        </Animated.View>
+        </GestureDetector>
       )}
 
 
-      <MapFabs
-        topInset={insets.top}
-        satelliteOn={mapType !== "standard"}
-        trafficOn={trafficOn}
-        onToggleLayers={onToggleLayers}
-        onToggleTraffic={onToggleTraffic}
-        onLocate={onLocate}
-        locating={locating}
-      />
+      {/* Erst, wenn die Leiste darüber vermessen ist — sonst stünde die Reihe
+          ein Bild lang an einer geratenen Stelle und spränge dann. */}
+      {topBarBottom != null ? (
+        <MapFabs
+          top={topBarBottom + ms(SPACE.md)}
+          onOpenMapType={openMapType}
+          bearing={cameraBearing}
+          pitch={cameraPitch}
+          onResetNorth={onResetNorth}
+        />
+      ) : null}
 
-      {!routeActive && (
+      {/* Das Blatt liegt NEBEN der Karte im Baum, nicht darin: Es ist ein
+          Fenster (`Modal`) und gehört nicht in die Kartenfläche. */}
+      <MapTypeSheet visible={mapTypeOpen} onClose={closeMapType} />
+
+      {routeActive && !liveActive ? (
+        /**
+         * Im Routen-Modus gibt es kein Auswahlfenster, das den Standort-Knopf
+         * halten könnte. Er steht dann im selben Abstand über der Tab-Leiste —
+         * gleiche Ecke, gleicher Abstand, nur ohne Blatt dazwischen.
+         */
+        <View
+          style={[
+            styles.routeLocate,
+            { bottom: ms(TAB_BAR_H) + insets.bottom + ms(SPACE.md) },
+          ]}
+          pointerEvents="box-none"
+        >
+          <LocateFab onPress={onLocate} locating={locating} />
+        </View>
+      ) : null}
+      {!routeActive && !liveActive && (
         <SurroundingsSheet
           mode={mode}
           setMode={handleModeChange}
           items={listItems}
           onSelectStop={selectStopFromList}
+          // Unten über dem Auswahlfenster, wie bei Google — das Blatt hält ihn
+          // und führt ihn mit (siehe `accessory` dort).
+          accessory={locateAccessory}
         />
       )}
     </View>
     </Freeze>
   );
 }
+
+/**
+ * Ersatzwert für die Dauer einer Rahmen-Fahrt, falls die Karte (noch) keine
+ * meldet. Die echte Dauer gibt `fitBounds` zurück (sie hängt am Weg); eine
+ * zweite Fahrt startet erst danach (siehe `cityRouteKey`).
+ */
+const CITY_FIT_MS = 820;
+
+/** Zoom für eine Stadt ohne zweiten Punkt (kein Standort) — die Stadt im Überblick. */
+const SINGLE_POINT_ZOOM = 11;
+/** Luft zwischen Kasten und Strecke beim Einrahmen einer Stadt. */
+const CITY_FIT_TOP_GAP = 24;
 
 const styles = scaledStyles({
   root: {
@@ -1137,6 +2449,11 @@ const styles = scaledStyles({
   searchWrap: {
     position: "absolute",
     left: 16,
+    right: 16,
+    zIndex: 30,
+  },
+  routeLocate: {
+    position: "absolute",
     right: 16,
     zIndex: 30,
   },

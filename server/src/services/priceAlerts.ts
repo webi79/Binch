@@ -1,4 +1,4 @@
-import { and, eq, inArray, lt } from "drizzle-orm";
+import { and, eq, inArray, isNull, lt, or } from "drizzle-orm";
 import admin from "firebase-admin";
 import { db } from "../db/client.js";
 import { priceAlerts, pushTokens, users } from "../db/schema.js";
@@ -182,7 +182,18 @@ const CURRENCY_SYMBOL: Record<string, string> = {
 
 function money(amount: number, currency: string): string {
   const sym = CURRENCY_SYMBOL[currency.toUpperCase()];
-  return sym ? `${amount} ${sym}` : `${amount} ${currency}`;
+  /**
+   * GERUNDET auf ganze Einheiten — wie überall sonst in der App.
+   *
+   * Der Anbieterpreis kommt mit zwei Nachkommastellen. Hier stand er roh, und
+   * damit sagte die Meldung „26.99 €", während das Alarm-Blatt und die Liste
+   * unter der Glocke „27 EUR" zeigen. Dieselbe Zahl an zwei Orten verschieden
+   * zu schreiben lässt den Nutzer nach einem Unterschied suchen, den es nicht
+   * gibt — und in vierzig Zeichen kosten die drei Zeichen zusätzlich Platz, den
+   * sonst die Ortsnamen hätten.
+   */
+  const shown = Math.round(amount);
+  return sym ? `${shown} ${sym}` : `${shown} ${currency}`;
 }
 
 /**
@@ -509,9 +520,19 @@ function fcm(): admin.messaging.Messaging | null {
  * Sie stehen zu lassen hieße, sie bei jeder künftigen Prüfung erneut
  * anzuschreiben — und die Alarme daran blieben für immer stumm.
  */
-async function sendPush(messages: PushMessage[]): Promise<void> {
+/**
+ * Gibt zurück, ob überhaupt VERSCHICKT werden konnte.
+ *
+ * `false` heißt: Es gibt keine Zugangsdaten, kein einziger Versuch hat
+ * stattgefunden. Das muss der Aufrufer wissen — er vermerkt den Alarm sonst als
+ * gemeldet, obwohl nie etwas rausging, und die Entprellung von zwölf Stunden
+ * verschluckt ihn. Fehler EINZELNER Nachrichten sind davon nicht betroffen:
+ * Dort hat ein Versuch stattgefunden, und tote Kennungen werden dabei
+ * aufgeräumt.
+ */
+async function sendPush(messages: PushMessage[]): Promise<boolean> {
   const messaging = fcm();
-  if (!messaging) return;
+  if (!messaging) return false;
   for (let i = 0; i < messages.length; i += FCM_BATCH) {
     const batch = messages.slice(i, i + FCM_BATCH);
     try {
@@ -604,6 +625,7 @@ async function sendPush(messages: PushMessage[]): Promise<void> {
       console.warn("[priceAlerts] push failed:", e);
     }
   }
+  return true;
 }
 
 /**
@@ -626,6 +648,66 @@ export async function markNotified(alertIds: string[], price: number): Promise<v
     .update(priceAlerts)
     .set({ lastNotifiedAt: new Date(), notifiedPrice: String(price) })
     .where(inArray(priceAlerts.id, alertIds));
+}
+
+/**
+ * Den Alarm BEANSPRUCHEN, bevor gesendet wird — in einem einzigen Schreibbefehl.
+ *
+ * WOZU: Zwei Suchen auf derselben Strecke können gleichzeitig laufen. Beide
+ * lesen die Entprellung, beide finden sie abgelaufen, beide verschicken — und
+ * der Nutzer bekommt dieselbe Meldung doppelt. Die Prüfung im Speicher kann das
+ * nicht verhindern; zwischen Lesen und Schreiben liegt bei uns inzwischen eine
+ * vollständige Runde zu Firebase.
+ *
+ * Die Bedingung steht deshalb IM Schreibbefehl: Postgres sperrt die Zeile beim
+ * Ändern, und nur der Lauf, der sie tatsächlich umgesetzt hat, bekommt sie
+ * zurück. Der andere geht leer aus und schickt nichts.
+ *
+ * Es ist dieselbe Regel wie in der Schleife oben (`NOTIFY_COOLDOWN_MS`) — hier
+ * nur an der einzigen Stelle, an der sie sich nicht überholen lässt.
+ */
+async function claimForNotify(alertIds: string[], price: number): Promise<Set<string>> {
+  if (alertIds.length === 0) return new Set();
+  const cutoff = new Date(Date.now() - NOTIFY_COOLDOWN_MS);
+  const rows = await db
+    .update(priceAlerts)
+    .set({ lastNotifiedAt: new Date(), notifiedPrice: String(price) })
+    .where(
+      and(
+        inArray(priceAlerts.id, alertIds),
+        or(isNull(priceAlerts.lastNotifiedAt), lt(priceAlerts.lastNotifiedAt, cutoff)),
+      ),
+    )
+    .returning({ id: priceAlerts.id });
+  return new Set(rows.map((r) => r.id));
+}
+
+/**
+ * Die Beanspruchung zurücknehmen — wenn nichts rausging, war sie unberechtigt.
+ *
+ * Damit bleibt die Eigenschaft erhalten, für die der Versand überhaupt vor den
+ * Vermerk gezogen wurde: Ein Alarm, dessen Meldung nie abging (etwa weil keine
+ * Firebase-Zugangsdaten hinterlegt sind), gilt hinterher NICHT als gemeldet.
+ * Sonst schwiege er zwölf Stunden und würde beim nächsten App-Start als
+ * erledigt weggeräumt, ohne dass ihn je jemand gesehen hat.
+ */
+async function releaseClaim(
+  alertIds: string[],
+  prior: Map<string, { lastNotifiedAt: Date | null; notifiedPrice: string | null }>,
+): Promise<void> {
+  /**
+   * Den Stand VOR dem Beanspruchen zurück, nicht „nie gemeldet": Hier stand
+   * `null` für beides — ein Alarm, der gestern gemeldet hatte, verlor damit
+   * seine Entprellung und seinen Vergleichspreis und meldete beim nächsten
+   * Lauf denselben Preis erneut.
+   */
+  for (const id of alertIds) {
+    const before = prior.get(id);
+    await db
+      .update(priceAlerts)
+      .set({ lastNotifiedAt: before?.lastNotifiedAt ?? null, notifiedPrice: before?.notifiedPrice ?? null })
+      .where(eq(priceAlerts.id, id));
+  }
 }
 
 /**
@@ -653,6 +735,8 @@ export async function evaluateAlerts(
         desiredPrice: priceAlerts.desiredPrice,
         notifyOnRise: priceAlerts.notifyOnRise,
         lastNotifiedAt: priceAlerts.lastNotifiedAt,
+        // Für `releaseClaim`: den Stand VOR dem Beanspruchen wiederherstellen.
+        notifiedPrice: priceAlerts.notifiedPrice,
         departDate: priceAlerts.departDate,
         locale: pushTokens.locale,
         timezone: pushTokens.timezone,
@@ -764,8 +848,50 @@ export async function evaluateAlerts(
         .where(inArray(priceAlerts.id, seen));
     }
     if (notified.length > 0) {
-      await markNotified(notified, price);
-      await sendPush(messages);
+      /**
+       * ERST VERSCHICKEN, DANN VERMERKEN — die Reihenfolge war andersherum, und
+       * das war ein Loch.
+       *
+       * `sendPush` steigt still aus, wenn keine Firebase-Zugangsdaten da sind.
+       * Vermerkt man vorher, gilt der Alarm als gemeldet, obwohl nie etwas
+       * rausging: Die Entprellung schweigt zwölf Stunden, und das Nachholen in
+       * der App löscht ihn beim nächsten Start als „erledigt". Der Nutzer
+       * verlöre einen Alarm, ohne je eine Meldung gesehen zu haben.
+       *
+       * Andersherum bleibt ein Restrisiko, und es ist das kleinere: Stürzt der
+       * Server zwischen Versand und Vermerk ab, meldet derselbe Alarm später
+       * erneut. Auf dem Gerät ersetzt die zweite Meldung die erste (gleicher
+       * Sammel-Schlüssel und gleiches Kennzeichen) — man sieht also keine zwei
+       * Einträge. Eine mögliche Wiederholung ist besser als ein verschluckter
+       * Alarm.
+       */
+      /**
+       * ERST BEANSPRUCHEN, DANN VERSCHICKEN — und bei Misserfolg freigeben.
+       *
+       * Hier stand „erst verschicken, dann vermerken", mit der Begründung, dass
+       * ein Alarm nicht als gemeldet gelten darf, wenn nichts rausging. Die
+       * Begründung stimmt weiter und bleibt erhalten (siehe `releaseClaim`) —
+       * die Reihenfolge allein löste sie aber auf Kosten eines Rennens: Zwischen
+       * Prüfen und Vermerken lag eine ganze Runde zu Firebase, und in diesem
+       * Fenster konnte eine zweite Suche denselben Alarm noch einmal zustellen.
+       *
+       * Mit dem beanspruchenden Schreibbefehl gilt beides: Doppelte können
+       * nicht mehr entstehen, und ein gescheiterter Versand hinterlässt keinen
+       * stillgelegten Alarm.
+       */
+      const claimed = await claimForNotify(notified, price);
+      if (claimed.size > 0) {
+        // Nur senden, was dieser Lauf auch bekommen hat — `messages` und
+        // `notified` entstehen in derselben Schleife, Eintrag für Eintrag.
+        const mine = messages.filter((_, i) => claimed.has(notified[i]!));
+        const sent = await sendPush(mine);
+        if (!sent) {
+          await releaseClaim(
+            [...claimed],
+            new Map(rows.map((r) => [r.id, { lastNotifiedAt: r.lastNotifiedAt, notifiedPrice: r.notifiedPrice }])),
+          );
+        }
+      }
     }
   } catch (e) {
     // eslint-disable-next-line no-console

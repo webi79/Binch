@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { runSearch } from "../services/searchService.js";
-import { ipLimiter, rateLimit } from "../util/rateLimit.js";
+import { EXPENSIVE_IP_CEILING_FACTOR, ipLimiter, rateLimit } from "../util/rateLimit.js";
 import { evaluateAlerts } from "../services/priceAlerts.js";
 import type { TravelMode } from "../db/schema.js";
 
@@ -60,8 +60,11 @@ const MODE_PATHS: Array<{ path: string; mode: TravelMode }> = [
   { path: "/api/search/cruises", mode: "CRUISE" },
 ];
 
+/** Siehe die Prüfung vor `evaluateAlerts`: Spielraum für die Zeitzone. */
+const ALERT_WINDOW_SLACK_MS = 90 * 60 * 1000;
+
 export async function searchRoutes(app: FastifyInstance) {
-  const preHandler = ipLimiter("search", SEARCH_LIMITS);
+  const preHandler = ipLimiter("search", SEARCH_LIMITS, { ipCeilingFactor: EXPENSIVE_IP_CEILING_FACTOR });
   for (const { path, mode } of MODE_PATHS) {
     app.get(path, { preHandler }, async (req, reply) => {
       const parsed = querySchema.safeParse(req.query);
@@ -106,6 +109,43 @@ export async function searchRoutes(app: FastifyInstance) {
        * Auch bei einer Antwort aus dem Cache: Der Preis darin ist gültig, und
        * der Server hält ihn über seine eigene Auffrischung frisch.
        */
+      /**
+       * NICHT bei „Mehr Ergebnisse" — und das ist kein Feinschliff, sondern
+       * die Regel „wir schätzen keine Preise".
+       *
+       * Mit `paginationToken` liefert der Anbieter die NÄCHSTE Seite, also
+       * spätere Verbindungen desselben Tages. Deren günstigster Preis ist nicht
+       * der günstigste der Strecke — er ist der günstigste eines Ausschnitts,
+       * und der liegt fast immer höher. Daraus folgten zwei Schäden auf einmal:
+       * Der zuletzt gesehene Preis wäre falsch fortgeschrieben, und ein Alarm
+       * mit „auch bei Anstieg melden" feuerte eine Meldung über einen Anstieg,
+       * den es nie gab. Wer sie anträfe, sähe in der Liste daraufhin eine
+       * andere Zahl als in der Meldung.
+       *
+       * Geprüft wird deshalb nur auf der ERSTEN Seite. Sie enthält den
+       * vollständigen Satz, gegen den ein Alarm gemeint ist.
+       */
+      if (parsed.data.paginationToken) return result;
+      /**
+       * Und nur, wenn die Suche den TAG abdeckt — nicht bloß einen späten
+       * Ausschnitt.
+       *
+       * Mit einer gewählten Uhrzeit (etwa 18:00) fehlen die Fahrten davor; ihr
+       * günstigster Preis ist der eines Ausschnitts, und ein Alarm mit „auch bei
+       * Anstieg melden" meldete einen Anstieg, den es nicht gab. „Ab jetzt"
+       * zählt als ganzer Tag: Früher Abgefahrenes kann ohnehin niemand mehr
+       * kaufen. Anderthalb Stunden Spielraum decken die Zeitzone ab (das Datum
+       * ist ein Kalendertag, die Uhrzeit UTC).
+       */
+      if (parsed.data.departTime) {
+        const windowStart = Date.parse(parsed.data.departTime);
+        const dayStart = Date.parse(`${parsed.data.departDate}T00:00:00Z`);
+        const coveredFrom = Math.max(Date.now(), Number.isFinite(dayStart) ? dayStart : 0);
+        if (Number.isFinite(windowStart) && windowStart - coveredFrom > ALERT_WINDOW_SLACK_MS) {
+          return result;
+        }
+      }
+
       void evaluateAlerts(
         {
           mode,

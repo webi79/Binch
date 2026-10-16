@@ -19,6 +19,7 @@ import { RecentHistoryOverlay } from "@/components/home/RecentHistoryOverlay";
 import { LegTimelineOverlay } from "@/components/results/LegTimelineOverlay";
 import { DetailsOverlay } from "@/components/results/DetailsOverlay";
 import { StopDetailSheet } from "@/components/surroundings/StopDetailSheet";
+import { CitySearchPanels } from "@/components/surroundings/CitySearchPanels";
 import { AppAlertHost } from "@/components/ui/AppAlertHost";
 import { NotificationsSheet } from "@/components/home/NotificationsSheet";
 import { PriceAlertRouter } from "@/components/notifications/PriceAlertRouter";
@@ -30,6 +31,7 @@ import { SavedToastHost } from "@/components/ui/SavedToastHost";
 import { StationSaveToastHost } from "@/components/surroundings/StationSaveToastHost";
 import { TicketDetailOverlay } from "@/components/saved/TicketDetailOverlay";
 import { BinchSplash } from "@/components/ui/BinchSplash";
+import { markLaunchSplashDone } from "@/lib/ui/launchSplash";
 import { KeyboardHeightProbe } from "@/lib/nav/keyboardHeight";
 import { SettingsSubOverlay } from "@/app/(tabs)/settings";
 import { BinchTabBar } from "@/components/ui/BinchTabBar";
@@ -216,7 +218,12 @@ export default function RootLayout() {
         >
           <BinchSplash
             duration={3500}
-            onFinish={() => setSplashDone(true)}
+            onFinish={() => {
+              // Meldet das Ende auch nach draußen: Der wechselnde Platzhalter
+              // der Suchleiste startet erst jetzt (siehe lib/ui/launchSplash.ts).
+              markLaunchSplashDone();
+              setSplashDone(true);
+            }}
           />
         </Animated.View>
       )}
@@ -272,6 +279,10 @@ export default function RootLayout() {
                 damit der Slide ÜBER der FloatingTabBar UND allen Tab-Pages
                 liegt — wie alle anderen Sheets im Root-Layout. */}
             <StopDetailSheet />
+            {/* Such-Slide und Preis-Alarm hinter dem Kasten über dem
+                Stadt-Blatt — hier, weil das Stadt-Blatt selbst hier hängt und
+                die Slide darüber liegen muss (siehe CitySearchPanels.tsx). */}
+            <CitySearchPanels />
             {/* SearchHeroOverlay am ROOT (nicht im Home-Tab): nur hier ist die
                 Overlay-Fläche == Fenster, sodass die Fenster-Koordinaten der
                 Kachel (pageX/pageY) exakt auf die Icon-/Box-Platzierung passen.

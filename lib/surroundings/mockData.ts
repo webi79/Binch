@@ -26,6 +26,8 @@ export interface MapMarker {
   kinds?: MarkerKind[];
   coord: Coord;
   label?: string;
+  /** Zusatz bei gleichnamigem Halt daneben (siehe SurroundingsMarker). */
+  detail?: string;
   selected?: boolean;
   big?: boolean;
 }

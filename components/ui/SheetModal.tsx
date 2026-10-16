@@ -20,7 +20,7 @@ import { GestureDetector, GestureHandlerRootView } from "react-native-gesture-ha
 import { usePalette } from "@/lib/theme/appBg";
 import { SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import { scaledStyles } from "@/lib/ui/compact";
-import { useSheetSwipe } from "@/lib/ui/sheetSwipe";
+import { dragHealOffset, snapToPixel, useSheetSwipe } from "@/lib/ui/sheetSwipe";
 
 /**
  * Blatt von unten — die Hülle, die sich das Ticket-Blatt und die Optionen des
@@ -158,8 +158,15 @@ function Sheet({
     [translateY, sheetH],
   );
 
+  /**
+   * Ganze Gerätepixel + Selbstkorrektur beim Ziehen — beides erklärt in
+   * lib/ui/sheetSwipe.ts (`snapToPixel`, `startDragHeal`).
+   */
+  const heal = useSharedValue(0);
+  /** Wird von woanders geschlossen — die Wisch-Geste hält sich dann heraus (`closing` in useSheetSwipe). */
+  const closingSv = useSharedValue(false);
   const sheetAnim = useAnimatedStyle(() => ({
-    transform: [{ translateY: translateY.value }],
+    transform: [{ translateY: snapToPixel(translateY.value) + dragHealOffset(heal) }],
   }));
 
   const closingRef = useRef(false);
@@ -193,6 +200,7 @@ function Sheet({
   const scheduleClose = useCallback((afterMs: number) => {
     if (closingRef.current) return;
     closingRef.current = true;
+    closingSv.value = true;
     closeTimer.current = setTimeout(() => onCloseRef.current(), afterMs);
   }, []);
 
@@ -200,6 +208,7 @@ function Sheet({
   const requestClose = useCallback(() => {
     if (closingRef.current) return;
     markSheetMoving(SHEET_OUT.duration);
+    closingSv.value = true;
     translateY.value = withTiming(sheetH.value || 900, SHEET_OUT);
     scheduleClose(SHEET_OUT.duration);
   }, [scheduleClose, translateY, sheetH]);
@@ -217,6 +226,8 @@ function Sheet({
     y: translateY,
     travel: sheetH,
     onDismiss: scheduleClose,
+    heal,
+    closing: closingSv,
   });
 
   return (

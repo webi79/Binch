@@ -34,7 +34,17 @@ interface Props {
   /** Wird beim Tap auf einen Einzel-Marker (NICHT Cluster) aufgerufen.
    *  Übergibt die ID des Markers (= location.code). */
   onMarkerPress?: (id: string) => void;
+  /**
+   * Unsichtbar, aber eingehängt — in der Live-Ansicht. Ab- und wieder
+   * Aufbauen hieße drei Quellen und sechzehn Ebenen neu in den Stil zu legen,
+   * auf dem UI-Strang, genau während Blatt und Kamera fahren (das war ein Teil
+   * des Ruckelns beim Zurück). Umschalten ist eine Eigenschaft je Ebene.
+   */
+  hidden?: boolean;
 }
+
+const SHOWN = { visibility: "visible" } as const;
+const HIDDEN = { visibility: "none" } as const;
 
 // Stabile IDs (siehe v11-Constraint: keine id-Änderungen zur Laufzeit).
 // Drei separate GeoJSON-Sources, jeweils mit eigenen Cluster-Settings.
@@ -90,7 +100,8 @@ const MM_ICON_OFFSET_3_MID: [number, number] = [0, 0];
 const MM_ICON_OFFSET_3_RIGHT: [number, number] = [70, 0];
 
 
-export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }: Props) {
+export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, hidden = false }: Props) {
+  const vis = hidden ? HIDDEN : SHOWN;
   // Akzent fließt in alle „airport"-Marker (in MapLibre-Style-Expressions als
   // Literal-Hex eingebettet). Train/Bus/Cruise haben weiterhin Mode-spezifische
   // Farben (Gelb/Lila/Blau) damit Marker-Typen visuell unterscheidbar bleiben.
@@ -201,6 +212,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         id={CLUSTER_CIRCLE_LAYER_ID}
         type="circle"
         filter={["has", "point_count"]}
+        layout={vis}
         paint={{
           "circle-color": clusterColorMain,
           "circle-stroke-color": "#14181A",
@@ -222,6 +234,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         source={SRC_ID}
         filter={["has", "point_count"]}
         layout={{
+          ...vis,
           "text-field": ["get", "point_count_abbreviated"],
           "text-font": ["Noto Sans Regular"],
           "text-size": 12,
@@ -238,6 +251,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         source={SRC_ID}
         filter={["all", ["!", ["has", "point_count"]], [">=", ["get", "kindsCount"], 2]]}
         layout={{
+          ...vis,
           "icon-image": [
             "case",
             ["==", ["get", "kindsCount"], 3], "marker-pill-3",
@@ -262,6 +276,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         type="circle"
         source={SRC_ID}
         filter={["all", ["!", ["has", "point_count"]], ["<", ["get", "kindsCount"], 2]]}
+        layout={vis}
         paint={{
           "circle-radius": [
             "interpolate", ["linear"], ["zoom"],
@@ -292,6 +307,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         source={SRC_ID}
         filter={["all", ["!", ["has", "point_count"]], [">=", ["get", "kindsCount"], 2]]}
         layout={{
+          ...vis,
           "icon-image": [
             "match",
             ["get", "kind"],
@@ -325,6 +341,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         source={SRC_ID}
         filter={["all", ["!", ["has", "point_count"]], [">=", ["get", "kindsCount"], 2]]}
         layout={{
+          ...vis,
           "icon-image": [
             "match",
             ["get", "kind1"],
@@ -358,6 +375,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         source={SRC_ID}
         filter={["all", ["!", ["has", "point_count"]], [">=", ["get", "kindsCount"], 3]]}
         layout={{
+          ...vis,
           "icon-image": [
             "match",
             ["get", "kind2"],
@@ -390,6 +408,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         source={SRC_ID}
         filter={["!", ["has", "point_count"]]}
         layout={{
+          ...vis,
           "icon-image": [
             "match",
             ["get", "kind"],
@@ -444,6 +463,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         source={SRC_ID}
         filter={["all", ["!", ["has", "point_count"]], [">=", ["get", "kindsCount"], 2]]}
         layout={{
+          ...vis,
           "icon-image": [
             "match",
             ["get", "kind1"],
@@ -476,6 +496,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         source={SRC_ID}
         filter={["all", ["!", ["has", "point_count"]], [">=", ["get", "kindsCount"], 3]]}
         layout={{
+          ...vis,
           "icon-image": [
             "match",
             ["get", "kind2"],
@@ -518,6 +539,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
       <Layer
         id={BG_SINGLE_BUS_LAYER_ID}
         type="circle"
+        layout={vis}
         paint={{
           "circle-radius": [
             "interpolate", ["linear"], ["zoom"],
@@ -535,6 +557,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         id={ICON_BUS_LAYER_ID}
         type="symbol"
         layout={{
+          ...vis,
           "icon-image": "marker-bus",
           "icon-size": [
             "interpolate", ["linear"], ["zoom"],
@@ -571,6 +594,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         id="surroundings-markers-aircr-cluster"
         type="circle"
         filter={["has", "point_count"]}
+        layout={vis}
         paint={{
           "circle-color": clusterColorAircr,
           "circle-stroke-color": "#14181A",
@@ -592,6 +616,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         source={SRC_ID_AIRCR}
         filter={["has", "point_count"]}
         layout={{
+          ...vis,
           "text-field": ["get", "point_count_abbreviated"],
           "text-font": ["Noto Sans Regular"],
           "text-size": 12,
@@ -607,6 +632,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         type="circle"
         source={SRC_ID_AIRCR}
         filter={["!", ["has", "point_count"]]}
+        layout={vis}
         paint={{
           "circle-radius": [
             "interpolate", ["linear"], ["zoom"],
@@ -630,6 +656,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress }:
         type="symbol"
         filter={["!", ["has", "point_count"]]}
         layout={{
+          ...vis,
           "icon-image": [
             "match",
             ["get", "kind"],

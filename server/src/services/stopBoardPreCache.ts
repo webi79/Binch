@@ -15,23 +15,19 @@
  * ersten Stunde nach Server-Start ist die Liste leer und Pre-Cache tut nichts.
  * Sobald Traffic da ist, kristallisiert sich die Hot-Set heraus.
  */
-import {
-  getStopBoard,
-  getHottestKeys,
-  currentOutboundBudgetUsed,
-} from "./stopInfoService.js";
+import { getStopBoard, getHottestKeys } from "./stopInfoService.js";
+import { dbHasRoom } from "./dbQuota.js";
 
 const TICK_INTERVAL_MS = 50_000;
 const TOP_N = 10;
-const SKIP_IF_BUDGET_OVER = 35; // out of 50/min — leave 15 for user traffic
 
 let timer: NodeJS.Timeout | null = null;
 
 async function tick(): Promise<void> {
-  if (currentOutboundBudgetUsed() > SKIP_IF_BUDGET_OVER) {
-    // Outbound-Pfad eng — Pre-Cache cedes Priority.
-    return;
-  }
+  // Nur mit freiem Platz in der Hintergrund-Stufe des Bahn-Kontingents
+  // (services/dbQuota.ts) — die Suche und offene Tafeln gehen vor. Jeder
+  // einzelne Abruf nimmt darunter trotzdem seinen eigenen Platz.
+  if (!dbHasRoom("background")) return;
   const hot = getHottestKeys(TOP_N);
   // Sequentiell statt parallel — vermeidet Burst der unser eigenes Throttle
   // triggern würde. 10 Stops × 200ms Latenz = ~2s pro Tick, weit innerhalb 50s.

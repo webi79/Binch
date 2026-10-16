@@ -14,7 +14,7 @@
  * Map-Marker-Kontext. Im Chat tappt der User nur — wer Details will, sucht
  * die Verbindung über Bo direkt oder im Search-Tab.
  */
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { View, Text, Pressable, StyleSheet, ActivityIndicator } from "react-native";
 import { useQuery } from "@tanstack/react-query";
 import { useIsFocused } from "@react-navigation/native";
@@ -35,6 +35,7 @@ import {
   type StopBoardResponse,
 } from "@/lib/api/client";
 import { scaledStyles } from "@/lib/ui/compact";
+import { formatTimeInZone, localTimeHint, shiftIsoByMinutes } from "@/lib/time-format";
 
 const C = {
   card: "#171719",
@@ -55,17 +56,21 @@ interface Props {
   initialData?: StopBoardResponse;
 }
 
-function formatTime(iso: string): string {
+/**
+ * Uhrzeit in der Ortszeit des Halts (`tz` aus der Tafel), wie im Halt-Blatt und
+ * in der Zeitleiste. Hier stand die Uhr des Geräts — dieselbe Abfahrt in Oldham
+ * war im Chat „16:33", im Blatt dahinter „15:33". Ohne Zone bleibt es beim Gerät.
+ */
+function formatTime(iso: string, tz?: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "—";
+  if (tz) return formatTimeInZone(iso, tz);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-function addDelayToTime(iso: string, delayMin: number): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  d.setMinutes(d.getMinutes() + delayMin);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+function addDelayToTime(iso: string, delayMin: number, tz?: string): string {
+  if (Number.isNaN(Date.parse(iso))) return "—";
+  return formatTime(shiftIsoByMinutes(iso, delayMin), tz);
 }
 
 function iconForProduct(product: string | null): LucideIcon {
@@ -146,6 +151,9 @@ function StopBoardCardInner({ stop, initialBoard, initialData }: Props) {
 
   const items = data?.results ?? [];
   const first = items[0];
+  /** Ortszeit-Zone des Halts — und der leise Hinweis, wenn sie nicht die des Geräts ist. */
+  const tz = data?.stop?.tz;
+  const zoneHint = useMemo(() => (tz ? localTimeHint([tz], t) : null), [tz, t]);
 
   const tabLabel = (kind: BoardKind) =>
     kind === "departures" ? t("stop.tab.departures") : t("stop.tab.arrivals");
@@ -164,7 +172,7 @@ function StopBoardCardInner({ stop, initialBoard, initialData }: Props) {
       <Pressable
         onPress={() => {
           haptic("button");
-          useSearchStore.getState().selectStop({ code: stop.code, label: stop.label });
+          useSearchStore.getState().selectStop({ code: stop.code, label: stop.label, detail: data?.stop?.detail });
           openStopSheet();
         }}
         style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
@@ -177,6 +185,11 @@ function StopBoardCardInner({ stop, initialBoard, initialData }: Props) {
           </Text>
           <ChevronRight size={18} color={C.sub} strokeWidth={2.2} />
         </View>
+        {zoneHint ? (
+          <Text style={styles.zoneHint} numberOfLines={1}>
+            {zoneHint}
+          </Text>
+        ) : null}
       </Pressable>
 
       {/* Tab-Switcher Departures / Arrivals */}
@@ -227,11 +240,11 @@ function StopBoardCardInner({ stop, initialBoard, initialData }: Props) {
       ) : (
         <>
           {first && (
-            <Hero item={first} accentSolid={accent.solid} fetchedAt={data?.fetchedAt} />
+            <Hero item={first} tz={tz} accentSolid={accent.solid} fetchedAt={data?.fetchedAt} />
           )}
           {/* Liste der nächsten ~5 weiteren — schon ohne first */}
           {items.slice(1, 6).map((item) => (
-            <Row key={item.id} item={item} accentSolid={accent.solid} accentSubtle={accent.subtle} accentBorder={accent.border} />
+            <Row key={item.id} item={item} tz={tz} accentSolid={accent.solid} accentSubtle={accent.subtle} accentBorder={accent.border} />
           ))}
         </>
       )}
@@ -241,10 +254,12 @@ function StopBoardCardInner({ stop, initialBoard, initialData }: Props) {
 
 function Hero({
   item,
+  tz,
   accentSolid,
   fetchedAt,
 }: {
   item: StopBoardItem;
+  tz?: string;
   accentSolid: string;
   fetchedAt: string | undefined;
 }) {
@@ -291,7 +306,7 @@ function Hero({
   const RING_R = 28;
   const CIRC = 2 * Math.PI * RING_R;
   const realTime =
-    delay > 0 ? addDelayToTime(item.plannedTime, delay) : formatTime(item.plannedTime);
+    delay > 0 ? addDelayToTime(item.plannedTime, delay, tz) : formatTime(item.plannedTime, tz);
   const subText =
     delay > 0
       ? `${realTime} · +${delay} Min${item.platform ? ` · ${item.platform}` : ""}`
@@ -344,11 +359,13 @@ function Hero({
 
 function Row({
   item,
+  tz,
   accentSolid,
   accentSubtle,
   accentBorder,
 }: {
   item: StopBoardItem;
+  tz?: string;
   accentSolid: string;
   accentSubtle: string;
   accentBorder: string;
@@ -359,11 +376,11 @@ function Row({
     <View style={styles.row}>
       <View style={styles.rowTime}>
         <Text style={[styles.rowTimeText, delay > 0 && styles.rowTimeStrike]}>
-          {formatTime(item.plannedTime)}
+          {formatTime(item.plannedTime, tz)}
         </Text>
         {delay > 0 && (
           <Text style={[styles.rowTimeReal, { color: C.delay }]}>
-            {addDelayToTime(item.plannedTime, delay)}
+            {addDelayToTime(item.plannedTime, delay, tz)}
           </Text>
         )}
       </View>
@@ -409,6 +426,9 @@ const styles = scaledStyles({
     letterSpacing: -0.2,
   },
 
+  // „Ortszeit (UTC+1)" unter dem Namen — leise, nur wenn die Zone des Halts
+  // nicht die des Geräts ist.
+  zoneHint: { color: C.sub, fontSize: 11, fontWeight: "500", marginTop: 2 },
   tabs: { flexDirection: "row", gap: 6 },
   tab: {
     flex: 1,

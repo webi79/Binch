@@ -16,12 +16,8 @@
  * HAFAS hinter db-rest hat eigene Limits — daher der Cache.
  */
 import { config } from "../config.js";
-import {
-  claimUserBudget,
-  claimBackgroundBudget,
-  enqueueRefresh,
-  dbVendoBudgetUsed,
-} from "./dbVendoQueue.js";
+import { enqueueRefresh } from "./dbVendoQueue.js";
+import { dbQuotaUsed, reportIfBlocked, tryAcquireDb, type DbLane } from "./dbQuota.js";
 import {
   fetchDepartures as multiFetchDepartures,
   fetchArrivals as multiFetchArrivals,
@@ -55,10 +51,26 @@ export interface StopBoardItem {
   platform: string | null;
   /** Hat der Stop einen Anschluss erwischt / die Fahrt fährt überhaupt? */
   cancelled: boolean;
+  /** Nur bei Flügen: was die Live-Ansicht braucht (IATA-Codes, ISO-UTC). */
+  flight?: {
+    from: string;
+    to: string;
+    depP: string | null;
+    depE: string | null;
+    arrP: string | null;
+    arrE: string | null;
+    aircraft: string | null;
+  };
 }
 
 export interface StopBoardResponse {
   results: StopBoardItem[];
+  /**
+   * Der Halt, dessen Zeiten die Tafel zeigt, wie ihn die Quelle kennt — nur
+   * intern: Die Route vergleicht ihn mit unserer Haltestelle und meldet einen
+   * fremden Halt als `stop.servedBy` (routes/stops.ts).
+   */
+  source?: { name: string; latitude: number | null; longitude: number | null };
   /** Frische der Daten — wann wurde der HAFAS-Roundtrip gemacht. */
   fetchedAt: string;
   /** ISO-UTC der serverseitigen Cache-Gültigkeit. */
@@ -128,7 +140,7 @@ function isHot(key: string): boolean {
 
 /** Aktueller Outbound-Druck — Re-Export aus dem Shared-Throttle für Pre-Cache. */
 export function currentOutboundBudgetUsed(): number {
-  return dbVendoBudgetUsed();
+  return dbQuotaUsed();
 }
 
 function cacheKey(hafasId: string, board: StopBoard, profile: HafasProfileKey): string {
@@ -198,11 +210,12 @@ function normalize(raw: DbRestDeparture, board: StopBoard, idx: number): StopBoa
 /** Single db-rest-Call mit optionalem `when`-Anker. Liefert leeres Array bei
  *  Provider-Fehler (für die Retry-Schleife oben). */
 async function dbRestCall(
+  lane: DbLane,
   hafasId: string,
   board: StopBoard,
   whenIso?: string,
 ): Promise<DbRestDeparture[]> {
-  const url = new URL(`${config.DBREST_BASE_URL}/stops/${encodeURIComponent(hafasId)}/${board}`);
+  const url = new URL(`${lane.dbrestUrl}/stops/${encodeURIComponent(hafasId)}/${board}`);
   url.searchParams.set("duration", "720");
   url.searchParams.set("results", "20");
   url.searchParams.set("stopovers", "false");
@@ -217,7 +230,11 @@ async function dbRestCall(
       headers: { Accept: "application/json" },
       signal: controller.signal,
     });
-    if (!res.ok) throw new Error(`db-rest ${res.status} for ${url}`);
+    if (!res.ok) {
+      // Sperre von bahn.de: diese Spur schonen (siehe dbQuota.ts).
+      await reportIfBlocked(lane, res);
+      throw new Error(`db-rest ${res.status} for ${url}`);
+    }
     const data = (await res.json()) as { departures?: DbRestDeparture[]; arrivals?: DbRestDeparture[] } | DbRestDeparture[];
     return Array.isArray(data)
       ? data
@@ -293,19 +310,28 @@ async function fetchFromDbRest(
   // verschobenem `when` weiter (+4 h, +8 h, +12 h). Erste nicht-leere Antwort
   // gewinnt. Tagsüber an einer normalen Station feuert nur 1 Call.
   //
-  // Jeder Retry verbraucht einen Slot aus dem entsprechenden Budget-Topf:
-  //   - priority="user"       → claimUserBudget (bis 50/min Hard-Cap)
-  //   - priority="background" → claimBackgroundBudget (bis 38/min, User-Reserve frei)
-  // Wenn das jeweilige Budget alle ist, brechen wir den Retry-Versuch ab —
-  // bei Background-Tasks bedeutet das im Worst Case „Refresh schlägt fehl,
-  // Cache bleibt stale" (next access enqueued neu).
-  const claim = priority === "user" ? claimUserBudget : claimBackgroundBudget;
+  // Jeder Versuch nimmt einen Platz aus dem gemeinsamen Bahn-Kontingent
+  // (services/dbQuota.ts): eine Tafel, die jemand ansieht, als `board`, ein
+  // Auffrischen im Hintergrund als `background`. Ist für die Stufe nichts
+  // frei, endet die Versuchsreihe — im Hintergrund heißt das „bleibt, wie sie
+  // war" (der nächste Zugriff reiht neu ein).
   const offsetsH = [0, 4, 8, 12];
   let list: DbRestDeparture[] = [];
   for (const offset of offsetsH) {
-    if (!claim()) break;
+    const lane = tryAcquireDb(priority === "user" ? "board" : "background");
+    if (!lane) {
+      /**
+       * Schon für den ERSTEN Versuch kein Platz: Das ist keine leere Tafel,
+       * sondern keine Antwort — also ein Fehler. Eine leere Liste landete
+       * sonst im Zwischenspeicher, und im Hintergrund überschrieb sie sogar
+       * eine gute Tafel. So bleibt die alte stehen (siehe
+       * `triggerBackgroundRefresh`), und beim Nutzer greift der Ersatz.
+       */
+      if (offset === 0) throw new Error("db-rest: kein Platz im Bahn-Kontingent");
+      break;
+    }
     const whenIso = offset === 0 ? undefined : new Date(Date.now() + offset * 3_600_000).toISOString();
-    list = await dbRestCall(hafasId, board, whenIso);
+    list = await dbRestCall(lane, hafasId, board, whenIso);
     if (list.length > 0) break;
   }
   // Dedupe BEVOR slice — sonst kicken Duplikate echte unique Einträge aus dem
@@ -377,10 +403,19 @@ export async function getStopBoard(
   // Budget-Claim; bei Multi-Hafas-Profilen (AT/PL/LU/DK) direkt durch
   // hafas-client in-process. Kein Background-Queue für Non-DE — wir refreshen
   // dort nur on-demand, der dbVendoQueue ist DB-spezifisch.
-  const promise = fetchBoard(hafasId, board, profile, "user")
+  // Der Vorlauf (`internal`) holt im Hintergrund — er darf der Tafel, die
+  // gerade jemand ansieht, und der Suche keinen Platz nehmen.
+  const promise = fetchBoard(hafasId, board, profile, opts.internal ? "background" : "user")
     .then((data) => {
       cache.set(key, { data, cachedAt: Date.now(), ttlMs: HOT_TTL_MS, refreshing: false });
       return data;
+    })
+    .catch((err: unknown) => {
+      // Keine frische Antwort (etwa kein Platz im Bahn-Kontingent): Eine noch
+      // brauchbare gespeicherte Tafel ist besser als keine.
+      const stale = cache.get(key);
+      if (stale && Date.now() - stale.cachedAt < HARD_MAX_AGE_MS) return stale.data;
+      throw err;
     })
     .finally(() => {
       inflight.delete(key);
@@ -478,10 +513,20 @@ export function getHottestKeys(limit: number): { hafasId: string; board: StopBoa
   }
   ranked.sort((a, b) => b.count - a.count);
   const out: { hafasId: string; board: StopBoard }[] = [];
-  for (const { key } of ranked.slice(0, limit)) {
-    const [board, hafasId] = key.split(":", 2);
-    if (!board || !hafasId) continue;
-    out.push({ hafasId, board: board as StopBoard });
+  for (const { key } of ranked) {
+    if (out.length >= limit) break;
+    /**
+     * Der Schlüssel ist `profil:tafel:id` (siehe `cacheKey`). Hier wurde bisher
+     * in ZWEI Teile zerlegt — heraus kamen tafel="db" und id="departures", und
+     * der Vorlauf fragte seit jeher `/stops/departures/db` ab: 404, alle 50 s,
+     * bis zu zehnmal, jedes Mal ein Platz aus dem Bahn-Kontingent. Der Vorlauf
+     * gilt nur für DE (`profile === "db"`), die anderen Profile laufen nicht
+     * über dbrest.
+     */
+    const [profile, board, ...rest] = key.split(":");
+    const hafasId = rest.join(":");
+    if (profile !== "db" || (board !== "departures" && board !== "arrivals") || !hafasId) continue;
+    out.push({ hafasId, board });
   }
   return out;
 }
@@ -555,11 +600,16 @@ export async function resolveHafasByCoord(
     if (profile !== "db") {
       return multiResolveStation(profile, lat, lng, label);
     }
-    const url = new URL(`${config.DBREST_BASE_URL}/locations/nearby`);
+    // Ein Platz aus dem Bahn-Kontingent (Stufe `board`) — ohne keiner.
+    const lane = tryAcquireDb("board");
+    if (!lane) return null;
+    const url = new URL(`${lane.dbrestUrl}/locations/nearby`);
     url.searchParams.set("latitude", String(lat));
     url.searchParams.set("longitude", String(lng));
     url.searchParams.set("distance", "300");
     url.searchParams.set("results", "8");
+    // `language=de` — die Vorgabe „en" sperrt Akamai teils mit 403 (trips.ts).
+    url.searchParams.set("language", "de");
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 6_000);
     try {
@@ -567,6 +617,7 @@ export async function resolveHafasByCoord(
         headers: { Accept: "application/json" },
         signal: controller.signal,
       });
+      await reportIfBlocked(lane, res);
       if (!res.ok) return null;
       const listRaw = (await res.json()) as DbRestNearby[];
       if (!Array.isArray(listRaw) || listRaw.length === 0) return null;

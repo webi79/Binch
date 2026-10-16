@@ -209,7 +209,14 @@ const ENDPOINT_TYPE_RANK: Record<string, number> = {
 export async function resolvePlanEndpoint(q: string): Promise<PlanEndpoint | null> {
   const hits = await searchLocations(q, "ALL");
   if (hits.length === 0) return null;
-  const compatible = hits.filter((h) => stationNameCompatible(q, h.label) || stationNameCompatible(q, h.city));
+  // Auch gegen den vollen Quellnamen (`matchLabel`): „Rochdale Road" steht nur
+  // dort, angezeigt wird „Oldham College".
+  const compatible = hits.filter(
+    (h) =>
+      stationNameCompatible(q, h.label) ||
+      stationNameCompatible(q, h.matchLabel) ||
+      stationNameCompatible(q, h.city),
+  );
   const pool = compatible.length > 0 ? compatible : hits.slice(0, 1);
   /**
    * Nur zwei Stufen, und der Rest bleibt, wie die Suche ihn sortiert hat.
@@ -260,7 +267,7 @@ async function groundStopAtAirport(
         * cos(radians(l.longitude) - radians(${lng}))
       + sin(radians(${lat})) * sin(radians(l.latitude))))`;
   const rows = await db.execute(sql`
-    SELECT l.code, l.label, l.city, l.country, l.latitude, l.longitude, l.type
+    SELECT l.code, coalesce(l.display_name, l.label) AS label, l.city, l.country, l.latitude, l.longitude, l.type
     FROM ${locations} l
     WHERE l.type IN ('TRAIN', 'BUS')
       AND l.latitude IS NOT NULL
@@ -408,7 +415,16 @@ async function searchLeg(args: {
   );
   const out = await Promise.race([search, timeout]).catch(() => null);
   if (out === "timeout" || out == null) return [];
-  return out.results ?? [];
+  /**
+   * Von der Bahn als gefährdet gemeldete Verbindungen (`warning`) nur, wenn es
+   * nichts anderes gibt — ausgefallene nie. Die Auswahl unten sortiert nach
+   * Ankunft bzw. Dauer, nicht nach der Server-Reihenfolge: Ohne diesen Filter
+   * stand ein ausgefallener Zubringer im Plan, sobald er am besten zur
+   * Abflugzeit passte.
+   */
+  const all = out.results ?? [];
+  const working = all.filter((r) => !r.warning);
+  return working.length > 0 ? working : all.filter((r) => r.warning !== "cancelled");
 }
 
 export async function planMultimodal(args: PlanArgs): Promise<PlanOutcome> {

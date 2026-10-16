@@ -23,6 +23,7 @@ import { CLOSE_ICON_SIZE, GUTTER, SPACE } from "@/lib/theme/spacing";
 import { scaledStyles } from "@/lib/ui/compact";
 import { useSheetSwipe } from "@/lib/ui/sheetSwipe";
 import type { TravelMode } from "@/types/search";
+import { FadePress } from "@/components/ui/FadePress";
 
 const C = {
   /** Der X-Knopf trägt in Ortswähler, Bo, Spracheingabe und Benachrichtigungen
@@ -103,6 +104,17 @@ export interface SearchEditPanelProps {
    * Aufrufer), sonst schriebe das Formular sich bei jedem Durchgang selbst um.
    */
   initial: SearchHeroInitial | null;
+  /**
+   * Unter welchem Namen die Fahrt als „Blatt in Bewegung" gemeldet wird.
+   *
+   * Die Slide gibt es zweimal — über der Ergebnisliste und über dem
+   * Stadt-Blatt der Karte. Die Meldungen sind eine Menge von Namen; unter
+   * demselben Namen könnte das Parken der einen die laufende Fahrt der anderen
+   * austragen, und an der Meldung hängt die Freigabe der Texturen.
+   */
+  slideKey?: string;
+  /** Nur einfache Fahrt — siehe `oneWayOnly` in SearchHero. */
+  oneWayOnly?: boolean;
 }
 
 /**
@@ -141,6 +153,8 @@ function SearchEditPanelComponent({
   onApply,
   mode,
   initial,
+  slideKey = "searchEdit",
+  oneWayOnly = false,
 }: SearchEditPanelProps) {
   const t = useT();
   const palette = usePalette();
@@ -207,7 +221,7 @@ function SearchEditPanelComponent({
    * Vorzeichen dieser Zahl.
    */
   const park = -(mounted && sheetH > 0 ? sheetH : MAX_H);
-  const { y, style, run, adopt, parkNow, warm } = useSheetSlide("searchEdit", park);
+  const { y, style, run, adopt, parkNow, warm, heal } = useSheetSlide(slideKey, park);
 
   /**
    * Die Verdunkelung hängt am SELBEN Wert wie die Fahrt.
@@ -386,6 +400,9 @@ function SearchEditPanelComponent({
     // läge sonst über der ganzen Ergebnisliste — auch geschlossen. Und am
     // Deckel gehört die Bewegung dem Formular, siehe `capped`.
     enabled: visible && !capped,
+    heal,
+    // Die Ausfahrt hängt am Offen-Sein — die Geste hält sich dann heraus.
+    closing: !visible,
   });
 
   /** Zurück-Taste schließt das Blatt, statt den Bildschirm zu verlassen. */
@@ -539,15 +556,14 @@ function SearchEditPanelComponent({
               * Blatt, das sich in derselben Zeit bewegt. Sie liefe über die
               * volle Dauer der Rückfahrt dagegen an.
               */}
-            <Pressable
+            <FadePress
               onPress={dismiss}
               hitSlop={12}
               accessibilityRole="button"
               accessibilityLabel={t("search.close")}
-              style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
             >
               <X color={C.closeIcon} size={CLOSE_ICON_SIZE} />
-            </Pressable>
+            </FadePress>
           </View>
 
           {/**
@@ -572,6 +588,7 @@ function SearchEditPanelComponent({
             <SearchHero
               mode={mode}
               embedded
+              oneWayOnly={oneWayOnly}
               initial={initial}
               active={visible}
               onSubmit={handleSubmit}
@@ -640,10 +657,13 @@ const styles = scaledStyles({
    * Maße aus dem Benachrichtigungs-Blatt, das sie seinerseits aus dem
    * Ortswähler hat — dem Vorbild-Fall für die Kopfzeile eines Blattes.
    *
-   * `paddingTop` ist der eine Wert, der nicht abgeschrieben werden konnte:
-   * Der Ortswähler braucht seine 56 zum größten Teil für die Statusleiste. Die
-   * trägt hier das Blatt selbst (`insets.top`), die Kopfzeile beginnt also mit
-   * derselben Luft, die auch das Benachrichtigungs-Blatt lässt.
+   * `paddingTop` ist GLEICH dem seitlichen Abstand — dieselbe Korrektur wie im
+   * Benachrichtigungs-Blatt, aus demselben Grund.
+   *
+   * Hier standen 24 gegen 20 an den Seiten. Die Statusleiste trägt bei diesem
+   * Blatt der Rahmen selbst (`insets.top`), die Kopfzeile beginnt also auf
+   * einer freien Kante — und in einer freien Ecke muss ein Zeichen zu beiden
+   * Kanten denselben Abstand haben, sonst wirkt das Blatt schief aufgehängt.
    *
    * `paddingBottom` ist der andere, und der ist HERGELEITET statt übernommen.
    *
@@ -688,7 +708,7 @@ const styles = scaledStyles({
     alignItems: "center",
     gap: SPACE.md,
     paddingHorizontal: GUTTER,
-    paddingTop: SPACE.xxl,
+    paddingTop: GUTTER,
     paddingBottom: SPACE.xl,
   },
 });

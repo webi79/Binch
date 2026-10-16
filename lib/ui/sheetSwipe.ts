@@ -44,8 +44,8 @@
  * `SurroundingsSheet`). Die haben mehr als „offen oder weg" und behalten ihre
  * eigene Geste; von hier nehmen sie nur die Torhüter-Funktion.
  */
-import { useMemo } from "react";
-import { Dimensions } from "react-native";
+import { useLayoutEffect, useMemo } from "react";
+import { Dimensions, PixelRatio } from "react-native";
 import { Gesture, type NativeGesture } from "react-native-gesture-handler";
 import Animated, {
   cancelAnimation,
@@ -55,6 +55,7 @@ import Animated, {
   useAnimatedRef,
   useAnimatedScrollHandler,
   useSharedValue,
+  withRepeat,
   withTiming,
   type AnimatedRef,
   type SharedValue,
@@ -134,6 +135,79 @@ const WINDOW_H = Dimensions.get("window").height;
  * `Animated.ScrollView` sein, sonst läuft der Scroll-Stand über den JS-Strang
  * und ist genau dann veraltet, wenn er gebraucht wird.
  */
+/** Gerätepixel je Punkt — außerhalb der Worklets gelesen, dort nur die Zahl. */
+const DEVICE_PX = PixelRatio.get();
+
+/**
+ * Die Lage eines Blattes auf GANZE Gerätepixel.
+ *
+ * Ein Blatt folgt dem Finger in Bruchteilen eines Pixels. Android setzt Schrift
+ * senkrecht aber immer auf ganze Pixel, Flächen und Ränder dagegen geglättet
+ * dazwischen: Bei jedem Bild sprang die Schrift um ein Pixel gegen ihre Pille,
+ * ihre Zeile, ihre Trennlinie. Stand bisher nur im Haltestellen-Blatt und im
+ * Auswahlfenster; gilt jetzt für jedes Blatt, das man ziehen kann.
+ */
+export function snapToPixel(v: number): number {
+  "worklet";
+  return Math.round(v * DEVICE_PX) / DEVICE_PX;
+}
+
+/**
+ * Länger hält niemand ein Blatt fest (siehe `DRAG_MAX_MS` in transitionBusy.ts).
+ * VOR der Funktion: Das Worklet nimmt die Zahl beim Laden des Moduls mit.
+ */
+const DRAG_HEAL_HALF_CYCLES = 30;
+
+/**
+ * SELBSTKORREKTUR WÄHREND DES ZIEHENS — gegen zurückgeschriebene Lagen.
+ *
+ * Die App lässt Reanimated Verschiebung und Deckkraft direkt an die Ansichten
+ * schreiben, am React-Baum vorbei (`ANDROID_SYNCHRONOUSLY_UPDATE_UI_PROPS` in
+ * package.json). Jeder React-Durchgang IRGENDWO in der App trägt dann die
+ * zuletzt bekannten Reanimated-Werte in den Baum ein (`ReanimatedCommitHook`) —
+ * und bringt sie erst ein, zwei Bilder später auf den Bildschirm. Fällt er in
+ * ein Ziehen, setzt er das Blatt auf eine ältere Lage zurück. Bewegt sich der
+ * Finger weiter, korrigiert das nächste Bild; bleibt er LIEGEN, bleibt auch die
+ * falsche Lage stehen, bis sich wieder etwas bewegt. Gemeldet als „ziehe ich
+ * die Slide runter und lasse den Finger drauf, buggen die Elemente".
+ *
+ * Das Ticket-Blatt zeigte das nicht, weil dort während des Ziehens nichts
+ * rendert. Die übrigen rendern — Gedrückt-Zustände, eintreffende Daten, der
+ * Bildschirm dahinter.
+ *
+ * Deshalb läuft, solange ein Finger auf dem Blatt liegt, dieser Wert ständig
+ * zwischen 0 und 1 hin und her. Die Blätter rechnen ihn als Tausendstel Punkt
+ * in ihre Lage ein (`dragHealOffset`) — unsichtbar, aber jedes Bild ein
+ * anderer Wert. Damit schreibt Reanimated die RICHTIGE Lage in jedem Bild neu,
+ * und ein zurückgeschriebener Wert steht höchstens ein Bild. Nach dem Loslassen
+ * steht er wieder auf 0; die Ausfahrt oder das Einrasten bewegt das Blatt
+ * ohnehin in jedem Bild.
+ */
+export function startDragHeal(heal: SharedValue<number>): void {
+  "worklet";
+  // Begrenzt auf 30 halbe Runden (15 s) statt endlos: Bliebe ein Loslassen je
+  // unbemerkt, liefe der Puls sonst für immer — und das Blatt würde bei jedem
+  // Bild neu geschrieben, auch unter einer ruhenden oder ausrollenden Karte.
+  heal.value = withRepeat(
+    withTiming(1, { duration: 500, easing: Easing.linear }),
+    DRAG_HEAL_HALF_CYCLES,
+    true,
+  );
+}
+
+
+export function stopDragHeal(heal: SharedValue<number>): void {
+  "worklet";
+  cancelAnimation(heal);
+  heal.value = 0;
+}
+
+/** Der Beitrag zur Lage — ein Tausendstel Punkt, siehe `startDragHeal`. */
+export function dragHealOffset(heal: SharedValue<number>): number {
+  "worklet";
+  return heal.value * 0.001;
+}
+
 export interface SheetScrollGate {
   /**
    * Gehört an die Liste (`ref={gate.ref}`) — darüber wird sie festgehalten.
@@ -279,6 +353,23 @@ export interface SheetSwipeOptions {
    * eine positive Länge — es ist der Weg aus dem Bild, nicht ein Ziel.
    */
   direction?: "down" | "up";
+  /**
+   * Die Selbstkorrektur des Blattes (siehe `startDragHeal`) — die Geste stößt
+   * sie beim Aufsetzen an und hält sie beim Loslassen an. Das Blatt rechnet sie
+   * über `dragHealOffset` in seine Lage ein.
+   */
+  heal?: SharedValue<number> | null;
+  /**
+   * `true` = das Blatt wird gerade von woanders geschlossen (Zurück-Taste,
+   * Verdunkelung angetippt). Siehe `released` unten.
+   *
+   * Als geteilter Wert, wenn der Besitzer seine Ausfahrt SELBST startet: Er
+   * setzt ihn davor, beide Schreibvorgänge kommen in dieser Reihenfolge auf dem
+   * UI-Strang an. Als Wahrheitswert (`!open`), wenn die Ausfahrt in einem Effekt
+   * am Offen-Sein hängt — der wird hier im Layout-Effekt gespiegelt, also vor
+   * jedem gewöhnlichen Effekt desselben Durchgangs.
+   */
+  closing?: SharedValue<boolean> | boolean | null;
 }
 
 export function useSheetSwipe({
@@ -290,7 +381,36 @@ export function useSheetSwipe({
   rest = 0,
   gate = null,
   direction = "down",
+  heal = null,
+  closing = null,
 }: SheetSwipeOptions) {
+  /**
+   * `closing` als Wahrheitswert, gespiegelt auf den UI-Strang — im
+   * Layout-Effekt, also vor dem Effekt, der die Ausfahrt anstößt (über
+   * `useSheetSlide` sogar erst ein Bild später).
+   *
+   * NICHT `enabled`: Das schalten Besitzer auch aus anderen Gründen ab (die
+   * Such-Slide etwa, wenn ihr Formular an die Höhengrenze stößt). Galt jedes
+   * Abschalten als „wird geschlossen", blieb ein Blatt, dem mitten im Ziehen
+   * die Geste abgeschaltet wurde, halb gezogen stehen.
+   */
+  const closingFlag = useSharedValue(typeof closing === "boolean" ? closing : false);
+  /**
+   * Hat DIESE Geste das Blatt weggewischt? Gesetzt auf dem UI-Strang im Bild
+   * des Loslassens — der Besitzer erfährt es erst über `onDismiss` auf dem
+   * JS-Strang, und in diesem Fenster (50–200 ms unter Last) konnte ein neuer
+   * Griff die Ausfahrt abbrechen. Zurückgesetzt, sobald das Blatt wieder offen
+   * ist (`closing` wird falsch) — Blätter mit eigenem Merker werden je Öffnen
+   * neu aufgebaut.
+   */
+  const dismissed = useSharedValue(false);
+  useLayoutEffect(() => {
+    if (typeof closing === "boolean") {
+      closingFlag.value = closing;
+      if (!closing) dismissed.value = false;
+    }
+  }, [closing, closingFlag, dismissed]);
+  const closingSv = typeof closing === "boolean" ? closingFlag : closing;
   /**
    * Der Nullpunkt der Bewegung.
    *
@@ -341,6 +461,21 @@ export function useSheetSwipe({
   const nativeScroll = gate?.native ?? null;
 
   return useMemo(() => {
+    /**
+     * Hat jemand anderes das Blatt übernommen — schließt es gerade von woanders
+     * (`closing`)?
+     *
+     * Dann schreibt die Geste nichts mehr. Wer das Blatt festhielt und dabei
+     * die Zurück-Taste drückte, bekam sonst im nächsten Bild die Lage des
+     * Fingers zurückgeschrieben — das brach die Ausfahrt ab, und beim Loslassen
+     * rastete ein logisch geschlossenes Blatt wieder ein. Schaltet der Besitzer
+     * dabei `enabled` ab, bricht die Geste zudem ab, und der Abbruch-Zweig
+     * holte das Blatt mitten in der Ausfahrt an die Ruhelage.
+     */
+    const released = () => {
+      "worklet";
+      return dismissed.value || (closingSv !== null && closingSv.value);
+    };
     const g = Gesture.Pan()
       .enabled(enabled)
       .activeOffsetY(SWIPE_ACTIVATE * dir)
@@ -350,7 +485,14 @@ export function useSheetSwipe({
       // Punkte nach oben an und gibt nach unten auf.
       .failOffsetY(-SWIPE_ACTIVATE * dir)
       .failOffsetX([-FAIL_X, FAIL_X])
+      // Selbstkorrektur ab dem Aufsetzen — siehe `startDragHeal`.
+      .onBegin(() => {
+        if (heal !== null) startDragHeal(heal);
+      })
       .onStart((e) => {
+        // Ein Blatt, das gerade geschlossen wird, lässt sich nicht fangen — die
+        // Ausfahrt bleibt, `active` auch (kein Zurückholen im Abbruch).
+        if (released()) return;
         active.value = true;
         // Eine laufende Kurve anhalten und von dort weitermachen — sonst reißt
         // das Zupacken das Blatt im ersten Bild an den Ruhepunkt.
@@ -359,6 +501,7 @@ export function useSheetSwipe({
         base.value = e.translationY;
       })
       .onUpdate((e) => {
+        if (!active.value || released()) return;
         /**
          * Wer die Bewegung zeigt, entscheidet die LAGE des Blattes zuerst.
          *
@@ -450,6 +593,7 @@ export function useSheetSwipe({
         }
       })
       .onEnd((e) => {
+        if (!active.value || released()) return;
         /**
          * Gemessen wird der Weg des FINGERS, nicht der Abstand des Blattes zur
          * Ruhelage.
@@ -493,6 +637,9 @@ export function useSheetSwipe({
             // abreißen lässt.
             runOnJS(markSheetMoving)(SWIPE_OUT.duration);
           }
+          // Nur mit `closing`: Ohne ihn gäbe es nichts, was den Merker beim
+          // nächsten Öffnen zurücksetzt — die Geste wäre danach tot.
+          if (closingSv !== null) dismissed.value = true;
           runOnJS(onDismiss)(SWIPE_OUT.duration, y.value);
           return;
         }
@@ -517,10 +664,11 @@ export function useSheetSwipe({
          * bevor diese Geste anspringt.
          */
         if (onList !== null) onList.value = false;
+        if (heal !== null) stopDragHeal(heal);
         const wasActive = active.value;
         active.value = false;
         // Nur was angesprungen ist, gehört auch zurückgeholt — siehe `active`.
-        if (success || !wasActive) return;
+        if (success || !wasActive || released()) return;
         if (y.value !== rest) settleBack(y, rest);
       });
 
@@ -531,9 +679,12 @@ export function useSheetSwipe({
     active,
     base,
     startY,
+    closingSv,
+    dismissed,
     dir,
     drive,
     enabled,
+    heal,
     nativeScroll,
     onDismiss,
     onList,

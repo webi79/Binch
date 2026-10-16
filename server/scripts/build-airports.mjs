@@ -77,6 +77,69 @@ function parseRow(line) {
 const DISPLAY = new Intl.DisplayNames(["en"], { type: "region" });
 
 /**
+ * Stadtnamen, bei denen `municipality` die STANDORTGEMEINDE nennt und nicht die
+ * Stadt, die der Flughafen bedient — „Colombier-Saugnieu" für Lyon, „Balice"
+ * für Kraków, „Ferno"-artige Namen, nach denen niemand sucht.
+ *
+ * Das Feld ist mehr als Anzeige: Die Ortssuche durchsucht es neben dem Namen
+ * (Ciampino steht nur über „Rome" auf der Liste für Rom, CDG nur über
+ * „Paris", Narita nur über „Tokyo"), und der Vorlauf des Stadt-Blatts plant
+ * mit ihm. Entstanden aus
+ * dem Datenbank-Abgleich im Sept. 2026: Dort stand für diese Flughäfen bereits
+ * der bessere Name, ein erneuter Seed hätte ihn zurückgedreht.
+ */
+const CITY_OVERRIDES = {
+  ACH: "Sankt Gallen",
+  BGY: "Bergamo",
+  BRU: "Brussels",
+  CRV: "Crotone",
+  CUF: "Cuneo",
+  ETZ: "Metz",
+  EWR: "New York",
+  FCN: "Nordholz",
+  FLR: "Florence",
+  FMO: "Münster",
+  FNI: "Nîmes",
+  FUE: "Puerto del Rosario",
+  GOA: "Genoa",
+  GRZ: "Graz",
+  HDF: "Heringsdorf",
+  HEI: "Büsum",
+  HHN: "Hahn",
+  IAD: "Washington",
+  IEG: "Zielona Góra",
+  KRK: "Kraków",
+  KSF: "Kassel",
+  LCG: "A Coruña",
+  LEJ: "Leipzig",
+  LEN: "León",
+  LIG: "Limoges",
+  LIL: "Lille",
+  LIN: "Milan",
+  LPY: "Le Puy-en-Velay",
+  LRT: "Lorient",
+  LUG: "Lugano",
+  LYS: "Lyon",
+  MRS: "Marseille",
+  MXP: "Milan",
+  NAP: "Naples",
+  NRT: "Tokyo",
+  OSR: "Ostrava",
+  OST: "Ostend",
+  OUI: "Ouessant",
+  PAD: "Paderborn",
+  RMU: "Murcia",
+  RNS: "Rennes",
+  TER: "Lajes",
+  TPE: "Taipei",
+  TRN: "Turin",
+  VBS: "Brescia",
+  VCE: "Venice",
+  VIT: "Vitoria-Gasteiz",
+  VRN: "Verona",
+};
+
+/**
  * OurAirports `municipality` auf einen brauchbaren Stadtnamen bringen.
  *
  * Das Feld ist nicht einheitlich. Es kommt vor als „London", als „London,
@@ -166,7 +229,7 @@ const airports = rows
   .map((r) => ({
     iata: r.iata_code,
     name: shortName(r.name),
-    city: cityName(r.municipality || r.name, r.name),
+    city: CITY_OVERRIDES[r.iata_code] ?? cityName(r.municipality || r.name, r.name),
     country: countryName(r.iso_country),
     // Größenklasse, und die ist kein Beiwerk: Die Suche sortierte unter
     // Flughäfen zuletzt nach „kürzeres Label gewinnt". Bei 391 kuratierten

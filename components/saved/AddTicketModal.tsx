@@ -33,7 +33,7 @@ import { persistTicketImages } from "@/lib/saved/ticketImages";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useAccent } from "@/lib/theme/accent";
 import { scaledStyles } from "@/lib/ui/compact";
-import { useSheetScrollGate, useSheetSwipe } from "@/lib/ui/sheetSwipe";
+import { dragHealOffset, snapToPixel, useSheetScrollGate, useSheetSwipe } from "@/lib/ui/sheetSwipe";
 
 interface Props {
   visible: boolean;
@@ -181,8 +181,15 @@ function AddTicketSheet({
     });
   }, [translateY, sheetH]);
 
+  /**
+   * Ganze Gerätepixel + Selbstkorrektur beim Ziehen — beides erklärt in
+   * lib/ui/sheetSwipe.ts (`snapToPixel`, `startDragHeal`).
+   */
+  const heal = useSharedValue(0);
+  /** Wird von woanders geschlossen — die Wisch-Geste hält sich dann heraus (`closing` in useSheetSwipe). */
+  const closingSv = useSharedValue(false);
   const sheetAnim = useAnimatedStyle(() => ({
-    transform: [{ translateY: translateY.value }],
+    transform: [{ translateY: snapToPixel(translateY.value) + dragHealOffset(heal) }],
   }));
 
   /**
@@ -231,6 +238,7 @@ function AddTicketSheet({
   const scheduleClose = useCallback((afterMs: number) => {
     if (closingRef.current) return;
     closingRef.current = true;
+    closingSv.value = true;
     closeTimer.current = setTimeout(() => onCloseRef.current(), afterMs);
   }, []);
 
@@ -239,6 +247,7 @@ function AddTicketSheet({
     if (closingRef.current) return;
     // Auch hier: die Ausfahrt war nicht angemeldet, siehe LegTimelineOverlay.
     markSheetMoving(SHEET_OUT.duration);
+    closingSv.value = true;
     translateY.value = withTiming(sheetH.value || 900, SHEET_OUT);
     scheduleClose(SHEET_OUT.duration);
   }, [scheduleClose, translateY, sheetH]);
@@ -261,6 +270,8 @@ function AddTicketSheet({
     onDismiss: scheduleClose,
     enabled: !busy,
     gate,
+    heal,
+    closing: closingSv,
   });
 
   const pickAndParse = async (fallbackMode: TravelMode) => {

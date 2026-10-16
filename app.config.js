@@ -125,6 +125,11 @@ module.exports = {
       "expo-audio",
       "./plugins/withDisplayRatePin",
       /**
+       * MapLibre Native MIT GLOBUS — selbst gebaut aus maplibre-native#4533,
+       * bis MapLibre ihn veröffentlicht. Details im Plugin.
+       */
+      "./plugins/withMaplibreGlobe",
+      /**
        * Meldungen aufs Gerät — für die Preis-Alarme.
        *
        * Als Plugin und nicht von Hand am Android-Projekt: Der Ordner `android`

@@ -45,10 +45,11 @@ import {
   Info,
   type LucideIcon,
 } from "lucide-react-native";
-import { format, parseISO } from "date-fns";
 import { de, enGB, es, fr } from "date-fns/locale";
-import { formatTimeInZone, shiftIsoByMinutes } from "@/lib/time-format";
+import { formatLocalizedDateInZone, formatTimeInZone, localTimeHint, shiftIsoByMinutes } from "@/lib/time-format";
+import { changesText } from "@/lib/format/routeMeta";
 import { DelayedTime } from "@/components/results/DelayedTime";
+import { JOURNEY_WARNING_COLORS, JourneyWarningIcon } from "@/components/results/JourneyWarningBadge";
 import { useT } from "@/lib/i18n/useT";
 import { holdLayer, layerGeneration, rearmLayer, releaseLayer } from "@/lib/nav/transitionLayer";
 import { useSearchStore } from "@/stores/searchStore";
@@ -498,6 +499,18 @@ const DetailsContent = memo(function DetailsContent({
      * die einzigen beiden, denen der Vorlauf auf der Rückfahrt fehlte.
      */
     const raf = requestAnimationFrame(() => {
+    /**
+     * Wurde in diesem einen Bild schon wieder geöffnet? Dann NICHT zurückfahren.
+     *
+     * Dasselbe Muster wie bei Bo (siehe `openAssistant`): Eine Karte startet
+     * ihre Einfahrt im Tipp-Handler (`startDetailsPush`), also VOR dem Render,
+     * dessen Aufräumen diesen Rückruf abbestellen würde. Fiel der Tipp genau
+     * zwischen diesen Effekt und sein Bild, setzte die abgebrochene Rückfahrt
+     * die frische Einfahrt auf 0 — das Blatt kam kurz und fuhr wieder hinaus,
+     * und der Öffnen-Zweig startete nichts nach, weil die Fahrt ja „lief".
+     * Der Merker ist ein JS-Wert (kein Zugriff auf den geteilten Wert).
+     */
+    if (isDetailsPushStarted()) return;
     detailsPush.value = withTiming(0, POP_SPRING, (finished?: boolean) => {
       "worklet";
       // Die Textur der Unterlage lebt jetzt genau so lange wie die Bewegung.
@@ -652,19 +665,18 @@ const DetailsContent = memo(function DetailsContent({
   // jeder savedTrips-Mutation.
   const isDirect = result.stops === 0;
   const stopVia = !isDirect && result.stopLabels?.length ? result.stopLabels[0] : null;
-  const stopLabel =
-    result.stops === 0
-      ? t("details.stop.zero")
-      : result.stops === 1
-      ? t("details.stop.one")
-      : t("details.stop.many").replace("{count}", String(result.stops));
+  // Umstiege (beim Flug: Stopps) — „1 Stopp" las sich bei Zug und Bus wie ein Halt.
+  const stopLabel = changesText(result.mode, result.stops, t);
+  // Datum in der Zone des Abfahrtshalts, wie die Uhrzeit darunter.
   const dateStr = (() => {
     try {
-      return format(parseISO(result.departTime), "d. MMM", { locale: dateLocale });
+      return formatLocalizedDateInZone(result.departTime, result.originTz, "d. MMM", dateLocale);
     } catch {
       return "";
     }
   })();
+  /** „Ortszeit (UTC+1)", wenn Ab- oder Ankunft nicht in der Zeit des Geräts stehen. */
+  const zoneHint = localTimeHint([result.originTz, result.destinationTz], t, Date.parse(result.departTime) || Date.now());
   // TZ-bewusst: Flüge speichern "floating local time" mit originTz/destinationTz
   // = "UTC" → formatTimeInZone zeigt die Wall-Clock verbatim (kein +2h-Bug).
   // Züge/Busse mit echter IANA-Zone werden korrekt in ihrer Zone angezeigt;
@@ -683,18 +695,25 @@ const DetailsContent = memo(function DetailsContent({
       return "";
     }
   })();
+  // Gefährdet laut Bahn (siehe JourneyWarning). Ausgefallen = nichts zu buchen.
+  const warning = result.warning;
+  const cancelled = warning === "cancelled";
   // Verspätung: neue Ist-Zeit klein über der durchgestrichenen Fahrplanzeit.
   const departDelayedStr =
-    (result.departDelayMinutes ?? 0) > 0
+    !cancelled && (result.departDelayMinutes ?? 0) > 0
       ? formatTimeInZone(shiftIsoByMinutes(result.departTime, result.departDelayMinutes!), result.originTz)
       : undefined;
   const arriveDelayedStr =
-    (result.arriveDelayMinutes ?? 0) > 0
+    !cancelled && (result.arriveDelayMinutes ?? 0) > 0
       ? formatTimeInZone(shiftIsoByMinutes(result.arriveTime, result.arriveDelayMinutes!), result.destinationTz)
       : undefined;
 
-  const originName = result.originLabel?.split(",")[0]?.trim() || displayCode(result.origin) || result.origin;
-  const destName = result.destLabel?.split(",")[0]?.trim() || displayCode(result.destination) || result.destination;
+  // Der GANZE Name: Bis hier wurde nach dem ersten Komma abgeschnitten — aus
+  // „Enschede, Lindestraat" (so heißt der Halt amtlich) wurde „Enschede".
+  // Länder stehen in unseren Namen nie hinter dem Komma (siehe ResultsView,
+  // `stationLabel`).
+  const originName = result.originLabel?.trim() || displayCode(result.origin) || result.origin;
+  const destName = result.destLabel?.trim() || displayCode(result.destination) || result.destination;
 
   const paxKey = passengers === 1 ? "details.passenger.one" : "details.passenger.many";
   const paxLabel = t(paxKey).replace("{count}", String(passengers));
@@ -979,12 +998,16 @@ const DetailsContent = memo(function DetailsContent({
                     "16:15 → 16:15" anzeigen. Stattdessen Em-Dash bis das echte
                     Result da ist. */}
                 <View style={styles.trainTimeRow}>
-                  <DelayedTime scheduled={departTime} delayed={departDelayedStr} style={styles.trainTime} />
+                  <DelayedTime
+                    scheduled={departTime}
+                    delayed={departDelayedStr}
+                    style={[styles.trainTime, cancelled && styles.trainTimeCancelled]}
+                  />
                   <Text style={styles.trainTimeDash}> → </Text>
                   <DelayedTime
                     scheduled={pending ? "—" : arriveTime}
                     delayed={pending ? undefined : arriveDelayedStr}
-                    style={styles.trainTime}
+                    style={[styles.trainTime, cancelled && styles.trainTimeCancelled]}
                   />
                 </View>
                 {stopVia ? (
@@ -996,6 +1019,11 @@ const DetailsContent = memo(function DetailsContent({
                     {carrier}
                   </Text>
                 )}
+                {zoneHint && !pending ? (
+                  <Text style={styles.zoneHint} numberOfLines={1}>
+                    {zoneHint}
+                  </Text>
+                ) : null}
               </View>
               <View style={{ alignItems: "flex-end" }}>
                 {/* Stops + Duration sind im Pending-Stub beide 0 / "Direkt" —
@@ -1008,6 +1036,25 @@ const DetailsContent = memo(function DetailsContent({
                 </Text>
               </View>
             </View>
+
+            {/* Warnung der Bahn, sichtbar ohne Scrollen — dieselbe Zeile wie
+                „Gut zu wissen" unten, nur in Warnfarbe. Wo genau es hakt,
+                zeigt die Zeitleiste dahinter (Umstieg bzw. Teilstrecke). */}
+            {warning && !pending ? (
+              <View style={[styles.infoRow, styles.warningInfoRow, { backgroundColor: palette.s2 }]}>
+                <View style={[styles.infoBadge, { backgroundColor: JOURNEY_WARNING_COLORS[warning].bg }]}>
+                  <JourneyWarningIcon warning={warning} size={16} />
+                </View>
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <Text style={[styles.infoTitle, { color: JOURNEY_WARNING_COLORS[warning].fg }]}>
+                    {t(`details.warning.${warning}.title`)}
+                  </Text>
+                  <Text style={styles.infoSubtitle} numberOfLines={3}>
+                    {t(`details.warning.${warning}.sub`)}
+                  </Text>
+                </View>
+              </View>
+            ) : null}
 
             {/* Details-anzeigen Ghost-Button — im Pending-State versteckt
                 weil noch keine Legs/Stopovers da sind, der LegTimelineOverlay
@@ -1064,34 +1111,43 @@ const DetailsContent = memo(function DetailsContent({
                 </>
               ) : null}
 
-              <SectionHeader
-                title={t("details.bookticket")}
-                caption={
-                  flightOptionsLoading ? pricesLabel : `${providerCountLabel} · ${pricesLabel}`
-                }
-              />
-              <View style={styles.sectionContent}>
-                {/* Skeletons solange entweder der Surroundings-Stub noch die
-                    echte Search-API abwartet (`pending`) ODER die Flug-Buchungs-
-                    Optionen noch laden (`flightOptionsLoading`). In beiden Fällen
-                    kennen wir noch keine echten Preise — wir zeigen bewusst
-                    KEINEN Schätzpreis, sonst springt er beim Reinkommen der
-                    realen Optionen. Sobald die echten Provider da sind (oder ein
-                    ehrlicher Single-Provider-Fallback), switcht's auf die Cards. */}
-                {pending || flightOptionsLoading ? (
-                  <>
-                    <ProviderCardSkeleton />
-                    <ProviderCardSkeleton />
-                    <ProviderCardSkeleton />
-                  </>
-                ) : (
-                  <>
-                    {providerList.map((p, i) => (
-                      <ProviderCard key={`${p.name}-${i}`} provider={p} t={t} />
-                    ))}
-                  </>
-                )}
-              </View>
+              {/* Ausgefallen: KEIN Buchungsbereich. Die Fahrt findet nicht statt,
+                  bahn.de verkauft sie nicht — ein Knopf „Buchen" wäre ein
+                  Versprechen, das am Ende ins Leere läuft. Der Hinweis oben sagt
+                  warum. Bei gefährdetem Anschluss bleibt er: DB bietet die
+                  Verbindung weiter an, und der Hinweis steht direkt darüber. */}
+              {cancelled ? null : (
+                <>
+                  <SectionHeader
+                    title={t("details.bookticket")}
+                    caption={
+                      flightOptionsLoading ? pricesLabel : `${providerCountLabel} · ${pricesLabel}`
+                    }
+                  />
+                  <View style={styles.sectionContent}>
+                    {/* Skeletons solange entweder der Surroundings-Stub noch die
+                        echte Search-API abwartet (`pending`) ODER die Flug-Buchungs-
+                        Optionen noch laden (`flightOptionsLoading`). In beiden Fällen
+                        kennen wir noch keine echten Preise — wir zeigen bewusst
+                        KEINEN Schätzpreis, sonst springt er beim Reinkommen der
+                        realen Optionen. Sobald die echten Provider da sind (oder ein
+                        ehrlicher Single-Provider-Fallback), switcht's auf die Cards. */}
+                    {pending || flightOptionsLoading ? (
+                      <>
+                        <ProviderCardSkeleton />
+                        <ProviderCardSkeleton />
+                        <ProviderCardSkeleton />
+                      </>
+                    ) : (
+                      <>
+                        {providerList.map((p, i) => (
+                          <ProviderCard key={`${p.name}-${i}`} provider={p} t={t} />
+                        ))}
+                      </>
+                    )}
+                  </View>
+                </>
+              )}
             </>
           ) : null}
         </ScrollView>
@@ -1488,8 +1544,12 @@ const styles = scaledStyles({
     lineHeight: 24,
   },
   trainTimeRow: { flexDirection: "row", alignItems: "center" },
+  // Ausgefallen: wie die durchgestrichene Fahrplanzeit in DelayedTime.
+  trainTimeCancelled: { color: C.sub, textDecorationLine: "line-through" },
   trainTimeDash: { color: C.sub, fontSize: 22, fontWeight: "700" },
   trainVia: { fontSize: 13, color: C.sub, marginTop: 3, fontWeight: "500" },
+  // Ortszeit-Hinweis unter „via …" — eine Stufe leiser.
+  zoneHint: { fontSize: 11, color: C.sub, marginTop: 2, fontWeight: "500", opacity: 0.85 },
   stopsText: { fontSize: 13, fontWeight: "700", color: C.alert },
   stopsTextDirect: { fontSize: 13, fontWeight: "700" },
   durationText: { fontSize: 13, color: C.sub, marginTop: 3, fontWeight: "500" },
@@ -1534,6 +1594,8 @@ const styles = scaledStyles({
     justifyContent: "center",
   },
   infoTitle: { fontSize: 15, fontWeight: "700", color: C.text, letterSpacing: -0.15 },
+  // Abstand zur Fahrtzeile darüber; Farbe der Fläche kommt aus der Palette.
+  warningInfoRow: { marginTop: 12 },
   infoSubtitle: { fontSize: 12, color: C.sub, marginTop: 2, fontWeight: "500" },
 
   /* Provider card */

@@ -1,63 +1,26 @@
+import { dbHasRoom, withDbPriority } from "./dbQuota.js";
+
 /**
- * Shared Rate-Limiter + Background-Refresh-Queue für db-vendo.
+ * Background-Refresh-Queue für db-vendo.
  *
- * Zwei Prioritätsstufen über einem gemeinsamen 50/min-Budget:
- *   - „user"       → User wartet auf Response (SearchHero, Stop-Tap, Locations).
- *                    Darf bis HARD_CAP ziehen. Bekommt im Konflikt Vorrang.
- *   - „background" → SWR-Refresh, History-Route-Refresh, Pre-Cache.
- *                    Darf nur bis (HARD_CAP - USER_RESERVE) → User-Calls
- *                    haben dadurch immer freie Slots.
- *
- * Queue:
- *   - Background-Refreshes werden via `enqueueRefresh` registriert
+ * Das Budget (wie viele Anfragen pro Minute an bahn.de gehen dürfen, mit
+ * Vorrang für die Suche) steht in services/dbQuota.ts. Hier liegt nur die
+ * Warteschlange für das Auffrischen im Hintergrund:
+ *   - Aufträge werden via `enqueueRefresh` registriert
  *   - Dedup per `key` — 100 parallele Refresh-Wünsche für dieselbe Route
  *     ergeben 1 Task
- *   - Worker tickt alle 1.5 s, holt höchste Priorität, prüft Background-Budget
- *   - Falls Budget alle: Worker idled, Task bleibt liegen
+ *   - Worker tickt alle 1.5 s, holt höchste Priorität, prüft das Budget der
+ *     Stufe `background`; ist es alle, bleibt der Auftrag liegen
  *   - Max-Age pro Task (Default 5 min) — stale Refreshes verfallen
- *
- * Headroom-Strategie:
- *   - DB-Limit:       60/min IPv4
- *   - Unser HARD_CAP: 50/min (10 Slots gegen Clock-Skew + interne Retries)
- *   - USER_RESERVE:   20 → Background darf max 30/min ziehen
- *   - Resultat: User-Traffic-Spike auf 30/min schiebt Background komplett raus,
- *               User kann noch bis 50/min weiter feuern
  */
 
-const WINDOW_MS = 60_000;
-const HARD_CAP = 50;
-const USER_RESERVE = 20; // 20 Slots immer für User — Background-Cap = 30/min
+/**
+ * Das Budget selbst steht seit Sept. 2026 in services/dbQuota.ts — EIN Zähler
+ * für alles, was an bahn.de geht (vorher zählten hier nur die Tafeln). Diese
+ * Datei ist nur noch die Warteschlange für das Auffrischen im Hintergrund.
+ */
 const WORKER_TICK_MS = 1500; // 40/min Worker-Tickrate (gedeckelt durch Budget)
 const DEFAULT_TASK_MAX_AGE_MS = 5 * 60_000;
-
-const outboundTimes: number[] = [];
-
-function pruneOld(): number {
-  const cutoff = Date.now() - WINDOW_MS;
-  while (outboundTimes.length > 0 && outboundTimes[0]! < cutoff) outboundTimes.shift();
-  return outboundTimes.length;
-}
-
-/** Aktueller Outbound-Druck (Calls in den letzten 60s). */
-export function dbVendoBudgetUsed(): number {
-  return pruneOld();
-}
-
-/** Versuch einen User-Slot zu reservieren. Liefert true wenn Budget da. */
-export function claimUserBudget(): boolean {
-  const usage = pruneOld();
-  if (usage >= HARD_CAP) return false;
-  outboundTimes.push(Date.now());
-  return true;
-}
-
-/** Versuch einen Background-Slot zu reservieren (strenger gecapped). */
-export function claimBackgroundBudget(): boolean {
-  const usage = pruneOld();
-  if (usage >= HARD_CAP - USER_RESERVE) return false;
-  outboundTimes.push(Date.now());
-  return true;
-}
 
 interface RefreshTask {
   /** Dedup-Key — gleicher Key überschreibt vorhandene Tasks (höhere Priorität gewinnt). */
@@ -100,8 +63,28 @@ export function enqueueRefresh(opts: EnqueueOpts): void {
   });
 }
 
+/**
+ * Längste Laufzeit eines Auftrags, bevor die Schlange weitergeht — eine
+ * Zugsuche im Hintergrund braucht höchstens ihre Anbieter-Grenze (15 s) plus
+ * Preise (≈ 13 s); das Doppelte davon ist sicher „hängt".
+ */
+const TASK_WATCHDOG_MS = 60_000;
+
+/** Läuft gerade ein Auftrag? Die Uhr tickt ohne zu warten — ohne diesen Merker
+ *  starteten langsame Aufträge überlappend, alle nach derselben Budget-Prüfung. */
+let ticking = false;
+
 async function tick(): Promise<void> {
-  if (tasks.size === 0) return;
+  if (tasks.size === 0 || ticking) return;
+  ticking = true;
+  try {
+    await runNext();
+  } finally {
+    ticking = false;
+  }
+}
+
+async function runNext(): Promise<void> {
 
   // Expirierte Tasks abräumen, höchste Priorität raussuchen.
   const now = Date.now();
@@ -120,14 +103,29 @@ async function tick(): Promise<void> {
   // eigentliche Slot-Claim passiert IM execute() durch den Fetch selbst
   // (`claimBackgroundBudget`), sodass jede physische dbRest-Anfrage gezählt
   // wird (inkl. Retries innerhalb eines fetchFromDbRest-Calls).
-  if (dbVendoBudgetUsed() >= HARD_CAP - USER_RESERVE) return;
+  if (!dbHasRoom("background")) return;
 
   tasks.delete(best.key);
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
   try {
-    await best.execute();
+    // Alles, was dieser Auftrag bei der Bahn fragt, zählt als Hintergrund —
+    // auch wenn er dieselbe Funktion wie eine echte Suche aufruft.
+    //
+    // Mit Wachhund: Die Aufträge laufen einer nach dem anderen (`ticking`).
+    // Hängt einer (Sidecar antwortet nicht), stünde sonst die ganze Schlange.
+    // Nach `TASK_WATCHDOG_MS` geht es weiter; der hängende Auftrag darf im
+    // Hintergrund noch zu Ende laufen.
+    await Promise.race([
+      withDbPriority("background", () => best.execute()),
+      new Promise((_, reject) => {
+        watchdog = setTimeout(() => reject(new Error("watchdog")), TASK_WATCHDOG_MS);
+      }),
+    ]);
   } catch {
     // Refresh-Fehler ignorieren — der nächste User-Access triggert eine
     // neue Anfrage (entweder direkt oder erneut enqueued).
+  } finally {
+    clearTimeout(watchdog);
   }
 }
 

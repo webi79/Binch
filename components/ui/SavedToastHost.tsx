@@ -157,7 +157,12 @@ function Toast() {
     // Welches Ergebnis war offen, als getippt wurde? Im Handler lesen, nicht im
     // Render — dort würde es bei jedem Render überschrieben und der Wächter unten
     // verglichen gegen die NEUE Auswahl, also genau gegen die, die er schützen soll.
-    const openId = useSearchStore.getState().selectedResult?.id;
+    // Den Öffnungs-Zähler, nicht die Kennung: Wer dieselbe Verbindung schließt
+    // und gleich wieder öffnet, hat wieder dieselbe Kennung (siehe
+    // `selectedResultSeq`).
+    const openSeq = useSearchStore.getState().selectedResult
+      ? useSearchStore.getState().selectedResultSeq
+      : null;
     /**
      * Den Ergebnis-Bildschirm SOFORT wegstellen, bevor der Reiter wechselt.
      *
@@ -212,7 +217,7 @@ function Toast() {
           // öffnet, bekam sein frisch geöffnetes Detail sonst kommentarlos wieder
           // zugemacht (die Aktion nullt auch die Bein-Zeitleiste mit).
           const st = useSearchStore.getState();
-          if (st.selectedResult?.id !== openId) return;
+          if (openSeq == null || !st.selectedResult || st.selectedResultSeq !== openSeq) return;
           clearSelectedResult();
         }, 2000);
   }, [ring, check, hide, router, clearSelectedResult]);

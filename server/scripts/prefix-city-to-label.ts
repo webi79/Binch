@@ -25,6 +25,21 @@ import { locations } from "../src/db/schema.js";
 const CHUNK = 2000;
 
 async function main() {
+  /**
+   * STILLGELEGT (Sept. 2026) — nur noch mit `--force`.
+   *
+   * Das Skript klebte den Wert von `city` vor jedes Label, das ihn nicht
+   * enthielt. Stand dort ein Stadtteil (die alte Gemeinde-Ermittlung lieferte
+   * reichlich davon), entstanden Namen wie „Stationsbuurt Den Haag HS" oder
+   * „Neubau Wien Westbahnhof"; `fix-stop-cities.ts` hat sie wieder entfernt.
+   * Gebraucht wird es für die Suche nicht mehr: Die durchsucht das Stadtfeld
+   * ohnehin mit (Anrath findet man über „Willich"). Und es kennt keine
+   * Sprachen — „Vienna" stünde bald vor „Wien Hbf".
+   */
+  if (!process.argv.includes("--force")) {
+    console.error("[prefix-city] stillgelegt — siehe Kommentar im Skript. Nur mit --force.");
+    process.exit(1);
+  }
   const t0 = Date.now();
   console.log("[prefix-city] loading rows with city set…");
   const rows = await db

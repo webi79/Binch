@@ -342,6 +342,37 @@ export function syncDeviceLocale(): void {
 }
 
 /** Die zuletzt geholte Kennung, ohne zu fragen. `null` = noch keine. */
+/**
+ * Die Kennung fürs AUFRÄUMEN — ohne die Erlaubnis-Schranke.
+ *
+ * WOZU ES DAS BRAUCHT: `restorePushToken` steigt aus, sobald die Erlaubnis
+ * NICHT erteilt ist. Für alles, was zustellen will, ist das richtig. Fürs
+ * Löschen ist es eine Falle: Wer die Meldungen in den Systemeinstellungen
+ * abschaltet und danach einen gespeicherten Alarm wegwerfen will, bekommt keine
+ * Kennung mehr — und ohne sie weist der Server das Löschen ab. Die Karte wäre
+ * sichtbar und unlöschbar, also genau der Zustand, gegen den in diesem Projekt
+ * an vier Stellen geschrieben steht.
+ *
+ * Dass es überhaupt geht: Die Laufzeit-Erlaubnis auf Android regelt das
+ * ANZEIGEN von Meldungen, nicht die Registrierung bei Firebase. Die Kennung
+ * gibt es also weiterhin — sie taugt hier nur nicht mehr zum Zustellen,
+ * sondern nur noch als Ausweis gegenüber dem eigenen Server.
+ *
+ * NICHT in den Zwischenspeicher: Sonst liefe `restorePushToken` künftig an
+ * seiner eigenen Prüfung vorbei (es gibt den Zwischenspeicher zuerst heraus),
+ * und der Abgleich beim Start legte Alarme für ein Gerät an, das sie gar nicht
+ * anzeigen kann.
+ */
+export async function pushTokenForCleanup(): Promise<string | null> {
+  if (cachedToken) return cachedToken;
+  try {
+    const res = await Notifications.getDevicePushTokenAsync();
+    return typeof res.data === "string" && res.data.length > 0 ? res.data : null;
+  } catch {
+    return null;
+  }
+}
+
 export function knownPushToken(): string | null {
   return cachedToken;
 }

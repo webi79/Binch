@@ -56,6 +56,56 @@ Anmeldung, Favoriten, Hin-&-Rückreise, das Farbsystem.
       3. Client lädt von uns, mit HuggingFace als Rückfall, wenn unsere Adresse
          nicht antwortet. Traffic: ~60 MB je Installation (10.000 Nutzer ≈ 600 GB,
          im Hetzner-Kontingent unkritisch).
+- [ ] **BEIM HETZNER-UMZUG: Datenbank absichern.** Seit 01.10.2026 lauscht Postgres nur
+      noch auf `127.0.0.1`, das Passwort kommt aus `POSTGRES_PASSWORD` in `server/.env`
+      (Rückfall `binch` nur lokal). Offen für den Server:
+      1. Starkes `POSTGRES_PASSWORD` setzen — auf einer BESTEHENDEN DB zusätzlich
+         `ALTER ROLE binch PASSWORD '…'` (Postgres liest die Variable nur beim ersten
+         Start eines leeren Volumes).
+      2. `binch` ist Superuser (so legt das Postgres-Image die erste Rolle an). Eigene
+         Rolle für den Server anlegen (`binch_app`: nur SELECT/INSERT/UPDATE/DELETE auf
+         die Tabellen, `ALTER DEFAULT PRIVILEGES` für künftige) und `DATABASE_URL` von
+         `binch-server` darauf umstellen; `binch` bleibt für Migrationen und Importe.
+         NICHT `ALTER ROLE binch NOSUPERUSER` — dann hat die DB keinen Superuser mehr.
+- [ ] **BEIM HETZNER-UMZUG: Migrationen 0024–0031 NICHT in einem Rutsch auf eine
+      befüllte Datenbank.** Drizzles Migrator spielt alle offenen Dateien in EINER
+      Transaktion ein: Auf 1,6 Mio `locations`-Zeilen baut das 8 GIN-Indizes, von
+      denen spätere Dateien 4 wieder löschen, und `0027` schreibt die ganze Tabelle
+      neu (`ADD COLUMN … STORED`) — mit ACCESS-EXCLUSIVE-Sperre bis zum Ende.
+      Ortssuche, Such-Auflösung und Karte stünden minutenlang. Und `0027` hat kein
+      `IF NOT EXISTS`. Vorgehen: entweder leere DB migrieren und DANN importieren,
+      oder die Indizes vorher von Hand `CONCURRENTLY` bauen und im Wartungsfenster
+      migrieren (oder 0024–0030 zu einer Netto-Datei zusammenlegen).
+- [ ] **Esri-Schlüssel (`ESRI_API_KEY`) läuft am 05.10.2027 ab** (Eintrag „binch-imagery"
+      in der ArcGIS Location Platform) — Esri begrenzt API-Schlüssel auf
+      höchstens ein Jahr. Vor Ablauf in der ArcGIS Location Platform einen neuen
+      erzeugen und in `server/.env` tauschen (sonst fällt die Esri-Ebene still aus,
+      die App zeigt dann wieder Copernicus). Verbrauch je Monat: Tabelle
+      `imagery_usage`; Deckel `ESRI_MONTHLY_TILE_CAP` (Vorgabe 1,9 Mio.).
+- [ ] **MapLibre mit Globus ist SELBST GEBAUT** — aus den noch offenen Pull Requests
+      [maplibre-native#4533](https://github.com/maplibre/maplibre-native/pull/4533)
+      (Globus) und [#4534](https://github.com/maplibre/maplibre-native/pull/4534)
+      (Atmosphäre), dazu unser Patch für Sterne, Milchstraße (Foto ESO/S. Brunier,
+      CC BY 4.0 — Nennung über die Quelle `sky-credit`), Erdschatten und weiche
+      Polkappen. Version `13.6.1-globe.6` für alle vier Architekturen in
+      [`vendor/maplibre-native/`](vendor/maplibre-native/README.md), eingebunden
+      über `plugins/withMaplibreGlobe.js`. Offen:
+      1. `vendor/` muss mit eingecheckt sein, sonst fehlt die Bibliothek im
+         EAS-Build (17 MB).
+      2. Sobald MapLibre Globus und Himmel veröffentlicht: Verzeichnis und Plugin
+         löschen, maplibre-react-native auf die offizielle Version heben.
+- [ ] **Patch für maplibre-react-native ist NICHT eingecheckt**
+      (`patches/@maplibre+maplibre-react-native+11.2.1.patch`, Kamerakurve,
+      Fling, Gesten-Brücke). Ohne ihn baut EAS die Karte ohne all das. Beim
+      Neuerzeugen Bauordner ausschließen, sonst wird er 7 MB groß:
+      `npx patch-package @maplibre/maplibre-react-native --exclude 'package\.json$|^android/build/|^android/\.gradle/|^android/\.cxx/|^android/\.classpath$|^android/\.project$|^android/\.settings/'`
+- [ ] **Fahrplantabellen dauerhaft schlank halten.** Der Import löscht und schreibt
+      einen Feed in EINER Transaktion neu; die Indizes wuchsen dadurch Woche für Woche
+      (`gtfs_stop_times_pk` 17 GB, davon ~70 % Ballast). Seit 01.10.2026 baut
+      `refresh-all-feeds.sh` sie nach jedem Einspielen `CONCURRENTLY` neu auf
+      (DB 43 → 28 GB). Sauberer: `gtfs_stop_times` nach `feed_id` partitionieren und
+      je Feed per `DETACH`/`ATTACH` tauschen statt `DELETE`. Und prüfen, ob `gb-gtfs`
+      (72 % aller Haltezeiten) nicht besser über MOTIS läuft.
 - [ ] Keine Tests (kein Jest, keine `*.test.tsx`)
 - [ ] Kein Linter / Prettier-Config
 - [ ] Keine CI

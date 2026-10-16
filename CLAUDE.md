@@ -117,6 +117,7 @@ Daraus folgen zwei Regeln, die man nicht versehentlich umdrehen sollte:
 | `/api/search/cruises` | Kreuzfahrten suchen | gleiche wie Flüge |
 | `/api/locations` | Autocomplete für Orte | `q` (string), `mode` (`FLIGHT` \| `TRAIN` \| `BUS` \| `CRUISE` \| `ALL`) |
 | `/redirect/{token}` | Buchungs-Redirect (im Browser/InApp geöffnet, kein API-Call) | — |
+| `/api/live/trip` | Live-Ansicht: Halte mit Lage + Zeiten, Linienführung, `boardIndex` | `tripId`, `stopCode`, `atTime` |
 
 ### Response: `SearchResponse` (von `/api/search/*`)
 
@@ -135,7 +136,7 @@ Daraus folgen zwei Regeln, die man nicht versehentlich umdrehen sollte:
 - `departTime`, `arriveTime` — ISO datetime, **UTC**
 - `originTz?`, `destinationTz?` — IANA timezone (z.B. `Europe/Berlin`)
 - `dateOnly?` — `true` wenn nur das Datum bekannt ist, Uhrzeit unbekannt
-- `durationMinutes`, `stops`, `stopLabels[]`
+- `durationMinutes`, `stops`, `stopLabels[]` — `stops` zählt die **Umstiege** (Flug: Zwischenlandungen), `stopLabels` nennt die Umstiegshalte; die Halte unterwegs stehen am Leg (`legs[].stops`/`stopovers`). Eine einzelne Fahrt (Tafel → Zeitleiste) hat `stops: 0`.
 - `price`, `currency`
 - `deepLink` — server-only, wird vom Backend durch `redirectToken` ersetzt bevor's an den Client geht
 - `redirectToken` — Client baut damit `${API_BASE_URL}/redirect/${token}`
@@ -145,8 +146,14 @@ Daraus folgen zwei Regeln, die man nicht versehentlich umdrehen sollte:
 
 ```ts
 { results: Location[] }
-// Location = { code, label, city, country, type: TravelMode | "ALL" }
+// Location = { code, label, detail?, city, country, type: TravelMode | "ALL" }
 ```
+
+**Haltestellennamen:** `label` ist überall (Suche, Karte, Tafel, `/api/locations/by-codes`, Bo) der **offizielle Anzeigename** — DB-Spalte `locations.display_name`, sonst `locations.label`. Das DB-`label` selbst bleibt der volle Quellname („Oldham, Rochdale Road / Oldham College (Stop RA)") und dient nur Abgleichen (Tafel, HAFAS, Dubletten, Kartengruppierung); die Suche findet über beide. `detail` („Rochdale Road · Stop RA") gibt es nur bei gleichnamigem Halt derselben Art ≤ 400 m — dezent neben dem Namen zeigen, nie im Namen. In Großbritannien, wo beide Straßenseiten gleich heißen, ist es sonst das häufigste Fahrtziel von dort („→ Truro"). Regeln: `server/scripts/lib/stopNames.ts`, Bestand: `server/scripts/fix-stop-names.ts`.
+
+**Tafel** (`/api/stops/:code/{departures|arrivals}`): `stop = { code, label, hafasId, detail?, tz?, servedBy? }` — `tz` ist die Ortszeit-Zone des Halts; die Tafel-Zeiten (UTC) werden in ihr angezeigt, mit Hinweis „Ortszeit (UTC+1)", wenn sie von der Gerätezeit abweicht (`localTimeHint` in `lib/time-format.ts`). `servedBy = { name, distanceM }` heißt: Die Zeiten stammen von einem ANDEREN, nahen Halt (> 30 m, anderer Name) — die App sagt das über der Liste („Zeiten von „X" · 48 m entfernt").
+
+**Live-Ansicht** (Sende-Knopf an der Tafel-Zeile → Karte verfolgt das Fahrzeug): Es gibt KEINE echten Positionsdaten — die App rechnet die Lage aus Fahrplan + Echtzeit-Verspätung (`lib/live/motion.ts`: Trapez-Fahrt je Stück, Mindest-Haltezeit; `lib/live/flight.ts`: Großkreis, Steig-/Sinkflug, Rollzeiten — Flüge aus `StopBoardItem.flight` der Flugtafel). Die Info-Karte zeigt Fahrplanzeiten (wie die Tafel), nie die simulierten. 3D-Körper per `fill-extrusion` (`lib/live/shapes.ts`, Breite bewusst verstärkt — echt wäre ein Zug schmaler als seine Linie); Kartenebene `components/live/LiveVehicleLayer.tsx`, Bedienung + Folge-Kamera `components/live/LiveOverlay.tsx`. Prüfen ohne Gerät: `~/binch-backups/live-tests/` (Tests + `render/scene.mts` für mbgl-render).
 
 ### Fehler-Handling im Client
 

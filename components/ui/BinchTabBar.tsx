@@ -1,7 +1,8 @@
 import { memo, useCallback, useEffect, useMemo, useRef } from "react";
 import { Image, Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import Animated from "react-native-reanimated";
+import Animated, { useAnimatedStyle } from "react-native-reanimated";
+import { chromeShift, travelBar } from "@/lib/surroundings/mapChrome";
 import { router, usePathname } from "expo-router";
 
 import { noteTabPress, usePressBounce } from "@/lib/motion";
@@ -346,6 +347,26 @@ export function BinchTabBar() {
   const insets = useSafeAreaInsets();
   const theme = useSearchStore((st) => st.theme);
   const barSolid = BAR_SOLID[theme] ?? BAR_SOLID.gray;
+  /**
+   * Unsichtbar unter einer offenen Haltestelle, über die gerade etwas fährt.
+   *
+   * Das Haltestellen-Blatt steht im Wurzel-Layout VOR dieser Leiste und deckt
+   * sie nur über seine Android-Höhe (`elevation: 20`) ab. Fährt ein Detail-Blatt,
+   * die Zeitleiste oder die Ergebnisliste darüber, gibt es diese Höhe ab
+   * (`sheetCovered` in `StopDetailSheet`) — sonst zeichnete es sich über sie. Ab
+   * da gilt die Reihenfolge im Layout, und die Leiste lag plötzlich ÜBER der
+   * Haltestelle: Beim Tipp auf eine Abfahrt tauchte sie auf, solange die Details
+   * von rechts hereinglitten. Dieselbe Bedingung wie `covered` dort, nur mit
+   * offener Haltestelle — ein Wahrheitswert, also ein Durchgang je Wechsel.
+   */
+  const underCoveredStop = useSearchStore(
+    (st) =>
+      st.selectedStop != null &&
+      (st.selectedResult != null ||
+        st.legTimelineOverlayOpen ||
+        st.directTripResult != null ||
+        st.resultsParams != null),
+  );
 
   const t = useT();
   /**
@@ -513,6 +534,23 @@ export function BinchTabBar() {
    * Knoten, den Reanimated Bild für Bild beschreibt. Dieselbe Änderung wie an
    * Detail-, Ticket- und Profil-Blatt.
    */
+  /**
+   * Nur-Karte-Modus des Karten-Tabs: Die Leiste steht unten, fährt also nach
+   * UNTEN hinaus — mit derselben Verschiebung wie alle anderen Teile, bis sie
+   * hinter dem Rand ist (siehe `lib/surroundings/mapChrome.ts`). Auf jedem
+   * anderen Tab steht die Verschiebung auf 0: Der Karten-Tab setzt sie beim
+   * Verlassen ohne Bewegung zurück.
+   *
+   * Der Weg ist die eigene Höhe. Das Auswahlfenster darüber fährt im selben
+   * Tempo und bleibt damit an ihr kleben; es hat nur den längeren Weg.
+   */
+  const chromeTravel = BAR_H + insets.bottom;
+  useEffect(() => {
+    travelBar.value = chromeTravel;
+  }, [chromeTravel]);
+  const chromeStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: Math.min(chromeShift.value, chromeTravel) }],
+  }));
   const barStyle = useMemo(
     () => [
       styles.bar,
@@ -521,8 +559,10 @@ export function BinchTabBar() {
         height: BAR_H + insets.bottom,
         backgroundColor: BAR_TINT[theme] ?? BAR_TINT.gray,
       },
+      chromeStyle,
+      underCoveredStop ? styles.barUnderCoveredStop : null,
     ],
-    [insets.bottom, theme],
+    [insets.bottom, theme, chromeStyle, underCoveredStop],
   );
 
 
@@ -549,8 +589,12 @@ export function BinchTabBar() {
        *
        * Die Ausnahme stammt aus der Zeit, als Bo eine Route war und BAULICH
        * unter der Leiste lag. Damals war sie richtig.
+       *
+       * Einzige Ausnahme heute: unsichtbar unter einer verdeckten Haltestelle
+       * (`underCoveredStop`). Dort fiele ein Tipp sonst auf eine Leiste, die man
+       * nicht sieht, und wechselte heimlich den Tab.
        */
-      pointerEvents="auto"
+      pointerEvents={underCoveredStop ? "none" : "auto"}
       style={barStyle}
       // Der Inhalt scheint durch: Die Fläche ist dunkel getönt statt deckend,
       // und die Seiten darunter haben volle Höhe (die Bibliothek gibt ihnen
@@ -573,6 +617,8 @@ export function BinchTabBar() {
 }
 
 const styles = scaledStyles({
+  /** Siehe `underCoveredStop` — Deckkraft 0 zeichnet nichts, kostet also nichts. */
+  barUnderCoveredStop: { opacity: 0 },
   bar: {
     position: "absolute",
     left: 0,

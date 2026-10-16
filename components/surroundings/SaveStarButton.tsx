@@ -300,11 +300,10 @@ export function SaveStarButton({ size = 46, starSize = 30, saved: savedProp, onC
       hitSlop={10}
       accessibilityRole="button"
       accessibilityLabel={saved ? "Unsave station" : "Save station"}
-      style={({ pressed }) => [
-        styles.btn,
-        { width: size, height: size },
-        pressed && { transform: [{ scale: 0.84 }] },
-      ]}
+      /* ARRAY statt Funktion — siehe `SearchBar.tsx`: Mit der Funktions-Form
+         kam an dieser `Pressable` kein Stil an, der Knopf verlor damit Fläche
+         UND Größe. */
+      style={[styles.btn, { width: size, height: size }]}
     >
       {/* Umriss-Stern (immer sichtbar, weiß) */}
       <Svg width={starSize} height={starSize} viewBox="0 0 24 24">

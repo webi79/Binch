@@ -1,0 +1,1 @@
+ALTER TABLE "imagery_usage" ALTER COLUMN "month" SET DATA TYPE varchar(10);

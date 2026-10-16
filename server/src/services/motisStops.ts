@@ -49,8 +49,16 @@ interface MotisStopTimePlace {
   scheduledTrack?: string;
   cancelled?: boolean;
 }
+/** Start und Ziel der FAHRT — nicht des Halts. Siehe `direction` in `toItem`. */
+interface MotisTripEnd {
+  name?: string;
+}
 interface MotisStopTime {
   place: MotisStopTimePlace;
+  /** Wo die Fahrt HERKOMMT — die Richtungsangabe einer Ankunftstafel. */
+  tripFrom?: MotisTripEnd;
+  /** Wohin sie fährt. Deckt sich meist mit `headsign`, ist aber gepflegter. */
+  tripTo?: MotisTripEnd;
   mode: string;
   realTime?: boolean;
   headsign?: string;
@@ -101,7 +109,32 @@ function toItem(st: MotisStopTime, board: StopBoard, idx: number): StopBoardItem
     delayMinutes,
     line,
     product: modeToProduct(st.mode),
-    direction: st.headsign ?? "",
+    /**
+     * Bei ANKÜNFTEN die HERKUNFT, nicht das Ziel.
+     *
+     * Hier stand für beide Tafeln `headsign` — also immer das Fahrtziel. Unter
+     * „Ankünfte" ist das die falsche Auskunft: Wer dort steht, wartet auf
+     * jemanden und will wissen, WOHER der Zug kommt. Im gemeldeten Fall stand
+     * an einer Ankunft in Werl „Soest, Bahnhof", obwohl der Zug aus Dortmund
+     * kam und nach Soest weiterfuhr.
+     *
+     * Schlimmer noch: Die zweite Quelle derselben Tafel (db-rest) nimmt dafür
+     * `provenance`, also die Herkunft. Dieselbe Zeile bedeutete damit je nach
+     * antwortendem Anbieter etwas anderes — ein Unterschied, den niemand sehen
+     * kann. MOTIS liefert beides mit (`tripFrom`/`tripTo`), es war nur das
+     * falsche Feld gegriffen.
+     */
+    /**
+     * `|| undefined` und nicht `??`: Ein Feld, das da ist, aber LEER, ist
+     * hier kein Wert, sondern eine fehlende Angabe. `??` greift nur bei
+     * `null`/`undefined` — eine leere Zeichenkette hätte die Ausweichwege
+     * unten übersprungen, und in der Tafel stünde eine Zeile ohne Richtung.
+     */
+    direction:
+      (board === "arrivals" ? st.tripFrom?.name?.trim() || undefined : undefined) ??
+      (st.headsign?.trim() || undefined) ??
+      (st.tripTo?.name?.trim() || undefined) ??
+      "",
     platform: cleanPlatform(p.track ?? p.scheduledTrack) ?? null,
     cancelled: !!(p.cancelled || st.cancelled || st.tripCancelled),
   };
@@ -154,10 +187,32 @@ export async function getMotisStopBoard(
   const stop = await resolveMotisStopId(code, label);
   if (!stop) return null;
 
+  /**
+   * `direction=LATER` MUSS mit — sonst blättert MOTIS bei Ankünften RÜCKWÄRTS.
+   *
+   * DAS WAR DER FEHLER, und er sah harmlos aus: `arriveBy=true` liest sich wie
+   * „gib mir Ankünfte statt Abfahrten". Es bestimmt bei `/stoptimes` aber AUCH
+   * die Blätterrichtung — und die kippt damit auf „die letzten n Ereignisse VOR
+   * dem Zeitpunkt". Nachgemessen an Werl, Bahnhof (15.09., 02:33 UTC):
+   *
+   *   n=10                      → erster Eintrag 03:15Z  (Zukunft, richtig)
+   *   n=10&arriveBy=true        → erster Eintrag 14.09. 18:52Z  (VERGANGENHEIT)
+   *   n=10&arriveBy=true&direction=LATER → erster Eintrag 03:15Z  (Zukunft)
+   *
+   * An einer kleinen Station reichen zwanzig Ereignisse rückwärts locker bis
+   * zum Vortag — genau deshalb stand unter „Ankünfte" um halb fünf morgens eine
+   * Ankunft um 16:11 vom Vortag, mit „0 Min" davor (der Countdown klemmt
+   * negative Werte auf null).
+   *
+   * Ausdrücklich für BEIDE Tafeln gesetzt, obwohl Abfahrten es nicht bräuchten
+   * (nachgemessen: mit und ohne identisch): Die Kopplung an `arriveBy` ist die
+   * Falle. Wer sie einmal übersieht, baut sie wieder ein.
+   */
   // Doppelt so viele roh holen — der Feed-Dedup halbiert die Liste grob.
   const url =
     `/v6/stoptimes?stopId=${encodeURIComponent(stop.id)}` +
-    `&n=${Math.min(limit * 2, 60)}${board === "arrivals" ? "&arriveBy=true" : ""}`;
+    `&n=${Math.min(limit * 2, 60)}&direction=LATER` +
+    `${board === "arrivals" ? "&arriveBy=true" : ""}`;
   let raw: { stopTimes?: MotisStopTime[] };
   try {
     raw = (await motisFetch(url)) as { stopTimes?: MotisStopTime[] };
@@ -176,5 +231,7 @@ export async function getMotisStopBoard(
     fetchedAt: new Date(now).toISOString(),
     // Kurz gültig — Echtzeit-Board, aber Cache schont Transitous.
     validUntil: new Date(now + 60_000).toISOString(),
+    // Der Halt, den MOTIS gewählt hat — ohne Namenstreffer der nächste.
+    source: { name: stop.name, latitude: stop.lat ?? null, longitude: stop.lon ?? null },
   };
 }

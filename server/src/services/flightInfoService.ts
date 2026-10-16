@@ -76,7 +76,14 @@ function toIso(s: string | undefined): string | null {
   return Number.isFinite(t) ? new Date(t).toISOString() : null;
 }
 
-function normalize(m: AdbFlight, board: StopBoard, idx: number): StopBoardItem | null {
+/** Effektive Zeit eines Flug-Punkts: tatsächlich → Bahn → geändert → vorhergesagt. */
+function effectiveTime(p: AdbTimePoint | undefined): string | null {
+  return (
+    toIso(p?.actualTime?.utc) ?? toIso(p?.runwayTime?.utc) ?? toIso(p?.revisedTime?.utc) ?? toIso(p?.predictedTime?.utc)
+  );
+}
+
+function normalize(m: AdbFlight, board: StopBoard, idx: number, ourIata: string): StopBoardItem | null {
   // Bei Departures-Request: m.departure = unser Airport (mit Gate/Time),
   //                         m.arrival   = Ziel-Airport.
   // Bei Arrivals-Request:   m.arrival   = unser Airport,
@@ -85,11 +92,7 @@ function normalize(m: AdbFlight, board: StopBoard, idx: number): StopBoardItem |
   const otherAirport = board === "departures" ? m.arrival : m.departure;
 
   const planned = toIso(here?.scheduledTime?.utc);
-  const actual =
-    toIso(here?.actualTime?.utc) ??
-    toIso(here?.runwayTime?.utc) ??
-    toIso(here?.revisedTime?.utc) ??
-    toIso(here?.predictedTime?.utc);
+  const actual = effectiveTime(here);
   if (!planned) return null;
   const delay =
     actual ? Math.round((Date.parse(actual) - Date.parse(planned)) / 60000) : null;
@@ -110,6 +113,20 @@ function normalize(m: AdbFlight, board: StopBoard, idx: number): StopBoardItem |
     direction,
     platform: here?.gate ?? here?.terminal ?? null,
     cancelled,
+    /**
+     * Alles, was die Live-Ansicht für den Flug braucht — die Tafel hat es mit
+     * `withLeg` ohnehin (Zeiten auch am anderen Flughafen). Keine weitere,
+     * bezahlte Anfrage: Wo das Flugzeug gerade ist, rechnet die App aus.
+     */
+    flight: {
+      from: (board === "departures" ? ourIata : m.departure?.airport?.iata ?? "").toUpperCase(),
+      to: (board === "departures" ? m.arrival?.airport?.iata ?? "" : ourIata).toUpperCase(),
+      depP: toIso(m.departure?.scheduledTime?.utc),
+      depE: effectiveTime(m.departure),
+      arrP: toIso(m.arrival?.scheduledTime?.utc),
+      arrE: effectiveTime(m.arrival),
+      aircraft: m.aircraft?.model?.trim() || null,
+    },
   };
 }
 
@@ -161,7 +178,7 @@ async function fetchFromAeroDataBox(iata: string, board: StopBoard): Promise<Sto
     const data = (await res.json()) as AdbResponse;
     const list = board === "departures" ? (data.departures ?? []) : (data.arrivals ?? []);
     const results = list
-      .map((m, i) => normalize(m, board, i))
+      .map((m, i) => normalize(m, board, i, iata))
       .filter((r): r is StopBoardItem => r !== null)
       // Schon vom Provider sortiert, aber zur Sicherheit nach planned aufsteigend
       .sort((a, b) => a.plannedTime.localeCompare(b.plannedTime))

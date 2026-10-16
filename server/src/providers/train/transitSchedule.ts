@@ -1,4 +1,5 @@
 import { eq, sql } from "drizzle-orm";
+import tzLookup from "tz-lookup";
 import { db } from "../../db/client.js";
 import { locations } from "../../db/schema.js";
 import {
@@ -242,7 +243,7 @@ function prependWalkingLeg(
   const walkingLeg: LegInfo = {
     origin: origin.code,
     destination: station.code,
-    originLabel: origin.label,
+    originLabel: origin.displayName ?? origin.label,
     destLabel: station.label,
     originLat: origin.latitude != null ? Number(origin.latitude) : undefined,
     originLng: origin.longitude != null ? Number(origin.longitude) : undefined,
@@ -256,6 +257,8 @@ function prependWalkingLeg(
     line: `Zu Fuß · ${walkingDistMeters} m`,
     product: "walk",
     stops: 0,
+    originTz: zoneAt(origin.latitude, origin.longitude) ?? result.originTz,
+    destTz: result.originTz ?? zoneAt(station.latitude, station.longitude),
   };
 
   // Train-Legs aus dem dbVendo-Result kommen in `result.legs` (von dbVendo
@@ -272,8 +275,10 @@ function prependWalkingLeg(
     ...result,
     externalId: `hybrid:${origin.code}:${result.externalId}:${idx}`,
     origin: origin.code,
-    originLabel: input.originLabel ?? origin.label,
+    originLabel: input.originLabel ?? origin.displayName ?? origin.label,
     departTime: walkStartIso,
+    // Die Reise beginnt jetzt am Fußweg — dessen Zone, sonst die des Bahnhofs.
+    originTz: zoneAt(origin.latitude, origin.longitude) ?? result.originTz,
     durationMinutes: result.durationMinutes + walkingMinutes,
     legs: allLegs,
     stopLabels,
@@ -299,9 +304,29 @@ function empty(start: number): ProviderResult {
   };
 }
 
+/**
+ * Ortszeit-Zone aus der Lage (offline). Die Treffer dieses Anbieters trugen
+ * bisher KEINE Zone — die App fiel dann auf die Uhr des Geräts zurück, und eine
+ * Abfahrt in Oldham stand in der Ergebnisliste in deutscher Zeit, in der
+ * Zeitleiste in britischer.
+ */
+function zoneAt(lat: number | string | null | undefined, lon: number | string | null | undefined): string | undefined {
+  const la = lat == null ? NaN : Number(lat);
+  const lo = lon == null ? NaN : Number(lon);
+  if (!Number.isFinite(la) || !Number.isFinite(lo)) return undefined;
+  try {
+    return tzLookup(la, lo);
+  } catch {
+    return undefined;
+  }
+}
+
 interface StopRow {
   code: string;
+  /** Voller Quellname — für Tafel- und HAFAS-Abgleich. */
   label: string;
+  /** Offizieller Anzeigename, falls abweichend — für alles, was der Nutzer sieht. */
+  displayName: string | null;
   country: string | null;
   subtype: string | null;
   type: string | null;
@@ -315,6 +340,7 @@ async function loadStop(code: string): Promise<StopRow | null> {
     .select({
       code: locations.code,
       label: locations.label,
+      displayName: locations.displayName,
       country: locations.country,
       subtype: locations.subtype,
       type: locations.type,
@@ -373,6 +399,8 @@ async function fetchOriginDepartures(stop: StopRow): Promise<StopBoardItem[]> {
     board: "departures",
     latitude: lat,
     longitude: lon,
+    label: stop.label,
+    type: stop.type,
   });
   if (gtfs) return gtfs.results;
 
@@ -477,7 +505,10 @@ function toNormalizedResult(
     ? Math.max(1, Math.round((Date.parse(arrive) - Date.parse(depart)) / 60_000))
     : 0;
   const stopovers = enriched?.stopovers ?? [];
-  const stopLabels = stopovers.map((s) => s.name).filter((n): n is string => !!n);
+  // Zonen aus der Lage von Start- und Endhalt — die App zeigt jede Zeit in der
+  // Ortszeit IHRES Halts (lib/time-format.ts).
+  const originTz = zoneAt(stop.latitude, stop.longitude);
+  const destTz = zoneAt(enriched?.lastStopLat, enriched?.lastStopLng) ?? originTz;
   // destLabel: enriched ? Endstations-Name : Linien-Richtung (= Headsign).
   // Vorteil enriched: User sieht die echte Endstation („Scheveningen Haven")
   // statt nur das Headsign (manchmal kürzer/abweichend).
@@ -487,7 +518,7 @@ function toNormalizedResult(
         {
           origin: stop.code,
           destination: input.destination,
-          originLabel: input.originLabel ?? stop.label,
+          originLabel: input.originLabel ?? stop.displayName ?? stop.label,
           destLabel: directionLabel ?? undefined,
           originLat: enriched.firstStopLat ?? undefined,
           originLng: enriched.firstStopLng ?? undefined,
@@ -502,6 +533,8 @@ function toNormalizedResult(
           stops: stopovers.length,
           stopovers: stopovers.length > 0 ? stopovers : undefined,
           tripId: item.id,
+          originTz,
+          destTz,
         },
       ]
     : undefined;
@@ -509,14 +542,21 @@ function toNormalizedResult(
     externalId: `schedule:${stop.code}:${item.id}:${idx}`,
     origin: stop.code,
     destination: input.destination,
-    originLabel: input.originLabel ?? stop.label,
+    originLabel: input.originLabel ?? stop.displayName ?? stop.label,
     destLabel: directionLabel || (input.destLabel ?? ""),
     departTime: depart,
     arriveTime: arrive,
+    originTz,
+    destinationTz: destTz,
     dateOnly: false,
     durationMinutes,
-    stops: stopovers.length,
-    stopLabels,
+    // `stops`/`stopLabels` der VERBINDUNG zählen Umstiege und nennen die
+    // Umstiegs-Halte (wie bei allen Anbietern). Eine Fahrt ab der Tafel ist
+    // EINE Fahrt — keine Umstiege. Hier standen die Zwischenhalte, und die
+    // Karte zeigte bei einer direkten Busfahrt „29 Stopps"; die Zwischenhalte
+    // stehen richtig am Leg (`legs[0].stops`).
+    stops: 0,
+    stopLabels: [],
     legs,
     price: 0,
     currency: input.currency,

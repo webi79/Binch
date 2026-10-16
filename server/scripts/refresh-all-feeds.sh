@@ -21,6 +21,9 @@ fi
 cd "$SCRIPT_DIR/.."
 
 started=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# Merker für „wurde in diesem Lauf etwas neu eingespielt?" (siehe REINDEX unten).
+RUN_MARK="${TMPDIR:-/tmp}/binch-gtfs-schedule/.run-started"
+mkdir -p "$(dirname "$RUN_MARK")" && touch "$RUN_MARK"
 echo ""
 echo "================================================"
 echo " GTFS-Refresh started at $started"
@@ -43,7 +46,8 @@ while IFS='|' read -r feed_id url active rest; do
   url=$(echo "$url" | xargs)
   echo ""
   echo "--- $feed_id ---"
-  if ./scripts/import-gtfs-feed.sh "$feed_id" "$url"; then
+  # `</dev/null`: Der Import darf die Feed-Liste dieser Schleife nicht lesen.
+  if ./scripts/import-gtfs-feed.sh "$feed_id" "$url" </dev/null; then
     ok=$((ok + 1))
     # OTP-Coupling: Wenn das Volume gemounted ist UND der Feed in OTP-relevanten
     # Ländern ist (aktuell nur NL), kopieren wir die ZIP rüber damit OTP beim
@@ -81,6 +85,17 @@ echo "Running VACUUM ANALYZE on gtfs_* tables…"
 if [[ -n "${DATABASE_URL:-}" ]]; then
   # Im Container: DATABASE_URL ist gesetzt — direkt psql.
   psql "$DATABASE_URL" -c "VACUUM ANALYZE gtfs_stop_times, gtfs_trips, gtfs_routes, gtfs_stops, gtfs_calendar, gtfs_calendar_dates;" 2>&1 | tail -3 || true
+  # Der Import löscht und schreibt einen Feed in EINER Transaktion neu. Die
+  # Tabelle verkraftet das (VACUUM gibt den Platz zur Wiederverwendung frei),
+  # die Indizes nicht: Sie wuchsen Woche für Woche — `gtfs_stop_times_pk` stand
+  # im Okt. 2026 bei 17 GB, davon rund 70 % Ballast. Neu aufbauen, sobald etwas
+  # neu eingespielt wurde; CONCURRENTLY sperrt weder Lesen noch Schreiben.
+  if [[ -n "$(find "${TMPDIR:-/tmp}/binch-gtfs-schedule" -maxdepth 2 -name imported -newer "$RUN_MARK" 2>/dev/null)" ]]; then
+    echo "Indizes der Fahrplantabellen neu aufbauen…"
+    for idx in gtfs_stop_times_pk gtfs_stop_times_stop gtfs_trips_pk gtfs_calendar_dates_lookup; do
+      psql "$DATABASE_URL" -c "REINDEX INDEX CONCURRENTLY $idx;" 2>&1 | tail -1 || true
+    done
+  fi
 else
   # Lokal vom Host: über docker compose.
   docker compose exec -T db psql -U binch -d binch -c "VACUUM ANALYZE gtfs_stop_times, gtfs_trips, gtfs_routes, gtfs_stops, gtfs_calendar, gtfs_calendar_dates;" 2>&1 | tail -3 || true
@@ -88,3 +103,5 @@ fi
 
 ended=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 echo "GTFS-Refresh finished at $ended"
+# Fehlschlag melden — der Takt (gtfs-refresh-loop.sh) versucht es dann früher.
+[[ "$fail" -eq 0 ]]

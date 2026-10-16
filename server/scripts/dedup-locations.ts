@@ -19,6 +19,7 @@
 import { sql, isNotNull } from "drizzle-orm";
 import { db } from "../src/db/client.js";
 import { locations } from "../src/db/schema.js";
+import { dedupCategory, haversineMeters, normalizeName } from "./lib/locationDedup.js";
 
 const CLUSTER_RADIUS_M = 500;
 const CHUNK = 1000;
@@ -62,42 +63,7 @@ function prefer(a: Row, b: Row): boolean {
   return a.label.length < b.label.length;
 }
 
-function normalizeName(label: string): string {
-  return label
-    .toLowerCase()
-    // Spezifische Zusammensetzungen ZUERST — sonst bleibt nach „Bahnhof"-
-    // Entfernen ein dangling „s"/„u" stehen das den Schlüssel zersägt
-    // („Unna West S-Bahnhof" → „unna west s" ≠ „Unna West" → „unna west").
-    .replace(/\b[su][\s\-]?bahnhof\b/g, " ")
-    .replace(/\bhauptbahnhof\b/g, " ")
-    .replace(/\bbahnhof\b/g, " ")
-    .replace(/\bhbf\.?\b/g, " ")
-    .replace(/\bbf\.?\b/g, " ")
-    .replace(/\bs[+\- ]?u\b/g, " ")
-    .replace(/\bs[\s\-]?bahn\b/g, " ")
-    .replace(/\bu[\s\-]?bahn\b/g, " ")
-    .replace(/\bzob\b/g, " ")
-    .replace(/\bgare\b/g, " ")
-    .replace(/\bstation\b/g, " ")
-    .replace(/\bstazione\b/g, " ")
-    .replace(/\bestaci[óo]n\b/g, " ")
-    .replace(/\bstacja\b/g, " ")
-    .replace(/\bn[aá]draž[íi]\b/g, " ")
-    .replace(/[(),.;:/\-]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
-function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
-  const R = 6371000;
-  const toRad = (x: number) => (x * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
 
 /** Greedy-Clustering: für jeden Row prüfen ob er in der Nähe (≤ radius m)
  *  eines schon existierenden Clusters liegt; ja → dazu, sonst → neuer Cluster. */
@@ -162,22 +128,7 @@ async function main() {
   //
   // RAIL fasst LONG_DISTANCE/REGIONAL/SUBURBAN zusammen (gleicher Bahnhof aus
   // verschiedenen Quellen mit unterschiedlicher Subtype-Detail → mergen).
-  function category(subtype: string | null, type: string): string {
-    switch (subtype) {
-      case "LONG_DISTANCE":
-      case "REGIONAL":
-      case "SUBURBAN":
-        return "RAIL";
-      case "SUBWAY": return "SUBWAY";
-      case "TRAM": return "TRAM";
-      case "BUS":
-      case "COACH":
-        return "BUS";
-      case "FERRY": return "FERRY";
-      default:
-        return type === "TRAIN" ? "RAIL" : "BUS";
-    }
-  }
+  const category = dedupCategory;
 
   const groups = new Map<string, Row[]>();
   for (const row of rows) {

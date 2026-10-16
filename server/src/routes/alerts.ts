@@ -7,7 +7,7 @@ import { requireUser } from "../services/authSession.js";
 import { ipLimiter } from "../util/rateLimit.js";
 
 /**
- * Preis-Alarme — Anlegen, Auflisten, Löschen.
+ * Preis-Alarme — Anlegen, Auflisten, Pausieren, Löschen.
  *
  * KEIN Konto nötig, und das ist eine Entscheidung: Wer die App installiert und
  * einen Alarm setzt, soll ihn bekommen, ohne sich vorher anzumelden. Der
@@ -76,6 +76,16 @@ const ackSchema = z.object({
   /** „received" = die App hat sie bekommen, „tapped" = jemand hat sie geöffnet. */
   kind: z.enum(["received", "tapped"]),
 });
+
+/**
+ * Der Schalter auf der Karte — mehr ist an einem bestehenden Alarm änderbar.
+ *
+ * Bewusst nur dieses eine Feld: Alles andere (Strecke, Datum, Schwelle) ist
+ * Teil der Identität des Alarms — der eindeutige Index steht genau darauf. Wer
+ * das ändern will, legt ihn neu an; `POST` ersetzt den bestehenden dann von
+ * selbst.
+ */
+const patchSchema = z.object({ active: z.boolean() });
 
 const createSchema = z.object({
   /** Die Push-Kennung des Geräts — sie ist der Besitzer des Alarms. */
@@ -375,6 +385,68 @@ export async function alertsRoutes(app: FastifyInstance) {
       .orderBy(desc(priceAlerts.createdAt))
       .limit(100);
     return { alerts: rows };
+  });
+
+  /**
+   * Einen Alarm PAUSIEREN oder wieder aufnehmen — ohne ihn wegzuwerfen.
+   *
+   * WARUM ES DAS GEBEN MUSS: Der Schalter auf der Karte löschte hier bisher.
+   * „Aus" hieß, die Zeile verschwand vom Server, „an" legte eine neue an. Für
+   * den Nutzer ist das etwas anderes als das, was er tut — er legt einen
+   * Schalter um und meint eine Pause, keine Kündigung. Und der Unterschied
+   * blieb nicht theoretisch: Die neu angelegte Zeile hatte eine neue Kennung,
+   * eine zurückgesetzte Entprellung und keinen zuletzt gesehenen Preis mehr;
+   * scheiterte das Anlegen beim Wiedereinschalten, stand in der App ein Alarm,
+   * den es nirgends gab.
+   *
+   * Hier wird deshalb nur ein Merker umgelegt. Alles andere bleibt stehen:
+   * Kennung, Grundpreis, Schwelle, `lastSeenPrice`. Die Prüfung liest ohnehin
+   * nur aktive Alarme (`evaluateAlerts`), ein pausierter ist damit genauso
+   * stumm wie ein gelöschter — nur eben wiederbelebbar.
+   *
+   * Ein Alarm, dessen Abfahrt schon vorbei ist, lässt sich hier wieder
+   * einschalten. Das ist Absicht: Prüfen kann ihn ohnehin nur eine Suche auf
+   * genau dieses Datum, und die App sucht nicht in der Vergangenheit. Der
+   * tägliche Lauf setzt ihn beim nächsten Mal wieder auf inaktiv. Ihn hier
+   * abzulehnen hieße, einen Fehlerweg für einen Fall zu bauen, der nichts
+   * auslöst.
+   */
+  app.patch("/api/alerts/:id", { preHandler }, async (req, reply) => {
+    const id = (req.params as { id?: string })?.id;
+    const token = pushTokenOf(req);
+    if (!id || !token) return reply.code(400).send({ error: "Bad request" });
+    // Erst die Form der Kennung, dann erst Postgres — siehe Löschen darunter.
+    if (!UUID_RE.test(id)) return reply.code(400).send({ error: "Bad request" });
+    const parsed = patchSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Bad request" });
+    /**
+     * Die Push-Kennung MIT in die Bedingung — sie ist hier die Berechtigung,
+     * wie beim Löschen. Ohne sie könnte jeder fremde Alarme stummschalten, der
+     * eine Alarm-Kennung errät.
+     */
+    const [device] = await db
+      .select({ id: pushTokens.id })
+      .from(pushTokens)
+      .where(eq(pushTokens.token, token))
+      .limit(1);
+    if (!device) return reply.code(404).send({ error: "Unknown device" });
+    const changed = await db
+      .update(priceAlerts)
+      .set({ active: parsed.data.active })
+      .where(and(eq(priceAlerts.id, id), eq(priceAlerts.pushTokenId, device.id)))
+      .returning({ id: priceAlerts.id });
+    /**
+     * 404 „Unknown alert", wenn nichts umgelegt wurde — und das ist für die App
+     * eine ANWEISUNG, keine Sackgasse: Beim Einschalten legt sie den Alarm
+     * daraufhin neu an. Die Zeile kann fehlen, weil die Push-Kennung gewechselt
+     * hat (Neuinstallation, Wiederherstellung, von Firebase als tot gemeldet)
+     * und die Alarme per Kaskade mitgingen.
+     *
+     * Dieselbe Regel wie beim Löschen: Ein Erfolg, der nichts getan hat, ist
+     * schlimmer als ein ehrlicher Fehlschlag.
+     */
+    if (changed.length === 0) return reply.code(404).send({ error: "Unknown alert" });
+    return reply.code(204).send();
   });
 
   app.delete("/api/alerts/:id", { preHandler }, async (req, reply) => {

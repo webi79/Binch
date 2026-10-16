@@ -1,3 +1,4 @@
+import { exonymQueryVariants } from "./cityExonyms.js";
 /**
  * Stationsnamen vergleichbar machen — EINE Stelle für alle Provider.
  *
@@ -113,6 +114,18 @@ function placeTokens(s: string): Set<string> {
       .split(/[^\p{L}\p{N}]+/u)
       .filter((t) => t.length >= 4 && !GENERIC_TOKENS.has(t)),
   );
+}
+
+/**
+ * Wie `sameCity`, aber sprachfest: Auch ein Exonym zählt (Prag/Praha/Prague,
+ * Mailand/Milano). Die Karte beschriftet in der Landessprache, die kuratierten
+ * Städte heißen deutsch, Flughäfen englisch — ohne das fand der Vorlauf des
+ * Stadt-Blatts bei „Praha" keinen Bahnhof mit dem Namen der Stadt.
+ */
+export function sameCityAnyLanguage(query: string, candidate?: string | null): boolean {
+  if (!candidate) return false;
+  if (sameCity(query, candidate)) return true;
+  return exonymQueryVariants(query).some((v) => sameCity(v, candidate));
 }
 
 export function sameCity(query: string, candidate?: string | null): boolean {

@@ -7,7 +7,7 @@
 import { memo, useMemo, useState } from "react";
 import { View, Text, StyleSheet } from "react-native";
 import { usePalette } from "@/lib/theme/appBg";
-import { format, parseISO } from "date-fns";
+import { formatLocalizedDateInZone, formatTimeInZone } from "@/lib/time-format";
 import { de, enGB, es, fr } from "date-fns/locale";
 import { Ticket } from "@/types/saved";
 import { useT } from "@/lib/i18n/useT";
@@ -76,18 +76,19 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
    */
   const [confirmOpen, setConfirmOpen] = useState(false);
 
-  // Header-Datum + Abfahrtszeit ("22. Aug · 07:25").
+  // Header-Datum + Abfahrtszeit ("22. Aug · 07:25") — in der Ortszeit des
+  // Abfahrtsorts, wie im Ticket selbst (TicketParts). Hier stand die Uhr des
+  // Geräts: Ein Ticket ab London zeigte außen 08:25 und innen 07:25.
   const headerLine = useMemo(() => {
     if (!ticket.departTime) return "";
     try {
-      const d = parseISO(ticket.departTime);
-      const date = format(d, "d. MMM", { locale: dateLocale });
-      const time = format(d, "HH:mm");
+      const date = formatLocalizedDateInZone(ticket.departTime, ticket.originTz, "d. MMM", dateLocale);
+      const time = formatTimeInZone(ticket.departTime, ticket.originTz);
       return `${date} · ${time}`;
     } catch {
       return "";
     }
-  }, [ticket.departTime, dateLocale]);
+  }, [ticket.departTime, ticket.originTz, dateLocale]);
 
   // Titel: "FromCity — ToCity" (em-dash mit Spaces, matched das Template-
   // Design). Fallback auf Codes wenn keine Cities geparst wurden.
@@ -102,12 +103,11 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
   const departAtLine = useMemo(() => {
     if (!ticket.departTime) return "";
     try {
-      const d = parseISO(ticket.departTime);
-      return t("saved.ticket.depart.at").replace("{time}", format(d, "HH:mm"));
+      return t("saved.ticket.depart.at").replace("{time}", formatTimeInZone(ticket.departTime, ticket.originTz));
     } catch {
       return "";
     }
-  }, [ticket.departTime, t]);
+  }, [ticket.departTime, ticket.originTz, t]);
 
   /**
    * Die Textur des Reiters entsteht beim AUFSETZEN des Fingers.

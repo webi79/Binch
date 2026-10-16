@@ -81,7 +81,24 @@ export interface LegInfo {
   stopovers?: StopoverInfo[];
   /** HAFAS-Trip-ID — wird gebraucht für Polyline-Abruf (`/trips/{id}?polyline=true`). */
   tripId?: string;
+  /**
+   * Von der QUELLE gemeldete Gefährdung an genau dieser Stelle:
+   *   - "cancelled": diese Teilstrecke fällt aus;
+   *   - "connectionAtRisk": der Umstieg IN diese Teilstrecke ist
+   *     voraussichtlich nicht zu schaffen.
+   * Liegt im gespeicherten `legs`-JSON — darüber kennt auch der Cache die
+   * Warnung der Gesamtreise (siehe util/journeyTimeline.ts).
+   */
+  warning?: JourneyWarning;
 }
+
+/**
+ * Warnung zu einer Verbindung, die die Quelle selbst als gefährdet meldet
+ * (DB: „Der Anschluss kann voraussichtlich nicht erreicht werden" bzw.
+ * „Verbindung fällt aus"). Solche Treffer werden gezeigt — markiert, hinter den
+ * funktionierenden, ausgefallene ohne Preis.
+ */
+export type JourneyWarning = "connectionAtRisk" | "cancelled";
 
 export interface NormalizedResult {
   externalId: string;
@@ -107,6 +124,9 @@ export interface NormalizedResult {
   stops: number;
   stopLabels: string[];
   legs?: LegInfo[];
+  /** Gefährdet laut Quelle — immer aus den Teilstrecken abgeleitet
+   *  (`journeyWarningFromLegs`), damit Live und Cache dasselbe sagen. */
+  warning?: JourneyWarning;
   price: number;
   currency: string;
   deepLink: string;

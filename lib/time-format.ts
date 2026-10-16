@@ -7,7 +7,8 @@
 // `formatInTimeZone` aus date-fns-tz nutzt einen eingebauten IANA-Timezone-
 // Lookup und liefert konsistent den richtigen Wert.
 
-import { formatInTimeZone } from "date-fns-tz";
+import { format, type Locale } from "date-fns";
+import { formatInTimeZone, getTimezoneOffset } from "date-fns-tz";
 
 /**
  * Gedächtnis für bereits formatierte Zeitpunkte.
@@ -96,6 +97,19 @@ export function dayOffset(
   return Math.round((arrDay - depDay) / msPerDay);
 }
 
+/**
+ * Wie viele Kalendertage liegt `iso` nach HEUTE — beides in der Zone `tz`
+ * (0 = heute, 1 = morgen). Die Tafel braucht das: An selten bedienten Halten
+ * reichen die nächsten Abfahrten über Tage, und „05:41" ohne Tag las sich wie
+ * heute früh statt Montag.
+ */
+export function daysFromToday(iso: string, tz: string | undefined, now: number = Date.now()): number {
+  // Auf die Minute gerundet: `dayKey` merkt sich Ergebnisse je ISO-Text, und
+  // ein Schlüssel je Millisekunde flutete den Speicher bei jedem Bild.
+  const today = new Date(Math.floor(now / 60_000) * 60_000).toISOString();
+  return Math.round((dayKey(iso, tz) - dayKey(today, tz)) / 86_400_000);
+}
+
 function dayKey(iso: string, tz: string | undefined): number {
   // Ebenfalls gemerkt: `dayOffset` läuft zweimal pro Karte und landet für die
   // Abfahrt bei allen Treffern derselben Suche auf demselben Wert.
@@ -105,4 +119,83 @@ function dayKey(iso: string, tz: string | undefined): number {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   });
   return Date.parse(`${ymdCached}T00:00:00Z`);
+}
+
+// ---------------------------------------------------------------------------
+// Ortszeit-Hinweis
+// ---------------------------------------------------------------------------
+
+/**
+ * Versatz der Zone `tz` gegenüber UTC zum Zeitpunkt `at`, in Minuten.
+ *
+ * `null` für unbekannte Zonen — und für „UTC" selbst: Flüge tragen „UTC" als
+ * Zeichen für „schwimmende Ortszeit" (die Uhrzeit steht wörtlich so im
+ * Flugplan, siehe DetailsOverlay). Das ist keine echte Zone, ein Hinweis
+ * „Ortszeit (UTC+0)" wäre dort falsch.
+ */
+export function zoneOffsetMinutes(tz: string | undefined, at: number = Date.now()): number | null {
+  if (!tz || tz === "UTC") return null;
+  try {
+    const ms = getTimezoneOffset(tz, at);
+    return Number.isFinite(ms) ? Math.round(ms / 60_000) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Weicht die Ortszeit in `tz` zum Zeitpunkt `at` von der Uhr des Geräts ab? */
+export function differsFromDeviceTime(tz: string | undefined, at: number = Date.now()): boolean {
+  const zone = zoneOffsetMinutes(tz, at);
+  if (zone === null) return false;
+  // getTimezoneOffset des Geräts zählt andersherum (Berlin im Sommer: -120).
+  return zone !== -new Date(at).getTimezoneOffset();
+}
+
+/** „UTC+1", „UTC−4", „UTC+5:30" — mit echtem Minuszeichen. */
+export function utcOffsetLabel(offsetMinutes: number): string {
+  const sign = offsetMinutes < 0 ? "−" : "+";
+  const abs = Math.abs(offsetMinutes);
+  const h = Math.floor(abs / 60);
+  const m = abs % 60;
+  return `UTC${sign}${h}${m ? `:${String(m).padStart(2, "0")}` : ""}`;
+}
+
+/**
+ * Der dezente Hinweis „Ortszeit (UTC+1)" — nur, wenn die gezeigten Zeiten
+ * NICHT der Uhr des Geräts entsprechen. Wer in Deutschland eine Tafel in
+ * Oldham ansieht, soll „15:33" nicht für deutsche Zeit halten.
+ *
+ * Mehrere Zonen (eine Fahrt über eine Zeitzonengrenze): dann ohne Versatz —
+ * jede Zeit steht in der Zone IHRES Halts.
+ *
+ * @param t Übersetzer aus `useT()` — Schlüssel `time.localZone` / `time.localEachStop`.
+ */
+export function localTimeHint(
+  zones: Array<string | undefined>,
+  t: (key: string) => string,
+  at: number = Date.now(),
+): string | null {
+  const real = [...new Set(zones.filter((z): z is string => !!z && z !== "UTC"))];
+  if (!real.some((z) => differsFromDeviceTime(z, at))) return null;
+  const offsets = [...new Set(real.map((z) => zoneOffsetMinutes(z, at)).filter((o): o is number => o !== null))];
+  if (offsets.length === 1) return t("time.localZone").replace("{offset}", utcOffsetLabel(offsets[0]!));
+  return t("time.localEachStop");
+}
+
+/**
+ * Datum („Mi., 14. Okt.") in der Zone des Halts — mit Sprache.
+ *
+ * Auch „UTC" (die schwimmende Flug-Ortszeit) wird IN dieser Zone gelesen:
+ * Mit der Gerätezone sprang ein Abflug um 23:30 auf einem deutschen Gerät
+ * auf den nächsten Tag, während die Uhrzeit daneben 23:30 blieb.
+ */
+export function formatLocalizedDateInZone(
+  isoUtc: string,
+  tz: string | undefined,
+  pattern: string,
+  locale: Locale,
+): string {
+  return cached(`L|${isoUtc}|${tz ?? ""}|${pattern}|${locale.code ?? ""}`, () =>
+    tz ? formatInTimeZone(new Date(isoUtc), tz, pattern, { locale }) : format(new Date(isoUtc), pattern, { locale }),
+  );
 }

@@ -1,5 +1,5 @@
 /**
- * Chat-Agent „Bo" — Claude Haiku 4.5 über Anthropic SDK.
+ * Chat-Agent „Bo" — Claude Haiku 5.5 über Anthropic SDK (siehe `BO_MODEL`).
  *
  * Architektur:
  *  - manueller Agent-Loop (kein toolRunner, da wir SSE-Events an den Client
@@ -9,10 +9,12 @@
  *  - Prompt-Caching: cache_control auf System-Block 1 (cached auch die davor
  *    gerenderten tools). Volatiles (Locale, heutiges Datum) lebt im zweiten,
  *    UNgecachten System-Block — invalidiert den Prefix nicht.
- *  - max_tokens=1024 reicht für Antworten ohne Truncation
+ *  - max_tokens=4096: Haiku 5.5 denkt standardmäßig mit, und das Denken zählt
+ *    in dieses Limit (1024 reichte nur für Haiku 4.5 ohne Denken)
  *
  * Kosten-Design (gemessen, nicht geraten — jeder API-Call zahlt den
- * Cache-Read des ~8k-Prefixes plus den ganzen Verlauf als Input):
+ * Cache-Read des ~8k-Prefixes — mit dem Tokenizer von Haiku 5.5 rund 30 %
+ * mehr, geschätzt ~10k — plus den ganzen Verlauf als Input):
  *  - Eine Suche ist EIN Tool-Cycle: search_journey nimmt Klartext-Ortsnamen
  *    und löst sie server-seitig auf (früher: separater find_location-
  *    Roundtrip = ein API-Call mehr pro Suche). Mehrdeutigkeit kommt als
@@ -39,6 +41,47 @@ import { and, eq, gte, isNotNull, lte, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import { planMultimodal, resolvePlanEndpoint, type PlanEndpoint, type PlanLeg } from "./multimodalPlanner.js";
+
+// ---------------------------------------------------------------------------
+// Modell
+// ---------------------------------------------------------------------------
+/**
+ * Claude Haiku 5.5 statt Haiku 4.5. Bis 100K Tokens Prompt kostet es ein
+ * Zehntel: $0,10 / $0,50 je Million Tokens Ein-/Ausgabe statt $1 / $5. Derselbe
+ * Text zählt dort rund 30 % mehr Tokens, und das Modell denkt standardmäßig
+ * mit — eine Bo-Antwort ist trotzdem grob 6- bis 8-mal günstiger. Dazu folgt es
+ * Anweisungen deutlich besser (Anthropics Umstiegsleitfaden).
+ *
+ * Nichts in diesem Aufruf bricht beim Umstieg: kein `temperature`, kein
+ * Assistant-Prefill, kein Denkbudget, kein erzwungenes Werkzeug; Text wird nach
+ * Block-TYP gelesen, nicht nach Position (Antworten können mit Denkblöcken
+ * beginnen), und Ablehnungen (`refusal`) sind unten schon behandelt — einen
+ * serverseitigen Rückfall gibt es für Haiku 5.5 nicht.
+ *
+ * Über `BO_MODEL` ohne Neubau zurückschaltbar, z. B. auf `claude-haiku-4-5`.
+ */
+const BO_MODEL = process.env.BO_MODEL?.trim() || "claude-haiku-5-5";
+/**
+ * Wie viel Bo nachdenkt. „medium" ist die Vorgabe von Haiku 5.5. „low" wäre
+ * schneller und billiger, überspringt laut Anthropic in langen Agent-Prompts
+ * aber eher eine nötige Suche — und die Suchen sind Bos Kern. Über `BO_EFFORT`
+ * umstellbar (low/medium/high).
+ */
+const BO_EFFORT: "low" | "medium" | "high" =
+  process.env.BO_EFFORT === "low" || process.env.BO_EFFORT === "high" ? process.env.BO_EFFORT : "medium";
+/** Haiku 4.5 und Sonnet 4.5 kennen `effort` nicht — dort wäre er ein 400. */
+const BO_SENDS_EFFORT = !/^claude-(haiku-4|sonnet-4-5)/.test(BO_MODEL);
+/**
+ * UNTER 100.000 Tokens Prompt bleiben: Darüber rechnet Haiku 5.5 den
+ * fünffachen Satz ab ($0,50 / $2,50). Geschätzt über Zeichen, bewusst
+ * vorsichtig mit 2,5 Zeichen je Token (Deutsch und JSON liegen mit dem
+ * Tokenizer von Haiku 5.5 darüber). Vom Budget geht eine Reserve für die
+ * Werkzeug-Runden des laufenden Turns ab — deren Ergebnisse (Suchtreffer)
+ * kommen erst in der Schleife dazu.
+ */
+const PROMPT_TOKEN_BUDGET = 90_000;
+const TURN_RESERVE_TOKENS = 20_000;
+const CHARS_PER_TOKEN_CONSERVATIVE = 2.5;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -120,7 +163,17 @@ export type ChatEvent =
       action: "save_trip" | "unsave_trip" | "open_results";
       payload?: Record<string, unknown>;
     }
-  | { type: "usage"; input: number; output: number; cacheRead: number; cacheWrite: number }
+  | {
+      type: "usage";
+      input: number;
+      output: number;
+      cacheRead: number;
+      cacheWrite: number;
+      /** Welches Modell geantwortet hat — für die Kostenrechnung im Server-Log. */
+      model?: string;
+      /** So viele alte Nachrichten wurden für das Token-Budget weggelassen. */
+      trimmed?: number;
+    }
   | { type: "error"; message: string }
   | { type: "done" };
 
@@ -143,7 +196,7 @@ export function isChatAvailable(): boolean {
 // System-Prompt
 // ---------------------------------------------------------------------------
 // Bewusst ausführlich + mit Few-Shot-Beispielen, weil Haiku 4.5 erst ab
-// 4096-Token-Prefix-Länge cached. Kürzer = `cache_read_input_tokens: 0` ohne
+// 4096-Token-Prefix-Länge cachte (Haiku 5.5 schon ab 512). Kürzer = `cache_read_input_tokens: 0` ohne
 // Fehler. Außerdem: konkrete Beispiele verbessern auch die Antwortqualität
 // gegenüber abstrakten Regeln (klassischer Few-Shot-Effekt).
 //
@@ -254,6 +307,8 @@ Die Regel dahinter: Zweimal dieselbe Frage ist immer ein Fehler. Wenn du nach EI
 Bei „vergleich Route A mit Route B" rufst du \`plan_multimodal\` zweimal mit unterschiedlichem \`viaOriginAirport\` und stellst die Unterschiede gegenüber — Gesamtdauer, Umsteigezeit, Preis, Anzahl der Wechsel. Sag ehrlich, was für welche spricht, statt beide gleich gut zu finden.
 
 **Ortsnamen immer MIT Stadt:** Niemals nur „Hbf" / „Bahnhof" / „Flughafen" als Ortsangabe — immer mit Stadtnamen kombinieren („Hbf" als Antwort auf eine Berlin-Frage = „Berlin Hbf").
+
+**Uhrzeiten immer in Ortszeit:** Nennst du eine Uhrzeit, dann die Ortszeit am jeweiligen Halt — genau so zeigt sie die App. Nimm sie WÖRTLICH aus \`localTime\` / \`departLocal\` / \`arriveLocal\`, rechne nie selbst aus \`departTime\` (das ist UTC) um. Liegt der Halt in einer anderen Zeitzone als der Nutzer (London, Lissabon), sag dazu „Ortszeit".
 
 ## search_journey
 Sucht konkrete Verbindungen zwischen zwei Orten. Du übergibst die **Ortsnamen als Klartext** — der Server löst sie selbst zu Stationen/Flughäfen/Häfen auf. Keine Codes nötig.
@@ -1015,7 +1070,8 @@ async function resolvePoiToStop(
   const rows = await db
     .select({
       code: locations.code,
-      label: locations.label,
+      // Angezeigt (und Bo genannt) wird der offizielle Name.
+      label: sql<string>`coalesce(${locations.displayName}, ${locations.label})`,
       city: locations.city,
       country: locations.country,
       latitude: locations.latitude,
@@ -1089,7 +1145,7 @@ async function knownStopsInCity(
   const rows = await db
     .select({
       code: locations.code,
-      label: locations.label,
+      label: sql<string>`coalesce(${locations.displayName}, ${locations.label})`,
       city: locations.city,
       country: locations.country,
     })
@@ -1150,6 +1206,8 @@ async function resolveJourneyEndpoint(
     city: r.city ?? null,
     country: r.country ?? null,
   }));
+  /** Voller Quellname je Code — „Rochdale Road" steht nur dort, nicht im angezeigten „Oldham College". */
+  const fullLabel = new Map(results.map((r) => [r.code, r.matchLabel]));
   /**
    * NAMENSPRÜFUNG — hier fehlte sie, und das ist die gefährlichste Fehlerklasse,
    * die dieses Projekt kennt.
@@ -1185,7 +1243,10 @@ async function resolveJourneyEndpoint(
   const queryForms = [q, ...exonymQueryVariants(q)];
   const named = all.filter((r) =>
     queryForms.some(
-      (form) => stationNameCompatible(form, r.label) || stationNameCompatible(form, r.city),
+      (form) =>
+        stationNameCompatible(form, r.label) ||
+        stationNameCompatible(form, fullLabel.get(r.code)) ||
+        stationNameCompatible(form, r.city),
     ),
   );
   /**
@@ -1496,11 +1557,32 @@ async function execTool(
        * bleibt es beim alten Verhalten — die Karte kommt, der Client holt selbst.
        */
       const liveBoard = await loadStopBoard(top.code, board).catch(() => null);
+      /**
+       * Ortszeit am Halt, fertig ausgerechnet. Die Zeilen tragen UTC, und Bo
+       * kannte die Zone des Halts bisher gar nicht — in Oldham hätte er „16:33"
+       * (deutsche Zeit) gesagt, während Tafel und Zeitleiste „15:33" zeigen.
+       */
+      const stopTz = liveBoard?.stop.tz;
+      const localHHMM = (iso: string, delay: number): string | null => {
+        if (!stopTz) return null;
+        try {
+          return new Intl.DateTimeFormat("de-DE", {
+            timeZone: stopTz,
+            hour: "2-digit",
+            minute: "2-digit",
+            hourCycle: "h23",
+          }).format(new Date(Date.parse(iso) + delay * 60_000));
+        } catch {
+          return null;
+        }
+      };
       const rows = (liveBoard?.results ?? []).slice(0, 8).map((r) => ({
         line: r.line,
         direction: r.direction,
         plannedTime: r.plannedTime,
+        localTime: localHHMM(r.plannedTime, 0),
         delayMinutes: r.delayMinutes ?? 0,
+        localTimeWithDelay: r.delayMinutes ? localHHMM(r.plannedTime, r.delayMinutes) : null,
         platform: r.platform ?? null,
         product: r.product ?? null,
       }));
@@ -1510,16 +1592,18 @@ async function execTool(
           stop: { code: top.code, label: top.label },
           board,
           fetchedAt: liveBoard?.fetchedAt ?? null,
+          timeZone: stopTz ?? null,
           /**
            * Die nächsten acht — mehr braucht keine Antwort, und mehr würde nur
-           * Kontext kosten. Zeiten sind ISO mit Zonenangabe; rechne sie in die
-           * Ortszeit am Halt um, wenn du sie nennst.
+           * Kontext kosten. `localTime` ist die Ortszeit am Halt (dieselbe, die
+           * Tafel und Zeitleiste der App zeigen) — nenn GENAU diese, nie eine
+           * selbst umgerechnete.
            */
           next: rows,
           instruction:
             rows.length === 0
               ? "No live rows available. Say so plainly; do not invent departures."
-              : "You CAN read these rows. If the user asked for a specific time (\"when does the next train go\"), answer with the concrete departure from `next` — line, direction, time, and delay if any. The card with the full board is shown to the user anyway, so do not repeat the whole list; name the one they asked for and offer the rest ONLY if it helps.",
+              : "You CAN read these rows. If the user asked for a specific time (\"when does the next train go\"), answer with the concrete departure from `next` — line, direction, time, and delay if any. Always state times as `localTime` (local time at the stop, exactly as the app shows it); if `timeZone` differs from the user's zone, you may add that it is local time there. The card with the full board is shown to the user anyway, so do not repeat the whole list; name the one they asked for and offer the rest ONLY if it helps.",
         }),
         // Der Client fetcht die Live-Daten selber direkt gegen
         // /api/stops/:code/{board} — Tab-Switch (Departures↔Arrivals) kann
@@ -1646,6 +1730,9 @@ async function execTool(
             to: l.result.destLabel ?? l.result.destination,
             departTime: l.result.departTime,
             arriveTime: l.result.arriveTime,
+            // Ortszeit an Ab- bzw. Ankunftsort — so zeigt sie die App.
+            departLocal: l.result.originTz ? localDepartHHMM(l.result.departTime, l.result.originTz) : null,
+            arriveLocal: l.result.destinationTz ? localDepartHHMM(l.result.arriveTime, l.result.destinationTz) : null,
             durationMinutes: l.result.durationMinutes,
             price: l.result.price > 0 ? l.result.price : null,
             provider: l.result.provider,
@@ -1941,6 +2028,13 @@ async function execTool(
               stops: top.stops,
               departTime: top.departTime,
               arriveTime: top.arriveTime,
+              /**
+               * Ortszeit an Ab- bzw. Ankunftsort, so wie die App sie zeigt —
+               * `departTime`/`arriveTime` sind UTC. Nennt Bo eine Uhrzeit,
+               * dann diese.
+               */
+              departLocal: top.originTz ? localDepartHHMM(top.departTime, top.originTz) : null,
+              arriveLocal: top.destinationTz ? localDepartHHMM(top.arriveTime, top.destinationTz) : null,
             },
             totalResults: filtered.length,
             ...(applied.length > 0 && {
@@ -2042,6 +2136,33 @@ export async function runChatTurn(
     return;
   }
 
+  /**
+   * Alten Verlauf kürzen, bis der Prompt sicher unter `PROMPT_TOKEN_BUDGET`
+   * bleibt — von vorn, die aktuelle Frage (letzte Nachricht) bleibt immer.
+   *
+   * NUR HIER, vor der Schleife: Innerhalb eines Turns muss der Verlauf
+   * unverändert bleiben. Haiku 5.5 schickt Denkblöcke mit, und die gelten nur
+   * für genau den Verlauf, in dem sie entstanden — eine Änderung davor wäre
+   * beim nächsten Aufruf ein 400. Bei 59 Nachrichten Obergrenze im Client
+   * greift das praktisch nie; es ist der Deckel, nicht der Normalfall.
+   */
+  const contentChars = (m: Anthropic.Messages.MessageParam) =>
+    typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length;
+  const fixedChars = SYSTEM_PROMPT.length + JSON.stringify(TOOLS).length + 200;
+  const historyBudgetChars =
+    (PROMPT_TOKEN_BUDGET - TURN_RESERVE_TOKENS) * CHARS_PER_TOKEN_CONSERVATIVE - fixedChars;
+  let historyChars = messages.reduce((sum, m) => sum + contentChars(m), 0);
+  let trimmedMessages = 0;
+  while (historyChars > historyBudgetChars && messages.length > 1) {
+    historyChars -= contentChars(messages.shift()!);
+    trimmedMessages++;
+    // Der Verlauf muss weiter mit dem Nutzer beginnen.
+    while (messages.length > 1 && messages[0]!.role === "assistant") {
+      historyChars -= contentChars(messages.shift()!);
+      trimmedMessages++;
+    }
+  }
+
   let toolUseCycles = 0;
   // Max 4 Tool-Use-Cycles — die normale Suche ist EIN Cycle (search_journey
   // löst Ortsnamen selbst auf, get_today gibt's nicht mehr). Puffer für
@@ -2088,12 +2209,15 @@ export async function runChatTurn(
       // Edge-Case mit dem Caching-Layer hat: bei sehr schnellen Responses
       // (alles aus Cache) fehlen die content_block_delta-Events teilweise
       // und der Iterator/Listener verpasst die Text-Deltas. Non-streaming
-      // funktioniert robust und Haiku 4.5 ist eh so schnell dass die
+      // funktioniert robust und Haiku ist eh so schnell, dass die
       // wahrnehmbare Latenz kaum unterschiedlich ist (~500-800ms TTFT vs
       // ~200ms first-delta). Caching wirkt unverändert.
       const finalMessage = await client.messages.create({
-        model: "claude-haiku-4-5",
-        max_tokens: 1024,
+        model: BO_MODEL,
+        // Platz fürs Mitdenken von Haiku 5.5 (zählt in dieses Limit) plus die
+        // Antwort. Bos Antworten selbst bleiben kurz — das regelt der Prompt.
+        max_tokens: 4096,
+        ...(BO_SENDS_EFFORT ? { output_config: { effort: BO_EFFORT } } : {}),
         // System-Prompt als zwei Blöcke:
         // 1) Großer, statischer Prompt mit cache_control → cached zusammen
         //    mit den TOOLS (die rendern davor in der Prefix-Ordnung).
@@ -2158,6 +2282,9 @@ export async function runChatTurn(
         output: usage.output_tokens,
         cacheRead: usage.cache_read_input_tokens ?? 0,
         cacheWrite: usage.cache_creation_input_tokens ?? 0,
+        model: BO_MODEL,
+        // Nur beim ersten Aufruf des Turns — danach ist schon gezählt.
+        ...(trimmedMessages > 0 && toolUseCycles === 0 ? { trimmed: trimmedMessages } : {}),
       });
 
       // End-of-Turn — wir sind fertig. (Flush als Sicherheitsnetz, falls die

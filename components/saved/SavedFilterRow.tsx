@@ -52,6 +52,20 @@ export const SavedFilterRow = memo(function SavedFilterRow({
        * war gewollt.
        */
       contentPadding={0}
+      /**
+       * VOLLE BREITE — die vier teilen sich die Zeile zu gleichen Teilen.
+       *
+       * Sie standen linksbündig und endeten rund ein Fünftel vor dem rechten
+       * Rand. Darüber sitzt der Umschalter Reisen/Tickets, der die volle Breite
+       * einnimmt, und darunter Karten, die es ebenfalls tun — dazwischen eine
+       * Reihe, die vorher aufhört, liest sich als abgeschnitten und nicht als
+       * Absicht.
+       *
+       * Der Abstand zwischen den Knöpfen bleibt derselbe (`SPACE.md`), und die
+       * Kanten links und rechts kommen weiterhin vom Polster der Liste — die
+       * Knöpfe stehen damit genau auf den Kanten der Karten darunter.
+       */
+      fill
       /** Der Abstand nach unten trennt die Reihe von der ersten Karte. */
       style={{ marginBottom: SPACE.md }}
     />

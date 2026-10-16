@@ -4,6 +4,7 @@ import { and, eq, gte, isNotNull, lte, or, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import { ipLimiter } from "../util/rateLimit.js";
+import { BoundedTtlCache } from "../util/boundedCache.js";
 
 /**
  * Liefert Haltestellen/Bahnhöfe in der Nähe einer Koordinate. Quelle ist die
@@ -25,6 +26,33 @@ const querySchema = z.object({
 });
 
 type MarkerKind = "train" | "subway" | "bus" | "tram" | "airport";
+
+/**
+ * Art eines Halts für die Frage „derselbe Halt?" auf der Karte (siehe `MERGE_M`).
+ * Tram und U-Bahn sind EINE Art — wie in services/gtfsSchedule.ts: Wie eine
+ * Stadtbahn eingestuft wird, regelt jede Quelle anders („Köln Dom/Hbf" steht
+ * einmal als Tram, einmal als U-Bahn in der Tabelle — dieselbe Station).
+ */
+type StopFamily = "rail" | "metro" | "bus" | "ferry";
+
+function familyOf(subtype: string | null, type: string): StopFamily {
+  switch (subtype) {
+    case "LONG_DISTANCE":
+    case "REGIONAL":
+    case "SUBURBAN":
+      return "rail";
+    case "SUBWAY":
+    case "TRAM":
+      return "metro";
+    case "FERRY":
+      return "ferry";
+    case "BUS":
+    case "COACH":
+      return "bus";
+    default:
+      return type === "TRAIN" ? "rail" : "bus";
+  }
+}
 
 /** Subtype → Marker-Kind:
  *    LONG_DISTANCE / REGIONAL / SUBURBAN → train (gelb)
@@ -64,7 +92,10 @@ interface SurroundingsMarker {
   latitude: number;
   longitude: number;
   selected?: boolean;
+  /** Angezeigter Name — der offizielle (`display_name`), sonst die Quelle. */
   label?: string;
+  /** Unterscheidungs-Zusatz, nur bei gleichnamigem Nachbarn (`display_detail`). */
+  detail?: string;
 }
 
 interface LineBadge {
@@ -75,6 +106,7 @@ interface LineBadge {
 interface SurroundingsListItem {
   id: string;
   name: string;
+  detail?: string;
   kinds: MarkerKind[];
   distance: string;
   lines?: LineBadge[];
@@ -163,6 +195,8 @@ async function fetchTransitNearby(
     .select({
       code: locations.code,
       label: locations.label,
+      displayName: locations.displayName,
+      displayDetail: locations.displayDetail,
       type: locations.type,
       subtype: locations.subtype,
       kinds: locations.kinds,
@@ -279,24 +313,43 @@ async function fetchTransitNearby(
   }
   candidates.sort((a, b) => a.dist - b.dist);
 
-  // Dedup über exakt gleichen normalisierten Namen — alle Stops mit demselben
-  // Namen werden zu EINEM Marker zusammengefasst. Die `kinds`-Arrays aller
-  // gemergten Rows werden weiter unten vereinigt, sodass z.B. „Dortmund Barop
-  // Parkhaus" am Ende kinds=["subway","bus"] hat und das Frontend beide Icons
-  // in einer Multi-Mode-Pille rendert.
+  /**
+   * Zusammengefasst wird nur, was DERSELBE Halt ist — nicht alles, was gleich
+   * heißt. Vorher wurde jeder Halt im Umkreis mit gleichem (normalisiertem)
+   * Namen ein Marker: beide Straßenseiten einer Bushaltestelle (je mit eigener
+   * Tafel) und der Bahnhof „Werl" samt der Bushaltestelle „Werl, Bahnhof" davor
+   * — eine Zug-Bus-Pille, deren Tipp nur die Zugtafel zeigte; die Busse am
+   * Bahnhof waren auf der Karte nicht zu erreichen.
+   *
+   * Jetzt nur noch innerhalb derselben ART (`familyOf`) und nah beieinander:
+   *   • Bahnhof, Stadtbahn (Tram/U-Bahn), Fähre: gleicher Name bis `MERGE_M` —
+   *     derselbe Bahnhof aus mehreren Quellen (StaDa, Fahrplan, OSM), 30–100 m
+   *     versetzt.
+   *   • Bus: gleichnamige Halte sind fast immer die beiden Fahrtrichtungen,
+   *     jede mit eigener Tafel — eigene Marker. Nur exakt deckungsgleiche
+   *     Zeilen (≤ 2 m) gelten als doppelt eingelesen. Echte Dubletten entfernt
+   *     ohnehin die Bereinigung (scripts/fix-stop-data.ts).
+   */
+  const MERGE_M: Record<StopFamily, number> = { rail: 400, metro: 200, ferry: 200, bus: 2 };
   const groups: Item[][] = [];
-  const groupByKey = new Map<string, number>();
+  const groupsByKey = new Map<string, number[]>();
   for (const item of candidates) {
     const norm = normalizeName(item.row.label);
     if (!norm) {
       groups.push([item]);
       continue;
     }
-    const existing = groupByKey.get(norm);
-    if (existing !== undefined) {
-      groups[existing]!.push(item);
+    const family = familyOf(item.row.subtype, item.row.type);
+    const key = `${family}|${norm}`;
+    const radius = MERGE_M[family];
+    const same = (groupsByKey.get(key) ?? []).find((gi) => {
+      const anchor = groups[gi]![0]!;
+      return haversineMeters(anchor.lat, anchor.lng, item.lat, item.lng) <= radius;
+    });
+    if (same !== undefined) {
+      groups[same]!.push(item);
     } else {
-      groupByKey.set(norm, groups.length);
+      groupsByKey.set(key, [...(groupsByKey.get(key) ?? []), groups.length]);
       groups.push([item]);
     }
   }
@@ -355,14 +408,16 @@ async function fetchTransitNearby(
       longitude: s.canonical.lng,
       // Label mitgeben damit das Frontend beim Marker-Tap sofort den
       // Stationsnamen im Detail-Sheet zeigen kann (ohne extra Roundtrip).
-      label: s.canonical.row.label,
+      label: s.canonical.row.displayName ?? s.canonical.row.label,
+      ...(s.canonical.row.displayDetail ? { detail: s.canonical.row.displayDetail } : {}),
       selected: i === 0,
     };
   });
 
   const listItems: SurroundingsListItem[] = sorted.map((s, i) => ({
     id: s.canonical.row.code,
-    name: s.canonical.row.label,
+    name: s.canonical.row.displayName ?? s.canonical.row.label,
+    ...(s.canonical.row.displayDetail ? { detail: s.canonical.row.displayDetail } : {}),
     kinds: s.kinds,
     distance: formatDistance(s.canonical.dist),
     selected: i === 0,
@@ -371,9 +426,60 @@ async function fetchTransitNearby(
   return { markers, list: listItems };
 }
 
+/**
+ * Fertige Antworten kurz aufheben — dieselbe Ecke kostet dann gar nichts mehr.
+ *
+ * WAS SICH DAMIT ÄNDERT: Die Karte fragt in einem ~500m-Raster, und dieselben
+ * Rasterfelder werden ständig erneut besucht — beim Zurückwischen, beim
+ * Wegzoomen und Wiederkommen, beim nächsten App-Start, und von jedem weiteren
+ * Gerät in derselben Stadt. Bisher lief dafür jedes Mal die volle Abfrage samt
+ * Zusammenlegen gleichnamiger Haltestellen.
+ *
+ * Der Schlüssel sind die Parameter, wie sie HEREINKOMMEN — ungerundet. Auf ein
+ * Raster zu runden hätte die Trefferquote erhöht, aber den angefragten
+ * Mittelpunkt verschoben: Entfernungen und die Reihenfolge „nächstgelegene
+ * zuerst" bezögen sich dann auf einen anderen Punkt als den gefragten. Die App
+ * schickt ohnehin gerundete Werte, der Gewinn wäre also klein und der Preis
+ * eine stille Ungenauigkeit.
+ *
+ * Zehn Minuten: Die Tabelle ändert sich nur bei einem Datenimport, also
+ * höchstens wöchentlich. Die kurze Frist ist nicht wegen der Aktualität da,
+ * sondern damit der Speicher nicht an alten Ecken festhält.
+ *
+ * 400 Einträge: Ein Stadt-Ausschnitt wiegt rund 11 KB, ein weit
+ * herausgezoomter mit 400 Markierungen ein Vielfaches — der Deckel hält das
+ * im niedrigen zweistelligen Megabyte-Bereich, und der Cache verdrängt nach
+ * Alter (LRU).
+ */
+const nearbyCache = new BoundedTtlCache<SurroundingsResponse>(400, 10 * 60 * 1000);
+
 export async function surroundingsRoutes(app: FastifyInstance) {
-  // Surroundings: MOTIS/Transit-nearby — verbraucht DB-/MOTIS-Kontingent.
-  const preHandler = ipLimiter("surroundings", [{ limit: 40, windowMs: 60 * 1000 }]);
+  /**
+   * Das Budget der KARTE — und es war um Größenordnungen zu knapp.
+   *
+   * Hier standen 40 Anfragen pro Minute mit der Begründung, der Endpunkt
+   * verbrauche „DB-/MOTIS-Kontingent". Das stimmt nicht (mehr): Er fragt
+   * ausschließlich die eigene `locations`-Tabelle, kein einziger fremder
+   * Dienst wird angefasst — siehe den Kopf dieser Datei. Die Begründung stammt
+   * aus einer Fassung, die es nicht mehr gibt.
+   *
+   * Die Wirkung war dagegen sehr real. Die App fragt pro Kartenausschnitt
+   * (~500m-Raster), also einmal pro Wischgeste, die das Raster verlässt.
+   * Nachgemessen: Ab Anfrage 41 antwortet die Route mit `429` und
+   * `Retry-After: 60` — danach kommt eine GANZE MINUTE lang kein Pin mehr. In
+   * der App sieht das aus, als brauche der Server ewig; tatsächlich antwortet
+   * er in Millisekunden und weigert sich nur.
+   *
+   * Zwei Fenster statt einem: Das Minutenfenster deckt normales Erkunden ab
+   * (vier Ausschnitte pro Sekunde sind mehr, als eine Hand schafft), das
+   * Stundenfenster fängt trotzdem jemanden ab, der die Tabelle systematisch
+   * abgrast. Teuer ist der Aufruf nicht — die Abfrage läuft über den
+   * Geo-Index und kostet einstellige Millisekunden.
+   */
+  const preHandler = ipLimiter("surroundings", [
+    { limit: 240, windowMs: 60 * 1000 },
+    { limit: 3000, windowMs: 60 * 60 * 1000 },
+  ]);
   app.get("/api/surroundings", { preHandler }, async (req, reply) => {
     const parsed = querySchema.safeParse(req.query);
     if (!parsed.success) {
@@ -382,7 +488,25 @@ export async function surroundingsRoutes(app: FastifyInstance) {
     const { latitude, longitude, distance, mode, limit, zoom } = parsed.data;
 
     if (mode === "transit") {
+      const key = `${latitude}|${longitude}|${distance}|${limit}|${zoom}`;
+      const hit = nearbyCache.get(key);
+      /**
+       * Und die Antwort darf auch AUF DEM GERÄT liegen bleiben.
+       *
+       * Androids HTTP-Schicht (OkHttp, unter `fetch`) hält GET-Antworten mit
+       * dieser Kopfzeile selbst vor — und zwar auf der Platte, also über den
+       * App-Start hinaus. Der Zwischenspeicher der Abfrage-Schicht in der App
+       * lebt dagegen nur in dieser Sitzung und wird nach fünf Minuten
+       * aufgeräumt. Zusammen heißt das: Wer eine Ecke schon einmal gesehen hat,
+       * bekommt ihre Nadeln ohne einen einzigen Netzaufruf wieder.
+       *
+       * Fünf Minuten, also kürzer als der Cache hier: Die Frist auf dem Gerät
+       * lässt sich nicht widerrufen, die hier schon (Neustart des Servers).
+       */
+      reply.header("Cache-Control", "public, max-age=300");
+      if (hit) return hit;
       const data = await fetchTransitNearby(latitude, longitude, distance, limit, zoom);
+      nearbyCache.set(key, data);
       return data;
     }
 

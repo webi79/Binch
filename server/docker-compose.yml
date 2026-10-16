@@ -30,12 +30,60 @@ services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
+    # Postgres lief auf WERKSEINSTELLUNGEN — und die passen zu einer Datenbank,
+    # die auf einen Bastelrechner von 2005 gebaut wurde, nicht zu dieser hier.
+    #
+    # DER BEFUND: `locations` ist 856 MB groß (437 MB Tabelle, 1,6 Mio Zeilen,
+    # dazu der Geo-Index). Der Standard-`shared_buffers` ist 128 MB, also ein
+    # Siebtel davon. Die Kartenpins fragen bei jedem neuen Ausschnitt eine
+    # ANDERE Ecke dieser Tabelle ab — die Seiten liegen also fast nie im
+    # Puffer. Gemessen am Endpunkt: derselbe Ausschnitt 4 ms, ein frischer
+    # 24 bis 152 ms. Die Abfrage selbst braucht 1,5 ms; der Rest war Warten auf
+    # Seiten. Die Trefferquote des Heaps lag bei 32 %.
+    #
+    # 1 GB fasst `locations` samt Indizes vollständig — nach dem ersten Besuch
+    # bleibt eine Gegend drin. Der Rechner hat 15 GB, das ist unterhalb der
+    # üblichen Faustregel (ein Viertel des Arbeitsspeichers) und lässt den
+    # GTFS-Importen ihren Platz.
+    #
+    # `random_page_cost` runter, weil hier eine SSD steckt: Der Vorgabewert 4
+    # stammt aus der Zeit drehender Platten und lässt den Planer Index-Zugriffe
+    # meiden, die in Wahrheit billig sind.
+    #
+    # `effective_cache_size` sagt dem Planer nur, wie viel das Betriebssystem
+    # zusätzlich zwischenspeichert — es belegt KEINEN Speicher.
+    # Docker gibt einem Container 64 MB unter /dev/shm — Postgres legt dort die
+    # gemeinsamen Speicherstücke paralleler Abfragen an. Mit dem größeren
+    # `work_mem` und dem gesenkten `random_page_cost` wählt der Planer solche
+    # Pläne jetzt deutlich häufiger (die Ortssuche über 1,6 Mio Zeilen ist genau
+    # so einer), und läuft der Platz aus, bricht die Abfrage mit „could not
+    # resize shared memory segment" ab statt langsamer zu werden.
+    shm_size: 1gb
+    command:
+      - postgres
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - effective_cache_size=4GB
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=256MB
     environment:
       POSTGRES_USER: binch
-      POSTGRES_PASSWORD: binch
+      # Aus `.env` (POSTGRES_PASSWORD) — der Rückfall „binch" gilt nur lokal.
+      # Achtung: Postgres liest das nur beim ALLERERSTEN Start eines leeren
+      # Volumes. Auf einer bestehenden DB zusätzlich `ALTER ROLE binch PASSWORD …`.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-binch}
       POSTGRES_DB: binch
     ports:
-      - "5432:5432"
+      # Nur auf dem Rechner selbst erreichbar. Mit „5432:5432" lauschte die DB
+      # auf ALLEN Schnittstellen — Dockers Portfreigaben gehen an ufw vorbei,
+      # auf einem Server wäre sie damit aus dem Internet erreichbar gewesen.
+      # Die Container sprechen sie ohnehin über das Docker-Netz an (`db:5432`).
+      - "127.0.0.1:5432:5432"
     volumes:
       - binch-db:/var/lib/postgresql/data
     healthcheck:
@@ -106,6 +154,12 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    # Protokolle nicht endlos wachsen lassen (sie enthalten IP-Adressen).
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     # Bind-Adresse des Klartext-Ports steuerbar über SERVER_BIND.
     #   DEV  (Default 0.0.0.0): 3000 im LAN erreichbar — das Handy braucht das.
     #   PROD (SERVER_BIND=127.0.0.1): 3000 nur noch HOST-LOKAL. Vom Netz aus NICHT
@@ -131,7 +185,7 @@ services:
     environment:
       # DB ist im Docker-Network unter dem Hostname `db` erreichbar — NICHT
       # localhost (das wäre der Container selbst).
-      DATABASE_URL: postgres://binch:binch@db:5432/binch
+      DATABASE_URL: postgres://binch:${POSTGRES_PASSWORD:-binch}@db:5432/binch
       # db-vendo läuft intern auf Port 3000 (nicht 3001 wie extern gemapped).
       DBREST_BASE_URL: http://dbrest:3000
       DBWEB_BASE_URL: http://dbweb:3000
@@ -145,13 +199,22 @@ services:
 
   # Periodischer GTFS-Schedule-Refresh — re-importiert alle Feeds aus
   # `scripts/gtfs-feeds.conf` (NL/BE/CZ/GB, FR ist aktuell auf inactive).
+  # Dazu alle 30 Tage der Haltestellen-Abgleich (`scripts/refresh-stops.sh`,
+  # Quellen in `scripts/stops-feeds.conf`): neue Halte dazu, vorhandene
+  # auffrischen, nie löschen.
   # Läuft als Sidecar im selben Image wie `binch-server` (hat tsx + scripts
-  # + curl/unzip dabei). Endlos-Loop mit `sleep 604800` = 1 Woche.
+  # + curl/unzip dabei). Takt: `scripts/gtfs-refresh-loop.sh` — 7 Tage ab dem
+  # letzten Lauf (nicht ab jedem Containerstart), nach einem Fehlschlag 1 Tag.
+  # Jeder Lauf fragt die Quellen bedingt an und importiert nur, was neuer ist.
   #
   # Wenn der Loop crashed (z.B. ein einzelner Feed-Download 500's), restart-
   # unless-stopped bringt's wieder hoch. import-gtfs-feed.sh purged pro
   # feed_id und re-inserts atomar — DB wächst nicht mit jeder Iteration.
   # VACUUM ANALYZE läuft am Ende jedes Refresh-Zyklus → kein Bloat.
+  #
+  # Nach Änderungen an den Skripten: `docker compose build gtfs-refresh &&
+  # docker compose up -d gtfs-refresh` — sie sind ins Image gebacken. Nur die
+  # Feed-Liste ist hineingereicht und gilt ab dem nächsten Lauf.
   gtfs-refresh:
     build:
       context: .
@@ -162,15 +225,23 @@ services:
         condition: service_healthy
     env_file: .env
     environment:
-      DATABASE_URL: postgres://binch:binch@db:5432/binch
+      DATABASE_URL: postgres://binch:${POSTGRES_PASSWORD:-binch}@db:5432/binch
       NODE_ENV: production
-    # ./scripts ist im Image gebaked, aber wir cd'en explizit damit die
-    # Pfade relativ stimmen. `|| true` damit ein einzelner Failure nicht
-    # die ganze Loop kippt.
-    command: ["sh", "-c", "cd /app && while true; do ./scripts/refresh-all-feeds.sh || true; echo 'Next refresh in 7 days…'; sleep 604800; done"]
+    # Takt und Fehlerbehandlung: siehe scripts/gtfs-refresh-loop.sh. Die
+    # Feed-Liste kommt von außen herein — neue URLs ohne Rebuild.
+    command: ["/app/scripts/gtfs-refresh-loop.sh"]
+    volumes:
+      - ./scripts/gtfs-feeds.conf:/app/scripts/gtfs-feeds.conf:ro
+      # Die Haltestellen-Quellen des monatlichen Abgleichs (refresh-stops.sh).
+      - ./scripts/stops-feeds.conf:/app/scripts/stops-feeds.conf:ro
+      # Takt-Zeitstempel und die zuletzt geladenen ZIPs — auf einem Volume, damit
+      # ein Neuaufbau des Containers (nach Skript-Änderungen) nicht jedes Mal
+      # einen kompletten Neu-Download samt Import auslöst.
+      - gtfs-work:/tmp/binch-gtfs-schedule
     # Memory-Limit höher als binch-server weil GTFS-Imports mehrere Millionen
-    # Rows in Batches laden — Node-Heap kann temporär 1-2 GB ziehen.
-    mem_limit: 2g
+    # Rows in Batches laden — Node-Heap kann temporär 1-2 GB ziehen, beim
+    # Schweizer Haltestellen-Feed mehr (refresh-stops.sh setzt 2,5 GB Heap).
+    mem_limit: 3g
 
   # OTP-Routing wurde versucht aber auf diesem Host (15 GB RAM) ist NL OVAPI
   # zu groß für den Graph-Build — der StopTimeMapper sprengt die JVM beim
@@ -196,6 +267,11 @@ services:
   #   DOMAIN=api.deine-domain.de docker compose --profile tls up -d
   caddy:
     image: caddy:2-alpine
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     profiles: ["tls"]
     restart: unless-stopped
     ports:
@@ -218,6 +294,8 @@ volumes:
   # identisch zum bloßen `binch-db:` ohne Wert, aber strikte YAML-Schema-Linter
   # bemängeln den null-Wert. Mit explizitem `{}` ist die Warnung weg.
   binch-db: {}
+  # Arbeitsverzeichnis des GTFS-Refresh (Takt + ZIPs), siehe `gtfs-refresh`.
+  gtfs-work: {}
   # Persistente Caddy-Zertifikate/ACME-Account — ohne das würde Caddy bei jedem
   # Neustart neu bei Let's Encrypt anfragen und liefe ins Rate-Limit.
   caddy-data: {}

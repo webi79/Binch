@@ -227,7 +227,7 @@ function tripTypesFor(mode: TravelMode): { id: TripType; key: string }[] {
   return base;
 }
 
-function extraOptionsFor(mode: TravelMode): string[] {
+export function extraOptionsFor(mode: TravelMode): string[] {
   switch (mode) {
     case "FLIGHT":
       return ["search.class.economy", "search.class.business", "search.class.first"];
@@ -278,6 +278,12 @@ interface Props {
    * ist also durch, bevor jemand das Blatt sieht.
    */
   embedded?: boolean;
+  /**
+   * Nur einfache Fahrt — ohne Umschalter Hin/Rück. Für die Such-Slide über dem
+   * Stadt-Blatt: Das zeigt eine Richtung, und ein Hin-und-Rück-Gesamtpreis an
+   * einer Hinfahrt-Zeile wäre irreführend.
+   */
+  oneWayOnly?: boolean;
   /**
    * Vorbelegung. Angewandt wird sie, wenn sich die IDENTITÄT dieses Objekts
    * ändert — nicht bei jedem Durchgang.
@@ -363,6 +369,7 @@ function SearchHeroComponent({
   bgTrigger,
   resetTrigger,
   embedded = false,
+  oneWayOnly = false,
   initial = null,
   onSubmit,
   active = true,
@@ -381,7 +388,7 @@ function SearchHeroComponent({
   // (clipContentStyle). Ein animierter Knoten weniger in diesem Baum.
   const dateLocale = DATE_LOCALES[locale] ?? enUS;
 
-  const [tripType, setTripType] = useState<TripType>("roundtrip");
+  const [tripType, setTripType] = useState<TripType>(oneWayOnly ? "oneway" : "roundtrip");
   const [origin, setOrigin] = useState<Location | null>(null);
   const [destination, setDestination] = useState<Location | null>(null);
   const [departDate, setDepartDate] = useState<Date | null>(null);
@@ -674,7 +681,11 @@ function SearchHeroComponent({
     });
 
   const Icon = MODE_ICON[mode];
-  const tripTypes = useMemo(() => tripTypesFor(mode), [mode]);
+  const tripTypes = useMemo(() => {
+    const all = tripTypesFor(mode);
+    // Eine einzige Art → der Umschalter entfällt ganz (siehe `tripTypes.length > 1`).
+    return oneWayOnly ? all.filter((tt) => tt.id === "oneway") : all;
+  }, [mode, oneWayOnly]);
   const extraOpts = useMemo(() => extraOptionsFor(mode), [mode]);
   // BinchHero-Props stabil halten damit memo greift. Time-of-Day einmal beim
   // Mount auswerten — würde sich während einer Session sowieso kaum ändern.
@@ -772,6 +783,9 @@ function SearchHeroComponent({
       if (locationPickerResult.field === "from") {
         setOrigin(locationPickerResult.location);
         clearError("origin");
+        // Ein vorhandenes, aber rot markiertes Ziel war „gleich dem Start" —
+        // mit einem neuen Start ist das behoben.
+        if (destination) clearError("destination");
       } else {
         setDestination(locationPickerResult.location);
         clearError("destination");
@@ -974,6 +988,12 @@ function SearchHeroComponent({
     const missing = new Set<ErrorField>();
     if (!origin) missing.add("origin");
     if (!destination) missing.add("destination");
+    // Dieselbe Station als Start und Ziel: Die Suche ergäbe nichts und kostete
+    // trotzdem bei den Anbietern — das Ziel wird markiert wie ein fehlendes.
+    // Nicht bei Kreuzfahrten: Rundreisen enden im Abfahrtshafen.
+    if (mode !== "CRUISE" && origin && destination && origin.code === destination.code) {
+      missing.add("destination");
+    }
     if (!departDate) missing.add("depart");
     if (isRoundtrip && !returnDate) missing.add("return");
     // Doppeltipp-Sperre. In den ersten ~100ms existiert der Ergebnis-Bildschirm
@@ -1260,6 +1280,11 @@ function SearchHeroComponent({
         ]}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
+        // Eingebettet (Such-Slide, die man zum Schließen wischt): kein
+        // Dehn-Effekt am Rand. Android dehnt sonst den Inhalt, solange der
+        // Finger über den Rand hinaus zieht — gegen das Blatt, das in dieselbe
+        // Richtung fährt. Das Ticket-Blatt schaltet ihn aus demselben Grund ab.
+        overScrollMode={embedded ? "never" : undefined}
         // Wird aus der Berührung doch ein Scrollen, ist die Textur sofort wieder
         // weg. Sie wird beim Aufsetzen des Fingers auf den Knopf angefordert
         // (siehe dort) — ohne diese Gegenbuchung bliebe sie 1,4s über einer

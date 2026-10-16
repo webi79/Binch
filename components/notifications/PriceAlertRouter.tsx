@@ -9,10 +9,10 @@ import * as Notifications from "expo-notifications";
  * Modul importiert. Das ist keine Zusicherung: Wer dort den Import umbaut,
  * nimmt lautlos die Vordergrund-Anzeige mit. Hier steht er ausdrücklich.
  */
-import { setAlertActiveOnServer } from "@/lib/notifications/alertToggle";
+import { openAlertRoute } from "@/lib/nav/openAlertRoute";
+import { deleteAlertOnServer } from "@/lib/notifications/alertToggle";
 import { ackNotification, ensurePushToken, restorePushToken, syncDeviceLocale } from "@/lib/notifications/push";
 import { catchUpFiredAlerts, syncPriceAlerts } from "@/lib/notifications/syncAlerts";
-import { startResultsPush } from "@/lib/nav/overlayCover";
 import { priceAlertKey, useSearchStore } from "@/stores/searchStore";
 import type { AlertHit } from "@/types/saved";
 
@@ -53,16 +53,6 @@ interface AlertPayload {
   pct?: string;
 }
 
-/**
- * Die Ergebnisliste öffnen — auf demselben Weg wie eine Verlaufskarte.
- *
- * Erst die Bewegung anstoßen, dann EIN BILD SPÄTER die Parameter setzen. Diese
- * Reihenfolge ist im Projekt an drei Stellen erkämpft und begründet: Der
- * Schreibvorgang macht einen über 2000 Zeilen langen Baum sichtbar, und sein
- * Commit läuft bei einem Ereignis synchron zu Ende, während die Bewegung nur
- * eingereiht wird. Andersherum liefe erst der ganze Aufbau und dann erst führe
- * etwas los.
- */
 /**
  * Eine eingetroffene Meldung in die Liste unter der Glocke schreiben.
  *
@@ -148,51 +138,27 @@ function recordHit(p: AlertPayload): void {
   });
 
   /**
-   * Und auf dem Server nachziehen — bewusst OHNE darauf zu warten.
+   * Und auf dem Server nachziehen — GELÖSCHT, nicht pausiert.
    *
-   * Das läuft im Empfangs- oder Tipp-Weg einer Meldung; dort auf eine
-   * Netzantwort zu warten hieße, die Öffnung der Ergebnisliste dahinter
-   * anzustellen. Scheitert es, bleibt der Alarm auf dem Server und meldet
-   * beim nächsten Mal erneut — dann läuft genau dieser Weg wieder und der
-   * Versuch wiederholt sich. Es heilt sich also selbst, statt dauerhaft
-   * schiefzustehen.
+   * Hier stand `setAlertActiveOnServer(fired, false)`, und das war richtig,
+   * solange Ausschalten Löschen bedeutete. Seit der Schalter nur noch pausiert,
+   * wäre es der schlimmste Ausgang: Der Alarm verschwindet hier aus der Liste
+   * (er hat ja ausgelöst und steht jetzt unter der Glocke), und mit ihm seine
+   * Server-Kennung — die Zeile bliebe pausiert für immer in der Datenbank, von
+   * der App aus weder sichtbar noch erreichbar.
+   *
+   * Ein ausgelöster Alarm ist erledigt, und Erledigtes wird gelöscht — dieselbe
+   * Entscheidung wie im Nachhol-Weg (`catchUpFiredAlerts`).
+   *
+   * Bewusst OHNE darauf zu warten: Das läuft im Empfangs- oder Tipp-Weg einer
+   * Meldung; dort auf eine Netzantwort zu warten hieße, die Öffnung der
+   * Ergebnisliste dahinter anzustellen. Scheitert es, bleibt der Alarm auf dem
+   * Server — dann holt ihn der nächste App-Start nach (`catchUpFiredAlerts`
+   * löscht ihn dort). Es heilt sich also selbst, statt dauerhaft schiefzustehen.
    */
-  if (fired) void setAlertActiveOnServer(fired, false);
+  if (fired) void deleteAlertOnServer(fired);
 }
 
-function openResultsFor(p: AlertPayload): void {
-  if (!p.mode || !p.origin || !p.destination || !p.departDate) return;
-  const rp: Record<string, string> = {
-    mode: p.mode,
-    origin: p.origin,
-    destination: p.destination,
-    originLabel: p.originLabel ?? p.origin,
-    destLabel: p.destLabel ?? p.destination,
-    departDate: p.departDate,
-    /**
-     * Die Suche wird GENAUSO geöffnet, wie der Alarm sie gespeichert hat.
-     *
-     * Rückreise, Reisendenzahl und Klasse gehören zum Schlüssel des Alarms —
-     * der Preis einer Antwort ist der Gesamtpreis der Gruppe. Würde hier
-     * pauschal „eine Person, einfache Fahrt" stehen, meldete die Nachricht
-     * 120 € und die Liste daraufhin 31 €. Eine Meldung, deren Zahl nach dem
-     * Tipp nicht mehr stimmt, ist schlimmer als keine.
-     *
-     * Fehlt ein Feld, stammt die Meldung von einem älteren Server — dann
-     * greifen dieselben Vorgaben wie in der Suchroute.
-     */
-    passengers: p.passengers ?? "1",
-    currency: p.currency ?? "EUR",
-    ...(p.returnDate ? { returnDate: p.returnDate } : {}),
-    ...(p.travelClass ? { travelClass: p.travelClass } : {}),
-    tripType: p.returnDate ? "roundtrip" : "oneway",
-  };
-  startResultsPush();
-  requestAnimationFrame(() => {
-    useSearchStore.getState().setPendingResultsRoute(rp);
-    useSearchStore.getState().setResultsParams(rp);
-  });
-}
 
 /**
  * Was beim ANTIPPEN einer Alarm-Meldung passieren muss — an EINER Stelle.
@@ -226,7 +192,26 @@ function handleAlertTap(data: AlertPayload): void {
   void ensurePushToken().then((r) => {
     if (r.ok) ackNotification("tapped");
   });
-  openResultsFor(data);
+  /**
+   * Der Öffner liegt in `lib/nav/openAlertRoute` — nicht mehr hier.
+   *
+   * Seit die Karte unter der Glocke dieselbe Suche öffnen kann, gibt es zwei
+   * Aufrufer. Zwei Fassungen davon hießen: Der eine Weg öffnet eine Suche für
+   * eine Person, der andere für vier — und die Preise in der Liste sagten
+   * jeweils etwas anderes.
+   */
+  openAlertRoute({
+    mode: data.mode ?? "",
+    origin: data.origin ?? "",
+    destination: data.destination ?? "",
+    originLabel: data.originLabel,
+    destLabel: data.destLabel,
+    departDate: data.departDate ?? "",
+    returnDate: data.returnDate,
+    passengers: data.passengers,
+    travelClass: data.travelClass,
+    currency: data.currency,
+  });
 }
 
 export function PriceAlertRouter() {

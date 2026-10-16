@@ -19,6 +19,7 @@ import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useSearchStore } from "@/stores/searchStore";
 import { MapSurface, type MapSurfaceHandle } from "@/components/surroundings/MapSurface";
+import { useResolvedMapStyle } from "@/lib/theme/mapStyleChoice";
 import { MapSkeleton } from "@/components/surroundings/MapSkeleton";
 import { RouteLayer } from "@/components/surroundings/RouteLayer";
 import { RouteBanner } from "@/components/surroundings/RouteBanner";
@@ -33,12 +34,24 @@ export default function RouteMapScreen() {
   const pendingRoute = useSearchStore((s) => s.pendingRoute);
   const clearRoute = useSearchStore((s) => s.clearRoute);
   const mapRef = useRef<MapSurfaceHandle>(null);
+  const mapStyleName = useResolvedMapStyle();
+  /** Die Beschriftung folgt der App-Sprache — siehe `locale` an der Kartenfläche. */
+  const locale = useSearchStore((s) => s.locale);
+  /** Kartentyp UND Sprache: Ändert sich eins, entsteht eine neue Karte (`key`). */
+  const mapKey = `${mapStyleName}:${locale}`;
 
   // Die native MapLibre-Surface ist die ersten Frames WEISS, bis Style und
   // Tiles gerendert sind — dieser Screen mountet die Map frisch, also blitzte
   // beim Öffnen kurz Weiß auf. Gleiches Muster wie im Surroundings-Tab: das
   // dunkle Skelett liegt oben, bis onMapRendered feuert, dann fadet es weg.
-  const [mapTilesRendered, setMapTilesRendered] = useState(false);
+  //
+  // „Gezeichnet" gilt je KARTE, nicht je Bildschirm: Nach einem Wechsel von
+  // Kartentyp oder Sprache (in den Einstellungen, während dieser Bildschirm im
+  // Stapel liegt) entsteht eine neue Karte. Sie startet ohne Ausschnitt weit
+  // draußen — das Skelett deckt sie wieder ab, bis sie gezeichnet ist, und der
+  // Rahmen um die Route wird für sie neu gesetzt (Effekt unten).
+  const [renderedKey, setRenderedKey] = useState<string | null>(null);
+  const mapTilesRendered = renderedKey === mapKey;
 
   // Bei Mount Auto-fit auf alle Waypoints. Berechne die Bbox aus allen
   // Koordinaten der Route.
@@ -106,7 +119,24 @@ export default function RouteMapScreen() {
 
   return (
     <View style={[styles.root, { backgroundColor: appBg }]}>
-      <MapSurface ref={mapRef} onMapRendered={() => setMapTilesRendered(true)}>
+      {/**
+        * Dieselbe Karten-Wahl wie im Umgebungs-Tab.
+        *
+        * Hier fehlte die Angabe ganz, und ohne sie greift die Vorgabe „dunkel".
+        * Wer Satellit eingestellt hatte, bekam die Zugstrecke trotzdem auf der
+        * dunklen Karte — die Einstellung sah aus, als hätte sie sich
+        * zurückgesetzt. Es gibt nur EINE Karten-Wahl in dieser App, und beide
+        * Karten lesen sie jetzt aus derselben Quelle.
+        *
+        * Der `key` hat denselben Grund wie im Umgebungs-Tab — siehe dort.
+        */}
+      <MapSurface
+        key={mapKey}
+        styleName={mapStyleName}
+        locale={locale}
+        ref={mapRef}
+        onMapRendered={() => setRenderedKey(mapKey)}
+      >
         <RouteLayer
           waypoints={pendingRoute.waypoints}
           legs={pendingRoute.legs}

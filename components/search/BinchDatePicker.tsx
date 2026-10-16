@@ -13,6 +13,7 @@
  *  - DayCell als React.memo damit Selection-Changes nur 2 Cells re-rendern
  */
 import { memo, useCallback, useMemo, useState, type ReactNode, useRef } from "react";
+import { PICKER_HEADER_TOP } from "@/lib/theme/spacing";
 import { subscribeLayer, holdLayer, rearmLayer } from "@/lib/nav/transitionLayer";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import { PICKER_IN, PICKER_OUT } from "@/lib/nav/overlayCover";
@@ -50,6 +51,7 @@ import {
 } from "./TimeSheet";
 import { scaledStyles } from "@/lib/ui/compact";
 import { useSearchStore } from "@/stores/searchStore";
+import { FadePress } from "@/components/ui/FadePress";
 
 const C = {
   bg: "#0D0D0D",
@@ -83,6 +85,38 @@ const LOAD_MORE_MONTHS = 12;
 const MAX_MONTHS = 12;
 
 const pad = (n: number) => String(n).padStart(2, "0");
+
+/**
+ * Die nächste WÄHLBARE Uhrzeit — aber nur, wenn der Tag der heutige ist.
+ *
+ * WOZU: Wer heute fährt, meint fast nie neun Uhr dreißig. Die Vorgabe des
+ * Wählers ist eine gute Annahme für jeden anderen Tag und eine schlechte für
+ * diesen einen: Um halb eins nachmittags eine Suche ab 09:30 aufzusetzen heißt,
+ * dem Nutzer eine Liste mit drei Stunden Vergangenheit vorzusetzen, die er
+ * selbst wegräumen muss.
+ *
+ * GERASTERT, nicht gerundet: Das Rad kennt nur Vielfache von `step` (Vorgabe
+ * fünf). Um 12:54 ist die nächste wählbare Zeit 12:55, nicht 12:54 — und
+ * aufgerundet wird, nicht zur nächsten: 12:50 läge hinter uns.
+ *
+ * Fällt der nächste Platz hinter Mitternacht (nach 23:55), bleibt es beim
+ * letzten Platz DIESES Tages. Der Tag ist gewählt, und ihn ungefragt auf morgen
+ * weiterzudrehen wäre eine andere Antwort als die gestellte Frage.
+ *
+ * `null` für jeden anderen Tag — dort gilt die Vorgabe.
+ */
+function nextSlotForToday(
+  y: number,
+  m: number,
+  d: number,
+  step: number,
+): { hour: number; minute: number } | null {
+  const now = new Date();
+  if (y !== now.getFullYear() || m !== now.getMonth() || d !== now.getDate()) return null;
+  const mins = now.getHours() * 60 + now.getMinutes();
+  const slot = Math.min(Math.ceil(mins / step) * step, 24 * 60 - step);
+  return { hour: Math.floor(slot / 60), minute: slot % 60 };
+}
 
 function priceFor(y: number, m: number, d: number): number {
   const seed = Math.abs(((y * 372 + m * 31 + d) * 2654435761) % 100000);
@@ -641,6 +675,27 @@ const DatePickerContent = memo(function DatePickerContent({
   const [hour, setHour] = useState(initialDate?.getHours() ?? DEFAULT_TIME.hour);
   const [minute, setMinute] = useState(initialDate?.getMinutes() ?? DEFAULT_TIME.minute);
   /**
+   * Hat der Nutzer die Uhrzeit SELBST gewählt?
+   *
+   * Daran hängt, ob die Zeit dem Datum folgen darf. Vorbelegt wird nur, solange
+   * niemand sie angefasst hat — eine eigene Wahl beim Wechsel des Datums
+   * stillschweigend zu überschreiben wäre schlimmer als gar keine Vorbelegung:
+   * Wer 06:00 einstellt und danach den Tag korrigiert, sucht sonst ab neun.
+   *
+   * Als Ref und nicht als Zustand: Es wird nichts davon gezeichnet, ein
+   * Durchgang mehr wäre der einzige Effekt.
+   *
+   * ANFANGSWERT AUS `initialDate`: Liegt beim Öffnen schon ein Datum an, hat
+   * der Nutzer diese Suche bereits einmal bestätigt — samt Uhrzeit, die oben
+   * aus genau diesem Datum gelesen wird. Stünde hier `false`, wäre sie nicht
+   * geschützt: Ein Tipp auf einen anderen Tag setzte eine eingestellte
+   * Abfahrt um 18:00 stillschweigend auf die Vorgabe zurück. Der Preis dieser
+   * Wahl ist klein und die andere Richtung: Wer beim letzten Mal die Vorgabe
+   * stehen ließ, bekommt beim Umstellen auf HEUTE keine Vorbelegung mehr. Eine
+   * fehlende Bequemlichkeit ist harmloser als eine überschriebene Eingabe.
+   */
+  const timePickedRef = useRef(initialDate != null);
+  /**
    * Stabil — sonst ist das `memo()` um `ModeTabs` wirkungslos.
    *
    * Als Pfeilfunktion am Ort war die Eigenschaft bei JEDEM Durchgang neu, und
@@ -755,6 +810,10 @@ const DatePickerContent = memo(function DatePickerContent({
       setSel(null);
       setHour(DEFAULT_TIME.hour);
       setMinute(DEFAULT_TIME.minute);
+      // Und den Merker mit: Die nächste Sitzung fängt ohne eigene Wahl an,
+      // sonst bliebe die Vorbelegung nach einem einzigen Griff ans Zeitrad für
+      // immer aus.
+      timePickedRef.current = false;
       // Gehörte nie in diese Liste: Wer die Uhrzeit-Auswahl offen hatte und den
       // Wähler über die Zurück-Geste verließ, bekam sie beim nächsten Öffnen
       // sofort wieder vorgesetzt.
@@ -863,15 +922,37 @@ const DatePickerContent = memo(function DatePickerContent({
 
   /** Fest — sonst baut das Blatt bei jedem Durchgang seine Rückmeldung neu ein. */
   const applyTime = useCallback((h: number, m: number) => {
+    // Ab jetzt gehört die Uhrzeit dem Nutzer — siehe `timePickedRef`.
+    timePickedRef.current = true;
     setHour(h);
     setMinute(m);
   }, []);
 
   // Stabiler onDayPress damit DayCell-memo greift.
-  const onDayPress = useCallback((y: number, m: number, d: number) => {
-    haptic("button");
-    setSel({ y, m, d });
-  }, []);
+  const onDayPress = useCallback(
+    (y: number, m: number, d: number) => {
+      haptic("button");
+      setSel({ y, m, d });
+      /**
+       * Die Uhrzeit folgt dem Datum — solange sie niemand selbst gesetzt hat.
+       *
+       * HEUTE: der nächste wählbare Platz (siehe `nextSlotForToday`). Jeder
+       * ANDERE Tag: zurück auf die Vorgabe. Das Zurücksetzen gehört mit dazu,
+       * sonst bliebe eine Zeit stehen, die nur wegen „heute" gewählt wurde —
+       * wer erst heute antippt und dann den Sechzehnten, führe sonst um 12:55
+       * statt zur Vorgabe.
+       *
+       * `minuteStep` in den Abhängigkeiten: Die Vorbelegung muss auf demselben
+       * Raster liegen wie das Rad, sonst rastete das Blatt beim Öffnen sichtbar
+       * auf eine andere Zahl.
+       */
+      if (timePickedRef.current) return;
+      const slot = nextSlotForToday(y, m, d, minuteStep);
+      setHour(slot ? slot.hour : DEFAULT_TIME.hour);
+      setMinute(slot ? slot.minute : DEFAULT_TIME.minute);
+    },
+    [minuteStep],
+  );
 
   const onWeiter = () => {
     haptic("button");
@@ -939,15 +1020,34 @@ const DatePickerContent = memo(function DatePickerContent({
 
   return (
     <View style={[s.root, { backgroundColor: "transparent" }]}>
-      {/* Header — Padding-Top: safe-area + 24 (entspricht pt-6 vom Saved-
-          Tab) damit alles unter der Statusbar liegt. Title-Style matched
-          den "Saved"-Header (26px, font-black, tracking-tight). */}
-      <View style={[s.header, { paddingTop: insets.top + 24 }]}>
+      {/* Derselbe obere Abstand wie im Ortswähler — siehe `PICKER_HEADER_TOP`,
+          aber mit einem BODEN aus der Geräte-Einfassung.
+
+          Die 56 decken jedes Android-Gerät ab, auf dem dieses Blatt bisher lief
+          (Statusleiste plus Kerbe liegen dort unter 48). Sie sind aber eine
+          feste Zahl, und es gibt Geräte mit höherer Einfassung — auf einem
+          iPhone mit Dynamic Island sind es 59, und dann läge die Aufschrift
+          DARUNTER. Das Blatt zeichnet von ganz oben, es fängt also nichts ab.
+
+          `Math.max` ändert auf diesem Gerät nichts (24+8 bleibt unter 56) und
+          schiebt nur dort, wo es sonst verdeckt wäre.
+          Hier stand `insets.top + 24`, was auf diesem Gerät über siebzig ergab;
+          die Aufschrift saß damit sichtbar tiefer als dort, obwohl sich die
+          beiden Blätter abwechseln.
+
+          Der Rest des Kopfes stimmt damit Zahl für Zahl mit dem Ortswähler
+          überein (dort `px-5 pt-14 pb-4` mit `gap-3`): 20 seitlich, 56 oben,
+          16 unten, 12 Abstand. Der Inhalt darunter rückt von selbst mit — der
+          Abstand hängt am Kopf, nicht am Kalender.
+
+          Der alte Kommentar, der hier stand, beschrieb den Zustand VOR dieser
+          Änderung („safe-area + 24") und dazu eine Titel-Angabe, die schon
+          länger nicht mehr stimmte (siehe `title` im Stilblock). */}
+      <View style={[s.header, { paddingTop: Math.max(insets.top + 8, PICKER_HEADER_TOP) }]}>
         {/* Das X steht FREI — wie im Ortswähler, mit dem sich dieses Blatt
             abwechselt, und wie in jedem anderen Blatt der App. Es war die
             letzte Stelle mit einem gefüllten Kreis darum. */}
-        <Pressable
-          style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
+        <FadePress
           hitSlop={12}
           accessibilityRole="button"
           // Die Ebene für die AUSFAHRT schon beim Aufsetzen anlegen — für die
@@ -958,7 +1058,7 @@ const DatePickerContent = memo(function DatePickerContent({
           onPress={onClose}
         >
           <X color="#E5E7EB" size={26} />
-        </Pressable>
+        </FadePress>
         <Text style={s.title}>{title}</Text>
       </View>
 

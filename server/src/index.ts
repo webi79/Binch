@@ -8,15 +8,20 @@ import { redirectRoutes } from "./routes/redirect.js";
 import { ticketsRoutes } from "./routes/tickets.js";
 import { authRoutes } from "./routes/auth.js";
 import { surroundingsRoutes } from "./routes/surroundings.js";
+import { tilesRoutes } from "./routes/tiles.js";
 import { stopsRoutes } from "./routes/stops.js";
 import { tripsRoutes } from "./routes/trips.js";
 import { flightBookingOptionsRoutes } from "./routes/flightBookingOptions.js";
 import { chatRoutes } from "./routes/chat.js";
+import { tripPlanRoutes } from "./routes/tripPlan.js";
+import { walkRoutes } from "./routes/walk.js";
 import { alertsRoutes } from "./routes/alerts.js";
+import { flushEsriUsage, imageryRoutes } from "./routes/imagery.js";
 import { deactivateExpiredAlerts, startAlertExpiry, stopAlertExpiry } from "./services/priceAlerts.js";
 import { pool } from "./db/client.js";
 import { startStopBoardPreCache, stopStopBoardPreCache } from "./services/stopBoardPreCache.js";
 import { startDbVendoQueue, stopDbVendoQueue } from "./services/dbVendoQueue.js";
+import { startRetention, stopRetention } from "./services/retention.js";
 
 const app = Fastify({
   logger: {
@@ -29,7 +34,11 @@ const app = Fastify({
   // Nur hinter einem Reverse-Proxy true (siehe config.TRUST_PROXY): sonst würde
   // ein Angreifer per gefälschtem X-Forwarded-For seine IP frei wählen und die
   // Per-IP-Rate-Limits umgehen. Direkt exponiert (Default) = Peer-IP zählt.
-  trustProxy: config.TRUST_PROXY,
+  // Eine Stufe (Caddy), nicht „allen": Mit `true` nähme Fastify den LINKESTEN
+  // X-Forwarded-For-Eintrag, und den kann der Absender selbst setzen, sobald
+  // ein anhängender Proxy davor sitzt. Kommt ein CDN oder Lastverteiler vor
+  // Caddy, hier 2.
+  trustProxy: config.TRUST_PROXY ? 1 : false,
 });
 
 // CORS: mit CORS_ORIGINS (Prod) nur die gelisteten Origins, ungesetzt (Dev)
@@ -50,11 +59,15 @@ await app.register(redirectRoutes);
 await app.register(ticketsRoutes);
 await app.register(authRoutes);
 await app.register(surroundingsRoutes);
+await app.register(tilesRoutes);
 await app.register(stopsRoutes);
 await app.register(tripsRoutes);
 await app.register(alertsRoutes);
 await app.register(flightBookingOptionsRoutes);
 await app.register(chatRoutes);
+await app.register(tripPlanRoutes);
+await app.register(walkRoutes);
+await app.register(imageryRoutes);
 
 // db-vendo Background-Queue starten — Worker tickt alle 1.5s und arbeitet
 // SWR/History-Refreshes ab. Muss VOR dem Pre-Cache laufen, weil der Pre-Cache
@@ -70,6 +83,9 @@ const shutdown = async (signal: string) => {
   stopStopBoardPreCache();
   stopDbVendoQueue();
   stopAlertExpiry();
+  stopRetention();
+  // Gezählte Esri-Kacheln nicht verlieren (sonst fehlen bis zu 10 s im Kontingent).
+  await flushEsriUsage().catch(() => {});
   await app.close();
   await pool.end();
   process.exit(0);
@@ -95,6 +111,8 @@ try {
    */
   void deactivateExpiredAlerts();
   startAlertExpiry();
+  // Alte Suchdaten, abgelaufene Tokens und Sitzungen abräumen (services/retention.ts).
+  startRetention();
 } catch (err) {
   app.log.error(err);
   process.exit(1);

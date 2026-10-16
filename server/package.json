@@ -47,7 +47,8 @@
     "prefix:city-to-label": "tsx --env-file=.env scripts/prefix-city-to-label.ts",
     "validate:train": "tsx --env-file=.env scripts/validate-train-classification.ts",
     "diagnose:city-search": "tsx --env-file=.env scripts/diagnose-city-search.ts",
-    "reimport:all": "npm run wipe:locations && npm run db:seed && npm run import:stada && npm run import:gtfs:de:all && npm run import:gtfs:at && npm run import:gtfs:fr && npm run import:gtfs:nl && npm run import:gtfs:ch && npm run import:gtfs:cz && npm run import:gtfs:pl && npm run import:gtfs:be:all && npm run validate:train && npm run enrich:stops-city && npm run dedup:locations && npm run prefix:city-to-label",
+    "reimport:all": "npm run wipe:locations && npm run db:seed && npm run import:stada && npm run import:gtfs:de:all && npm run import:gtfs:at && npm run import:gtfs:fr && npm run import:gtfs:nl && npm run import:gtfs:ch && npm run import:gtfs:cz && npm run import:gtfs:pl && npm run import:gtfs:be:all && npm run validate:train && npm run enrich:stops-city && npm run dedup:locations",
+    "refresh:stops": "./scripts/refresh-stops.sh",
     "import:stada": "curl -sSL -o /tmp/trainline-stations.csv https://raw.githubusercontent.com/trainline-eu/stations/master/stations.csv && tsx --env-file=.env scripts/import-stada.ts",
     "import:gtfs:de": "curl -L --fail -o /tmp/gtfs-de.zip https://download.gtfs.de/germany/free/latest.zip && rm -rf /tmp/gtfs-de && unzip -o /tmp/gtfs-de.zip -d /tmp/gtfs-de && GTFS_DIR=/tmp/gtfs-de GTFS_COUNTRY=Germany GTFS_CODE_PREFIX=gtfs:de: tsx --env-file=.env scripts/import-gtfs.ts",
     "import:gtfs:de-vbb": "curl -L --fail -o /tmp/gtfs-de-vbb.zip https://www.vbb.de/vbbgtfs && rm -rf /tmp/gtfs-de-vbb && unzip -o /tmp/gtfs-de-vbb.zip -d /tmp/gtfs-de-vbb && GTFS_DIR=/tmp/gtfs-de-vbb GTFS_COUNTRY=Germany GTFS_CODE_PREFIX=gtfs:de:vbb: tsx --env-file=.env scripts/import-gtfs.ts",
@@ -88,6 +89,7 @@
     "pdfjs-dist": "^5.6.205",
     "pg": "^8.13.1",
     "pino-pretty": "^11.3.0",
+    "sharp": "^0.35.4",
     "tz-lookup": "^6.1.25",
     "zod": "^3.23.8"
   },

@@ -1,0 +1,1248 @@
+diff --git a/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/android/maps/BinchGestureBridge.java b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/android/maps/BinchGestureBridge.java
+new file mode 100644
+index 0000000..3efeaa3
+--- /dev/null
++++ b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/android/maps/BinchGestureBridge.java
+@@ -0,0 +1,31 @@
++package org.maplibre.android.maps;
++
++/**
++ * Binch: Zugang zu MapLibres Schalter „Geste läuft" für das eigene Ausrollen
++ * (`MLRNMapView.FlingDriver`).
++ *
++ * Warum der Schalter gebraucht wird: MapLibre zeichnet anders, solange sich
++ * die Kamera ändert (`TransformState::isChanging()` = Drehen, Zoomen, Schieben
++ * oder Geste). Nur dann werden Symbole weich („linear") abgetastet und das
++ * Luftbild stufenlos verschoben. Steht die Kamera laut MapLibre still, rasten
++ * Symbole und Luftbild auf ganze Bildpunkte ein — im Stand richtig, beim
++ * Gleiten ein Zittern. Das eigene Ausrollen verschiebt mit `scrollBy` ohne
++ * Animation; MapLibre hält die Kamera dabei für ruhend, weil der Finger schon
++ * weg ist. Während des Ausrollens wird die Geste deshalb weiter als laufend
++ * gemeldet, genau wie beim Ziehen.
++ *
++ * Die Klasse liegt in MapLibres Paket, weil `getTransform()` und
++ * `setGestureInProgress()` paketintern sind — derselbe Aufruf, den MapLibres
++ * `MapGestureDetector` beim Aufsetzen und Loslassen macht. Reflection wäre
++ * nach R8 (Umbenennen) nicht verlässlich.
++ */
++public final class BinchGestureBridge {
++  private BinchGestureBridge() {}
++
++  public static void setGestureInProgress(MapLibreMap map, boolean inProgress) {
++    // Beim Zurücksetzen frischt MapLibre dabei auch die zwischengespeicherte
++    // Kameraposition auf — `scrollBy` tut das nicht. Ohne das meldete
++    // `onRegionDidChange` am Ende des Ausrollens die Stelle des Loslassens.
++    map.getTransform().setGestureInProgress(inProgress);
++  }
++}
+diff --git a/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/camera/CameraStop.kt b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/camera/CameraStop.kt
+index 321734a..5cda778 100644
+--- a/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/camera/CameraStop.kt
++++ b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/camera/CameraStop.kt
+@@ -88,7 +88,7 @@ class CameraStop {
+                         cameraPaddingClipped[2],
+                         cameraPaddingClipped[3],
+                     )
+-                return CameraUpdateItem(map, update, duration, easing, callback)
++                return CameraUpdateItem(map, update, duration, easing, callback, mapView)
+             }
+ 
+             hasSetZoom = true
+@@ -112,6 +112,7 @@ class CameraStop {
+             duration,
+             easing,
+             callback,
++            mapView,
+         )
+     }
+ 
+diff --git a/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/camera/CameraUpdateItem.kt b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/camera/CameraUpdateItem.kt
+index cadb423..b47fde6 100644
+--- a/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/camera/CameraUpdateItem.kt
++++ b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/camera/CameraUpdateItem.kt
+@@ -1,11 +1,39 @@
+ package org.maplibre.reactnative.components.camera
+ 
++import android.animation.Animator
++import android.animation.AnimatorListenerAdapter
++import android.animation.ValueAnimator
++import android.view.animation.PathInterpolator
++import org.maplibre.android.camera.CameraPosition
+ import org.maplibre.android.camera.CameraUpdate
++import org.maplibre.android.camera.CameraUpdateFactory
+ import org.maplibre.android.constants.MapLibreConstants
++import org.maplibre.android.geometry.LatLng
++import org.maplibre.android.gestures.MoveGestureDetector
++import org.maplibre.android.gestures.RotateGestureDetector
++import org.maplibre.android.gestures.ShoveGestureDetector
++import org.maplibre.android.gestures.StandardScaleGestureDetector
+ import org.maplibre.android.maps.MapLibreMap
+ import org.maplibre.android.maps.MapLibreMap.CancelableCallback
+ import org.maplibre.reactnative.components.camera.constants.CameraEasing
++import org.maplibre.reactnative.components.mapview.MLRNMapView
+ import java.lang.ref.WeakReference
++import java.util.WeakHashMap
++import kotlin.math.PI
++import kotlin.math.abs
++import kotlin.math.acos
++import kotlin.math.atan2
++import kotlin.math.cos
++import kotlin.math.cosh
++import kotlin.math.hypot
++import kotlin.math.ln
++import kotlin.math.log2
++import kotlin.math.max
++import kotlin.math.pow
++import kotlin.math.sin
++import kotlin.math.sinh
++import kotlin.math.sqrt
++import kotlin.math.tanh
+ import java.util.concurrent.ExecutionException
+ import java.util.concurrent.RunnableFuture
+ import java.util.concurrent.TimeUnit
+@@ -17,6 +45,8 @@ class CameraUpdateItem(
+     private val duration: Int,
+     @param:CameraEasing.Easing private val easing: Int,
+     private val callback: CancelableCallback?,
++    /** Binch: für die Ereignisse während einer weichen Fahrt, siehe `runSmooth`. */
++    private val view: MLRNMapView? = null,
+ ) : RunnableFuture<Void?> {
+     private var isCameraActionFinished = false
+     private var isCameraActionCancelled = false
+@@ -41,6 +71,11 @@ class CameraUpdateItem(
+             return
+         }
+ 
++        // Binch: Ein neuer Kamerabefehl beendet eine laufende weiche Fahrt und
++        // ein laufendes Ausrollen — sonst zögen zwei Bewegungen an der Kamera.
++        stopSmooth(map)
++        view?.stopFling()
++
+         // animateCamera / easeCamera only allows positive duration
+         if (this.duration == 0 || easing == CameraEasing.NONE) {
+             map.moveCamera(cameraUpdate, callback)
+@@ -62,9 +97,314 @@ class CameraUpdateItem(
+                 map.easeCamera(cameraUpdate, duration, true, callback)
+             }
+ 
++            // Binch: auch der weite Sprung über die eigene Kurve (`flyPath`) —
++            // MapLibres `flyTo` fährt mit dem Vierfachen seines Mitteltempos los.
+             CameraEasing.FLY -> {
+-                map.animateCamera(cameraUpdate, duration, callback)
++                runSmooth(map, duration, callback, fly = true)
++            }
++
++            CameraEasing.SMOOTH -> {
++                runSmooth(map, duration, callback, fly = false)
++            }
++        }
++    }
++
++    /**
++     * Binch: eine Kamerafahrt mit EIGENER Kurve, Bild für Bild.
++     *
++     * MapLibres „ease" ist fest verdrahtet (`easeCamera(…, true)`, die
++     * Java-Schnittstelle kennt nur „ease ja/nein"), und diese Kurve startet mit
++     * voller Geschwindigkeit: Die Fling-Rechnung in `MapGestureDetector`
++     * multipliziert den Weg mit 0,28, damit die Karte beim Loslassen genau mit
++     * Fingergeschwindigkeit weiterläuft — die Kurve fängt also mit rund dem
++     * 3,6-Fachen ihrer Durchschnittsgeschwindigkeit an. Für einen Wisch richtig,
++     * für ein Antippen (Kompass, Standort) ein Ruck im ersten Bild und danach
++     * ein langes Kriechen.
++     *
++     * Hier läuft stattdessen ein `ValueAnimator` im Takt des Displays und setzt
++     * die Kamera bei jedem Bild mit `moveCamera` — derselbe Weg, den MapLibres
++     * eigener Standort-Baustein für seine Kamerafahrten nimmt. Die Kurve ist
++     * Material 3 „Standard" (0.2, 0, 0, 1): Googles eigene Bewegungskurve,
++     * aus dem Stand anfahrend und lang und weich landend.
++     *
++     * Die Mitte fährt auf dem Großkreis, der Zoom gleichmäßig in
++     * Äquator-Stufen (beides wie MapLibres eigene Globus-Fahrten, siehe unten),
++     * die Drehung auf dem kürzeren Weg. Weite Sprünge (`fly`) nehmen die
++     * Flugbahn aus `flyPath`. Jede
++     * Berührung der Karte bricht ab — MapLibres Bewegungsbeginn-Meldung taugt
++     * dafür nicht, sie feuert nur aus dem Ruhezustand, und während der Fahrt
++     * ist die Kamera nie in Ruhe. Deshalb hängt der Abbruch direkt an der
++     * Gestenerkennung.
++     *
++     * Und `moveCamera` meldet bei JEDEM Aufruf „Bewegung beginnt" und „Kamera
++     * in Ruhe" (`Transform.moveCamera`: `onCameraMoveStarted` → `jumpTo` →
++     * `onCameraIdle`). Ungefiltert käme so bei jedem Bild ein
++     * `onRegionDidChange` in JS an, und der ganze Ende-der-Bewegung-Ablauf der
++     * App liefe mit. `beginSmoothCamera`/`endSmoothCamera` machen daraus, was
++     * MapLibres eigene Animationen melden: pro Bild „ändert sich", am Ende
++     * einmal „in Ruhe".
++     */
++    private fun runSmooth(
++        map: MapLibreMap,
++        duration: Int,
++        callback: CancelableCallback,
++        fly: Boolean,
++    ) {
++        val start = map.cameraPosition
++        val end = cameraUpdate.getCameraPosition(map)
++        val from = start.target
++        val to = end?.target
++        if (end == null || from == null || to == null) {
++            map.moveCamera(cameraUpdate, callback)
++            return
++        }
++
++        // Binch: die Mitte auf dem GROSSKREIS, dem kürzesten Weg über die Kugel.
++        // Eine Gerade auf der Mercator-Karte (wie bisher) ist auf dem Globus eine
++        // Loxodrome, die bei weiten Wegen schief ausholt; bei kurzen Wegen auf der
++        // flachen Karte sind beide dasselbe. Über die Datumsgrenze von selbst kurz.
++        val a = unitVector(from)
++        val b = unitVector(to)
++        val angle = acos((a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).coerceIn(-1.0, 1.0))
++        // Binch: der Zoom in ÄQUATOR-Stufen, wie MapLibres eigene Globus-Fahrten
++        // rechnen: Derselbe Kartenzoom zeigt die Erde im Norden größer (1 / cos
++        // Breite). Gleichmäßig im Kartenzoom pumpte die Kugel deshalb, sobald eine
++        // Fahrt die Breite wechselte — wuchs, schrumpfte, landete. So behält sie
++        // ihre Größe, und die Zielstufe stimmt am Ende genau.
++        val zn0 = equatorZoom(start.zoom, from.latitude)
++        val zn1 = equatorZoom(end.zoom, to.latitude)
++        val dZoom = zn1 - zn0
++        val dBearing = ((end.bearing - start.bearing) % 360.0 + 540.0) % 360.0 - 180.0
++        val dTilt = end.tilt - start.tilt
++        // Binch: den Innenabstand MITFAHREN, nicht im ersten Bild setzen.
++        // `target` ist die Mitte INNERHALB des Innenabstands. Übernahm schon das
++        // erste Bild den neuen Abstand, zeigte derselbe Punkt schlagartig an
++        // eine andere Stelle — die Karte sprang, bevor die Fahrt begann (beim
++        // Stadt-Tipp um die halbe Höhe des Blattes). Gemeldet als „die Karte
++        // zittert, wenn ich auf einen Namen tippe".
++        val startPadding = start.padding ?: doubleArrayOf(0.0, 0.0, 0.0, 0.0)
++        val endPadding = end.padding ?: startPadding
++
++        // Je Fortschritt k (0 … 1, schon durch die Kurve): [Anteil des Weges,
++        // Zoom in Äquator-Stufen].
++        val path: (Double) -> DoubleArray =
++            (if (fly) flyPath(zn0, dZoom, angle, startPadding) else null)
++                ?: { k ->
++                    val zn = zn0 + dZoom * k
++                    // Binch: die Mitte ZOOM-BEWUSST — wie beim Zoomen um einen
++                    // festen Punkt. Linear überblendet raste die Karte beim
++                    // Hinauszoomen los: Derselbe Kartenweg ist bei hohem Zoom ein
++                    // Vielfaches an Bildschirmweg, und der lag ganz am Anfang. So
++                    // schwenkt sie beim Hineinzoomen zuerst (weit draußen, billig)
++                    // und gleitet beim Hinauszoomen gleichmäßig. Ohne Zoom: linear.
++                    val u =
++                        if (abs(dZoom) < 0.01) {
++                            k
++                        } else {
++                            (1.0 - 2.0.pow(-(zn - zn0))) / (1.0 - 2.0.pow(-dZoom))
++                        }
++                    doubleArrayOf(u, zn)
++                }
++
++        val animator = ValueAnimator.ofFloat(0f, 1f)
++        animator.duration = duration.toLong()
++        // Binch: Androids „fast out, slow in" statt (0.2, 0, 0, 1). Die alte
++        // Kurve hatte nach einem Fünftel der Zeit schon den halben Weg hinter
++        // sich — bei langen Fahrten (Stadt am Bildrand angetippt) ein Ruck,
++        // gemeldet als „hastig". Diese braucht dafür gut ein Drittel.
++        animator.interpolator = PathInterpolator(0.4f, 0f, 0.2f, 1f)
++        animator.addUpdateListener { anim ->
++            val t = (anim.animatedValue as Float).toDouble()
++            val builder = CameraPosition.Builder()
++            if (t >= 1.0) {
++                // Genau aufs Ziel, ohne Rundungsrest aus Kugel und Logarithmus.
++                builder.target(to).zoom(end.zoom)
++            } else {
++                val p = path(t)
++                val target = slerp(a, b, angle, p[0], from, to)
++                builder.target(target).zoom(p[1] + log2(cos(clampLat(target.latitude) * PI / 180.0)))
++            }
++            builder
++                .bearing(start.bearing + dBearing * t)
++                .tilt(start.tilt + dTilt * t)
++            builder.padding(
++                startPadding[0] + (endPadding[0] - startPadding[0]) * t,
++                startPadding[1] + (endPadding[1] - startPadding[1]) * t,
++                startPadding[2] + (endPadding[2] - startPadding[2]) * t,
++                startPadding[3] + (endPadding[3] - startPadding[3]) * t,
++            )
++            map.moveCamera(CameraUpdateFactory.newCameraPosition(builder.build()))
++        }
++
++        val stopper = GestureStopper(animator)
++        map.addOnMoveListener(stopper)
++        map.addOnScaleListener(stopper)
++        map.addOnRotateListener(stopper)
++        map.addOnShoveListener(stopper)
++        running[map] = animator
++        val gen = view?.beginSmoothCamera() ?: 0
++        animator.addListener(
++            object : AnimatorListenerAdapter() {
++                private var cancelled = false
++
++                override fun onAnimationCancel(animation: Animator) {
++                    cancelled = true
++                }
++
++                override fun onAnimationEnd(animation: Animator) {
++                    // Sicher mitten in der Gesten-Meldung: MapLibre führt diese
++                    // Zuhörer in kopierenden Listen (CopyOnWriteArrayList).
++                    map.removeOnMoveListener(stopper)
++                    map.removeOnScaleListener(stopper)
++                    map.removeOnRotateListener(stopper)
++                    map.removeOnShoveListener(stopper)
++                    if (running[map] === animator) running.remove(map)
++                    // Binch: WER beendet hat, entscheidet über die Meldung —
++                    // siehe `MLRNMapView.SmoothEnd`.
++                    val reason =
++                        when {
++                            !cancelled -> MLRNMapView.SmoothEnd.FINISHED
++                            stopper.byGesture -> MLRNMapView.SmoothEnd.GESTURE
++                            else -> MLRNMapView.SmoothEnd.SUPERSEDED
++                        }
++                    view?.endSmoothCamera(gen, reason)
++                    if (cancelled) callback.onCancel() else callback.onFinish()
++                }
++            },
++        )
++        animator.start()
++    }
++
++    /**
++     * Binch: die Flugbahn für weite Sprünge (`fly`) — erst hinaus, hinüber,
++     * wieder hinein, nach van Wijk & Nuij (2003) wie MapLibres `flyTo`, aber auf
++     * der weichen Kurve oben statt MapLibres Anfahrt mit vierfachem Tempo, und
++     * mit Weg und Zoom wie auf der Kugel (Großkreis, Äquator-Stufen). Null, wenn
++     * es nichts zu fliegen gibt — dann die gewöhnliche Fahrt.
++     */
++    private fun flyPath(
++        zn0: Double,
++        dZoom: Double,
++        angle: Double,
++        padding: DoubleArray,
++    ): ((Double) -> DoubleArray)? {
++        val v = view ?: return null
++        if (angle < 1e-7 || v.width == 0 || v.height == 0) return null
++        val density = v.resources.displayMetrics.density.toDouble()
++        // w0: die sichtbare Spanne in Bildpunkten, w1 dieselbe beim Zielzoom.
++        val w0 = max(v.width - padding[0] - padding[2], v.height - padding[1] - padding[3]).coerceAtLeast(1.0)
++        val w1 = w0 / 2.0.pow(dZoom)
++        // u1: der Weg über die Oberfläche, in Bildpunkten beim Startzoom.
++        val u1 = angle * 512.0 * 2.0.pow(zn0) * density / (2.0 * PI)
++        // ρ = 1,42: der Mittelwert aus van Wijks Nutzerstudie, auch MapLibres.
++        val rho = 1.42
++        val rho2 = rho * rho
++        fun r(descent: Boolean): Double {
++            val wi = if (descent) w1 else w0
++            val bi = (w1 * w1 - w0 * w0 + (if (descent) -1.0 else 1.0) * rho2 * rho2 * u1 * u1) / (2.0 * wi * rho2 * u1)
++            return ln(sqrt(bi * bi + 1.0) - bi)
++        }
++        val r0 = r(false)
++        val r1 = r(true)
++        val total = (r1 - r0) / rho
++        if (!r0.isFinite() || !r1.isFinite() || !(total > 0.0)) return null
++        val coshR0 = cosh(r0)
++        val sinhR0 = sinh(r0)
++        return { k ->
++            val s = k * total
++            val w = coshR0 / cosh(r0 + rho * s)
++            val u = w0 * (coshR0 * tanh(r0 + rho * s) - sinhR0) / rho2 / u1
++            doubleArrayOf(u.coerceIn(0.0, 1.0), zn0 + log2(1.0 / w))
++        }
++    }
++
++    /** Bricht eine weiche Fahrt ab, sobald eine Geste beginnt. */
++    private class GestureStopper(
++        private val animator: ValueAnimator,
++    ) : MapLibreMap.OnMoveListener,
++        MapLibreMap.OnScaleListener,
++        MapLibreMap.OnRotateListener,
++        MapLibreMap.OnShoveListener {
++        /** Binch: Hat eine Geste abgebrochen (und nicht ein neuer Kamerabefehl)? */
++        var byGesture = false
++            private set
++
++        private fun stopByGesture() {
++            byGesture = true
++            animator.cancel()
++        }
++
++        override fun onMoveBegin(detector: MoveGestureDetector) = stopByGesture()
++
++        override fun onMove(detector: MoveGestureDetector) {}
++
++        override fun onMoveEnd(detector: MoveGestureDetector) {}
++
++        override fun onScaleBegin(detector: StandardScaleGestureDetector) = stopByGesture()
++
++        override fun onScale(detector: StandardScaleGestureDetector) {}
++
++        override fun onScaleEnd(detector: StandardScaleGestureDetector) {}
++
++        override fun onRotateBegin(detector: RotateGestureDetector) = stopByGesture()
++
++        override fun onRotate(detector: RotateGestureDetector) {}
++
++        override fun onRotateEnd(detector: RotateGestureDetector) {}
++
++        override fun onShoveBegin(detector: ShoveGestureDetector) = stopByGesture()
++
++        override fun onShove(detector: ShoveGestureDetector) {}
++
++        override fun onShoveEnd(detector: ShoveGestureDetector) {}
++    }
++
++    companion object {
++        /** Die laufende weiche Fahrt je Karte — damit ein neuer Befehl sie beenden kann. */
++        private val running = WeakHashMap<MapLibreMap, ValueAnimator>()
++
++        fun stopSmooth(map: MapLibreMap) {
++            running.remove(map)?.cancel()
++        }
++
++        /** Kartenzoom → Zoom in Äquator-Stufen (wie `zoomAdjustment` im Globus-Kern). */
++        private fun equatorZoom(
++            zoom: Double,
++            latitude: Double,
++        ): Double = zoom - log2(cos(clampLat(latitude) * PI / 180.0))
++
++        private fun clampLat(latitude: Double): Double = latitude.coerceIn(-85.0511, 85.0511)
++
++        private fun unitVector(p: LatLng): DoubleArray {
++            val la = p.latitude * PI / 180.0
++            val lo = p.longitude * PI / 180.0
++            return doubleArrayOf(cos(la) * cos(lo), cos(la) * sin(lo), sin(la))
++        }
++
++        /** Der Punkt beim Anteil u auf dem Großkreis von `from` nach `to`. */
++        private fun slerp(
++            a: DoubleArray,
++            b: DoubleArray,
++            angle: Double,
++            u: Double,
++            from: LatLng,
++            to: LatLng,
++        ): LatLng {
++            // Kein Weg (oder genau auf die andere Seite der Erde, wo es keinen
++            // einen Großkreis gibt): einfach in Länge und Breite.
++            if (angle < 1e-12 || angle > PI - 1e-6) {
++                return LatLng(
++                    from.latitude + (to.latitude - from.latitude) * u,
++                    from.longitude + (to.longitude - from.longitude) * u,
++                )
+             }
++            val sa = sin(angle)
++            val wa = sin((1.0 - u) * angle) / sa
++            val wb = sin(u * angle) / sa
++            val x = wa * a[0] + wb * b[0]
++            val y = wa * a[1] + wb * b[1]
++            val z = wa * a[2] + wb * b[2]
++            return LatLng(atan2(z, hypot(x, y)) * 180.0 / PI, atan2(y, x) * 180.0 / PI)
+         }
+     }
+ 
+diff --git a/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/camera/constants/CameraEasing.kt b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/camera/constants/CameraEasing.kt
+index 593328c..e068849 100644
+--- a/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/camera/constants/CameraEasing.kt
++++ b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/camera/constants/CameraEasing.kt
+@@ -8,7 +8,13 @@ object CameraEasing {
+     const val EASE: Int = 2
+     const val FLY: Int = 3
+ 
+-    @IntDef(NONE, LINEAR, EASE, FLY)
++    /**
++     * Binch: weich anfahren UND weich landen — siehe `CameraUpdateItem.runSmooth`.
++     * MapLibres eigenes „ease" startet mit voller Geschwindigkeit.
++     */
++    const val SMOOTH: Int = 4
++
++    @IntDef(NONE, LINEAR, EASE, FLY, SMOOTH)
+     @Retention(AnnotationRetention.SOURCE)
+     annotation class Easing
+ 
+@@ -18,6 +24,7 @@ object CameraEasing {
+             "linear" -> LINEAR
+             "ease" -> EASE
+             "fly" -> FLY
++            "smooth" -> SMOOTH
+             else -> NONE
+         }
+ }
+diff --git a/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapView.kt b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapView.kt
+index 7c5fe02..7e3bc52 100644
+--- a/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapView.kt
++++ b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapView.kt
+@@ -1,15 +1,25 @@
+ package org.maplibre.reactnative.components.mapview
+ 
++import android.animation.Animator
++import android.animation.AnimatorListenerAdapter
++import android.animation.ValueAnimator
+ import android.annotation.SuppressLint
+ import android.content.Context
++import android.graphics.Bitmap
+ import android.graphics.BitmapFactory
++import android.graphics.drawable.BitmapDrawable
+ import android.graphics.PointF
+ import android.graphics.RectF
+ import android.os.Handler
+ import android.os.Looper
++import android.os.SystemClock
+ import android.util.AttributeSet
+ import android.view.Gravity
++import android.view.Choreographer
+ import android.view.MotionEvent
++import android.view.TextureView
++import android.view.VelocityTracker
++import android.view.ViewConfiguration
+ import android.view.View
+ import android.view.ViewGroup
+ import android.widget.FrameLayout
+@@ -29,8 +39,12 @@ import org.maplibre.android.camera.CameraPosition
+ import org.maplibre.android.camera.CameraUpdate
+ import org.maplibre.android.geometry.LatLng
+ import org.maplibre.android.gestures.MoveGestureDetector
++import org.maplibre.android.gestures.RotateGestureDetector
++import org.maplibre.android.gestures.ShoveGestureDetector
++import org.maplibre.android.gestures.StandardScaleGestureDetector
+ import org.maplibre.android.log.Logger
+ import org.maplibre.android.maps.AttributionDialogManager
++import org.maplibre.android.maps.BinchGestureBridge
+ import org.maplibre.android.maps.MapLibreMap
+ import org.maplibre.android.maps.MapLibreMapOptions
+ import org.maplibre.android.maps.MapView
+@@ -52,6 +66,7 @@ import org.maplibre.reactnative.components.AbstractMapFeature
+ import org.maplibre.reactnative.components.annotations.markerview.MLRNMarkerView
+ import org.maplibre.reactnative.components.annotations.markerview.MarkerViewManager
+ import org.maplibre.reactnative.components.annotations.pointannotation.MLRNPointAnnotation
++import org.maplibre.reactnative.components.camera.CameraUpdateItem
+ import org.maplibre.reactnative.components.camera.MLRNCamera
+ import org.maplibre.reactnative.components.images.MLRNImages
+ import org.maplibre.reactnative.components.layer.MLRNLayer
+@@ -68,6 +83,9 @@ import org.maplibre.reactnative.events.MapPressEvent
+ import org.maplibre.reactnative.utils.BitmapUtils
+ import org.maplibre.reactnative.utils.ConvertUtils
+ import org.maplibre.reactnative.utils.GeoJSONUtils
++import kotlin.math.exp
++import kotlin.math.hypot
++import kotlin.math.min
+ import kotlin.math.roundToInt
+ 
+ sealed class MapChild {
+@@ -201,12 +219,21 @@ open class MLRNMapView(
+     }
+ 
+     override fun onDestroy() {
++        // Binch: vor dem Freigeben der nativen Karte — ein Ausrollschritt
++        // danach ginge an eine zerstörte Karte.
++        stopFlingSilently()
++        clearStyleCover()
++        // Binch: ebenso eine laufende weiche Fahrt (`CameraUpdateItem.runSmooth`).
++        // Beim Wechsel des Kartentyps wird die Karte neu aufgebaut; die Fahrt
++        // rief sonst Bild für Bild `moveCamera` auf der zerstörten Karte auf.
++        mapLibreMap?.let { CameraUpdateItem.stopSmooth(it) }
+         super.onDestroy()
+         destroyed = true
+     }
+ 
+     override fun onAttachedToWindow() {
+         super.onAttachedToWindow()
++        applyPendingStyleCover()
+         ViewCompat.setOnApplyWindowInsetsListener(this) { _, insets ->
+             windowInsets = insets
+             updateUISettings()
+@@ -475,14 +502,53 @@ open class MLRNMapView(
+         updateScaleBar()
+ 
+         mapLibreMap.addOnCameraMoveStartedListener { reason ->
++            // Binch: während einer weichen Fahrt meldet jedes Bild einen
++            // Beginn — gemeldet wird nur der eine aus `beginSmoothCamera`.
++            if (smoothCamera) return@addOnCameraMoveStartedListener
+             cameraChangeTracker.setReason(reason)
+             handleMapChangedEvent("onRegionWillChange", true)
+         }
+ 
+         mapLibreMap.addOnCameraMoveListener {
+-            handleMapChangedEvent("onRegionIsChanging", true)
++            sendRegionIsChangingIfTurned()
+         }
+ 
++        // Binch: Zoom, Drehen, Kippen mit zwei Fingern — danach wird nicht
++        // ausgerollt, sonst glitte die Karte nach einem Zoom seitlich weg.
++        mapLibreMap.addOnScaleListener(
++            object : MapLibreMap.OnScaleListener {
++                override fun onScaleBegin(detector: StandardScaleGestureDetector) {
++                    multiFingerGesture = true
++                }
++
++                override fun onScale(detector: StandardScaleGestureDetector) {}
++
++                override fun onScaleEnd(detector: StandardScaleGestureDetector) {}
++            },
++        )
++        mapLibreMap.addOnRotateListener(
++            object : MapLibreMap.OnRotateListener {
++                override fun onRotateBegin(detector: RotateGestureDetector) {
++                    multiFingerGesture = true
++                }
++
++                override fun onRotate(detector: RotateGestureDetector) {}
++
++                override fun onRotateEnd(detector: RotateGestureDetector) {}
++            },
++        )
++        mapLibreMap.addOnShoveListener(
++            object : MapLibreMap.OnShoveListener {
++                override fun onShoveBegin(detector: ShoveGestureDetector) {
++                    multiFingerGesture = true
++                }
++
++                override fun onShove(detector: ShoveGestureDetector) {}
++
++                override fun onShoveEnd(detector: ShoveGestureDetector) {}
++            },
++        )
++
+         mapLibreMap.addOnMoveListener(
+             object : MapLibreMap.OnMoveListener {
+                 override fun onMoveBegin(detector: MoveGestureDetector) {
+@@ -499,7 +565,26 @@ open class MLRNMapView(
+             },
+         )
+ 
+-        mapLibreMap.addOnCameraIdleListener { sendRegionDidChangeEvent() }
++        mapLibreMap.addOnCameraIdleListener {
++            // Binch: „in Ruhe" nach jedem Bild einer weichen Fahrt ist in
++            // Wahrheit „ändert sich" — das Ende meldet `endSmoothCamera`.
++            if (smoothCamera) {
++                sendRegionIsChangingIfTurned()
++            } else if (flingDriver != null) {
++                // Binch: „in Ruhe" beim Loslassen, während die Karte gerade
++                // ausrollt. Das Ende meldet der `FlingDriver` selbst. Käme die
++                // Meldung hier durch, startete die App ihre Umgebungsabfrage
++                // für die Stelle des Loslassens — und die Antwort baute Liste
++                // und Haltestellen mitten im Ausrollen um (gemessen: Bilder bis
++                // 60 ms). MapLibres eigenes Ausrollen hatte diese Meldung
++                // zurückgenommen; seit es aus ist, tut das niemand mehr.
++                // (`trackFling` läuft vor MapLibres Gestenerkennung, und die
++                // Meldung kommt erst danach aus der Warteschlange — der
++                // `FlingDriver` steht hier also schon.)
++            } else {
++                sendRegionDidChangeEvent()
++            }
++        }
+     }
+ 
+     fun reflow() {
+@@ -566,7 +651,14 @@ open class MLRNMapView(
+ 
+     @SuppressLint("ClickableViewAccessibility")
+     override fun onTouchEvent(ev: MotionEvent?): Boolean {
++        if (ev != null) trackFling(ev)
++        // Binch: Wer anfasst, will die echte Karte — ein eingefrorenes Bild darüber
++        // bewegte sich nicht mit.
++        if (ev?.actionMasked == MotionEvent.ACTION_DOWN) fadeOutStyleCover(STYLE_COVER_TOUCH_FADE_MS)
+         val result = super.onTouchEvent(ev)
++        // Binch: MapLibre hat beim Loslassen eben „Geste vorbei" gesetzt — rollt
++        // die Karte aus, läuft sie für MapLibre weiter (siehe `holdGesture`).
++        if (ev?.actionMasked == MotionEvent.ACTION_UP) flingDriver?.holdGesture()
+ 
+         if (result && scrollEnabled == true) {
+             requestDisallowInterceptTouchEvent(true)
+@@ -575,6 +667,181 @@ open class MLRNMapView(
+         return result
+     }
+ 
++    /**
++     * Binch: AUSROLLEN IM DISPLAY-TAKT — siehe `updateUISettings`, warum.
++     *
++     * Die Fingergeschwindigkeit misst ein `VelocityTracker` über die ganze
++     * Geste; beim Loslassen zählt der Finger, der zuletzt abhebt. Damit rollt
++     * die Karte auch dann aus, wenn das Display zwischendurch einen zweiten
++     * Berührungspunkt gemeldet hat (auf dem Testgerät bei bis zu 60 % der
++     * Wische, obwohl mit einem Finger gewischt wurde) — MapLibres eigenes
++     * Ausrollen blieb dann fast immer aus. Nur nach echtem Zoomen, Drehen oder
++     * Kippen bleibt die Karte stehen.
++     */
++    private var flingTracker: VelocityTracker? = null
++    private var multiFingerGesture = false
++    private var flingDriver: FlingDriver? = null
++
++    private fun trackFling(ev: MotionEvent) {
++        when (ev.actionMasked) {
++            MotionEvent.ACTION_DOWN -> {
++                stopFling()
++                multiFingerGesture = false
++                flingTracker?.recycle()
++                flingTracker = VelocityTracker.obtain().also { it.addMovement(ev) }
++            }
++
++            MotionEvent.ACTION_MOVE, MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_POINTER_UP -> {
++                flingTracker?.addMovement(ev)
++            }
++
++            MotionEvent.ACTION_UP -> {
++                val tracker = flingTracker ?: return
++                tracker.addMovement(ev)
++                val maxVelocity = ViewConfiguration.get(context).scaledMaximumFlingVelocity.toFloat()
++                tracker.computeCurrentVelocity(1000, maxVelocity)
++                val id = ev.getPointerId(ev.actionIndex)
++                val vx = tracker.getXVelocity(id)
++                val vy = tracker.getYVelocity(id)
++                tracker.recycle()
++                flingTracker = null
++                if (!multiFingerGesture && scrollEnabled != false) {
++                    // `eventTime` und der Bildtakt laufen beide auf der
++                    // monotonen Uhr (uptimeMillis / System.nanoTime).
++                    startFling(vx, vy, ev.eventTime * 1_000_000L)
++                }
++            }
++
++            MotionEvent.ACTION_CANCEL -> {
++                flingTracker?.recycle()
++                flingTracker = null
++            }
++        }
++    }
++
++    private fun startFling(
++        vx: Float,
++        vy: Float,
++        releaseNanos: Long,
++    ) {
++        val map = mapLibreMap ?: return
++        // Unter 250 dp/s bleibt die Karte stehen — so hebt man den Finger nach
++        // genauem Zurechtschieben ab, ohne dass sie wegrutscht.
++        if (hypot(vx, vy) / displayDensity < FLING_MIN_DP_PER_S) return
++        // Gekippt wirkt dieselbe Fingerbewegung am Horizont viel weiter — wie in
++        // MapLibres eigenem Ausrollen die Geschwindigkeit mit der Neigung dämpfen.
++        val tiltDamping = 1f + (map.cameraPosition.tilt.toFloat() / 45f)
++        flingDriver = FlingDriver(map, vx / tiltDamping, vy / tiltDamping, releaseNanos).also { it.start() }
++    }
++
++    /** Beendet ein laufendes Ausrollen — bei einer neuen Berührung oder Kamerafahrt. */
++    fun stopFling() {
++        flingDriver?.cancel(notify = true)
++        flingDriver = null
++    }
++
++    /** Beim Abbau der Ansicht: anhalten, aber niemandem mehr etwas melden. */
++    private fun stopFlingSilently() {
++        flingDriver?.cancel(notify = false)
++        flingDriver = null
++    }
++
++    /**
++     * Ein Kamera-Schritt pro Display-Bild, abbremsend wie ein Körper mit
++     * Reibung: Geschwindigkeit v(t) = v0 · e^(−t/τ), zurückgelegter Weg
++     * v0 · τ · (1 − e^(−t/τ)). Der erste Schritt schließt damit nahtlos an die
++     * Fingergeschwindigkeit an, und die Zeit kommt aus dem Bildtakt
++     * (`frameTimeNanos`), nicht aus der Uhr — jeder Schritt ist genau so groß,
++     * wie es der Abstand der Display-Bilder verlangt.
++     *
++     * τ = 0,325 s: Ein Wisch mit 2000 dp/s rollt rund 650 dp weit aus, und
++     * nach einer dreiviertel Sekunde ist er auf ein Zehntel abgebremst.
++     *
++     * Solange ausgerollt wird, gilt die Geste für MapLibre als laufend
++     * (`holdGesture`, Begründung an `BinchGestureBridge`) — sonst zeichnet es
++     * Bus-, Zug- und Standortsymbole sowie das Luftbild wie bei stehender
++     * Kamera, auf ganze Bildpunkte eingerastet, und genau ab dem Loslassen
++     * zittert das Bild.
++     */
++    private inner class FlingDriver(
++        private val map: MapLibreMap,
++        private val vx: Float,
++        private val vy: Float,
++        /** Zeitpunkt des Loslassens, auf der Uhr des Bildtakts. */
++        private val releaseNanos: Long,
++    ) : Choreographer.FrameCallback {
++        private var startNanos = 0L
++        private var doneX = 0.0
++        private var doneY = 0.0
++        private var cancelled = false
++        private var holdingGesture = false
++
++        fun start() {
++            Choreographer.getInstance().postFrameCallback(this)
++        }
++
++        /** Nach MapLibres „Geste vorbei" beim Loslassen aufrufen. */
++        fun holdGesture() {
++            if (cancelled || holdingGesture) return
++            holdingGesture = true
++            BinchGestureBridge.setGestureInProgress(map, true)
++        }
++
++        /**
++         * VOR der Meldung „in Ruhe": Das Zurücksetzen frischt MapLibres
++         * zwischengespeicherte Kameraposition auf, aus der die Meldung ihre
++         * Mitte liest.
++         */
++        private fun releaseGesture() {
++            if (!holdingGesture) return
++            holdingGesture = false
++            BinchGestureBridge.setGestureInProgress(map, false)
++        }
++
++        fun cancel(notify: Boolean) {
++            if (cancelled) return
++            cancelled = true
++            Choreographer.getInstance().removeFrameCallback(this)
++            releaseGesture()
++            if (notify) sendRegionDidChangeEvent()
++        }
++
++        override fun doFrame(frameTimeNanos: Long) {
++            if (cancelled) return
++            if (startNanos == 0L) {
++                // Das letzte Bild beim Ziehen zeigte die Karte ein Bild vor
++                // diesem. Mit t = 0 hier stünde sie ein Bild lang still — ein
++                // Hänger genau beim Loslassen. Also mindestens einen vollen
++                // Bildabstand weit; kam dieses Bild verspätet, entsprechend
++                // weiter ab dem Loslassen.
++                val refreshRate = display?.refreshRate?.takeIf { it > 0f } ?: 60f
++                val frameNanos = (1e9 / refreshRate).toLong()
++                startNanos = min(releaseNanos, frameTimeNanos - frameNanos)
++            }
++            val t = (frameTimeNanos - startNanos) / 1e9
++            val decay = exp(-t / FLING_TAU_S)
++            val targetX = vx * FLING_TAU_S * (1 - decay)
++            val targetY = vy * FLING_TAU_S * (1 - decay)
++            val stepX = (targetX - doneX).toFloat()
++            val stepY = (targetY - doneY).toFloat()
++            doneX = targetX
++            doneY = targetY
++            if (stepX != 0f || stepY != 0f) map.scrollBy(stepX, stepY)
++
++            // Fertig, wenn ein Schritt unter einem Zehntel dp liegt — kein Auge
++            // sieht das noch, und es kostet weiter ein Kartenbild pro Takt.
++            val speedDp = min(hypot(vx, vy).toDouble() * decay / displayDensity, 1e6)
++            if (speedDp < FLING_STOP_DP_PER_S) {
++                cancelled = true
++                if (flingDriver === this) flingDriver = null
++                releaseGesture()
++                sendRegionDidChangeEvent()
++                return
++            }
++            Choreographer.getInstance().postFrameCallback(this)
++        }
++    }
++
+     override fun onLayout(
+         changed: Boolean,
+         left: Int,
+@@ -710,9 +977,18 @@ open class MLRNMapView(
+         handleMapChangedEvent("onDidFailLoadingMap")
+     }
+ 
++    /**
++     * Binch: Die beiden PRO-BILD-Ereignisse werden nicht mehr nach JS geschickt.
++     *
++     * Die App hört auf keines davon (sie nutzt nur die Karten-Ereignisse
++     * `onDidFinishRenderingMap…`), verschickt wurden sie trotzdem bei jedem
++     * Kartenbild — gemessen mit Perfetto beim Verschieben: 267 Kartenbilder pro
++     * Sekunde, also rund 530 Ereignisse pro Sekunde über die Brücke, jedes mit
++     * Umwandlung auf dem UI-Strang und Verteilung im JS-Strang, mitten in der
++     * Geste.
++     */
+     override fun onWillStartRenderingFrame() {
+         markerViewManager?.updateMarkers()
+-        handleMapChangedEvent("onWillStartRenderingFrame")
+     }
+ 
+     override fun onDidFinishRenderingFrame(
+@@ -720,11 +996,9 @@ open class MLRNMapView(
+         frameEncodingTime: Double,
+         frameRenderingTime: Double,
+     ) {
+-        if (fully) {
+-            handleMapChangedEvent("onDidFinishRenderingFrameFully")
+-        } else {
+-            handleMapChangedEvent("onDidFinishRenderingFrame")
+-        }
++        // Binch: Schnitt-Bild weg, sobald die neue Stelle ganz gezeichnet ist (`coverCut`).
++        lastFrameFully = fully
++        if (fully && cutHoldUntil != 0L && SystemClock.uptimeMillis() >= cutHoldUntil) endCut()
+     }
+ 
+     override fun onWillStartRenderingMap() {
+@@ -733,6 +1007,10 @@ open class MLRNMapView(
+ 
+     override fun onDidFinishRenderingMap(fully: Boolean) {
+         if (fully) {
++            // Binch: die neue Karte ist fertig — das eingefrorene Bild der alten darf gehen.
++            // Ein Schnitt (`coverCut`) wartet auf sein eigenes Zeichen: Diese Meldung
++            // kann noch von der alten Stelle stammen.
++            if (cutHoldUntil == 0L) fadeOutStyleCover(STYLE_COVER_FADE_MS)
+             handleMapChangedEvent("onDidFinishRenderingMapFully")
+         } else {
+             handleMapChangedEvent("onDidFinishRenderingMap")
+@@ -1191,6 +1469,21 @@ open class MLRNMapView(
+ 
+         val uiSettings = mapLibreMap!!.uiSettings
+ 
++        /**
++         * Binch: MapLibres eigenes Ausrollen ist AUS — das übernimmt `FlingDriver`.
++         *
++         * MapLibre rollt über eine Kamera-Animation aus, die auf dem Zeichen-Thread
++         * läuft, und der ist in der TextureView an keinen Display-Takt gebunden:
++         * Er zeichnet so schnell er kann (gemessen 267 Bilder pro Sekunde auf einem
++         * 120-Hz-Display), und das Display zeigt bei jedem Takt irgendeinen der
++         * fertigen Zwischenstände — gezählt 0 bis 6 neue Kartenbilder je
++         * Display-Bild. Das waren die Ruckler beim schnellen Wischen. Beim Ziehen
++         * mit liegendem Finger dagegen bewegt jede Berührung die Kamera genau
++         * einmal pro Takt, und das war auf dem Gerät flüssig. `FlingDriver` rollt
++         * deshalb genauso aus: ein Kamera-Schritt pro Display-Bild.
++         */
++        uiSettings.isFlingVelocityAnimationEnabled = false
++
+         if (scrollEnabled != null && uiSettings.isScrollGesturesEnabled != scrollEnabled) {
+             uiSettings.isScrollGesturesEnabled = scrollEnabled!!
+ 
+@@ -1494,6 +1787,127 @@ open class MLRNMapView(
+         return null
+     }
+ 
++    /**
++     * Binch: „Kamera ändert sich" nur melden, wenn sich DREHUNG oder NEIGUNG
++     * geändert hat.
++     *
++     * Die App braucht dieses Ereignis nur für den Kompass, der sich während
++     * einer Drehung mitdreht. Verschickt wurde es bei JEDER Kamerabewegung —
++     * gemessen beim Verschieben rund 200 pro Sekunde, jedes mit der vollen
++     * Kamerabeschreibung samt sichtbarem Ausschnitt, umgewandelt auf dem
++     * UI-Strang und verteilt im JS-Strang, ohne dass sich am Kompass etwas
++     * änderte. Mitte und Zoom am Ende einer Bewegung liefert weiterhin
++     * `onRegionDidChange`.
++     */
++    private var lastTurnBearing = Double.NaN
++    private var lastTurnPitch = Double.NaN
++
++    private fun sendRegionIsChangingIfTurned() {
++        val camera = mapLibreMap?.cameraPosition ?: return
++        if (!lastTurnBearing.isNaN() &&
++            Math.abs(camera.bearing - lastTurnBearing) < 0.05 &&
++            Math.abs(camera.tilt - lastTurnPitch) < 0.05
++        ) {
++            return
++        }
++        lastTurnBearing = camera.bearing
++        lastTurnPitch = camera.tilt
++        handleMapChangedEvent("onRegionIsChanging", true)
++    }
++
++    /** Binch: läuft gerade eine weiche Kamerafahrt (`CameraUpdateItem.runSmooth`)? */
++    private var smoothCamera = false
++
++    /**
++     * Binch: Nummer der laufenden weichen Fahrt.
++     *
++     * Löst eine Fahrt eine andere ab, läuft deren Ende (über die Warteschlange,
++     * siehe `endSmoothCamera`) erst NACH dem Beginn der neuen — und schaltete
++     * `smoothCamera` für den Rest der neuen Fahrt ab. Dann ging wieder jedes
++     * Bild als „Bewegung beginnt/in Ruhe" nach JS: genau die Ereignisflut, die
++     * `smoothCamera` abstellen soll. Mit der Nummer beendet nur die Fahrt, die
++     * gerade gilt.
++     */
++    private var smoothGen = 0
++
++    /**
++     * Binch: Hält die weiche Fahrt MapLibres „Geste läuft"? Dann ist die Kamera
++     * für MapLibre in Bewegung (`isChanging`): Symbole und Luftbild rasten nicht
++     * auf ganze Pixel — ohne das zitterten sie während der Fahrt, derselbe
++     * Effekt, den `FlingDriver.holdGesture` beim Ausrollen behebt.
++     */
++    private var smoothHoldsGesture = false
++
++    /** Wie eine weiche Fahrt endet — davon hängt ab, wer das Ende meldet. */
++    enum class SmoothEnd {
++        /** Angekommen: einmal „in Ruhe". */
++        FINISHED,
++
++        /** Von einem neuen Kamerabefehl abgelöst: still — das Ende meldet der neue. */
++        SUPERSEDED,
++
++        /** Von einer Geste abgebrochen: still — das Ende meldet die Geste, und
++         *  die Markierung „Geste läuft" gehört ab jetzt ihr. */
++        GESTURE,
++    }
++
++    fun beginSmoothCamera(): Int {
++        smoothGen++
++        smoothCamera = true
++        cameraChangeTracker.setReason(CameraChangeTracker.SDK_ANIMATION)
++        handleMapChangedEvent("onRegionWillChange", true)
++        val map = mapLibreMap
++        if (map != null && !smoothHoldsGesture) {
++            smoothHoldsGesture = true
++            BinchGestureBridge.setGestureInProgress(map, true)
++        }
++        return smoothGen
++    }
++
++    private fun releaseSmoothGesture() {
++        if (!smoothHoldsGesture) return
++        smoothHoldsGesture = false
++        val map = mapLibreMap ?: return
++        BinchGestureBridge.setGestureInProgress(map, false)
++    }
++
++    /**
++     * Angekommen: über die Warteschlange, nicht sofort — MapLibre stellt seine
++     * Kamera-Meldungen selbst als Nachrichten in dieselbe Schlange. Die des
++     * letzten Bildes sollen noch als „ändert sich" durchgehen, danach kommt
++     * genau ein „in Ruhe". Die Markierung „Geste läuft" fällt VOR dieser
++     * Meldung: Ihr Zurücksetzen frischt die Kameraposition auf, aus der die
++     * Meldung ihre Mitte liest.
++     */
++    fun endSmoothCamera(gen: Int, reason: SmoothEnd) {
++        when (reason) {
++            SmoothEnd.FINISHED -> {
++                android.os.Handler(android.os.Looper.getMainLooper()).post {
++                    if (gen != smoothGen) return@post
++                    // Erst die Markierung, DANN `smoothCamera` aus: Löst das
++                    // Zurücksetzen selbst ein „in Ruhe" aus, wird es so noch
++                    // geschluckt, und es bleibt bei genau einer Meldung.
++                    releaseSmoothGesture()
++                    smoothCamera = false
++                    sendRegionDidChangeEvent()
++                }
++            }
++
++            SmoothEnd.SUPERSEDED -> {
++                if (gen == smoothGen) smoothCamera = false
++                // Folgt eine weiche Fahrt, hält sie die Markierung sofort wieder;
++                // folgt eine MapLibre-Animation, führt die ihre eigene.
++                releaseSmoothGesture()
++            }
++
++            SmoothEnd.GESTURE -> {
++                if (gen == smoothGen) smoothCamera = false
++                // NICHT zurücksetzen: Die Geste hat die Markierung übernommen.
++                smoothHoldsGesture = false
++            }
++        }
++    }
++
+     fun sendRegionDidChangeEvent() {
+         handleMapChangedEvent("onRegionDidChange", true)
+         cameraChangeTracker.setReason(CameraChangeTracker.EMPTY)
+@@ -1550,7 +1964,158 @@ open class MLRNMapView(
+         return markerViewManager!!
+     }
+ 
++    /*
++     * Binch: KARTENTYP WECHSELN OHNE AUFBLITZEN.
++     *
++     * Die App baut beim Wechsel des Kartentyps die ganze Karte neu auf (`key` an der
++     * Kartenfläche — ein Stilwechsel unter laufender Karte stürzt ab). Die neue Fläche ist
++     * aber bis zu ihrem ersten vollständigen Bild leer, und das blitzte. Deshalb friert die
++     * ALTE Karte vorher ihr letztes Bild ein (`captureStyleCover`, aus JS über
++     * `createStaticMapImage({ output: "cover" })`), und die NEUE legt es sich als
++     * Vordergrund über, bis sie fertig gezeichnet hat — dann blendet es weich aus. Spätestens
++     * nach `STYLE_COVER_MAX_MS`, und sofort bei einer Berührung.
++     */
++    private var styleCover: BitmapDrawable? = null
++    private var styleCoverFade: ValueAnimator? = null
++    private val styleCoverTimeout = Runnable { fadeOutStyleCover(STYLE_COVER_FADE_MS) }
++
++    /** Das aktuelle Kartenbild für die nächste Karte einfrieren (auf dem UI-Thread). */
++    fun captureStyleCover() {
++        val texture = findTextureView(this) ?: return
++        val bitmap =
++            try {
++                texture.bitmap
++            } catch (_: Exception) {
++                null
++            } ?: return
++        synchronized(STYLE_COVER_LOCK) {
++            pendingStyleCover?.recycle()
++            pendingStyleCover = bitmap
++            pendingStyleCoverAt = SystemClock.uptimeMillis()
++        }
++    }
++
++    private fun applyPendingStyleCover() {
++        val bitmap =
++            synchronized(STYLE_COVER_LOCK) {
++                val pending = pendingStyleCover
++                val fresh = pending != null && SystemClock.uptimeMillis() - pendingStyleCoverAt < STYLE_COVER_MAX_MS
++                pendingStyleCover = null
++                if (fresh) pending else pending?.recycle().let { null }
++            } ?: return
++        clearStyleCover()
++        val drawable = BitmapDrawable(resources, bitmap)
++        styleCover = drawable
++        foreground = drawable
++        postDelayed(styleCoverTimeout, STYLE_COVER_MAX_MS)
++    }
++
++    private fun fadeOutStyleCover(durationMs: Long) {
++        val drawable = styleCover ?: return
++        removeCallbacks(styleCoverTimeout)
++        styleCoverFade?.let { if (it.duration <= durationMs) return else it.cancel() }
++        styleCoverFade =
++            ValueAnimator.ofInt(drawable.alpha, 0).apply {
++                duration = durationMs
++                addUpdateListener { drawable.alpha = it.animatedValue as Int }
++                addListener(
++                    object : AnimatorListenerAdapter() {
++                        private var cancelled = false
++
++                        override fun onAnimationCancel(animation: Animator) {
++                            cancelled = true
++                        }
++
++                        override fun onAnimationEnd(animation: Animator) {
++                            if (!cancelled && styleCover === drawable) clearStyleCover()
++                        }
++                    },
++                )
++                start()
++            }
++    }
++
++    /*
++     * Binch: SCHNITT STATT FLUG (Live-Ansicht).
++     *
++     * Ein weiter Kameraweg mit Neigung lädt auf jeder Zwischenstufe Kacheln, und die
++     * Fahrt läuft Bild für Bild auf diesem Strang (`CameraUpdateItem.runSmooth`) —
++     * zugleich mit dem Umbau der Oberfläche, der hier ebenfalls läuft. Gemeldet als
++     * „beim Zurück laggt es zwei Sekunden". Stattdessen das aktuelle Bild einfrieren
++     * und überlegen; die Kamera springt darunter (der Auftrag dazu kommt direkt
++     * hinterher, siehe `MapSurface.followTo`), und das alte Bild blendet aus, sobald
++     * die neue Stelle ganz gezeichnet ist — frühestens nach `CUT_MIN_HOLD_MS` (ein
++     * fertiges Bild der ALTEN Stelle darf nicht zählen), spätestens nach `maxMs`.
++     * Eine Berührung blendet sofort aus (`onTouchEvent`).
++     */
++    private var cutHoldUntil = 0L
++    private var lastFrameFully = false
++    private val cutCheck = Runnable { if (lastFrameFully) endCut() }
++
++    fun coverCut(maxMs: Long) {
++        val texture = findTextureView(this) ?: return
++        val bitmap =
++            try {
++                texture.bitmap
++            } catch (_: Exception) {
++                null
++            } ?: return
++        clearStyleCover()
++        val drawable = BitmapDrawable(resources, bitmap)
++        styleCover = drawable
++        foreground = drawable
++        lastFrameFully = false
++        cutHoldUntil = SystemClock.uptimeMillis() + CUT_MIN_HOLD_MS
++        postDelayed(cutCheck, CUT_MIN_HOLD_MS)
++        postDelayed(styleCoverTimeout, maxMs)
++    }
++
++    private fun endCut() {
++        if (cutHoldUntil == 0L) return
++        cutHoldUntil = 0L
++        removeCallbacks(cutCheck)
++        fadeOutStyleCover(CUT_FADE_MS)
++    }
++
++    private fun clearStyleCover() {
++        cutHoldUntil = 0L
++        removeCallbacks(cutCheck)
++        removeCallbacks(styleCoverTimeout)
++        val fade = styleCoverFade
++        styleCoverFade = null
++        fade?.cancel()
++        val drawable = styleCover ?: return
++        styleCover = null
++        if (foreground === drawable) foreground = null
++        // Kein `recycle()`: Ein schon aufgezeichnetes Bild des Render-Threads kann das
++        // Bitmap noch zeichnen. Die Speicherbereinigung gibt es frei.
++    }
++
++    private fun findTextureView(group: ViewGroup): TextureView? {
++        for (i in 0 until group.childCount) {
++            val child = group.getChildAt(i)
++            if (child is TextureView) return child
++            if (child is ViewGroup) findTextureView(child)?.let { return it }
++        }
++        return null
++    }
++
+     companion object {
+         const val LOG_TAG: String = "MLRNMapView"
++
++        /** Binch: das eingefrorene Bild der alten Karte, bis die neue es abholt. */
++        private val STYLE_COVER_LOCK = Any()
++        private var pendingStyleCover: Bitmap? = null
++        private var pendingStyleCoverAt = 0L
++        private const val STYLE_COVER_MAX_MS = 2500L
++        private const val STYLE_COVER_FADE_MS = 260L
++        private const val STYLE_COVER_TOUCH_FADE_MS = 120L
++        private const val CUT_MIN_HOLD_MS = 90L
++        private const val CUT_FADE_MS = 280L
+     }
+ }
++
++/** Binch: siehe `MLRNMapView.FlingDriver`. */
++private const val FLING_TAU_S = 0.325
++private const val FLING_MIN_DP_PER_S = 250f
++private const val FLING_STOP_DP_PER_S = 12.0
+diff --git a/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapViewModule.kt b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapViewModule.kt
+index 961d649..45e6f20 100644
+--- a/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapViewModule.kt
++++ b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapViewModule.kt
+@@ -184,6 +184,20 @@ class MLRNMapViewModule(
+         promise: Promise,
+     ) {
+         withViewportOnUIThread(reactTag, promise) {
++            // Binch: „cover" friert nur das aktuelle Bild für die nächste Karte ein
++            // (Kartentyp-Wechsel ohne Aufblitzen, siehe `MLRNMapView.captureStyleCover`).
++            if (output == "cover") {
++                it.captureStyleCover()
++                promise.resolve("")
++                return@withViewportOnUIThread
++            }
++            // Binch: „cut:<ms>" friert das Bild für DIESE Karte ein — Schnitt statt
++            // Flug in der Live-Ansicht (siehe `MLRNMapView.coverCut`).
++            if (output.startsWith("cut")) {
++                it.coverCut(output.substringAfter(':', "").toLongOrNull() ?: 900L)
++                promise.resolve("")
++                return@withViewportOnUIThread
++            }
+             it.takeSnap(output == "file") { payload ->
+                 promise.resolve(payload)
+             }
+diff --git a/node_modules/@maplibre/maplibre-react-native/lib/typescript/commonjs/components/camera/Camera.d.ts b/node_modules/@maplibre/maplibre-react-native/lib/typescript/commonjs/components/camera/Camera.d.ts
+index f112d58..185774c 100644
+--- a/node_modules/@maplibre/maplibre-react-native/lib/typescript/commonjs/components/camera/Camera.d.ts
++++ b/node_modules/@maplibre/maplibre-react-native/lib/typescript/commonjs/components/camera/Camera.d.ts
+@@ -28,7 +28,7 @@ export interface CameraOptions {
+ /**
+  * Easing function used for camera animations.
+  */
+-export type CameraEasing = undefined | "linear" | "ease" | "fly";
++export type CameraEasing = undefined | "linear" | "ease" | "fly" | "smooth";
+ /**
+  * Animation timing options for camera transitions.
+  */
+diff --git a/node_modules/@maplibre/maplibre-react-native/lib/typescript/module/components/camera/Camera.d.ts b/node_modules/@maplibre/maplibre-react-native/lib/typescript/module/components/camera/Camera.d.ts
+index f112d58..185774c 100644
+--- a/node_modules/@maplibre/maplibre-react-native/lib/typescript/module/components/camera/Camera.d.ts
++++ b/node_modules/@maplibre/maplibre-react-native/lib/typescript/module/components/camera/Camera.d.ts
+@@ -28,7 +28,7 @@ export interface CameraOptions {
+ /**
+  * Easing function used for camera animations.
+  */
+-export type CameraEasing = undefined | "linear" | "ease" | "fly";
++export type CameraEasing = undefined | "linear" | "ease" | "fly" | "smooth";
+ /**
+  * Animation timing options for camera transitions.
+  */
+diff --git a/node_modules/@maplibre/maplibre-react-native/src/components/camera/Camera.tsx b/node_modules/@maplibre/maplibre-react-native/src/components/camera/Camera.tsx
+index fbd228e..b5c7178 100644
+--- a/node_modules/@maplibre/maplibre-react-native/src/components/camera/Camera.tsx
++++ b/node_modules/@maplibre/maplibre-react-native/src/components/camera/Camera.tsx
+@@ -47,7 +47,7 @@ export interface CameraOptions {
+ /**
+  * Easing function used for camera animations.
+  */
+-export type CameraEasing = undefined | "linear" | "ease" | "fly";
++export type CameraEasing = undefined | "linear" | "ease" | "fly" | "smooth";
+ 
+ /**
+  * Animation timing options for camera transitions.

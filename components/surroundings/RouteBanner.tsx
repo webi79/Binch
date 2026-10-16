@@ -1,4 +1,4 @@
-import { View, Text, StyleSheet } from "react-native";
+import { View, Text, StyleSheet, type LayoutChangeEvent } from "react-native";
 import { ArrowLeft } from "lucide-react-native";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useT } from "@/lib/i18n/useT";
@@ -11,13 +11,15 @@ interface Props {
   /** Tap = Route schließen + zurück zum vorherigen Screen. */
   onBack: () => void;
   topInset: number;
+  /** Meldet die eigene Lage — die Knopfreihe darunter richtet sich danach. */
+  onLayout?: (e: LayoutChangeEvent) => void;
 }
 
 /**
  * Schwebendes Banner oben — Back-Arrow links auf SearchBar-Höhe, daneben
  * Route-Titel und Anzahl der Umstiege (Origin/Destination zählen nicht).
  */
-export function RouteBanner({ title, waypointCount, onBack, topInset }: Props) {
+export function RouteBanner({ title, waypointCount, onBack, topInset, onLayout }: Props) {
   const t = useT();
   const transferCount = Math.max(0, waypointCount - 2);
   const transferText =
@@ -26,7 +28,7 @@ export function RouteBanner({ title, waypointCount, onBack, topInset }: Props) {
       : `${transferCount} ${transferCount === 1 ? t("surroundings.route.transfer.one") : t("surroundings.route.transfer.many")}`;
 
   return (
-    <View style={[styles.wrap, { top: topInset + 8 }]} pointerEvents="box-none">
+    <View style={[styles.wrap, { top: topInset + 8 }]} pointerEvents="box-none" onLayout={onLayout}>
       <RippleTouch onPress={onBack} hitSlop={8} style={styles.backBtn}>
         <ArrowLeft color="#F4F4F5" size={20} strokeWidth={2.2} />
       </RippleTouch>

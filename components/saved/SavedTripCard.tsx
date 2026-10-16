@@ -23,6 +23,7 @@ import { useSearchStore } from "@/stores/searchStore";
 import { useT } from "@/lib/i18n/useT";
 import { useAccent } from "@/lib/theme/accent";
 import { formatTimeInZone, formatDateInZone } from "@/lib/time-format";
+import { changesText } from "@/lib/format/routeMeta";
 import { displayCode } from "@/lib/results/logos";
 import { haptic } from "@/lib/haptics";
 import { scaledStyles } from "@/lib/ui/compact";
@@ -75,16 +76,11 @@ function SavedTripCardInner({ trip }: Props) {
       const date = formatDateInZone(trip.departTime, trip.originTz);
       const origCode = trip.mode === "FLIGHT" ? displayCode(trip.origin) : "";
       const destCode = trip.mode === "FLIGHT" ? displayCode(trip.destination) : "";
-      const origin =
-        origCode || trip.originLabel?.split(",")[0]?.trim() || trip.origin;
-      const dest =
-        destCode || trip.destLabel?.split(",")[0]?.trim() || trip.destination;
-      const stops =
-        trip.stops === 0
-          ? t("details.stop.zero")
-          : trip.stops === 1
-          ? t("details.stop.one")
-          : t("details.stop.many").replace("{count}", String(trip.stops));
+      // Ganzer Name: „Enschede, Lindestraat" ist der Halt, nicht „Enschede".
+      const origin = origCode || trip.originLabel?.trim() || trip.origin;
+      const dest = destCode || trip.destLabel?.trim() || trip.destination;
+      // Umstiege (beim Flug: Stopps) — siehe `changesText`.
+      const stops = changesText(trip.mode, trip.stops, t);
       return {
         departStr: dep,
         arriveStr: arr,

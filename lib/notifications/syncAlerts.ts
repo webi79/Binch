@@ -33,6 +33,24 @@ export async function syncPriceAlerts(): Promise<void> {
     if (!token) return;
 
     for (const a of alerts) {
+      /**
+       * PAUSIERTE Alarme werden NICHT nachgetragen.
+       *
+       * Sonst legte dieser Abgleich sie vier Sekunden nach jedem App-Start neu
+       * an — aktiv und mit frischer Entprellung, während der Schalter weiter
+       * auf „aus" stand. Ein Schalter, der nicht schaltet, ist schlimmer als
+       * gar keiner.
+       *
+       * Ihre Zeile auf dem Server liegt ohnehin noch da und ist nur stumm
+       * gestellt; nachzutragen gibt es also nur in einem Fall etwas — wenn die
+       * Push-Kennung gewechselt hat und die Zeile per Kaskade mitging. Dann
+       * bleibt der Alarm pausiert, bis ihn jemand wieder einschaltet, und
+       * DIESER Weg legt ihn neu an (`setAlertActiveOnServer`). Ihn hier still
+       * wieder anzulegen hieße, einen abgeschalteten Alarm zu reaktivieren.
+       *
+       * Fehlt das Feld, gilt der Alarm als aktiv — siehe `PriceAlert.active`.
+       */
+      if (a.active === false) continue;
       try {
         const res = await createPriceAlert(
           {

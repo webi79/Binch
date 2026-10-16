@@ -1,4 +1,12 @@
-import { createContext, memo, useContext, useEffect, useMemo } from "react";
+import {
+  createContext,
+  memo,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  type ReactNode,
+} from "react";
 import { SHEET_IN } from "@/lib/nav/overlayCover";
 import { haptic } from "@/lib/haptics";
 import {
@@ -8,11 +16,14 @@ import {
   StyleSheet,
   useWindowDimensions,
   Pressable,
+  type LayoutChangeEvent,
   type ListRenderItemInfo,
 } from "react-native";
 import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
   Easing,
+  runOnJS,
+  useAnimatedReaction,
   useAnimatedStyle,
   useSharedValue,
   withTiming,
@@ -34,8 +45,23 @@ import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useT } from "@/lib/i18n/useT";
 import { MarkerKind, SheetMode, StopListItem } from "@/lib/surroundings/mockData";
 import { useAccent } from "@/lib/theme/accent";
-import { scaledStyles } from "@/lib/ui/compact";
-import { useSheetScrollGate } from "@/lib/ui/sheetSwipe";
+import { ms, scaledStyles } from "@/lib/ui/compact";
+import { SPACE } from "@/lib/theme/spacing";
+import {
+  dragHealOffset,
+  snapToPixel,
+  startDragHeal,
+  stopDragHeal,
+  useSheetScrollGate,
+} from "@/lib/ui/sheetSwipe";
+import { SheetTabs } from "@/components/surroundings/SheetTabs";
+import { chromeShift, travelBottom } from "@/lib/surroundings/mapChrome";
+import {
+  stopSheetHeal,
+  stopSheetSnap,
+  stopSheetY,
+} from "@/components/surroundings/stopSheetAnimation";
+import { reportSurroundingsTarget } from "@/lib/surroundings/mapViewport";
 
 const LIME = "#7FEA4D";
 const LIME_SUB = "rgba(127,234,77,0.18)";
@@ -92,9 +118,42 @@ interface Props {
    * hier wird nur die Kennung durchgereicht, die Zeile und Kartennadel teilen.
    */
   onSelectStop: (id: string) => void;
+  /**
+   * Was über dem Blatt rechts schwebt — der Standort-Knopf, wie bei Google.
+   *
+   * Das Blatt hält es selbst, weil nur das Blatt seine Lage kennt: Es steht
+   * immer denselben Abstand über der Oberkante, fährt beim Aufziehen mit und
+   * blendet sich aus, sobald das Blatt über den mittleren Rastpunkt hinaus
+   * steigt — dort ist die Karte zu klein, als dass der Knopf noch helfen würde,
+   * und er stieße oben an die Suchleiste.
+   *
+   * Ist das Haltestellen- bzw. Stadt-Blatt offen und reicht höher, steht der
+   * Knopf über DESSEN Kante (siehe `accessoryAnim`).
+   */
+  accessory?: ReactNode;
 }
 
-export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props) {
+
+/** Abstand des schwebenden Knopfes zur Oberkante des Blattes — das Raster. */
+const ACCESSORY_GAP = SPACE.md;
+/**
+ * Über welche Strecke oberhalb des mittleren Rastpunkts der Knopf ausblendet.
+ * Lang genug, dass er beim Aufziehen weich geht statt zu verschwinden.
+ */
+const ACCESSORY_FADE = 120;
+
+/**
+ * `memo`: Der Karten-Tab rendert oft (Ortung, Kamera in Ruhe, jedes Paket
+ * Gleisverläufe der Stadt) — ohne Schranke lief dieses Blatt samt Liste jedes
+ * Mal mit. Der Knopf darüber (`accessory`) kommt dafür fest gehalten an.
+ */
+export const SurroundingsSheet = memo(function SurroundingsSheet({
+  mode,
+  setMode,
+  items,
+  onSelectStop,
+  accessory,
+}: Props) {
   const palette = usePalette();
   const t = useT();
   const accent = useAccent();
@@ -136,6 +195,7 @@ export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props)
     const peekVisible = HANDLE_ZONE + TAB_ROW;
     const midVisible = Math.min(sheetHeight - 80, Math.max(420, screenHeight * 0.5));
     return {
+      fullTop,
       sheetHeight,
       tabBarSpace,
       // Vom Sheet aus runter geschoben (positiv = weiter unten):
@@ -155,9 +215,119 @@ export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props)
    * jedes andere Blatt von unten.
    */
   const translateY = useSharedValue(snap.sheetHeight);
-  const sheetAnim = useAnimatedStyle(() => ({
-    transform: [{ translateY: translateY.value }],
-  }));
+  /**
+   * Nur-Karte-Modus: Das Blatt steht in der unteren Bildhälfte, fährt also nach
+   * UNTEN hinaus — mit derselben Verschiebung wie alle anderen Teile, bis das
+   * Stück, das gerade zu sehen ist, hinter dem Rand liegt (siehe
+   * `lib/surroundings/mapChrome.ts`). Die eigenen Rastpunkte bleiben
+   * unberührt; beim Zurückholen steht es wieder, wo es stand.
+   */
+  /** Selbstkorrektur beim Ziehen — siehe `startDragHeal` in lib/ui/sheetSwipe.ts. */
+  const heal = useSharedValue(0);
+  const sheetAnim = useAnimatedStyle(() => {
+    const y = translateY.value + Math.min(chromeShift.value, snap.sheetHeight - translateY.value);
+    // Auf ganze Gerätepixel — sonst zittert die Schrift beim Ziehen gegen ihre
+    // Flächen (siehe `snapToPixel`).
+    return { transform: [{ translateY: snapToPixel(y) + dragHealOffset(heal) }] };
+  });
+
+  /**
+   * Der schwebende Knopf — seine Lage folgt Bild für Bild dem Blatt.
+   *
+   * Nur-Karte-Modus: Das Blatt fährt nach unten hinaus, und der Knopf darüber
+   * fährt mit. Weil er über der Oberkante steht, reichte das nicht: Er stünde
+   * am Ende knapp über dem unteren Rand. Deshalb zusätzlich um seinen eigenen
+   * Abstand samt Schatten weiter hinunter.
+   *
+   * Die Höhe wird gemessen (sie hängt an der Schriftskalierung), die Zahlen
+   * rechnet `ms` VOR dem Worklet aus — auf dem UI-Strang gibt es nur Worklets.
+   */
+  const accessoryGap = ms(ACCESSORY_GAP);
+  const accessoryH = useSharedValue(ms(44));
+  const onAccessoryLayout = useCallback(
+    (e: LayoutChangeEvent) => {
+      accessoryH.value = e.nativeEvent.layout.height;
+    },
+    [accessoryH],
+  );
+  /**
+   * ÜBER DEM HÖHEREN DER BEIDEN BLÄTTER.
+   *
+   * Das Haltestellen- bzw. Stadt-Blatt (StopDetailSheet) hängt am
+   * Wurzel-Layout und liegt über diesem Bildschirm. Fuhr es herein, schob es
+   * sich einfach über den Knopf — gemeldet als „der Button wird verdeckt". Jetzt
+   * steht er über der Kante des Blattes, das höher reicht: Das hereinfahrende
+   * Blatt nimmt ihn mit, beim Schließen sinkt er mit zurück auf dieses hier.
+   * Beide Blätter beginnen an derselben Oberkante (`fullTop`), ihre Lagen sind
+   * also direkt vergleichbar.
+   *
+   * Ausgeblendet wird nach der Regel des jeweiligen Blattes (über seinem
+   * mittleren Rastpunkt) — genommen wird die strengere, damit er über einem
+   * ganz aufgezogenen Blatt nie stehen bleibt.
+   *
+   * NUR-KARTE-MODUS: Der Knopf fährt dieselbe Verschiebung wie alles andere.
+   * Steht er über dem Haltestellen-Blatt, taucht er nach seiner eigenen Höhe
+   * hinter dessen Kante ab und kommt beim Zurückholen dort wieder heraus —
+   * dieses Blatt gehört zum Inhalt, nicht zur Oberfläche, und bleibt stehen
+   * (ein Tipp auf eine Haltestelle öffnet es auch im Nur-Karte-Modus).
+   * Gemeldet wird weiter nur der Weg über DIESEM Blatt (`travelBottom`): Er
+   * ist mindestens so lang, dass der Knopf danach auf jeden Fall hinter einem
+   * der beiden Blätter oder unter dem Rand liegt — auch wenn das
+   * Haltestellen-Blatt im Nur-Karte-Modus geschlossen wird.
+   *
+   * Auf ganze Gerätepixel wie die Blätter selbst, und zwar Kante und Abstand
+   * EINZELN: Sonst schwankte der Abstand zur Kante beim Ziehen um ein Pixel.
+   */
+  const stopMid = useMemo(
+    () => stopSheetSnap(screenHeight, insets.top, insets.bottom).mid,
+    [screenHeight, insets.top, insets.bottom],
+  );
+  const accessoryAnim = useAnimatedStyle(() => {
+    const lift = snapToPixel(accessoryH.value + accessoryGap);
+    const own = translateY.value;
+    const stop = stopSheetY.value;
+    const edge = Math.min(own, stop);
+    // Der Knopf fährt mit — und weiter, bis auch er hinter dem Rand ist: Er
+    // steht über der Kante, sein Weg ist um diesen Abstand länger.
+    const travel = snap.sheetHeight - edge + lift + 24;
+    const y = edge + Math.min(chromeShift.value, travel);
+    const ownFade = (own - (snap.mid - ACCESSORY_FADE)) / ACCESSORY_FADE;
+    const stopFade = (stop - (stopMid - ACCESSORY_FADE)) / ACCESSORY_FADE;
+    const opacity = Math.min(1, Math.max(0, Math.min(ownFade, stopFade)));
+    return {
+      opacity,
+      transform: [
+        {
+          // Mit der Selbstkorrektur BEIDER Blätter: Der Knopf hängt an der
+          // Kante dessen, das gerade höher reicht.
+          translateY:
+            snapToPixel(y) -
+            lift +
+            dragHealOffset(heal) +
+            dragHealOffset(stopSheetHeal),
+        },
+        // Ganz ausgeblendet aus dem Weg — ein unsichtbarer Knopf finge sonst
+        // Tipps auf die Karte ab.
+        { translateX: opacity < 0.01 ? 10000 : 0 },
+      ],
+    };
+  });
+  /**
+   * Den eigenen Weg melden — er hängt am Rastpunkt, ändert sich also, wenn das
+   * Blatt gezogen wird. Die Verschiebung des Nur-Karte-Modus muss bis zum
+   * längsten Weg aller Teile laufen (`maxTravel`).
+   */
+  const hasAccessory = accessory != null;
+  useAnimatedReaction(
+    () =>
+      snap.sheetHeight -
+      translateY.value +
+      (hasAccessory ? accessoryH.value + accessoryGap + 24 : 0),
+    (travel) => {
+      travelBottom.value = travel;
+    },
+    [hasAccessory, snap.sheetHeight, accessoryGap],
+  );
 
   useEffect(() => {
     // Beim ersten Mount in die Ruhestellung fahren — mit derselben Vorgabe wie
@@ -165,6 +335,7 @@ export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props)
     // eine eigene Feder; sie schwingt über und endet nur asymptotisch, während
     // alle anderen exakt landen.
     translateY.value = withTiming(snap.peek, SHEET_IN);
+    reportSurroundingsTarget(snap.peek);
   }, []);
 
   /**
@@ -212,6 +383,9 @@ export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props)
     Gesture.Pan()
     .activeOffsetY([-8, 8])
     .simultaneousWithExternalGesture(gate.native)
+    .onBegin(() => {
+      startDragHeal(heal);
+    })
     .onStart((e) => {
       startY.value = translateY.value;
       base.value = e.translationY;
@@ -266,6 +440,9 @@ export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props)
        * zieht man deutlich häufiger.
        */
       translateY.value = withTiming(closest, { duration: 180, easing: Easing.out(Easing.quad) });
+      // Das Ziel melden — die Kamera setzt den Standort in den neuen freien
+      // Ausschnitt (siehe lib/surroundings/mapViewport.ts).
+      runOnJS(reportSurroundingsTarget)(closest);
     })
     /**
      * Merker „Finger liegt auf der Liste" beim Ende der Berührung löschen.
@@ -276,12 +453,23 @@ export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props)
      */
     .onFinalize(() => {
       gate.onList.value = false;
+      stopDragHeal(heal);
     }),
-  [snap, startY, base, moved, translateY, gate]);
+  [snap, startY, base, moved, translateY, gate, heal]);
 
   const title = t(TITLE_KEY[mode]);
 
   return (
+    <>
+    {accessory ? (
+      <Animated.View
+        style={[styles.accessory, { top: snap.fullTop }, accessoryAnim]}
+        pointerEvents="box-none"
+        onLayout={onAccessoryLayout}
+      >
+        {accessory}
+      </Animated.View>
+    ) : null}
     <GestureDetector gesture={pan}>
     <Animated.View
       style={[
@@ -297,33 +485,16 @@ export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props)
         <View style={styles.handle} />
       </View>
 
-      <View style={styles.tabRow}>
-        {MODE_TABS.map(({ mode: tabMode, tKey, Icon }) => {
-          const active = mode === tabMode;
-          return (
-            <Pressable
-              key={tabMode}
-              style={styles.tab}
-              onPress={() => setMode(tabMode)}
-              android_ripple={null}
-              hitSlop={4}
-            >
-              <View style={styles.tabInner}>
-                <Icon color={active ? accent.solid : C.g2} size={18} strokeWidth={2} />
-                <Text
-                  style={[
-                    styles.tabLabel,
-                    { color: active ? C.white : C.g2, fontWeight: active ? "700" : "600" },
-                  ]}
-                >
-                  {t(tKey)}
-                </Text>
-              </View>
-              {active && <View style={[styles.tabUnderline, { backgroundColor: accent.solid }]} />}
-            </Pressable>
-          );
-        })}
-      </View>
+      {/* Dieselbe Reiter-Reihe wie im Stadt-Blatt — siehe SheetTabs.tsx. */}
+      <SheetTabs
+        tabs={MODE_TABS.map(({ mode: tabMode, tKey, Icon }) => ({
+          key: tabMode,
+          label: t(tKey),
+          Icon,
+        }))}
+        active={mode}
+        onChange={setMode}
+      />
 
       <View style={styles.titleRow}>
         <Text style={styles.title}>{title}</Text>
@@ -353,6 +524,20 @@ export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props)
         windowSize={5}
         maxToRenderPerBatch={8}
         initialNumToRender={8}
+        /**
+         * `removeClippedSubviews` MUSS bleiben — es war zwischenzeitlich
+         * ausgebaut, und das war ein Fehler mit spürbarer Folge.
+         *
+         * Die Begründung damals: Android rechne den sichtbaren Ausschnitt beim
+         * Verschieben des Blattes nicht nach. Falsch gedacht — abgehängt wird
+         * relativ zum EIGENEN Ausschnitt der Liste, und der wandert mit dem
+         * Blatt mit, ändert sich also gar nicht. Ohne die Option hingen dafür
+         * ALLE gebauten Zeilen dauerhaft im Baum (`windowSize` 5 = fünf
+         * Bildschirmhöhen, Dutzende Haltestellen mit Chips und Welle), und die
+         * wurden bei JEDEM Kartenbild mit durchgegangen — die Karte ist eine
+         * TextureView und zeichnet das Fenster bei jedem Bild neu. Gemeldet als
+         * „die Karte ruckelt beim Ausrollen wieder stark".
+         */
         removeClippedSubviews
         ListFooterComponent={
           <Text style={styles.footer}>
@@ -364,8 +549,9 @@ export function SurroundingsSheet({ mode, setMode, items, onSelectStop }: Props)
       </SelectStopContext.Provider>
     </Animated.View>
     </GestureDetector>
+    </>
   );
-}
+});
 
 /**
  * Der Rückruf fürs Antippen einer Zeile — über den Kontext, nicht als Eigenschaft.
@@ -446,6 +632,16 @@ const StopRow = memo(function StopRow({ item }: { item: StopListItem }) {
 });
 
 const styles = scaledStyles({
+  /**
+   * Der schwebende Knopf: rechts auf derselben Linie wie die Knopfreihe oben
+   * (`right: 16` in MapFabs.tsx), unter dem Blatt in der Schichtung — beide
+   * überlappen nie, und falls doch, gehört die Fläche dem Blatt.
+   */
+  accessory: {
+    position: "absolute",
+    right: 16,
+    zIndex: 30,
+  },
   sheet: {
     position: "absolute",
     left: 0,
@@ -476,37 +672,7 @@ const styles = scaledStyles({
     backgroundColor: "#FFFFFF",
     opacity: 0.85,
   },
-  tabRow: {
-    flexDirection: "row",
-    borderBottomColor: C.border,
-    borderBottomWidth: 1,
-    paddingHorizontal: 12,
-    paddingTop: 4,
-  },
-  tab: {
-    flex: 1,
-    paddingVertical: 12,
-    alignItems: "center",
-    position: "relative",
-  },
-  tabInner: {
-    flexDirection: "row",
-    alignItems: "center",
-    columnGap: 8,
-  },
-  tabLabel: {
-    fontSize: 14,
-    letterSpacing: -0.1,
-  },
-  tabUnderline: {
-    position: "absolute",
-    bottom: 0,
-    left: "15%",
-    right: "15%",
-    height: 3,
-
-    borderRadius: 2,
-  },
+  // Reiter-Reihe: siehe SheetTabs.tsx.
   titleRow: {
     flexDirection: "row",
     justifyContent: "space-between",

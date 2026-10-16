@@ -1,4 +1,4 @@
-import { ReactNode, createContext, useCallback, useContext, useEffect, useRef, useState, useMemo } from "react";
+import { ReactNode, createContext, memo, useCallback, useContext, useEffect, useRef, useState, useMemo } from "react";
 import { subscribeLayer, prepareLayer, holdLayer, rearmLayer } from "@/lib/nav/transitionLayer";
 import { markTransitionBusy } from "@/lib/nav/transitionBusy";
 import { setSheetMoving } from "@/lib/nav/searchHandoff";
@@ -43,7 +43,7 @@ import { GUTTER, SPACE, HEADING_TOP, HEADING_GAP, useNavbarSpace } from "@/lib/t
 import { ScreenHeading } from "@/components/ui/ScreenHeading";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
-import Svg, { Circle, Path, Rect } from "react-native-svg";
+import Svg, { Circle, Defs, Ellipse, G, LinearGradient, Path, Rect, Stop } from "react-native-svg";
 import {
   ChevronRight,
   Check,
@@ -981,7 +981,9 @@ function BackHeader({ title, onBack }: { title: string; onBack: () => void }) {
         }
       <Pressable
         onPress={onBack}
-        style={({ pressed }) => [styles.backHeaderBtn, pressed && { opacity: 0.7 }]}
+        /* ARRAY statt Funktion — siehe `SearchBar.tsx`. Sonst verliert der
+           Schließ-Knopf sein rundes Feld. */
+        style={styles.backHeaderBtn}
       >
         <X size={16} color={C.white} strokeWidth={2.5} />
       </Pressable>
@@ -1107,82 +1109,203 @@ function IconAlert() {
   );
 }
 
-/* ─── Hub flat illustrations ─── */
-function IlluDetails() {
-  const accent = useAccent();
+/* ─── Hub-Illustrationen: Bo in drei Rollen ─── */
+/**
+ * Die Kacheln zeigen Bo, unseren Reise-Geist — jeweils in der Rolle seines
+ * Bereichs: mit seinem Ausweis (Daten), am Zahnrad drehend (Einstellungen), mit
+ * Headset (Support). Vorher standen hier Strichmännchen, die zu keiner anderen
+ * Figur der App passten.
+ *
+ * Figur und Gesicht sind Bos eigene Pfaddaten aus `components/assistant/Bo.tsx`,
+ * nur verkleinert und nicht nachgezeichnet: Er soll als DERSELBE erkennbar sein.
+ * Bo steht in allen drei Bildern gleich groß an derselben Stelle (`HUB_BO_AT`);
+ * nur Requisite und Miene wechseln.
+ *
+ * Kosten: statisch, ohne Animation und Filter, nur Bos eigener Verlauf.
+ * Gleichfarbige Flächen liegen je in EINEM Pfad, denn unter Fabric ist jeder
+ * SVG-Knoten eine eigene native Ansicht. Zusammen sind es 51 Knoten, die alten
+ * Figuren hatten 55. Alles steht auf Modulebene: Innerhalb einer Komponente
+ * definiert, entstünde pro Render ein neuer Komponententyp, und React baute den
+ * Baum jedes Mal neu auf.
+ */
+const BO_INK = "#0D0D0D";
+const BO_GLINT = "#F4F4F5";
+/** Körper: Kuppe mit Radius 72 um (100|120), vier Zipfel am Saum. */
+const BO_BODY =
+  "M28 120 A72 72 0 0 1 172 120 L172 197 Q154 221 136 197 Q118 221 100 197 Q82 221 64 197 Q46 221 28 197 Z";
+/** Augen: Ellipsen 16 × 21 um (76|120) und (124|120). */
+const BO_EYE_L = "M60 120a16 21 0 1 0 32 0a16 21 0 1 0 -32 0Z";
+const BO_EYES = BO_EYE_L + "M108 120a16 21 0 1 0 32 0a16 21 0 1 0 -32 0Z";
+/**
+ * Glanzpunkte, je Auge oben groß und unten klein. Der kleine hat in Bo.tsx 70%
+ * Deckkraft; bei 0,7 dp Halbmesser sieht man davon nichts, im selben Pfad spart
+ * er aber einen Knoten.
+ */
+const BO_GLINT_L = "M76.5 112a5.5 5.5 0 1 0 11 0a5.5 5.5 0 1 0 -11 0ZM68.4 126a2.6 2.6 0 1 0 5.2 0a2.6 2.6 0 1 0 -5.2 0Z";
+const BO_GLINTS =
+  BO_GLINT_L + "M124.5 112a5.5 5.5 0 1 0 11 0a5.5 5.5 0 1 0 -11 0ZM116.4 126a2.6 2.6 0 1 0 5.2 0a2.6 2.6 0 1 0 -5.2 0Z";
+const BO_CHEEKS = "M43 150a13 7.5 0 1 0 26 0a13 7.5 0 1 0 -26 0ZM131 150a13 7.5 0 1 0 26 0a13 7.5 0 1 0 -26 0Z";
+/** Das zwinkernde Auge ist Bos Freude-Bogen, der Mund das Lächeln vom Winken. */
+const BO_WINK = "M109 124 Q124 104 139 124";
+const BO_SMILE = "M85 149 Q100 164 115 149";
+/** Schief, mit dem rechten Mundwinkel oben: das einzige Neue an Bos Gesicht. */
+const BO_SMIRK = "M88 151 Q103 160 114 146";
+/** Offener Freude-Mund, gefüllt. */
+const BO_LAUGH = "M82 149 Q100 180 118 149 Z";
+/** Bos Winke-Arm, hinter dem Körper angesetzt; gedreht wird er um die Schulter (150|132). */
+const BO_ARM = "M150 132 C176 126 198 110 205 80";
+/** Rund 40 × 45 dp, links in der Fläche; rechts bleibt Platz für die Requisite. */
+const HUB_BO_AT = "translate(2 5.5) scale(0.28)";
+
+/**
+ * Schloss an der Ausweis-Ecke: Bügel und Körper im Uhrzeigersinn, das
+ * Schlüsselloch gegenläufig, also ausgespart. Es sitzt knapp über der Kante des
+ * Ausweises — läge die Kante darunter, liefe sie sichtbar durchs Loch.
+ */
+const HUB_LOCK =
+  "M71.5 26H76.5A1.5 1.5 0 0 1 78 27.5V30.5A1.5 1.5 0 0 1 76.5 32H71.5A1.5 1.5 0 0 1 70 30.5V27.5A1.5 1.5 0 0 1 71.5 26Z" +
+  "M71.2 27V25.8A2.8 2.8 0 0 1 76.8 25.8V27H75.5V25.8A1.5 1.5 0 0 0 72.5 25.8V27Z" +
+  "M75.1 28.9A1.1 1.1 0 1 0 72.9 28.9A1.1 1.1 0 1 0 75.1 28.9Z";
+/** Zahnrad um (66,1|27): acht Zähne, Kopfkreis 12,5, Fußkreis 9,6, Nabe 4 (per evenodd ausgespart). */
+const HUB_GEAR =
+  "M64.15 17.6L64.34 14.62A12.5 12.5 0 0 1 67.86 14.62L68.05 17.6A9.6 9.6 0 0 1 71.37 18.98L73.61 17A12.5 12.5 0 0 1 76.1 19.49L74.12 21.73A9.6 9.6 0 0 1 75.5 25.05L78.48 25.24A12.5 12.5 0 0 1 78.48 28.76L75.5 28.95A9.6 9.6 0 0 1 74.12 32.27L76.1 34.51A12.5 12.5 0 0 1 73.61 37L71.37 35.02A9.6 9.6 0 0 1 68.05 36.4L67.86 39.38A12.5 12.5 0 0 1 64.34 39.38L64.15 36.4A9.6 9.6 0 0 1 60.83 35.02L58.59 37A12.5 12.5 0 0 1 56.1 34.51L58.08 32.27A9.6 9.6 0 0 1 56.7 28.95L53.72 28.76A12.5 12.5 0 0 1 53.72 25.24L56.7 25.05A9.6 9.6 0 0 1 58.08 21.73L56.1 19.49A12.5 12.5 0 0 1 58.59 17L60.83 18.98A9.6 9.6 0 0 1 64.15 17.6Z" +
+  "M70.1 27a4 4 0 1 0 -8 0a4 4 0 1 0 8 0Z";
+const HUB_BUBBLE = "M58 8H72A6 6 0 0 1 78 14V20A6 6 0 0 1 72 26H64L56.5 30.5L59 26H58A6 6 0 0 1 52 20V14A6 6 0 0 1 58 8Z";
+const HUB_BUBBLE_DOTS =
+  "M57.2 17a1.8 1.8 0 1 0 3.6 0a1.8 1.8 0 1 0 -3.6 0ZM63.2 17a1.8 1.8 0 1 0 3.6 0a1.8 1.8 0 1 0 -3.6 0ZM69.2 17a1.8 1.8 0 1 0 3.6 0a1.8 1.8 0 1 0 -3.6 0Z";
+/**
+ * Die rechte Kante der Zeichnung: 78,6, bei allen drei gleich — Ecke des
+ * Ausweises, Zahnkopf, Sprechblase samt Strich. Die viewBox legt sie genau auf
+ * den rechten Rand der Fläche. Erst damit misst `right` am Bildplatz bis zur
+ * GEZEICHNETEN Kante und nicht bis zu einem leeren Rest der Fläche; siehe
+ * `sectionCardIllu`.
+ */
+const HUB_VIEWBOX = "-1.4 0 80 72";
+/** Headset in Bos Einheiten, damit es um seine Kuppe sitzt: Bügel, Mikrofonarm, Muscheln samt Mikrofon. */
+const HUB_HEADBAND = "M25.03 118 A75 75 0 0 1 174.97 118";
+const HUB_MIC_BOOM = "M175 140 Q176 170 130 168";
+const HUB_HEADSET_FILL =
+  "M25 102a11 11 0 0 1 11 11v16a11 11 0 0 1 -22 0v-16a11 11 0 0 1 11 -11Z" +
+  "M175 102a11 11 0 0 1 11 11v16a11 11 0 0 1 -22 0v-16a11 11 0 0 1 11 -11Z" +
+  "M118 168a8 8 0 1 0 16 0a8 8 0 1 0 -16 0Z";
+
+/**
+ * Fläche, Bos Verlauf und sein Schatten am Boden — gleich für alle drei.
+ *
+ * Die Verlaufs-ID ist je Bild eine eigene: Auf dem Web teilen sich alle SVGs
+ * einer Seite einen ID-Raum.
+ */
+function HubIllu({ gid, children }: { gid: string; children: ReactNode }) {
   return (
-    <Svg width={80} height={72} viewBox="0 0 80 72">
-      <Circle cx={32} cy={18} r={10} fill="#C8C8CC" />
-      <Path d="M22 16 Q22 8 32 7 Q42 8 42 16 L42 13 Q39 5 32 5 Q25 5 22 13Z" fill="#212123" />
-      <Rect x={23} y={27} width={18} height={20} rx={6} fill={accent.solid} />
-      <Rect x={14} y={28} width={10} height={6} rx={3} fill={accent.solid} />
-      <Rect x={41} y={28} width={10} height={6} rx={3} fill={accent.solid} />
-      <Rect x={25} y={45} width={6} height={14} rx={3} fill="#171719" />
-      <Rect x={33} y={45} width={6} height={14} rx={3} fill="#171719" />
-      <Rect x={46} y={22} width={28} height={20} rx={4} fill="#171719" stroke={accent.solid} strokeWidth={1.2} />
-      <Rect x={46} y={22} width={28} height={6} rx={3} fill={accent.solid} fillOpacity={0.35} />
-      <Circle cx={53} cy={35} r={3.5} fill={accent.solid} fillOpacity={0.6} />
-      <Rect x={58} y={33} width={10} height={1.5} rx={0.75} fill={accent.solid} fillOpacity={0.5} />
-      <Rect x={58} y={36.5} width={7} height={1.5} rx={0.75} fill={accent.solid} fillOpacity={0.3} />
-      <Circle cx={28} cy={17} r={1.2} fill="#212123" />
-      <Circle cx={36} cy={17} r={1.2} fill="#212123" />
-      <Path d="M28 22 Q32 25 36 22" stroke="#212123" strokeWidth={1.2} strokeLinecap="round" fill="none" />
+    <Svg width={80} height={72} viewBox={HUB_VIEWBOX}>
+      <Defs>
+        <LinearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
+          <Stop offset="0" stopColor="#FFFFFF" />
+          <Stop offset="1" stopColor="#E9ECEC" />
+        </LinearGradient>
+      </Defs>
+      <Ellipse cx={30} cy={67.5} rx={13} ry={2} fill="#000000" fillOpacity={0.35} />
+      {children}
     </Svg>
   );
 }
 
-function IlluSettings() {
-  const accent = useAccent();
+/**
+ * Bo selbst, an seinem festen Platz.
+ *
+ * Die Miene steht je Bild fest und wechselt nie — die Verzweigungen unten
+ * hängen also nichts zur Laufzeit ein oder aus.
+ */
+function HubBo({
+  gid,
+  face,
+  accent,
+  arm,
+  children,
+}: {
+  gid: string;
+  face: "smile" | "wink" | "laugh";
+  accent: string;
+  /** Drehung des Winke-Arms um die Schulter; ohne Angabe kein Arm. */
+  arm?: string;
+  /** Was Bo trägt, in seinen Einheiten. */
+  children?: ReactNode;
+}) {
+  const wink = face === "wink";
   return (
-    <Svg width={80} height={72} viewBox="0 0 80 72">
-      <Rect x={4} y={56} width={72} height={5} rx={2.5} fill="#171719" />
-      <Rect x={14} y={46} width={48} height={10} rx={2} fill="#171719" />
-      <Rect x={16} y={18} width={44} height={30} rx={3} fill="#171719" stroke={accent.solid} strokeWidth={1} strokeOpacity={0.4} />
-      <Rect x={21} y={26} width={22} height={2.5} rx={1.25} fill="#212123" />
-      <Rect x={21} y={26} width={13} height={2.5} rx={1.25} fill={accent.solid} fillOpacity={0.7} />
-      <Circle cx={34} cy={27.25} r={3} fill={accent.solid} />
-      <Rect x={21} y={33} width={22} height={2.5} rx={1.25} fill="#212123" />
-      <Rect x={21} y={33} width={16} height={2.5} rx={1.25} fill={accent.solid} fillOpacity={0.5} />
-      <Circle cx={37} cy={34.25} r={3} fill={accent.solid} fillOpacity={0.8} />
-      <Rect x={21} y={40} width={22} height={2.5} rx={1.25} fill="#212123" />
-      <Rect x={21} y={40} width={8} height={2.5} rx={1.25} fill={accent.solid} fillOpacity={0.4} />
-      <Circle cx={29} cy={41.25} r={3} fill={accent.solid} fillOpacity={0.6} />
-      <Circle cx={64} cy={34} r={9} fill="#C8C8CC" />
-      <Path d="M55 32 Q55 25 64 24 Q73 25 73 32 L73 29 Q70 22 64 22 Q58 22 55 29Z" fill="#212123" />
-      <Path d="M56 42 Q56 39 64 39 Q72 39 72 42 L74 56 L54 56Z" fill={accent.solid} fillOpacity={0.7} />
-      <Circle cx={60} cy={33} r={1.2} fill="#212123" />
-      <Circle cx={68} cy={33} r={1.2} fill="#212123" />
-      <Path d="M60 38 Q64 41 68 38" stroke="#212123" strokeWidth={1.2} strokeLinecap="round" fill="none" />
-    </Svg>
+    <G transform={HUB_BO_AT}>
+      {arm ? (
+        <Path d={BO_ARM} transform={arm} stroke="#FFFFFF" strokeWidth={18} strokeLinecap="round" fill="none" />
+      ) : null}
+      <Path d={BO_BODY} fill={`url(#${gid})`} />
+      <Path d={BO_CHEEKS} fill={accent} fillOpacity={0.5} />
+      <Path d={wink ? BO_EYE_L : BO_EYES} fill={BO_INK} />
+      <Path d={wink ? BO_GLINT_L : BO_GLINTS} fill={BO_GLINT} />
+      {wink ? <Path d={BO_WINK} stroke={BO_INK} strokeWidth={7} strokeLinecap="round" fill="none" /> : null}
+      {face === "laugh" ? (
+        <Path d={BO_LAUGH} fill={BO_INK} />
+      ) : (
+        <Path d={wink ? BO_SMIRK : BO_SMILE} stroke={BO_INK} strokeWidth={5.5} strokeLinecap="round" fill="none" />
+      )}
+      {children}
+    </G>
   );
 }
 
-function IlluSupport() {
+/**
+ * `memo`, weil der Hub die Kacheln bei jedem Durchgang neu anlegt (Anmeldung,
+ * Sprache). Neu zeichnen müssen die Bilder nur bei einem anderen Akzent, und den
+ * holt sich jedes selbst.
+ */
+const IlluDetails = memo(function IlluDetails() {
   const accent = useAccent();
   return (
-    <Svg width={80} height={72} viewBox="0 0 80 72">
-      <Circle cx={34} cy={22} r={11} fill="#C8C8CC" />
-      <Path d="M23 20 Q23 11 34 10 Q45 11 45 20 L45 16 Q42 8 34 8 Q26 8 23 16Z" fill="#171719" />
-      <Path d="M23 19 Q23 10 34 10 Q45 10 45 19" stroke={accent.solid} strokeWidth={2.5} fill="none" strokeLinecap="round" />
-      <Rect x={20} y={18} width={6} height={8} rx={2.5} fill={accent.solid} />
-      <Rect x={42} y={18} width={6} height={8} rx={2.5} fill={accent.solid} />
-      <Path d="M23 24 Q17 28 16 33" stroke={accent.solid} strokeWidth={2} strokeLinecap="round" fill="none" />
-      <Circle cx={15} cy={35} r={2.5} fill={accent.solid} />
-      <Rect x={25} y={31} width={18} height={20} rx={6} fill={accent.solid} fillOpacity={0.8} />
-      <Rect x={15} y={32} width={11} height={6} rx={3} fill={accent.solid} fillOpacity={0.8} />
-      <Rect x={27} y={49} width={6} height={14} rx={3} fill="#171719" />
-      <Rect x={35} y={49} width={6} height={14} rx={3} fill="#171719" />
-      <Circle cx={29} cy={21} r={1.2} fill="#212123" />
-      <Circle cx={39} cy={21} r={1.2} fill="#212123" />
-      <Path d="M29 26 Q34 29 39 26" stroke="#212123" strokeWidth={1.2} strokeLinecap="round" fill="none" />
-      <Rect x={50} y={6} width={26} height={20} rx={6} fill="#171719" stroke={accent.solid} strokeWidth={1} />
-      <Path d="M54 26 L51 32 L60 26" fill="#171719" stroke={accent.solid} strokeWidth={1} />
-      <Circle cx={58} cy={16} r={2} fill={accent.solid} fillOpacity={0.8} />
-      <Circle cx={63} cy={16} r={2} fill={accent.solid} fillOpacity={0.8} />
-      <Circle cx={68} cy={16} r={2} fill={accent.solid} fillOpacity={0.8} />
-    </Svg>
+    <HubIllu gid="hubBoDetails">
+      <HubBo gid="hubBoDetails" face="smile" accent={accent.solid} />
+      {/* Sein Ausweis, mit seinem eigenen Bild und einem Schloss für den Datenschutz. */}
+      <G transform="rotate(-10 62 41)">
+        <Rect x={47} y={31} width={30} height={20} rx={3.2} fill="#212123" stroke={accent.solid} strokeWidth={1.2} />
+        <Rect x={50} y={34} width={10} height={12} rx={2} fill={accent.solid} fillOpacity={0.25} />
+        {/* Der Mini-Bo: Körper mit ausgesparten Augen, also ein Pfad. */}
+        <Path
+          d={BO_BODY + BO_EYES}
+          transform="translate(49.72 33.67) scale(0.053)"
+          fill="#FFFFFF"
+          fillRule="evenodd"
+        />
+        <Path d="M63 37.5h10" stroke={accent.solid} strokeWidth={2} strokeLinecap="round" />
+        <Path d="M63 41.8h7M63 46h9" stroke="#56565C" strokeWidth={1.6} strokeLinecap="round" />
+        <Path d={HUB_LOCK} fill={accent.solid} />
+      </G>
+    </HubIllu>
   );
-}
+});
+
+const IlluSettings = memo(function IlluSettings() {
+  const accent = useAccent();
+  return (
+    <HubIllu gid="hubBoSettings">
+      <Path d={HUB_GEAR} fill={accent.solid} fillRule="evenodd" />
+      {/* Bo greift mit dem Winke-Arm ins Zahnrad und zwinkert dabei. */}
+      <HubBo gid="hubBoSettings" face="wink" accent={accent.solid} arm="rotate(28 150 132)" />
+    </HubIllu>
+  );
+});
+
+const IlluSupport = memo(function IlluSupport() {
+  const accent = useAccent();
+  return (
+    <HubIllu gid="hubBoSupport">
+      <Path d={HUB_BUBBLE} fill="#212123" stroke={accent.solid} strokeWidth={1.2} strokeLinejoin="round" />
+      <Path d={HUB_BUBBLE_DOTS} fill={accent.solid} />
+      <HubBo gid="hubBoSupport" face="laugh" accent={accent.solid}>
+        <Path d={HUB_HEADBAND} stroke={accent.solid} strokeWidth={9} strokeLinecap="round" fill="none" />
+        <Path d={HUB_MIC_BOOM} stroke={accent.solid} strokeWidth={6} strokeLinecap="round" fill="none" />
+        <Path d={HUB_HEADSET_FILL} fill={accent.solid} />
+      </HubBo>
+    </HubIllu>
+  );
+});
 
 /* ─────────────────────── STYLES ─────────────────────── */
 const styles = scaledStyles({
@@ -1274,7 +1397,15 @@ const styles = scaledStyles({
     overflow: "hidden",
     position: "relative",
   },
-  sectionCardIllu: { position: "absolute", top: 4, right: 4, opacity: 0.92 },
+  /**
+   * Rechts derselbe Abstand wie der Text links: `SPACE.lg`, wie
+   * `sectionCard.paddingHorizontal`. Beide laufen durch `scaledStyles`, bleiben
+   * also auch auf kurzen Geräten gleich. Die SVG-Fläche selbst skaliert nicht
+   * mit; ihre viewBox legt die gezeichnete Kante genau auf ihren Rand (siehe
+   * `HUB_VIEWBOX`). Vorher stand hier 4, und die Bilder klebten mit 5 bis 9 dp
+   * am Rand.
+   */
+  sectionCardIllu: { position: "absolute", top: 4, right: SPACE.lg, opacity: 0.92 },
   sectionCardTextWrap: { maxWidth: "58%", zIndex: 1 },
   sectionCardTitle: {
     fontSize: 20,

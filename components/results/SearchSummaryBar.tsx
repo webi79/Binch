@@ -237,6 +237,114 @@ export const SearchSummaryBar = memo(function SearchSummaryBar({
 }: SearchSummaryBarProps) {
   const t = useT();
   const palette = usePalette();
+  const { Icon, routeLabel, metaLabel } = useSummaryLabels({
+    mode,
+    fromLabel,
+    toLabel,
+    departDate,
+    returnDate,
+    passengers,
+    travelClassKey,
+  });
+
+  return (
+    <View style={styles.row}>
+      {/* Freistehend, ohne Kreis und ohne Fläche — so wie das X in allen
+          Blättern der App. Ein umrandeter Knopf hätte hier zwei Flächen
+          nebeneinander gesetzt (Pfeil und Box) und die Box damit zu einer von
+          zweien gemacht, statt zum Inhalt der Zeile. */}
+      {/**
+        * `Pressable` statt `RippleTouch` — und das ist kein Stilbruch, sondern
+        * die Bedingung dafür, dass die Rückfahrt glatt läuft.
+        *
+        * Dieser Pfeil ist der Haupt-Ausgang der Ergebnisliste, und die fährt
+        * hinaus, während sie noch ihren vollen Inhalt trägt: zwanzig Karten mit
+        * Logos und Verläufen. Ohne GPU-Ebene wird das in JEDEM Bild der Ausfahrt
+        * neu gezeichnet — deshalb fordert `onBackTouchStart` sie beim AUFSETZEN
+        * des Fingers an. Ihr Aufbau ist im Projekt mit 66ms vermessen, das
+        * gehört in die 80 bis 150ms, die zwischen Aufsetzen und Loslassen
+        * ohnehin vergehen, und nicht in die ersten Bilder der Bewegung.
+        *
+        * Und genau deshalb keine Material-Welle: Die läuft beim LOSLASSEN aus,
+        * also mitten in die eben angelegte Ebene hinein, die sie dann Bild für
+        * Bild ungültig machen würde. Mit Welle wäre die Ebene schlechter als
+        * gar keine. Dieselbe Begründung wie an den Schließ-Knöpfen von
+        * Detail-Blatt und Profil-Unterschirm — und sie stand wörtlich an dem
+        * „Ändern"-Knopf, dessen Aufgabe dieser Pfeil übernommen hat.
+        */}
+      <Pressable
+        style={ICON_BOX}
+        hitSlop={ICON_HIT_SLOP}
+        onTouchStart={onBackTouchStart}
+        onPress={onBack}
+        accessibilityRole="button"
+        accessibilityLabel={t("common.back")}
+      >
+        <ArrowLeft size={CLOSE_ICON_SIZE} color={C.closeIcon} strokeWidth={2} />
+      </Pressable>
+
+      <RippleTouch
+        style={[styles.box, { backgroundColor: palette.s2 }]}
+        onPress={onPress}
+        // Der sichtbare Text wird von der Beschriftung verdeckt, sobald eine
+        // gesetzt ist — deshalb steht er hier vollständig drin, samt Hinweis auf
+        // das, was ein Tipp bewirkt.
+        accessibilityLabel={[routeLabel, metaLabel, t("results.summary.edit")]
+          .filter(Boolean)
+          .join(". ")}
+      >
+        <SummaryBoxContent Icon={Icon} routeLabel={routeLabel} metaLabel={metaLabel} />
+      </RippleTouch>
+
+      {/**
+        * Die Glocke steht FREI — kein Kreis, keine Fläche, kein Radius.
+        *
+        * Im Landingscreen sitzt sie in einer 44er-Scheibe in Kartenfarbe, und
+        * dort ist das richtig: Sie ist das einzige Bedienelement einer sonst
+        * leeren Kopfzeile und braucht etwas, das sie als Knopf ausweist. Hier
+        * steht sie am Ende einer Zeile, deren Mitte bereits eine gefüllte Box
+        * ist — eine zweite Fläche daneben hätte aus einer Box mit zwei Zeichen
+        * drei konkurrierende Flächen gemacht. Sie folgt jetzt dem Pfeil auf der
+        * anderen Seite und dem X in allen Blättern der App: nur das Zeichen.
+        *
+        * `borderless` bleibt: Die Welle soll sich kreisförmig über das Zeichen
+        * ausbreiten, nicht in einem Rechteck stehen bleiben, das gar nicht mehr
+        * zu sehen ist.
+        */}
+      <RippleTouch
+        style={ICON_BOX}
+        hitSlop={ICON_HIT_SLOP}
+        borderless
+        onPress={onBellPress}
+        accessibilityLabel={t("notifications.title")}
+      >
+        <Bell size={BELL_ICON_SIZE} color={C.text} />
+      </RippleTouch>
+    </View>
+  );
+});
+
+/**
+ * Was im Kasten steht — Symbol, Strecke, Eckdaten.
+ *
+ * Herausgelöst, weil derselbe Kasten auch über dem Stadt-Blatt der Karte steht
+ * (`CitySearchMorph`): Die Suchleiste verwandelt sich dort in genau diesen
+ * Kasten. Zwei Stellen, die Datum, Reisende und Klasse jede für sich
+ * zusammensetzen, sähen nach dem nächsten Feinschliff verschieden aus.
+ */
+export function useSummaryLabels({
+  mode,
+  fromLabel,
+  toLabel,
+  departDate,
+  returnDate,
+  passengers,
+  travelClassKey,
+}: Pick<
+  SearchSummaryBarProps,
+  "mode" | "fromLabel" | "toLabel" | "departDate" | "returnDate" | "passengers" | "travelClassKey"
+>): { Icon: LucideIcon; routeLabel: string; metaLabel: string } {
+  const t = useT();
   const locale = useSearchStore((s) => s.locale);
   const dateLocale = DATE_LOCALES[locale] ?? enUS;
 
@@ -292,95 +400,41 @@ export const SearchSummaryBar = memo(function SearchSummaryBar({
    */
   const metaLabel = [dateLabel, paxLabel, classLabel].filter(Boolean).join(META_SEP);
 
+  return { Icon, routeLabel, metaLabel };
+}
+
+/**
+ * Der Inhalt des Kastens: das Symbol links, rechts daneben Strecke und
+ * Eckdaten übereinander. Die Fläche (Farbe, Radius, Höhe) stellt der Aufrufer.
+ */
+export function SummaryBoxContent({
+  Icon,
+  routeLabel,
+  metaLabel,
+}: {
+  Icon: LucideIcon;
+  routeLabel: string;
+  metaLabel: string;
+}) {
   return (
-    <View style={styles.row}>
-      {/* Freistehend, ohne Kreis und ohne Fläche — so wie das X in allen
-          Blättern der App. Ein umrandeter Knopf hätte hier zwei Flächen
-          nebeneinander gesetzt (Pfeil und Box) und die Box damit zu einer von
-          zweien gemacht, statt zum Inhalt der Zeile. */}
-      {/**
-        * `Pressable` statt `RippleTouch` — und das ist kein Stilbruch, sondern
-        * die Bedingung dafür, dass die Rückfahrt glatt läuft.
-        *
-        * Dieser Pfeil ist der Haupt-Ausgang der Ergebnisliste, und die fährt
-        * hinaus, während sie noch ihren vollen Inhalt trägt: zwanzig Karten mit
-        * Logos und Verläufen. Ohne GPU-Ebene wird das in JEDEM Bild der Ausfahrt
-        * neu gezeichnet — deshalb fordert `onBackTouchStart` sie beim AUFSETZEN
-        * des Fingers an. Ihr Aufbau ist im Projekt mit 66ms vermessen, das
-        * gehört in die 80 bis 150ms, die zwischen Aufsetzen und Loslassen
-        * ohnehin vergehen, und nicht in die ersten Bilder der Bewegung.
-        *
-        * Und genau deshalb keine Material-Welle: Die läuft beim LOSLASSEN aus,
-        * also mitten in die eben angelegte Ebene hinein, die sie dann Bild für
-        * Bild ungültig machen würde. Mit Welle wäre die Ebene schlechter als
-        * gar keine. Dieselbe Begründung wie an den Schließ-Knöpfen von
-        * Detail-Blatt und Profil-Unterschirm — und sie stand wörtlich an dem
-        * „Ändern"-Knopf, dessen Aufgabe dieser Pfeil übernommen hat.
-        */}
-      <Pressable
-        style={ICON_BOX}
-        hitSlop={ICON_HIT_SLOP}
-        onTouchStart={onBackTouchStart}
-        onPress={onBack}
-        accessibilityRole="button"
-        accessibilityLabel={t("common.back")}
-      >
-        <ArrowLeft size={CLOSE_ICON_SIZE} color={C.closeIcon} strokeWidth={2} />
-      </Pressable>
-
-      <RippleTouch
-        style={[styles.box, { backgroundColor: palette.s2 }]}
-        onPress={onPress}
-        // Der sichtbare Text wird von der Beschriftung verdeckt, sobald eine
-        // gesetzt ist — deshalb steht er hier vollständig drin, samt Hinweis auf
-        // das, was ein Tipp bewirkt.
-        accessibilityLabel={[routeLabel, metaLabel, t("results.summary.edit")]
-          .filter(Boolean)
-          .join(". ")}
-      >
-        <Icon size={20} color={C.sub} strokeWidth={1.9} />
-        {/* `minWidth: 0` an der Textspalte: Ohne das weigert sich ein
-            Flex-Kind zu schrumpfen und schiebt die Glocke aus dem Bild, statt
-            die lange Strecke abzuschneiden. */}
-        <View style={styles.texts}>
-          <Text style={styles.route} numberOfLines={1}>
-            {routeLabel}
+    <>
+      <Icon size={20} color={C.sub} strokeWidth={1.9} />
+      {/* `minWidth: 0` an der Textspalte: Ohne das weigert sich ein
+          Flex-Kind zu schrumpfen und schiebt die Glocke aus dem Bild, statt
+          die lange Strecke abzuschneiden. */}
+      <View style={styles.texts}>
+        <Text style={styles.route} numberOfLines={1}>
+          {routeLabel}
+        </Text>
+        {metaLabel ? (
+          <Text style={styles.meta} numberOfLines={1}>
+            {metaLabel}
           </Text>
-          {metaLabel ? (
-            <Text style={styles.meta} numberOfLines={1}>
-              {metaLabel}
-            </Text>
-          ) : null}
-        </View>
-      </RippleTouch>
-
-      {/**
-        * Die Glocke steht FREI — kein Kreis, keine Fläche, kein Radius.
-        *
-        * Im Landingscreen sitzt sie in einer 44er-Scheibe in Kartenfarbe, und
-        * dort ist das richtig: Sie ist das einzige Bedienelement einer sonst
-        * leeren Kopfzeile und braucht etwas, das sie als Knopf ausweist. Hier
-        * steht sie am Ende einer Zeile, deren Mitte bereits eine gefüllte Box
-        * ist — eine zweite Fläche daneben hätte aus einer Box mit zwei Zeichen
-        * drei konkurrierende Flächen gemacht. Sie folgt jetzt dem Pfeil auf der
-        * anderen Seite und dem X in allen Blättern der App: nur das Zeichen.
-        *
-        * `borderless` bleibt: Die Welle soll sich kreisförmig über das Zeichen
-        * ausbreiten, nicht in einem Rechteck stehen bleiben, das gar nicht mehr
-        * zu sehen ist.
-        */}
-      <RippleTouch
-        style={ICON_BOX}
-        hitSlop={ICON_HIT_SLOP}
-        borderless
-        onPress={onBellPress}
-        accessibilityLabel={t("notifications.title")}
-      >
-        <Bell size={BELL_ICON_SIZE} color={C.text} />
-      </RippleTouch>
-    </View>
+        ) : null}
+      </View>
+    </>
   );
-});
+}
 
 const styles = scaledStyles({
   row: {

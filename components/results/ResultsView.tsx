@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, memo, type ReactNode } from "react";
+import { localTimeHint } from "@/lib/time-format";
 import {
   AppState,
   Platform,
@@ -31,10 +32,9 @@ import Animated, {
   useAnimatedReaction,
 } from "react-native-reanimated";
 import { TravelMode, SearchResult, SearchResponse } from "@/types/search";
-import { searchByMode, createPriceAlert } from "@/lib/api/client";
-import { ensurePushToken } from "@/lib/notifications/push";
+import { searchByMode } from "@/lib/api/client";
+import { createSearchAlert } from "@/lib/notifications/createSearchAlert";
 import { FilterChips } from "@/components/ui/FilterChips";
-import { showAlert } from "@/lib/alert";
 import { ResultCard } from "@/components/results/ResultCard";
 import { SearchSummaryBar } from "@/components/results/SearchSummaryBar";
 import { SearchProgressBar } from "@/components/results/SearchProgressBar";
@@ -167,18 +167,29 @@ function finishSearchHandoff(): void {
   useSearchStore.getState().closeSearchOverlay(true, true);
 }
 
+/** Funktionierend < Anschluss gefährdet < fällt aus. */
+function warningRank(r: SearchResult): number {
+  return r.warning === "cancelled" ? 2 : r.warning === "connectionAtRisk" ? 1 : 0;
+}
+
 function sortResults(list: SearchResult[], sort: SortKey): SearchResult[] {
   const copy = [...list];
   // Gleichstand → frühere Abfahrt zuerst. Ohne Tiebreak entschiede allein die
   // (zufällige) Eingangsreihenfolge.
   const byDeparture = (a: SearchResult, b: SearchResult) =>
     Date.parse(a.departTime) - Date.parse(b.departTime);
+  // Von der Bahn als gefährdet gemeldete Verbindungen in JEDEM Tab hinter die
+  // funktionierenden (wie der Server sortiert): Ein Anschluss, der laut DB
+  // platzt, darf nicht als „schnellste" oben stehen.
+  const byWarning = (a: SearchResult, b: SearchResult) => warningRank(a) - warningRank(b);
   const byPrice = (a: SearchResult, b: SearchResult) =>
-    priceForSort(a.price) - priceForSort(b.price);
+    byWarning(a, b) || priceForSort(a.price) - priceForSort(b.price);
 
   switch (sort) {
     case "fastest":
-      return copy.sort((a, b) => a.durationMinutes - b.durationMinutes || byDeparture(a, b));
+      return copy.sort(
+        (a, b) => byWarning(a, b) || a.durationMinutes - b.durationMinutes || byDeparture(a, b),
+      );
     // Preis-Sortierungen bewusst OHNE weiteren Tiebreak: bei Gleichstand (alle
     // Zug-Preise 0) bleibt so die Server-Reihenfolge nach Verbindungsqualität
     // erhalten — das ist die sinnvollste Anzeige, solange es keine Preise gibt.
@@ -1472,126 +1483,26 @@ export function ResultsView() {
    */
   const submitPriceAlert = useCallback(
     (desiredPrice: number, notifyOnRise: boolean) => {
-      /**
-       * Erst der Zustellweg, dann der Alarm.
-       *
-       * Die Berechtigung wird GENAU HIER erfragt und nicht beim App-Start: An
-       * dieser Stelle ist der Zweck offensichtlich, und unter Android ist ein
-       * „Nie erlauben" endgültig. Ohne Kennung wird gar kein Alarm angelegt —
-       * ein gespeicherter Alarm, den niemand zustellen kann, wäre ein
-       * Versprechen ohne Deckung.
-       */
-      void (async () => {
-        const push = await ensurePushToken();
-        if (!push.ok) {
-          /**
-           * Die beiden Fälle AUSEINANDERHALTEN.
-           *
-           * „Erlaubnis verweigert" schickt den Nutzer sinnvoll in die
-           * Systemeinstellungen. „Kein Zustellweg" tut das nicht — dort findet
-           * er nichts, weil das Problem am Build hängt und nicht an ihm. Eine
-           * Meldung, die auf die falsche Ursache zeigt, ist schlimmer als gar
-           * keine; genau das war hier der Fall.
-           */
-          if (push.reason === "denied") {
-            showAlert(t("alert.nopush.title"), t("alert.nopush.body"));
-          } else {
-            showAlert(
-              t("alert.nochannel.title"),
-              `${t("alert.nochannel.body")}\n\n${push.detail}`,
-            );
-          }
-          return;
-        }
-        const pushToken = push.token;
-        try {
-          const created = await createPriceAlert(
-            {
-              pushToken,
-              mode,
-              origin,
-              destination,
-              originLabel,
-              destLabel,
-              departDate,
-              /**
-               * Die Rückreise gehört MIT — sonst ist der Alarm mehrdeutig.
-               *
-               * Eine Suche mit Rückreise liefert eine andere Trefferliste als
-               * dieselbe Strecke ohne, also einen anderen günstigsten Preis.
-               * Fehlte sie, verglich der Server die Schwelle einer Hin- und
-               * Rückreise später mit dem Preis einer einfachen Fahrt — und
-               * meldete beim nächsten Mal sofort einen Preissturz, den es nie
-               * gab.
-               */
-              returnDate: returnDate || undefined,
-              // Reisende und Klasse gehören zum Preis — siehe `PriceAlert`.
-              passengers,
-              travelClass,
-              currency,
-              /**
-               * GERUNDET — dieselbe Zahl, die das Blatt angezeigt hat.
-               *
-               * Das Blatt rechnet mit `Math.round(currentPrice)`, hier ging der
-               * Rohwert hinaus. Bei 9,99 € stand auf dem Bildschirm ein
-               * Grundpreis von 10, während der Server 9,99 bekam — und wies die
-               * Anfrage zurück, weil der Wunschpreis nicht darunter lag. Beim
-               * Nutzer kam nur „Alarm konnte nicht angelegt werden" an, ohne
-               * Grund. Maßgeblich ist die Zahl, die er gesehen hat.
-               */
-              basePrice: Math.round(cheapestPrice),
-              desiredPrice,
-              notifyOnRise,
-            },
-            // Angemeldet? Dann verknüpft der Server den Alarm zusätzlich mit dem
-            // Konto, und er überlebt einen Gerätewechsel. Ohne Anmeldung geht es
-            // trotzdem.
-            useSearchStore.getState().authToken,
-          );
-          /**
-           * Lokal spiegeln, NACHDEM der Server bestätigt hat.
-           *
-           * Die Reihenfolge ist der Punkt: Der Server ist die Wahrheit, weil
-           * dort geprüft wird. Der lokale Eintrag ist nur die Anzeige — ihn
-           * vorher zu setzen hieße, einen Alarm anzuzeigen, den es nicht gibt.
-           */
-          useSearchStore.getState().addPriceAlertNoted(
-            {
-              // Die Kennung vom Server MIT merken — ohne sie ließe sich der
-              // Alarm später nur aus der Anzeige entfernen, nicht vom Server.
-              serverId: created.id,
-              mode,
-              origin,
-              destination,
-              originLabel,
-              destLabel,
-              departDate,
-              returnDate,
-              passengers,
-              travelClass,
-              currency,
-              // Dieselbe gerundete Zahl wie beim Server — die Anzeige darf
-              // nicht behaupten, der Alarm hänge an einem anderen Preis.
-              basePrice: Math.round(cheapestPrice),
-              desiredPrice,
-              notifyOnRise,
-            },
-            /**
-             * Der Hinweis sagt, WAS entstanden ist, die Unterzeile WO es liegt.
-             *
-             * Ohne ihn passierte nach dem Anlegen sichtbar nichts: Das Blatt
-             * schloss sich, und der Alarm lag in einem Reiter, den man gerade
-             * nicht ansieht. Man musste annehmen, es sei nichts passiert. Der
-             * rote Punkt am Reiter kommt aus demselben Aufruf.
-             */
-            t("alert.saved.title"),
-            `${originLabel} – ${destLabel}`,
-          );
-          haptic("important");
-        } catch {
-          showAlert(t("alert.failed.title"), t("alert.failed.body"));
-        }
-      })();
+      // Der Ablauf (Zustellweg, Rundung, lokaler Spiegel) steht an EINER
+      // Stelle — die Glocke über dem Stadt-Blatt der Karte nutzt ihn auch.
+      createSearchAlert(
+        {
+          mode,
+          origin,
+          destination,
+          originLabel,
+          destLabel,
+          departDate,
+          returnDate,
+          passengers,
+          travelClass,
+          currency,
+          cheapestPrice,
+          desiredPrice,
+          notifyOnRise,
+        },
+        t,
+      );
     },
     /**
      * `returnDate` gehört in die Liste — es wird im Rumpf zweimal benutzt.
@@ -2116,11 +2027,14 @@ const ResultsListHeader = memo(function ResultsListHeader({
   count,
   sort,
   onSort,
+  zoneHint,
 }: {
   /** Die VOLLE Trefferzahl der Richtung, nicht die gerade sichtbare Seite. */
   count: number;
   sort: SortKey;
   onSort: (key: SortKey) => void;
+  /** „Ortszeit (UTC+1)" — nur, wenn die Zeiten nicht der Uhr des Geräts folgen. */
+  zoneHint?: string | null;
 }) {
   const t = useT();
   const palette = usePalette();
@@ -2167,7 +2081,7 @@ const ResultsListHeader = memo(function ResultsListHeader({
           Bedienelement. In einer Pille sah sie aus wie einer der Knöpfe
           daneben, und man greift danach. */}
       <Text style={styles.countText} numberOfLines={1}>
-        {`${count} ${t("results.count")}`}
+        {`${count} ${t("results.count")}${zoneHint ? ` · ${zoneHint}` : ""}`}
       </Text>
 
       {/**
@@ -2271,6 +2185,21 @@ function ResultsListView({
   tLoading,
 }: ResultsListViewProps) {
   const tt = useT();
+  /**
+   * „Ortszeit (UTC+1)" in der Zeile mit der Trefferzahl — einmal für die Liste,
+   * nicht auf jeder Karte. Nur, wenn Ab- oder Ankunft nicht in der Zeit des
+   * Geräts stehen (London → Paris auf einem deutschen Gerät). Liegen die Halte
+   * in verschiedenen Zonen: „Ortszeit des jeweiligen Halts".
+   */
+  const zoneHint = useMemo(
+    () =>
+      localTimeHint(
+        data.slice(0, 20).flatMap((r) => [r.originTz, r.destinationTz]),
+        tt,
+        Date.parse(data[0]?.departTime ?? "") || Date.now(),
+      ),
+    [data, tt],
+  );
   // Mehr Treffer geladen als sichtbar? Dann kann der Footer sie lokal aufdecken.
   const hasHidden = totalCount > data.length;
   const showFooter =
@@ -2346,6 +2275,27 @@ function ResultsListView({
   );
 
   return (
+    /**
+     * Die Hülle hält den Abstand zum Suchkasten — und zwar FEST.
+     *
+     * Vorher lag er im scrollenden Inhalt (`listContent.paddingTop` plus
+     * `listHeader.paddingTop`). Damit wanderte er beim Hochziehen mit nach
+     * oben, und die Sortier-Knöpfe schoben sich bis auf null an die Unterkante
+     * des Kastens heran — mitten durchgeschnitten, ohne einen Hauch Luft
+     * dazwischen. Genau das war die Beanstandung.
+     *
+     * Hier liegt er am RAHMEN der Liste. Die Liste beginnt damit zwölf Punkte
+     * tiefer und schneidet ihren Inhalt an ihrer eigenen Oberkante ab: Im
+     * Ruhezustand sieht alles aus wie vorher, beim Scrollen bleibt der Streifen
+     * frei. Die Knöpfe verschwinden weiterhin mit nach oben — das war
+     * ausdrücklich gewollt —, nur eben eine Handbreit unter dem Kasten statt an
+     * ihm.
+     *
+     * `flex: 1` MUSS hier stehen: Die Liste bekommt ihre Höhe sonst von ihrem
+     * Inhalt (`flexGrow` einer ScrollView greift erst in einem Behälter, der
+     * selbst eine Höhe hat), und eine Liste ohne Höhe scrollt nicht.
+     */
+    <View style={styles.listViewport}>
     <Animated.FlatList
       /**
        * Wer scrollt, bekommt keine Textur — sie sofort wieder abgeben.
@@ -2412,7 +2362,7 @@ function ResultsListView({
        * über den Typ ab, die Schranke fängt den Rest.
        */
       ListHeaderComponent={
-        <ResultsListHeader count={totalCount} sort={sort} onSort={onSort} />
+        <ResultsListHeader count={totalCount} sort={sort} onSort={onSort} zoneHint={zoneHint} />
       }
       contentContainerStyle={styles.listContent}
       itemLayoutAnimation={animateReorder ? LinearTransition.duration(320) : undefined}
@@ -2498,6 +2448,7 @@ function ResultsListView({
         ) : null
       }
     />
+    </View>
   );
 }
 
@@ -2600,14 +2551,20 @@ const styles = scaledStyles({
    */
   progressWrap: { marginTop: 12 },
   /**
-   * Oben 8, nicht 12 — weil die Liste selbst schon 4 mitbringt.
+   * Oben KEIN Abstand mehr — die zwölf Punkte stehen jetzt an `listViewport`.
    *
-   * `listContent` setzt `paddingTop: 4`, und der Kopf liegt darin. Mit 12 hier
-   * stünden über der Trefferzahl 16 Punkte, über der Kopfzeile darüber aber 12:
-   * ein Versatz von vier Punkten zwischen zwei Abständen, die als derselbe
-   * gelesen werden. 4 + 8 ergibt genau den Takt, in dem der ganze Kopf steht.
+   * Hier lagen 8, und `listContent` brachte 4 mit; zusammen der Takt, in dem
+   * der ganze Kopf steht. Beide scrollten mit, und genau das war falsch (siehe
+   * `listViewport`). Die Summe ist unverändert 12, sie sitzt nur nicht mehr im
+   * Inhalt, sondern am Rahmen.
    */
-  listHeader: { paddingTop: SPACE.sm, paddingBottom: SPACE.md },
+  listHeader: { paddingBottom: SPACE.md },
+  /**
+   * Der feste Abstand zwischen Suchkasten und Liste. Die Zahl ist die Summe der
+   * beiden alten Inhalts-Polster (4 + 8) — im Ruhezustand ändert sich dadurch
+   * nichts, beim Scrollen alles.
+   */
+  listViewport: { flex: 1, paddingTop: 12 },
   /**
    * Filter und Sortierung — zwei gleich breite Knöpfe.
    *
@@ -2645,7 +2602,9 @@ const styles = scaledStyles({
    */
   chipRow: { marginTop: 12 },
 
-  listContent: { paddingHorizontal: GUTTER, paddingTop: 4, paddingBottom: 110 },
+  // Oben ohne Polster: siehe `listViewport` — der Abstand gehört an den Rahmen,
+  // nicht in den Inhalt, sonst scrollt er mit.
+  listContent: { paddingHorizontal: GUTTER, paddingBottom: 110 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
   errorWrap: {
     flex: 1,

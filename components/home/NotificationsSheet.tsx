@@ -10,6 +10,7 @@ import {
 } from "@/components/home/NotificationsEmpty";
 import { AlertHitList } from "@/components/home/AlertHitList";
 import { ClearSearchHistoryAlert } from "@/components/ui/ClearSearchHistoryAlert";
+import { RippleTouch } from "@/components/ui/RippleTouch";
 import { SHEET_TITLE } from "@/components/ui/SheetModal";
 import { SHEET_IN } from "@/lib/nav/overlayCover";
 import { useSheetSlide } from "@/lib/nav/sheetSlide";
@@ -18,8 +19,9 @@ import { useT } from "@/lib/i18n/useT";
 import { usePalette } from "@/lib/theme/appBg";
 import { GUTTER, SPACE } from "@/lib/theme/spacing";
 import { scaledStyles } from "@/lib/ui/compact";
-import { useSheetSwipe } from "@/lib/ui/sheetSwipe";
+import { dragHealOffset, snapToPixel, useSheetSwipe } from "@/lib/ui/sheetSwipe";
 import { useSearchStore } from "@/stores/searchStore";
+import { FadePress } from "@/components/ui/FadePress";
 
 const C = {
   white: "#F4F4F5",
@@ -121,7 +123,7 @@ export function NotificationsSheet() {
 
   // `style` der gemeinsamen Fahrt bleibt ungenutzt: Sie schreibt nur `y`, und
   // der Transform unten setzt sich aus `y` UND dem Ruhepunkt zusammen.
-  const { y, run, adopt, parkNow, warm } = useSheetSlide("notifications", park);
+  const { y, run, adopt, parkNow, warm, heal } = useSheetSlide("notifications", park);
 
   /**
    * Fahrt PLUS Ruhepunkt in einem Transform.
@@ -132,8 +134,9 @@ export function NotificationsSheet() {
    * gemeinsamen Fahrt. Geparkt steht das Blatt dadurch sogar noch etwas tiefer
    * als sonst; unter dem Bild ist unter dem Bild.
    */
+  // Ganze Gerätepixel + Selbstkorrektur beim Ziehen — siehe lib/ui/sheetSwipe.ts.
   const sheetStyle = useAnimatedStyle(() => ({
-    transform: [{ translateY: y.value + restY }],
+    transform: [{ translateY: snapToPixel(y.value + restY) + dragHealOffset(heal) }],
   }));
 
   /**
@@ -267,6 +270,9 @@ export function NotificationsSheet() {
     // Das Blatt hängt dauerhaft am Wurzel-Layout. Ein dauerhaft scharfer
     // Erkenner läge über dem ganzen Landingscreen — auch geschlossen.
     enabled: open,
+    heal,
+    // Die Ausfahrt hängt am Offen-Sein — die Geste hält sich dann heraus.
+    closing: !open,
   });
 
   /** Geänderter Parkplatz (sichere Fläche trifft ein) — neu parken, solange zu. */
@@ -357,33 +363,43 @@ export function NotificationsSheet() {
             * Zeichen-Animation mitten auf dem Blatt, das sich in derselben Zeit
             * bewegt. Sie liefe über die volle Dauer der Rückfahrt dagegen an.
             */}
-          <Pressable
+          <FadePress
             onPress={dismiss}
             hitSlop={12}
             accessibilityRole="button"
             accessibilityLabel={t("common.close")}
-            style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
           >
             <X color={C.closeIcon} size={26} />
-          </Pressable>
+          </FadePress>
           <Text style={styles.title} numberOfLines={1}>
             {t("notifications.title")}
           </Text>
           {/* Papierkorb wie im Verlaufs-Blatt: 44er Kreis auf `s2`, rotes
               Symbol. Ohne Ausgrauen — siehe `requestClear`. */}
-          <Pressable
+          {/**
+            * KEINE sichtbare Fläche hinter dem Papierkorb — nur die Welle.
+            *
+            * Im Stilblatt stand eine Kreisfläche, aber sie war nie zu sehen:
+            * Die Funktions-Form des `style` an einer `Pressable` wird von
+            * NativeWind verschluckt, es kam also gar nichts an. Als das
+            * auffiel, habe ich die Fläche „wiederhergestellt" — und damit
+            * etwas eingeführt, das es nie gab und das niemand wollte. Die
+            * Absicht des Codes ist nicht dasselbe wie der gewünschte Zustand.
+            *
+            * Der Kreis bleibt trotzdem: als Form der WELLE. `RippleTouch` mit
+            * `borderless` zeichnet sie kreisförmig über die Grenzen hinaus —
+            * man sieht sie beim Drücken und sonst nichts. Genau so halten es
+            * die übrigen Symbolknöpfe der App.
+            */}
+          <RippleTouch
             onPress={requestClear}
             hitSlop={10}
-            accessibilityRole="button"
+            borderless
             accessibilityLabel={t("notifications.clear.title")}
-            style={({ pressed }) => [
-              styles.trashBtn,
-              { backgroundColor: palette.s2 },
-              { opacity: pressed ? 0.6 : 1 },
-            ]}
+            style={styles.trashBtn}
           >
             <Trash2 size={20} color={C.danger} strokeWidth={2} />
-          </Pressable>
+          </RippleTouch>
         </View>
 
         {/**
@@ -474,18 +490,22 @@ const styles = scaledStyles({
    * von beiden übernommen. Der Ortswähler ist der Vorbild-Fall: `gap: 12`,
    * seitlich 20 (der Rand jedes Bildschirms), unten 16.
    *
-   * `paddingTop` ist der einzige Wert, der nicht abgeschrieben werden konnte:
-   * Der Ortswähler steht am oberen Bildschirmrand und braucht seine 56 zum
-   * größten Teil für die Statusleiste. Dieses Blatt fängt darunter an, hat also
-   * gar keine zu überbrücken. 24 ist die Luft, die der Datumswähler ÜBER seiner
-   * sicheren Fläche lässt — dieselbe Menge, nur ohne den Sockel darunter.
+   * `paddingTop` ist GLEICH dem seitlichen Abstand, und das war er nicht immer.
+   *
+   * Hier standen 24 gegen 20 an den Seiten — abgeschrieben vom Datumswähler,
+   * der sie ÜBER seiner sicheren Fläche lässt. Nur hat dieses Blatt keine zu
+   * überbrücken, und die vier Punkte Unterschied sah man: Das X stand weiter
+   * von der Oberkante entfernt als vom Rand.
+   *
+   * Eine Ecke ist eine Ecke. Steht in ihr ein Zeichen, muss es zu beiden Kanten
+   * denselben Abstand haben, sonst wirkt das Blatt schief aufgehängt.
    */
   header: {
     flexDirection: "row",
     alignItems: "center",
     gap: SPACE.md,
     paddingHorizontal: GUTTER,
-    paddingTop: SPACE.xxl,
+    paddingTop: GUTTER,
     paddingBottom: SPACE.lg,
   },
   /**
@@ -498,10 +518,23 @@ const styles = scaledStyles({
    * als zweite Bildschirm-Überschrift über der ersten.
    */
   title: { ...SHEET_TITLE, flex: 1 },
+  /**
+   * SO HOCH WIE DAS X, nicht 44 — und das ist die zweite Hälfte des schiefen
+   * Abstands.
+   *
+   * Der Kasten war 44 hoch. Die Kopfzeile richtet ihre Kinder mittig aus, also
+   * bestimmte er die Zeilenhöhe, und das 26 Punkte hohe X rutschte um
+   * (44−26)/2 = 9 Punkte nach unten. Zusammen mit den vier Punkten zu viel
+   * Polster stand es dreizehn Punkte tiefer, als es sollte — sichtbar, und
+   * genau so gemeldet.
+   *
+   * Die Trefferfläche leidet nicht: `hitSlop={10}` macht aus 26 wieder 46, und
+   * das liegt über der empfohlenen Mindestgröße. Ein Kasten, der Layout
+   * verschiebt, ist der falsche Weg dorthin — dafür gibt es `hitSlop`.
+   */
   trashBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+    width: 26,
+    height: 26,
     alignItems: "center",
     justifyContent: "center",
   },

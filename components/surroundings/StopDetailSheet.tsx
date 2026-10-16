@@ -1,17 +1,18 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useState, useRef } from "react";
-import { SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
-import { isTransitionBusy } from "@/lib/nav/transitionBusy";
+import { RippleTouch } from "@/components/ui/RippleTouch";
+import { PUSH_SPRING, SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
+import { isSheetDragging, isTransitionBusy, setSheetDragging } from "@/lib/nav/transitionBusy";
 import {
   View,
   Text,
-  Pressable,
   ActivityIndicator,
-  StyleSheet,
+  BackHandler,
   useWindowDimensions,
 } from "react-native";
 import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
   scrollTo,
+  useAnimatedProps,
   useAnimatedStyle,
   useSharedValue,
   withTiming,
@@ -32,18 +33,43 @@ import {
   type StopBoardResponse,
   type TripDetailResponse,
 } from "@/lib/api/client";
-import { useSearchStore, type SelectedStop } from "@/stores/searchStore";
+import { useSearchStore, type SelectedCity, type SelectedStop } from "@/stores/searchStore";
 import { useT } from "@/lib/i18n/useT";
 import type { MarkerKind } from "@/lib/surroundings/mockData";
-import { registerStopSheetAnimation } from "./stopSheetAnimation";
+import {
+  registerStopSheetAnimation,
+  stopSheetHeal,
+  stopSheetSnap,
+  stopSheetY,
+} from "./stopSheetAnimation";
+import { isMapMoving, reportStopSheetTarget } from "@/lib/surroundings/mapViewport";
+import { CityTripBody } from "@/components/surroundings/CityTripBody";
 import { stopToLocation } from "@/lib/surroundings/savedStation";
 import { haptic } from "@/lib/haptics";
 import { showConnectionNotFound } from "@/lib/connectionNotFoundAlert";
 import type { SearchResult, TravelMode } from "@/types/search";
 import { useAccent } from "@/lib/theme/accent";
 import { SaveStarButton } from "@/components/surroundings/SaveStarButton";
+import { ModePill } from "@/components/surroundings/ModePill";
+import { WalkIcon } from "@/components/ui/WalkIcon";
+import { iconForProduct } from "@/components/results/LinePill";
+import type { SharedValue } from "react-native-reanimated";
+import { LiveButton, useLiveClock } from "@/components/live/LiveButton";
+import { airportByIata } from "@/lib/live/model";
+import type { LiveSession } from "@/lib/live/types";
+import { router } from "expo-router";
 import { scaledStyles } from "@/lib/ui/compact";
-import { SWIPE_OUT, useSheetScrollGate } from "@/lib/ui/sheetSwipe";
+import { daysFromToday, formatLocalizedDateInZone, formatTimeInZone, localTimeHint, shiftIsoByMinutes } from "@/lib/time-format";
+import { de, enGB, es, fr } from "date-fns/locale";
+import {
+  dragHealOffset,
+  snapToPixel,
+  startDragHeal,
+  stopDragHeal,
+  SWIPE_ACTIVATE,
+  SWIPE_OUT,
+  useSheetScrollGate,
+} from "@/lib/ui/sheetSwipe";
 
 /**
  * Slide-Up-Sheet mit Abfahrten/Ankünften zur ausgewählten Haltestelle.
@@ -120,18 +146,45 @@ const TIME_FORMAT_OPTS: Intl.DateTimeFormatOptions = {
   hourCycle: "h23",
 };
 
-function formatTime(iso: string): string {
+/**
+ * Uhrzeit in der ORTSZEIT DES HALTS (`tz` aus der Tafel-Antwort), wie überall
+ * in der App (lib/time-format.ts). Hier stand die Uhr des Geräts: In Oldham
+ * zeigte die Tafel „16:33" (deutsche Zeit) und die Zeitleiste derselben Fahrt
+ * „15:33" (britische). Ohne Zone — alte Server-Antwort — bleibt es beim Gerät.
+ */
+function formatTime(iso: string, tz?: string): string {
+  if (tz) return formatTimeInZone(iso, tz);
   const d = new Date(iso);
   return d.toLocaleTimeString("de-DE", TIME_FORMAT_OPTS);
+}
+
+const DATE_LOCALES = { en: enGB, de, fr, es } as const;
+
+/**
+ * Tag einer Tafel-Zeile, wenn sie NICHT heute fährt (Ortszeit des Halts):
+ * „Morgen", sonst der Wochentag („Mo."); heute: null. An selten bedienten
+ * Halten reichen die nächsten Abfahrten über Tage — nachgezählt an einer
+ * Stichprobe über 16 Länder: 40 von 248 Halten, und „05:41" am Montag las sich
+ * wie heute früh. `short`: immer der Wochentag (passt in den Ring).
+ */
+function boardDayLabel(
+  iso: string,
+  tz: string | undefined,
+  locale: string,
+  tomorrow: string,
+  short = false,
+): string | null {
+  const days = daysFromToday(iso, tz);
+  if (days === 0) return null;
+  if (days === 1 && !short) return tomorrow;
+  return formatLocalizedDateInZone(iso, tz, "EEE", DATE_LOCALES[locale as keyof typeof DATE_LOCALES] ?? enGB);
 }
 
 /** ISO-Zeit + Delay-Minuten → tatsächliche Abfahrtszeit als „HH:MM"-String.
  *  Wird unter der durchgestrichenen Planzeit angezeigt wenn die Abfahrt
  *  verspätet ist. */
-function addDelayToTime(iso: string, delayMin: number): string {
-  const d = new Date(iso);
-  d.setMinutes(d.getMinutes() + delayMin);
-  return d.toLocaleTimeString("de-DE", TIME_FORMAT_OPTS);
+function addDelayToTime(iso: string, delayMin: number, tz?: string): string {
+  return formatTime(shiftIsoByMinutes(iso, delayMin), tz);
 }
 
 /** Minuten bis zur Abfahrt. Inklusive Delay damit der Hero-Ring auch
@@ -233,8 +286,11 @@ function tripDetailToSearchResult(detail: TripDetailResponse): SearchResult {
     originTz: detail.originTz,
     destinationTz: detail.destinationTz,
     durationMinutes: detail.durationMinutes,
-    stops: detail.stops,
-    stopLabels: detail.stopLabels,
+    // EINE Fahrt — keine Umstiege. `stops` der Verbindung zählt Umstiege, die
+    // Zwischenhalte stehen am Leg. Ältere Server schickten hier deren Zahl,
+    // und die Zeitleiste zeigte „29 Stopps · Umstieg".
+    stops: 0,
+    stopLabels: [],
     legs: detail.legs.map((l) => ({
       origin: l.origin,
       destination: l.destination,
@@ -246,6 +302,10 @@ function tripDetailToSearchResult(detail: TripDetailResponse): SearchResult {
       destLng: l.destLng,
       departTime: l.departTime,
       arriveTime: l.arriveTime,
+      // Zone DIESES Halts — ohne sie fiele die Zeitleiste auf die der Reise
+      // zurück (bei einer Fahrt über eine Zeitzonengrenze falsch).
+      originTz: l.originTz,
+      destTz: l.destTz,
       durationMinutes: l.durationMinutes,
       departPlatform: l.departPlatform,
       arrivePlatform: l.arrivePlatform,
@@ -352,38 +412,48 @@ function findBestMatch(results: SearchResult[], item: StopBoardItem): SearchResu
   return undefined;
 }
 
+/** Live-Knopf nur an Fahrten, die in diesem Fenster ab- oder ankommen. */
+const LIVE_PAST_MS = 30 * 60_000;
+const LIVE_AHEAD_MS = 90 * 60_000;
+
+/** Doppel-Tipp-Sperre im Direkt-Weg: die Zeitgrenze von `fetchTripDetail`
+ *  (12 s) plus Reserve. Gelöst wird sie, sobald die Antwort da ist. */
+const DIRECT_TAP_LOCK_MS = 12_500;
+
+/**
+ * Wartet, bis die Einfahrt des Detail-Blatts durch ist — `PUSH_SPRING` plus die
+ * Reserve von `markTransitionBusy`, und solange danach noch etwas fährt etwas
+ * länger, höchstens anderthalb Sekunden ab dem Tipp.
+ *
+ * Eintreffende Daten gehören nicht in die Fahrt. Die Tipp-Suchen antworteten
+ * laut Server-Log nach 0,1–0,4 s (aus dem Zwischenspeicher noch schneller), die
+ * Einfahrt dauert 0,43 s. Die Ersetzung des Platzhalters rendert das ganze
+ * Detail-Blatt neu — ein Commit mitten in der Bewegung, und jeder Commit
+ * schreibt die Reanimated-Werte erst ein, zwei Bilder später zurück
+ * (feedback_reanimated_commit_race). Wer langsamer antwortet, wartet hier gar
+ * nicht.
+ */
+async function afterDetailsPush(tapAt: number): Promise<void> {
+  const earliest = tapAt + PUSH_SPRING.duration + 80;
+  const latest = tapAt + 1_500;
+  for (;;) {
+    const now = Date.now();
+    if (now >= latest || (now >= earliest && !isTransitionBusy())) return;
+    await new Promise<void>((resolve) =>
+      setTimeout(resolve, Math.max(16, Math.min(earliest - now, 100))),
+    );
+  }
+}
+
 /** Kleines Walk-Männchen für die Subtitle-Zeile (Distanz zum Stop).
  *  Lucide hat kein Walking-Person-Icon, daher inline-SVG. Form orientiert sich
  *  an der WerlAbfahrten-Vorlage: kleiner Kopf-Kreis, Körper als Strich-Pfade
  *  für Beine/Arme. strokeLinecap=round damit das Männchen bei 14px-Größe
  *  weich aussieht und nicht pixelig. */
-function WalkIcon({ size = 14, color }: { size?: number; color: string }) {
-  return (
-    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
-      <Circle cx={13} cy={4.5} r={1.6} fill={color} />
-      <Path
-        d="M11 9l-2.5 2 1 4M11 9l3 1 1.5 3M11 9l-1 5-2 5M12.5 18l1.5 3"
-        stroke={color}
-        strokeWidth={1.9}
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </Svg>
-  );
-}
+// Das Geh-Symbol steht in components/ui/WalkIcon.tsx — das Stadt-Blatt nimmt es auch.
 
-/** Pro Departure das passende Mode-Icon im Line-Badge. Greift HAFAS-Produkte
- *  ab — alles was nicht Bus/Tram/Flight/Ferry ist landet auf Train (Default
- *  für regional/national/suburban/subway/…). */
-function iconForProduct(product: string | null): LucideIcon {
-  if (!product) return Train;
-  const p = product.toLowerCase();
-  if (/bus|coach/.test(p)) return Bus;
-  if (/tram|stadtbahn/.test(p)) return TramFront;
-  if (/flight|air/.test(p)) return Plane;
-  if (/ferry|ship/.test(p)) return Ship;
-  return Train;
-}
+// `iconForProduct` steht in components/results/LinePill.tsx — die Plaketten des
+// Stadt-Blatts brauchen dieselbe Zuordnung.
 
 /** Card-Row im neuen Hero-Design — eine Departure pro Card.
  *  Layout: Zeit-Block links (Plan + ggf. Real durchgestrichen), Lime-Line-
@@ -393,42 +463,66 @@ function iconForProduct(product: string | null): LucideIcon {
  *  eindeutig ist. */
 function StopBoardRow({
   item,
+  tz,
+  dayLabel,
   platformPrefix,
   loading,
   onPress,
+  onLive,
+  liveLabel,
+  liveClock,
 }: {
   item: StopBoardItem;
+  /** Ortszeit-Zone des Halts — siehe `formatTime`. */
+  tz?: string;
+  /** „Morgen"/„Mo." — nur wenn die Zeile nicht heute fährt (`boardDayLabel`). */
+  dayLabel?: string | null;
   platformPrefix: string;
   loading: boolean;
   onPress: () => void;
+  /** Live verfolgen — nur bei Fahrten, die gerade fahren oder bald kommen. */
+  onLive?: () => void;
+  liveLabel?: string;
+  /** Gemeinsamer Takt aller Live-Knöpfe der Tafel (`useLiveClock`). */
+  liveClock?: SharedValue<number>;
 }) {
   const accent = useAccent();
   const delay = item.delayMinutes ?? 0;
   const ModeIcon = iconForProduct(item.product);
-  const [pressed, setPressed] = useState(false);
   return (
-    <Pressable
+    <RippleTouch
       onPress={onPress}
       disabled={loading}
-      onPressIn={() => setPressed(true)}
-      onPressOut={() => setPressed(false)}
-      style={[styles.cardRow, pressed ? styles.cardRowPressed : null]}
+      /**
+       * Welle statt `Pressable` — beim Ziehen des Blattes landet der Finger
+       * meist genau hier. `Pressable` führt einen React-Zustand „gedrückt" und
+       * rendert beim Aufsetzen und beim Abbruch neu; dieser Durchgang fiel in den
+       * Anfang der Bewegung und setzte das Blatt kurz zurück (siehe
+       * `startDragHeal` in lib/ui/sheetSwipe.ts). Die native Welle braucht
+       * keinen Durchgang — wie die Kacheln im Ticket-Blatt.
+       */
+      style={styles.cardRow}
     >
       {/* Zeit-Block: Planzeit oben, bei Delay durchgestrichen + Real-Zeit
           in Delay-Farbe darunter. Pünktlich → nur Planzeit, kein zweiter
           Eintrag (vermeidet redundantes Doppel-Time). */}
       <View style={styles.cardTime}>
+        {dayLabel ? (
+          <Text style={styles.cardDay} numberOfLines={1}>
+            {dayLabel}
+          </Text>
+        ) : null}
         <Text
           style={[
             styles.cardTimeText,
             delay > 0 ? styles.cardTimeStrike : null,
           ]}
         >
-          {formatTime(item.plannedTime)}
+          {formatTime(item.plannedTime, tz)}
         </Text>
         {delay > 0 && (
           <Text style={styles.cardTimeReal}>
-            {addDelayToTime(item.plannedTime, delay)}
+            {addDelayToTime(item.plannedTime, delay, tz)}
           </Text>
         )}
       </View>
@@ -454,8 +548,10 @@ function StopBoardRow({
 
       {loading ? (
         <ActivityIndicator color={C.g1} size="small" style={{ marginLeft: 6 }} />
+      ) : onLive ? (
+        <LiveButton onPress={onLive} label={liveLabel ?? ""} clock={liveClock} />
       ) : null}
-    </Pressable>
+    </RippleTouch>
   );
 }
 
@@ -469,20 +565,36 @@ function StopBoardRow({
  *  Bus in 12 Min kommt vs 5 Min. Größer würde der Ring meist ~voll wirken. */
 function NextHero({
   item,
+  tz,
+  dayLabel,
+  ringDayLabel,
   fetchedAt,
   platformPrefix,
   nextLabel,
   ontimeLabel,
   loading,
   onPress,
+  onLive,
+  liveLabel,
+  liveClock,
 }: {
   item: StopBoardItem;
+  /** Ortszeit-Zone des Halts — der Ring zählt Minuten und braucht sie nicht. */
+  tz?: string;
+  /** „Morgen"/„Mo." vor der Uhrzeit, wenn die Fahrt nicht heute ist. */
+  dayLabel?: string | null;
+  /** Wochentag IM Ring statt der Minuten — „5700 Min" sagt niemandem etwas. */
+  ringDayLabel?: string | null;
   fetchedAt: string | undefined;
   platformPrefix: string;
   nextLabel: string;
   ontimeLabel: string;
   loading: boolean;
   onPress: () => void;
+  /** Live verfolgen — siehe `StopBoardRow`. */
+  onLive?: () => void;
+  liveLabel?: string;
+  liveClock?: SharedValue<number>;
 }) {
   const accent = useAccent();
   const palette = usePalette();
@@ -512,7 +624,17 @@ function NextHero({
      * Übersprungen wird nur der eine Takt, der nächste kommt in einer Sekunde.
      */
     const id = setInterval(() => {
-      if (isTransitionBusy()) return;
+      /**
+       * Auch WÄHREND EINES ZIEHENS aussetzen — das fehlte.
+       *
+       * `isTransitionBusy` meldet nur programmierte Fahrten. Ein Finger am
+       * Blatt meldet dort nichts, also lief der Takt mitten im Ziehen weiter —
+       * und zeichnete die ganze Liste samt SVG-Ringen neu, während sie unter
+       * dem Finger wanderte. Das war das sichtbare Springen der Elemente.
+       */
+      // Und nicht, solange die Karte fährt oder ausrollt: Ein Durchgang dort
+      // zeichnet unter der TextureView-Karte das ganze Fenster mit.
+      if (isTransitionBusy() || isSheetDragging() || isMapMoving()) return;
       setNow(Date.now());
     }, 1_000);
     return () => clearInterval(id);
@@ -542,18 +664,17 @@ function NextHero({
   // Ring-Fill: bei Daten-Fetch=0%, bei Abfahrt=100%. Linear über die echte
   // Wartezeit. Per-Sekunde-Update über `now` → sichtbare Bewegung.
   const frac = Math.min(1, Math.max(0, elapsedMs / totalMs));
-  const realTime = delay > 0 ? addDelayToTime(item.plannedTime, delay) : formatTime(item.plannedTime);
+  const clock = delay > 0 ? addDelayToTime(item.plannedTime, delay, tz) : formatTime(item.plannedTime, tz);
+  const realTime = dayLabel ? `${dayLabel} ${clock}` : clock;
   const subText = delay > 0
     ? `${realTime} · +${delay} Min${item.platform ? ` · ${platformPrefix} ${item.platform}` : ""}`
     : `${realTime} · ${ontimeLabel}${item.platform ? ` · ${platformPrefix} ${item.platform}` : ""}`;
-  const [pressed, setPressed] = useState(false);
   return (
-    <Pressable
+    <RippleTouch
       onPress={onPress}
       disabled={loading}
-      onPressIn={() => setPressed(true)}
-      onPressOut={() => setPressed(false)}
-      style={[styles.hero, { backgroundColor: palette.s2 }, pressed ? styles.heroPressed : null]}
+      // Welle statt React-Zustand „gedrückt" — Begründung an `StopBoardRow`.
+      style={[styles.hero, { backgroundColor: palette.s2 }]}
     >
       <View style={styles.heroRing}>
         <Svg width={84} height={84} viewBox="0 0 84 84">
@@ -574,8 +695,16 @@ function NextHero({
           />
         </Svg>
         <View style={styles.heroRingCenter} pointerEvents="none">
-          <Text style={styles.heroRingMin}>{mins}</Text>
-          <Text style={styles.heroRingLabel}>Min</Text>
+          {ringDayLabel ? (
+            <Text style={styles.heroRingDay} numberOfLines={1}>
+              {ringDayLabel}
+            </Text>
+          ) : (
+            <>
+              <Text style={styles.heroRingMin}>{mins}</Text>
+              <Text style={styles.heroRingLabel}>Min</Text>
+            </>
+          )}
         </View>
       </View>
 
@@ -588,6 +717,13 @@ function NextHero({
             </Text>
           </View>
           <Text style={styles.heroNextLabel}>{nextLabel}</Text>
+          {/* Oben rechts, auf der Höhe der Plakette — nicht mittig neben der
+              Karte, wo er mit dem Text um Platz stritt. */}
+          {onLive && !loading ? (
+            <View style={styles.heroLive}>
+              <LiveButton onPress={onLive} label={liveLabel ?? ""} clock={liveClock} />
+            </View>
+          ) : null}
         </View>
         <Text style={styles.heroDest} numberOfLines={1}>
           {item.direction || "—"}
@@ -603,7 +739,7 @@ function NextHero({
       {loading ? (
         <ActivityIndicator color={C.g1} size="small" style={{ marginLeft: 4 }} />
       ) : null}
-    </Pressable>
+    </RippleTouch>
   );
 }
 
@@ -622,30 +758,95 @@ function NextHero({
 function StopDetailSheetInner() {
   const palette = usePalette();
   const t = useT();
+  /** Sprache der App — für den Wochentag an Tafel-Zeilen, die nicht heute fahren. */
+  const locale = useSearchStore((s) => s.locale);
   const insets = useSafeAreaInsets();
   const { height: screenHeight } = useWindowDimensions();
   const accent = useAccent();
 
   const selectedStop = useSearchStore((s) => s.selectedStop);
   const clearSelectedStop = useSearchStore((s) => s.clearSelectedStop);
+  /**
+   * Die zweite Belegung dieser Fläche: eine angetippte STADT. Sie schließt sich
+   * mit der Haltestelle aus (siehe `selectCity` im Store); die Hülle — Bewegung,
+   * Rastpunkte, Wisch-Geste — ist dieselbe, nur der Inhalt und die mittlere
+   * Höhe unterscheiden sich.
+   */
+  const selectedCity = useSearchStore((s) => s.selectedCity);
+  const clearSelectedCity = useSearchStore((s) => s.clearSelectedCity);
+  /** Schließt, was gerade offen ist — Haltestelle oder Stadt. */
+  const closeSheet = useCallback(() => {
+    clearSelectedStop();
+    clearSelectedCity();
+  }, [clearSelectedStop, clearSelectedCity]);
+  /**
+   * Die Zurück-Taste schließt das Blatt — Haltestelle wie Stadt. Keines von
+   * beiden hat einen Hintergrund, der Tipps abfängt (siehe unten); ohne sie
+   * bliebe nur das Herunterwischen.
+   */
+  const sheetOpen = selectedStop != null || selectedCity != null;
+  useEffect(() => {
+    if (!sheetOpen) return;
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      closeSheet();
+      return true;
+    });
+    return () => sub.remove();
+  }, [sheetOpen, closeSheet]);
+  /**
+   * Liegt ein deckendes Blatt darüber (Detail-Blatt, Zeitleiste,
+   * Ergebnisliste)? Dann gibt dieses Blatt seine Höhe ab.
+   *
+   * Android sortiert Geschwister nach `elevation` VOR `zIndex`. Das
+   * Detail-Blatt fällt in Ruhe auf Höhe 0 (Schattenpass sparen), die
+   * Ergebnisliste hat gar keine — dieses Blatt (20) zeichnete sich dann mit
+   * seiner halben Höhe über sie, sobald sie standen. Abgegeben heißt: Die
+   * Reihenfolge im Wurzel-Layout gilt, und dort liegen sie alle nach ihm.
+   * Umgeschaltet wird, bevor sie hereinfahren — dieses Blatt steht dann still.
+   */
+  const covered = useSearchStore(
+    (s) =>
+      s.selectedResult != null ||
+      s.legTimelineOverlayOpen ||
+      s.directTripResult != null ||
+      s.resultsParams != null,
+  );
   const savedStations = useSearchStore((s) => s.savedStations);
   const toggleSavedStation = useSearchStore((s) => s.toggleSavedStation);
   const showStationToast = useSearchStore((s) => s.showStationToast);
-  const selectResult = useSearchStore((s) => s.selectResult);
-  const setSelectedResultPending = useSearchStore((s) => s.setSelectedResultPending);
-  const clearSelectedResult = useSearchStore((s) => s.clearSelectedResult);
+  const openPendingResult = useSearchStore((s) => s.openPendingResult);
+  const settlePendingResult = useSearchStore((s) => s.settlePendingResult);
   const openDirectTrip = useSearchStore((s) => s.openDirectTrip);
 
-  // Pro-Row-Loading-State für die „Tap auf Departure → Buchung wählen"-Flow.
-  // Wir tracken nur EINEN aktiven Search gleichzeitig — Doppel-Taps blockt
-  // das `disabled`-Prop in der Row.
+  /**
+   * Lade-Kreisel in der Zeile — nur noch für den DIREKT-Weg, wo das Blatt
+   * sichtbar bleibt, bis die Fahrt da ist. Im Buchungs-Weg deckt das
+   * Detail-Blatt die Zeile sofort zu; der Zustand kostete dort nur zwei
+   * Durchgänge des ganzen Blattes, der zweite mitten in der Einfahrt.
+   */
   const [loadingDepartureId, setLoadingDepartureId] = useState<string | null>(null);
   /** Laufende Nummer des zuletzt angetippten Abfahrts-Eintrags. */
   const departureReqRef = useRef(0);
+  /**
+   * Sperre gegen Doppel-Tipps auf DIESELBE Zeile — als Ref, nicht als Zustand:
+   * `disabled` aus dem Zustand trägt im selben Bild noch den alten Wert, zwei
+   * schnelle Tipps kamen beide durch (zwei Suchen, Bahn-Kontingent).
+   */
+  const tapLockRef = useRef<{ id: string; until: number; stub?: SearchResult } | null>(null);
 
   // displayStop = der zuletzt sichtbare Stop. Beim Slide-Out hilft das, den
   // Inhalt sichtbar zu halten bis die Animation durch ist.
   const [displayStop, setDisplayStop] = useState<SelectedStop | null>(null);
+  /** Wie `displayStop`: hält die Stadt über die Ausfahrt sichtbar. */
+  const [displayCity, setDisplayCity] = useState<SelectedCity | null>(null);
+  useEffect(() => {
+    if (selectedCity) {
+      setDisplayCity(selectedCity);
+      return;
+    }
+    const timer = setTimeout(() => setDisplayCity(null), 420);
+    return () => clearTimeout(timer);
+  }, [selectedCity]);
 
   // Sobald ein neuer Stop ankommt, übernehmen wir ihn sofort als displayStop.
   // Beim Schließen lassen wir displayStop die Slide-Out-Dauer (350ms) stehen
@@ -665,7 +866,30 @@ function StopDetailSheetInner() {
   // Beim Open: stop = selectedStop (sofort sichtbar, ohne useEffect-Lag).
   // Beim Close: selectedStop wird null, aber displayStop hält den letzten
   // Inhalt für die Slide-Out-Animation → Sheet wirkt nicht „leer" beim Zumachen.
-  const stop = selectedStop ?? displayStop;
+  // Eine offene Stadt verdrängt den Nachhall einer eben geschlossenen
+  // Haltestelle und umgekehrt — es steht immer genau ein Inhalt im Blatt.
+  const stop = selectedStop ?? (selectedCity ? null : displayStop);
+  const city = selectedCity ?? (selectedStop ? null : displayCity);
+  /** Was das Blatt gerade trägt — daran hängen Öffnen, Schließen und Höhe. */
+  const target = selectedStop ?? selectedCity;
+  /**
+   * Wechselt der Inhalt bei OFFENEM Blatt (Stadt → Stadt, Haltestelle →
+   * Haltestelle, und beides gemischt)? Dann fährt nichts herein — siehe den
+   * Effekt darunter. Gemerkt beim Rendern, gelesen im Effekt (dort ist der
+   * vorige Stand schon überschrieben).
+   *
+   * Haltestelle → Haltestelle gehört seit dieser Runde dazu: Das Blatt hat
+   * keinen abdeckenden Hintergrund mehr, die Karte dahinter bleibt bedienbar —
+   * und damit tippt man bei offenem Blatt die nächste Haltestelle an. Vorher
+   * fing der Hintergrund diesen Tipp ab und schloss nur.
+   */
+  const prevTargetRef = useRef<SelectedStop | SelectedCity | null>(null);
+  const cityToCityRef = useRef(false);
+  if (target !== prevTargetRef.current) {
+    const prev = prevTargetRef.current;
+    cityToCityRef.current = prev != null && target != null;
+    prevTargetRef.current = target;
+  }
   const kinds: MarkerKind[] =
     stop?.kinds && stop.kinds.length > 0 ? (stop.kinds as MarkerKind[]) : ["bus"];
   const [activeKind, setActiveKind] = useState<MarkerKind>(kinds[0] ?? "bus");
@@ -694,12 +918,132 @@ function StopDetailSheetInner() {
   // ersetzen wir das Stub-Result mit dem Match. Während der Wait-Zeit zeigt
   // DetailsOverlay Skeleton-Cards in der Provider-Sektion (siehe
   // `selectedResultPending`-Flag im Store).
+  //
+  // GRUNDSATZ: Eine Abfahrt, die auf der Tafel steht, endet nie als
+  // „versteckt". Findet die Buchungssuche sie nicht oder scheitert sie, zeigt
+  // der Rückfall die Fahrt selbst — Direkt-Weg, alle Halte, ohne Preis und ohne
+  // Buchung. Belegt (Server-DB, 30 Tage): 7 von 51 Tipp-Suchen enthielten den
+  // getippten Zug nicht, jedes Mal ein VERSPÄTETER Zug nach seiner Planzeit
+  // (Werl, RB 59 16:46 +5, getippt 16:50). Der Server sortiert nach Planzeit
+  // aus (`dropDeparted`), die Tafel zeigt den Zug bis zur echten Abfahrt.
+
+  /**
+   * Die Fahrt selbst, ab diesem Halt bis zur Endstation — Direkt-Weg und
+   * Rückfall des Buchungs-Wegs. DE-Tafeln liefern MOTIS-Kennungen, die der
+   * Server ohne Bahn-Kontingent auflöst (routes/trips.ts, `fetchTripBody`).
+   * Zeilen der Ankunftstafel: die Fahrt von ihrer Herkunft BIS hierher.
+   */
+  const loadTrip = (item: StopBoardItem, at: SelectedStop, board: BoardTab) =>
+    fetchTripDetail(item.id, {
+      // hafasId aus der Board-Antwort: damit der Server den Trip auf den
+      // User-Halt slicen kann (volle Linie A→Z vs. User steigt erst in der
+      // Mitte ein → wir wollen User-Halt → Endstation anzeigen).
+      fromStopId: data?.stop.hafasId ?? undefined,
+      // Label als Fallback, falls die ID nicht in den Trip-Stopovers
+      // matched (BVG/VBB-Bus-Stops haben oft uneindeutige IDs zwischen
+      // unserem Resolver und HAFAS-Trip-Body).
+      fromStopLabel: at.label,
+      // stopCode mitschicken — daraus leitet der Server das HAFAS-Profile ab
+      // (DE → dbrest, AT/PL/LU/DK → in-process hafas-client). Ohne den würde
+      // ein österreichischer Trip durch das DB-Profile geleitet und 404 liefern.
+      stopCode: at.code,
+      // Board-Direction mitgeben damit das Trip-Detail dieselbe
+      // Destination zeigt wie die Card die der User getappt hat.
+      // HAFAS' trip.direction weicht manchmal vom Board-Direction
+      // ab (M21 Berlin: Board zeigt „Charlottenburg, Goerdelersteg",
+      // trip.direction ist „S+U Jungfernheide").
+      direction: item.direction,
+      // Auf der Ankunftstafel ist `direction` die HERKUNFT des Zugs.
+      board,
+      // Die Zeit der Zeile — bei Fahrten aus den Länder-Fahrplänen (GTFS)
+      // bestimmt sie den Betriebstag (Nachtfahrt heute oder gestern).
+      atTime: item.plannedTime,
+    }).then(tripDetailToSearchResult);
+
+  /**
+   * Die Fahrt ließ sich nicht laden — ein LADEFEHLER, keine Aussage über die
+   * Verbindung. Hier stand „Diese Verbindung versteckt sich", auch bei 404,
+   * 429 oder Zeitlimit für eine Abfahrt, die sichtbar auf der Tafel steht.
+   */
+  const showTripLoadError = (mode: TravelMode) =>
+    showConnectionNotFound({
+      mode,
+      title: t("connectionNotFound.loadError.title"),
+      message: t("connectionNotFound.loadError.body"),
+    });
+
+  /**
+   * LIVE VERFOLGEN — der Knopf an der Zeile. Nur, wo es etwas zu sehen gibt:
+   * Die Fahrt kommt in den nächsten anderthalb Stunden oder ist gerade
+   * vorbei (dann fährt sie noch weiter), sie fällt nicht aus, und ein Flug
+   * hat beide Flughäfen und eine Abflugzeit (daraus wird gerechnet).
+   */
+  /** Ein Takt für alle Live-Knöpfe der Tafel — läuft nur bei offenem Blatt. */
+  const liveClock = useLiveClock(selectedStop != null);
+  const canLive = (it: StopBoardItem): boolean => {
+    if (it.cancelled) return false;
+    const at = Date.parse(it.plannedTime) + (it.delayMinutes ?? 0) * 60_000;
+    const now = Date.now();
+    if (!(at > now - LIVE_PAST_MS && at < now + LIVE_AHEAD_MS)) return false;
+    if (activeKind === "airport") {
+      const f = it.flight;
+      return !!f && (f.depE ?? f.depP) != null && !!airportByIata(f.from) && !!airportByIata(f.to);
+    }
+    return !!it.id;
+  };
+  const startLiveFor = (it: StopBoardItem) => {
+    if (!stop) return;
+    haptic("button");
+    // Auf der Ankunftstafel ist `direction` die HERKUNFT — dann lieber das
+    // Fahrtziel aus den Live-Daten (leer lassen, das Banner nimmt es von dort).
+    const direction = tab === "departures" ? it.direction : "";
+    const iata = stop.code.replace(/^airport:/i, "").toUpperCase();
+    const session: LiveSession =
+      activeKind === "airport" && it.flight
+        ? {
+            kind: "flight",
+            flight: it.flight,
+            line: it.line,
+            direction,
+            boardIndex: it.flight.from === iata ? 0 : it.flight.to === iata ? 1 : null,
+          }
+        : {
+            kind: "trip",
+            tripId: it.id,
+            stopCode: stop.code,
+            atTime: it.plannedTime,
+            line: it.line,
+            product: it.product,
+            direction,
+            tz: boardTz,
+          };
+    const st = useSearchStore.getState();
+    // Tafel über Bo geöffnet: Bo schließen — die Karte gehört jetzt dem Fahrzeug.
+    if (st.assistantOpen) st.closeAssistant();
+    st.startLive(session);
+    // Auf die Karte — ist sie schon vorn, bleibt alles, wie es ist. Bewusst
+    // kein `usePathname`: Dieses Blatt ist global und würde sonst bei jedem
+    // Seitenwechsel neu rendern.
+    router.navigate("/(tabs)/surroundings");
+  };
+
   const onSelectDeparture = (item: StopBoardItem) => {
     if (!stop) return;
     const mode = productToSearchMode(item.product);
     if (!mode) return; // Ferry o.ä. → keine Ticket-Suche verfügbar
     const directionText = item.direction?.trim();
     if (!directionText) return;
+    const lock = tapLockRef.current;
+    if (
+      lock &&
+      lock.id === item.id &&
+      Date.now() < lock.until &&
+      // Im Buchungs-Weg nur, solange der eigene Platzhalter noch offen ist —
+      // wer sofort zurückging, darf dieselbe Zeile gleich wieder antippen.
+      (!lock.stub || useSearchStore.getState().selectedResult === lock.stub)
+    ) {
+      return;
+    }
     haptic("button");
 
     // BUS-Mode: kein Booking-DetailsOverlay sondern direkt LegTimeline. Wir
@@ -721,43 +1065,51 @@ function StopDetailSheetInner() {
     //   - Nicht-DE Stops (unsere Booking-Suche kann die nicht handhaben)
     // Übrig bleibt: DE National/Regional Trains → Booking-Flow mit
     // DB-Navigator-Deeplink-Support.
+    // Die Tafel, von der die Zeile stammt — beim Tipp festgehalten.
+    const board = tab;
     const useDirectTripFlow =
+      // ANKUNFT: Die Richtung der Zeile ist die HERKUNFT des Zugs. Der
+      // Buchungs-Weg suchte damit eine Fahrt von hier ZUR Herkunft — die
+      // Gegenrichtung, und meist ein ganz anderer Zug, der zufällig um diese
+      // Zeit abfuhr. Ankünfte zeigen deshalb immer die Fahrt selbst.
+      board === "arrivals" ||
       mode === "BUS" ||
       isLocalTransitProduct(item.product) ||
       !isDeStop(stop.code);
+    /**
+     * EINE laufende Nummer für beide Wege, vergeben im Handler — nicht erst
+     * nach einem `await`. Die Gegenproben danach lesen den Ref, nie die
+     * Closure (siehe feedback_await_guard_stale_closure).
+     */
+    const req = ++departureReqRef.current;
     if (useDirectTripFlow) {
-      // hafasId aus der Board-Antwort: damit der Server den Trip auf den
-      // User-Halt slicen kann (volle Linie A→Z vs. User steigt erst in der
-      // Mitte ein → wir wollen User-Halt → Endstation anzeigen).
-      const fromStopId = data?.stop.hafasId ?? undefined;
-      // stopCode mitschicken — daraus leitet der Server das HAFAS-Profile ab
-      // (DE → dbrest, AT/PL/LU/DK → in-process hafas-client). Ohne den würde
-      // ein österreichischer Trip durch das DB-Profile geleitet und 404 liefern.
+      tapLockRef.current = { id: item.id, until: Date.now() + DIRECT_TAP_LOCK_MS };
       setLoadingDepartureId(item.id);
+      /**
+       * Gehört die Antwort noch zu dem, was man sieht? Zwei Busabfahrten schnell
+       * nacheinander: ohne Nummer gewann die LANGSAMERE Antwort. Und nach dem
+       * Schließen der Haltestelle (oder dem Wechsel zu einer anderen) ging die
+       * Zeitleiste sonst trotzdem noch auf.
+       */
+      const directStop = stop.code;
+      const stillCurrent = () =>
+        req === departureReqRef.current &&
+        useSearchStore.getState().selectedStop?.code === directStop;
       void (async () => {
         try {
-          const detail = await fetchTripDetail(item.id, {
-            fromStopId,
-            // Label als Fallback, falls die ID nicht in den Trip-Stopovers
-            // matched (BVG/VBB-Bus-Stops haben oft uneindeutige IDs zwischen
-            // unserem Resolver und HAFAS-Trip-Body).
-            fromStopLabel: stop.label,
-            stopCode: stop.code,
-            // Board-Direction mitgeben damit das Trip-Detail dieselbe
-            // Destination zeigt wie die Card die der User getappt hat.
-            // HAFAS' trip.direction weicht manchmal vom Board-Direction
-            // ab (M21 Berlin: Board zeigt „Charlottenburg, Goerdelersteg",
-            // trip.direction ist „S+U Jungfernheide").
-            direction: item.direction,
-          });
-          const result = tripDetailToSearchResult(detail);
-          openDirectTrip(result);
+          const trip = await loadTrip(item, stop, board);
+          if (!stillCurrent()) return;
+          openDirectTrip(trip);
         } catch {
+          if (!stillCurrent()) return;
           // Mode mitschicken (BUS in diesem Branch) damit „Zur Suche" direkt
           // den Bus-Tab öffnet, nicht irgendeine Suche.
-          showConnectionNotFound({ mode });
+          showTripLoadError(mode);
         } finally {
-          setLoadingDepartureId(null);
+          if (req === departureReqRef.current) {
+            setLoadingDepartureId(null);
+            tapLockRef.current = null;
+          }
         }
       })();
       return;
@@ -782,6 +1134,10 @@ function StopDetailSheetInner() {
       destLabel: directionText,
       departTime: item.plannedTime,
       arriveTime: item.plannedTime, // unbekannt — Provider füllt
+      // Zone der Tafel: Ohne sie stand die Abfahrt im Detail-Blatt bis zum
+      // Eintreffen des Treffers in der Zeit des GERÄTS — in der Zeile darunter
+      // aber in Ortszeit (auf einem Gerät außerhalb der Halt-Zone „14:33" statt „15:33").
+      originTz: data?.stop?.tz,
       durationMinutes: 0,
       stops: 0,
       stopLabels: [],
@@ -793,72 +1149,101 @@ function StopDetailSheetInner() {
 
     // Instant: DetailsOverlay slidet rein, Pending=true. Stop-Sheet bleibt
     // OFFEN dahinter — damit der User beim Schließen des Overlays direkt
-    // wieder in der Departures-Liste landet.
-    selectResult(stub, 1);
-    setSelectedResultPending(true);
-    setLoadingDepartureId(item.id);
+    // wieder in der Departures-Liste landet. EIN Schreibvorgang statt zwei,
+    // kein Lade-Zustand in diesem Blatt (die Zeile ist gleich zugedeckt).
+    const tapAt = Date.now();
+    tapLockRef.current = { id: item.id, until: tapAt + PUSH_SPRING.duration, stub };
+    /**
+     * Einen noch laufenden Direkt-Weg (Bus/Tram eben angetippt) hat dieser Tipp
+     * überholt (`req`). Dessen `finally` räumt den Kreisel nur als NEUESTER
+     * ab — ohne diese Zeile drehte seine Zeile weiter und blieb gesperrt
+     * (`disabled`), bis irgendwann ein anderer Direkt-Weg fertig wurde. Steht
+     * kein Kreisel, ist das derselbe Wert und rendert nichts.
+     */
+    setLoadingDepartureId(null);
+    openPendingResult(stub);
+    /**
+     * Zeigt das Detail-Blatt noch GENAU diesen Platzhalter, und ist dieser Tipp
+     * der neueste? Identität statt Kennung — `pending:${item.id}` ist bei
+     * einem erneuten Tipp auf dieselbe Abfahrt gleich. Wer das Blatt
+     * geschlossen hat, bekommt es nicht Sekunden später wieder aufgemacht.
+     */
+    const shown = () =>
+      req === departureReqRef.current && useSearchStore.getState().selectedResult === stub;
 
     // Background-Search — fire-and-forget, kein await blockiert den Slide.
     void (async () => {
-      const reqId = ++departureReqRef.current;
       let match: SearchResult | undefined;
-      let failed = false;
       try {
-        const res = await searchByMode(
-          {
-            mode,
-            origin,
-            destination: directionText,
-            originLabel: stop.label,
-            destLabel: directionText,
-            departDate,
-            // Ziel-Zeit als Hint für den Server: zentriere das Suchfenster auf
-            // genau diesen Zug. Ohne das landet ein Zug 4h in der Zukunft evtl.
-            // außerhalb der HAFAS-10er-Result-Page und wir finden ihn nie.
-            departTime: item.plannedTime,
-            passengers: 1,
-            currency: "EUR",
-          },
-          // Cache umgehen — der Server-Cache-Key enthält departTime nicht,
-          // sonst würde eine frühere Allgemein-Suche (z.B. um 14:00 mit
-          // Ergebnissen ab 14:00) den 16:29-Tap fälschlich bedienen.
-          { nocache: true },
-        );
+        const res = await searchByMode({
+          mode,
+          origin,
+          destination: directionText,
+          originLabel: stop.label,
+          destLabel: directionText,
+          departDate,
+          // Ziel-Zeit als Hint für den Server: zentriere das Suchfenster auf
+          // genau diesen Zug. Ohne das landet ein Zug 4h in der Zukunft evtl.
+          // außerhalb der HAFAS-10er-Result-Page und wir finden ihn nie.
+          departTime: item.plannedTime,
+          passengers: 1,
+          currency: "EUR",
+        });
+        /**
+         * KEIN `nocache` mehr.
+         *
+         * Begründet war er damit, dass der Server-Cache die Uhrzeit nicht
+         * kenne. Das gilt nicht mehr: `cacheKey` und `loadFromCache`
+         * (server/src/services/searchService.ts) tragen `departTime`. Dafür
+         * hing jeder Tipp am engen nocache-Budget des Servers (6 pro Minute
+         * und IP, routes/search.ts): Ab dem siebten Tipp kam binnen
+         * Millisekunden 429, und das Blatt schloss sich mitten in seiner
+         * Einfahrt — 39-mal an zwei Testabenden in den Logs. Ein erneuter Tipp
+         * auf dieselbe Abfahrt kommt jetzt aus dem Zwischenspeicher: sofort
+         * und ohne Bahn-Kontingent.
+         */
         match = findBestMatch(res.results, item);
       } catch {
-        failed = true;
+        // Netz, Zeitlimit, 429: kein Grund mehr, das Blatt zu schließen — der
+        // Rückfall unten zeigt die Fahrt trotzdem.
       }
-      setLoadingDepartureId(null);
-      // Ist dieser Tap überhaupt noch der aktuelle?
-      //
-      // Der Block läuft ohne Rückkanal: Vor dem Netz-Aufruf lag ein Tipp, danach
-      // wird bedingungslos in den GLOBALEN Auswahl-Zustand geschrieben. Wer
-      // zwischenzeitlich das Overlay geschlossen oder eine andere Abfahrt
-      // angetippt hat, bekam damit ein Overlay, das Sekunden später von selbst
-      // wieder aufspringt — oder im Fehlerfall eines, das sich schließt, obwohl
-      // es zu einer ANDEREN Verbindung gehört (`clearSelectedResult` nullt auch
-      // die Bein-Zeitleiste mit).
-      if (reqId !== departureReqRef.current) return;
+      // Kein Treffer: die Fahrt selbst holen, parallel zum Rest der Einfahrt.
+      const tripPromise = match || !shown() ? null : loadTrip(item, stop, board).catch(() => null);
+      await afterDetailsPush(tapAt);
+      if (!shown()) return;
       if (match) {
         // Stub durch echtes Result ersetzen — DetailsOverlay re-rendert mit
         // den korrekten Daten + dem bookingToken (für Multi-Provider-Liste).
-        selectResult(match, 1);
-        setSelectedResultPending(false);
+        //
+        // Ohne Abfahrts-Verspätung (db-vendo liefert keine, und ein Treffer
+        // aus dem Zwischenspeicher trägt nie eine) gilt die der Tafel: Es ist
+        // dieselbe Fahrt, und genau diese Zahl hat der Nutzer eben angetippt.
+        const boardDelay = item.delayMinutes ?? 0;
+        settlePendingResult(stub, {
+          result:
+            match.departDelayMinutes == null && boardDelay > 0
+              ? { ...match, departDelayMinutes: boardDelay }
+              : match,
+        });
         return;
       }
-      // Kein verlässlicher Treffer (Linie+Zeit) gefunden ODER Search-Error.
-      // WICHTIG: nicht das Stub-Result stehen lassen — das zeigt "16:15→16:15"
-      // mit duplizierter Abfahrts-/Ankunftszeit, was den User verwirrt. Lieber
-      // den Overlay zumachen und sagen was los ist; der StopDetailSheet
-      // bleibt dahinter offen, der User landet zurück auf der Departures-
-      // Liste und kann's nochmal versuchen oder normal suchen.
-      clearSelectedResult();
-      if (!failed) {
-        // BUS-Mode kommt hier nicht an (wird oben kurzgeschlossen), also
-        // TRAIN/FLIGHT. Mode mitschicken damit „Zur Suche" direkt den
-        // jeweiligen Tab öffnet.
-        showConnectionNotFound({ mode });
+      const trip = tripPromise ? await tripPromise : null;
+      if (!shown()) return;
+      if (trip) {
+        // Kein Buchungstreffer: Das Detail-Blatt fährt hinaus, die Zeitleiste
+        // derselben Fahrt herein — wie bei Bus und Tram. Kein Preis, keine
+        // Buchung; das Stop-Sheet bleibt darunter offen.
+        //
+        // Anders als bei Bus und Tram hat der Nutzer hier aber ein TICKET
+        // erwartet (Zug, Buchungs-Weg). Ohne Satz dazu wirkt die Zeitleiste
+        // wie ein Fehler — `timelineNotice` sagt, warum er sie sieht. Nur in
+        // diesem Rückfall; der Direkt-Weg (`openDirectTrip`) setzt ihn nie.
+        settlePendingResult(stub, { directTrip: { ...trip, timelineNotice: "noTicketOffer" } });
+        return;
       }
+      // Weder Treffer noch Fahrt: den Platzhalter nicht stehen lassen (er
+      // zeigt „16:15→16:15") — schließen und ehrlich sagen, was los ist.
+      if (settlePendingResult(stub, null)) showTripLoadError(mode);
     })();
   };
 
@@ -875,27 +1260,88 @@ function StopDetailSheetInner() {
     retry: 1,
   });
 
+  /**
+   * Ortszeit-Zone des Halts — kommt mit der Tafel (Server, aus der Lage). Alle
+   * Uhrzeiten des Blatts stehen in ihr, wie in der Zeitleiste dahinter; der
+   * Hinweis „Ortszeit (UTC+1)" erscheint nur, wenn sie von der Uhr des Geräts
+   * abweicht. Der Countdown-Ring zählt Minuten und braucht keine Zone.
+   */
+  const boardTz = data?.stop?.tz;
+  const zoneHint = useMemo(() => (boardTz ? localTimeHint([boardTz], t) : null), [boardTz, t]);
+  /** Unterscheidungs-Zusatz — vom Marker bzw. aus der Suche, sonst aus der Tafel. */
+  const stopDetail = stop?.detail ?? data?.stop?.detail;
+
+  /**
+   * Die laufende MINUTE — nur für das Aussortieren abgefahrener Züge.
+   *
+   * Eine Tafel kommt bis zu einer Viertelstunde aus dem Zwischenspeicher des
+   * Servers, und bleibt man am Blatt, altert sie weiter. Sie zeigte damit
+   * Abfahrten, die längst weg waren. Einmal pro Minute statt pro Sekunde (den
+   * Sekundentakt hat nur die oberste Zeile), und wie dort nicht in eine Fahrt,
+   * ein Ziehen oder eine Kartenbewegung hinein — dann eine Sekunde später.
+   */
+  const [minuteNow, setMinuteNow] = useState(() => Math.floor(Date.now() / 60_000));
+  useEffect(() => {
+    if (!selectedStop) return;
+    let id: ReturnType<typeof setTimeout>;
+    const schedule = (ms: number) => {
+      id = setTimeout(() => {
+        if (isTransitionBusy() || isSheetDragging() || isMapMoving()) {
+          schedule(1_000);
+          return;
+        }
+        setMinuteNow(Math.floor(Date.now() / 60_000));
+        schedule(60_000 - (Date.now() % 60_000) + 50);
+      }, ms);
+    };
+    // Beim Öffnen nachziehen (das Blatt stand womöglich lange zu) — aber erst
+    // NACH der Einfahrt: Ein Durchgang mitten in ihr ist genau das Zucken, das
+    // wir überall vermeiden. Die Tafel selbst kommt ohnehin erst danach.
+    schedule(SHEET_IN.duration + 50);
+    return () => clearTimeout(id);
+  }, [selectedStop]);
+
   const items: StopBoardItem[] = useMemo(() => {
-    const all = data?.results ?? [];
-    if (kinds.length < 2) return all;
-    return all.filter((it) => productMatchesKind(it.product, activeKind));
-  }, [data, kinds.length, activeKind]);
+    /**
+     * Nur was noch kommt: Abfahrten (bzw. Ankünfte) ab der laufenden Minute,
+     * mit Verspätung gerechnet. Ein Zug um 14:26 steht bis 14:26:59 da — als
+     * „jetzt" —, danach ist er weg. Vergangene braucht niemand.
+     */
+    const fromMs = minuteNow * 60_000;
+    const upcoming = (data?.results ?? []).filter(
+      (it) => Date.parse(it.plannedTime) + (it.delayMinutes ?? 0) * 60_000 >= fromMs,
+    );
+    if (kinds.length < 2) return upcoming;
+    return upcoming.filter((it) => productMatchesKind(it.product, activeKind));
+  }, [data, kinds.length, activeKind, minuteNow]);
 
   // Snap-Punkte (gleich wie SurroundingsSheet): full (oben), mid (halb),
   // sheetHeight = komplett off-screen unten.
-  const snap = useMemo(() => {
-    const fullTop = Math.max(60, insets.top + 12);
-    const sheetHeight = screenHeight - fullTop;
-    const midVisible = Math.min(sheetHeight - 80, Math.max(420, screenHeight * 0.5));
-    return {
-      sheetHeight,
-      full: 0,
-      mid: Math.max(0, sheetHeight - midVisible),
-    };
-  }, [screenHeight, insets.top]);
+  //
+  // Gerechnet an EINER Stelle (`stopSheetSnap`) — die Karte braucht die Höhe
+  // des Stadt-Blatts auch, um die Route darüber einzurücken. Für die
+  // Haltestelle sind es dieselben Werte wie bisher.
+  const baseSnap = useMemo(
+    () => stopSheetSnap(screenHeight, insets.top, insets.bottom),
+    [screenHeight, insets.top, insets.bottom],
+  );
+  /**
+   * Haltestelle und Stadt: EXAKT dieselben Rastpunkte — dieselbe Fläche soll
+   * mit beiden Inhalten gleich groß sein.
+   */
+  const snap = baseSnap;
 
   // Start: off-screen unten. Beim Selectstop animieren wir zu mid.
-  const translateY = useSharedValue(snap.sheetHeight);
+  //
+  // Der Wert liegt auf Modulebene (`stopSheetY`), weil der Standort-Knopf im
+  // Karten-Tab ihm folgt. Die Ruhestellung wird hier einmal gesetzt — das
+  // Blatt hängt dauerhaft am Wurzel-Layout und ist beim Anlegen geschlossen.
+  const translateY = stopSheetY;
+  useLayoutEffect(() => {
+    translateY.value = snap.sheetHeight;
+    // Nur beim Anlegen — danach gehört der Wert den Bewegungen.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   /**
    * Zeigt dem Effekt unten an, dass die Ausfahrt schon läuft.
    *
@@ -906,8 +1352,87 @@ function StopDetailSheetInner() {
    * wenn der Finger das Glas verlässt.
    */
   const settlingRef = useRef(false);
+  /**
+   * Auf GANZE Gerätepixel gerundet — das Zittern beim Ziehen.
+   *
+   * Das Blatt folgt dem Finger in Bruchteilen eines Pixels. Android setzt
+   * Schrift senkrecht aber immer auf ganze Pixel, Flächen und Ränder dagegen
+   * geglättet dazwischen: Bei jedem Bild sprang die Schrift um ein Pixel gegen
+   * ihre Pille, ihre Zeile, ihre Trennlinie. Gemeldet als „die Elemente in der
+   * Slide zittern". Gerundet bewegt sich alles gemeinsam; ein Pixel sind bei
+   * dieser Dichte rund ein Drittel Punkt — die Bewegung bleibt so weich wie
+   * vorher.
+   */
+  // Plus Selbstkorrektur beim Ziehen — siehe `startDragHeal` in lib/ui/sheetSwipe.ts.
   const sheetAnim = useAnimatedStyle(() => ({
-    transform: [{ translateY: translateY.value }],
+    transform: [{ translateY: snapToPixel(translateY.value) + dragHealOffset(stopSheetHeal) }],
+  }));
+  /**
+   * Die Liste scrollt NUR, wenn das Blatt ganz oben steht.
+   *
+   * Damit verschwindet der Wettstreit, der beim Ziehen sichtbar wurde: Der
+   * native Scroller bekommt dieselbe Berührung ab wie die Zieh-Geste und
+   * versuchte mitzuscrollen, während das Blatt wanderte — korrigiert wurde das
+   * bisher nachträglich, also in jedem Bild gegen ihn an. Abgeschaltet gibt es
+   * nichts mehr zu korrigieren.
+   *
+   * Es ändert NICHTS am Verhalten, und das ist der Punkt: Schon vorher konnte
+   * man die Liste unterhalb des oberen Rastpunkts nicht scrollen — jede Geste
+   * dort bewegt das Blatt (siehe `onUpdate`: der Zweig, der die Liste gewinnen
+   * lässt, verlangt einen Scroll-Stand über null, und den gibt es dort nie).
+   * Die Regel stand also längst in der Logik; sie wird hier nur ausgesprochen,
+   * wo der Scroller sie auch hört.
+   *
+   * Als ANIMIERTE Eigenschaft, nicht als Zustand: Ein Zustand wäre ein
+   * React-Durchgang mitten in der Bewegung — genau das, was hier abgestellt
+   * werden soll. So läuft es auf dem UI-Strang und rendert nichts.
+   *
+   * Die halbe Punkt Toleranz fängt Rundung ab; die Einrast-Bewegung landet
+   * exakt auf `snap.full`, die Liste ist danach also verlässlich wieder frei.
+   */
+  /**
+   * STADT-BLATT: Die Liste scrollt schon in der MITTE.
+   *
+   * Gemeldet als „man kann die Ergebnisse nicht scrollen". Die Regel oben
+   * stammt von der Abfahrtsliste, die in der Mitte fast ganz zu sehen ist. Die
+   * Verbindungen einer Stadt sind länger, und in der Mitte stehen davon zwei bis
+   * drei — wer weiter will, soll scrollen, nicht erst das Blatt aufziehen.
+   * Aufziehen geht über Kopf und Pillen; nach unten schließt die Liste, sobald
+   * sie oben steht (siehe `onUpdate` der Geste).
+   *
+   * Als geteilter Wert, weil die Geste auf dem UI-Strang läuft.
+   */
+  const cityMode = useSharedValue(false);
+  useEffect(() => {
+    cityMode.value = city != null;
+  }, [city, cityMode]);
+  /**
+   * Gehört die laufende Geste dem BLATT? Dann darf die Liste nicht scrollen —
+   * sie bekommt dieselbe Berührung ab und liefe sonst gegen das Blatt an.
+   * Gesetzt einmal zu Beginn der Geste (siehe `onStart`).
+   */
+  const sheetOwnsGesture = useSharedValue(false);
+  /** Gehört die laufende Geste der LISTE (Stadt-Blatt)? Dann bleibt das Blatt stehen. */
+  const listOwnsGesture = useSharedValue(false);
+  /**
+   * Schließt das Blatt gerade — per Zurück-Taste, durch den Wisch oder weil die
+   * Auswahl von woanders geleert wurde? Dann hält sich die Geste heraus.
+   *
+   * Wer das Blatt festhielt, während es von woanders geschlossen wurde, bekam
+   * im nächsten Bild die Lage des Fingers zurückgeschrieben: Die Ausfahrt brach
+   * ab, ihr Abschluss räumte den Inhalt nie ab, und beim Loslassen rastete ein
+   * logisch geschlossenes Blatt mit dem alten Inhalt wieder ein. Gesetzt VOR
+   * der Ausfahrt (siehe den Effekt unten) — beide Schreibvorgänge kommen in
+   * dieser Reihenfolge auf dem UI-Strang an.
+   */
+  const closing = useSharedValue(false);
+  /** Hat DIESE Geste das Blatt übernommen (angesprungen, als es nicht schloss)? */
+  const grabbed = useSharedValue(false);
+  const listProps = useAnimatedProps(() => ({
+    // Stadt: frei, außer das Blatt fährt gerade — dann liefe sie dagegen an.
+    scrollEnabled: cityMode.value
+      ? !sheetOwnsGesture.value && translateY.value <= snap.mid + 0.5
+      : translateY.value <= snap.full + 0.5,
   }));
 
   // Open/close animation getrieben durch selectedStop. 350ms matched die
@@ -924,17 +1449,45 @@ function StopDetailSheetInner() {
   useEffect(() => {
     return registerStopSheetAnimation({
       translateY,
-      getMid: () => snap.mid,
-      getSheetHeight: () => snap.sheetHeight,
+      getMid: () => baseSnap.mid,
+      getSheetHeight: () => baseSnap.sheetHeight,
     });
-  }, [snap.mid, snap.sheetHeight]);
+  }, [baseSnap]);
 
   // bodyReady-Riegel + Schließ-Bewegung. Beim Öffnen läuft die Bewegung schon
   // (aus dem Tipp-Handler, siehe openStopSheet) — hier wird nur der Inhalt
   // freigegeben. Beim Schließen fahren wir sie selbst.
   useLayoutEffect(() => {
-    if (selectedStop) {
+    closing.value = target == null;
+    if (target) {
+      /**
+       * Wechselt nur der INHALT (Stadt oder Haltestelle), während das Blatt
+       * schon offen ist, fährt nichts herein — also auch kein Riegel: Er ließe den Inhalt eine
+       * Einfahrt lang verschwinden, die gar nicht stattfindet, und das Blatt
+       * blitzte leer auf. Gemeldet als „die Elemente springen beim Wechsel der
+       * Stadt".
+       */
+      if (cityToCityRef.current) {
+        cityToCityRef.current = false;
+        /**
+         * Nicht sperren — aber die Freigabe NEU stellen.
+         *
+         * Kam der Wechsel noch während der Einfahrt (innerhalb von
+         * `SHEET_IN`), hat React eben den Zeitgeber der vorigen Runde
+         * abgeräumt; ohne neuen bliebe der Inhalt für immer gesperrt. Genau das
+         * war das Blatt, das die Route auf der Karte zeigte und darunter nichts
+         * — die Suche kam aus dem Zwischenspeicher und brauchte die Freigabe
+         * nicht, die Liste schon. Ist der Inhalt längst frei, ist das hier ein
+         * Aufruf ohne Wirkung.
+         */
+        const id = setTimeout(() => setBodyReady(true), SHEET_IN.duration);
+        return () => clearTimeout(id);
+      }
       setBodyReady(false);
+      // Die Tafel-Minute im selben Durchgang nachziehen, in dem der Inhalt
+      // ohnehin gesperrt ist: So zeigt die erste Liste nach der Einfahrt schon
+      // nur, was noch kommt, und der Nachzug-Takt danach ändert nichts mehr.
+      setMinuteNow(Math.floor(Date.now() / 60_000));
       // Sicherung: gehört zu genau einer Ausfahrt (siehe unten). Bliebe er
       // stehen, übersprünge die nächste ihre Bewegung.
       settlingRef.current = false;
@@ -955,6 +1508,8 @@ function StopDetailSheetInner() {
       return () => clearTimeout(id);
     } else {
       setBodyReady(false);
+      // Das Blatt geht — der freie Ausschnitt der Karte wächst (Kamera).
+      reportStopSheetTarget(null);
       // Fährt die Wisch-Geste schon, wird hier NICHT neu angesetzt: Eine zweite
       // Kurve auf demselben Wert setzte von der erreichten Stelle mit voller
       // Dauer an — sichtbar als Tempo-Wechsel mitten in der Ausfahrt.
@@ -966,12 +1521,15 @@ function StopDetailSheetInner() {
         snap.sheetHeight,
         SHEET_OUT,
         (finished) => {
-          if (finished) runOnJS(setDisplayStop)(null);
+          if (finished) {
+            runOnJS(setDisplayStop)(null);
+            runOnJS(setDisplayCity)(null);
+          }
         },
       );
       return undefined;
     }
-  }, [selectedStop, snap.mid, snap.sheetHeight]);
+  }, [target, snap.mid, snap.sheetHeight]);
 
   const startY = useSharedValue(0);
   /**
@@ -992,30 +1550,119 @@ function StopDetailSheetInner() {
    * Moment, in dem die Liste oben ankommt, um die ganze Scroll-Strecke.
    */
   const gate = useSheetScrollGate();
+  /**
+   * Scroll-Stand zurück auf null, sobald eine andere Liste im Blatt steht —
+   * andere Haltestelle, andere Stadt, anderer Reiter, oder das Blatt geht zu.
+   *
+   * Der Torhüter ist EINER für beide Inhalte, und eine neu eingehängte Liste
+   * meldet ihren Stand erst beim ersten Scrollen. Stand er noch auf dem Wert
+   * der vorigen Liste (z. B. 350 aus dem Stadt-Blatt), hielt das Blatt die neue
+   * Abfahrtsliste für gescrollt: Ziehen darüber tat nichts, gezogen werden
+   * konnte nur noch am Kopf.
+   */
+  useEffect(() => {
+    gate.scrollY.value = 0;
+  }, [target, tab, gate]);
   const base = useSharedValue(0);
+  /** Hat sich das BLATT in dieser Geste bewegt (nicht nur die Liste)? */
+  const sheetMoved = useSharedValue(false);
   /** Buchhaltung zum Wisch-Abwurf — die Bewegung selbst läuft schon. */
   const closeBySwipe = useCallback(() => {
     settlingRef.current = true;
     markSheetMoving(SWIPE_OUT.duration);
-    clearSelectedStop();
-  }, [clearSelectedStop]);
+    closeSheet();
+  }, [closeSheet]);
+  /** Wo der Finger aufsetzte, und ob über diese Berührung schon entschieden ist. */
+  const touchStartY = useSharedValue(0);
+  const decided = useSharedValue(false);
   const pan = useMemo(() =>
     Gesture.Pan()
     /**
-     * Erst ab acht Punkten Weg ist es ein Ziehen.
+     * Erst ab acht Punkten Weg ist es ein Ziehen — und dann wird ENTSCHIEDEN,
+     * wem die Berührung gehört, von Hand statt über `activeOffsetY`.
      *
      * Ohne die Schwelle nähme das Blatt jedem Knopf darunter die Berührung ab —
      * am Griff allein war das egal, auf der ganzen Fläche ist es der
      * Unterschied zwischen „Abfahrt antippen" und „Blatt verschieben". Beide
      * Richtungen, denn hier wird auch nach OBEN gezogen (auf `full`).
+     *
+     * STADT-BLATT, Finger auf der Liste: Nach OBEN gehört der Zug der Liste,
+     * nach unten auch, solange sie gescrollt ist — das Blatt gibt dann SOFORT
+     * ab (`fail`), und die Liste scrollt allein. Kopf, Unterzeile und Pillen
+     * bleiben stehen, die Verbindungen laufen unter der Kante hindurch.
+     *
+     * Vorher sprang das Blatt auch hier an und lief gleichzeitig mit der Liste
+     * (beide als gleichzeitig angemeldet); welche von beiden die Bewegung zeigte,
+     * entschied eine Regel im ersten Bild. Gemeldet als „ich kann nicht nach
+     * oben scrollen, um die anderen Routen anzuschauen". Ein Blatt, das gar
+     * nicht erst anspringt, kann der Liste nichts mehr wegnehmen — so hält es
+     * auch das Ticket-Blatt (`failOffsetY` in `useSheetSwipe`).
      */
-    .activeOffsetY([-8, 8])
+    .manualActivation(true)
+    .onTouchesDown((e) => {
+      // Nur der ERSTE Finger beginnt eine neue Entscheidung. Ein zweiter
+      // setzte sie sonst zurück, und ein spätes `fail()` träfe eine schon
+      // laufende Geste.
+      if (e.numberOfTouches !== 1) return;
+      const t = e.allTouches[0];
+      if (t) touchStartY.value = t.absoluteY;
+      decided.value = false;
+    })
+    .onTouchesMove((e, manager) => {
+      if (decided.value) return;
+      const t = e.allTouches[0];
+      if (!t) return;
+      const dy = t.absoluteY - touchStartY.value;
+      if (Math.abs(dy) < SWIPE_ACTIVATE) return;
+      decided.value = true;
+      if (cityMode.value && gate.onList.value && (dy < 0 || gate.scrollY.value > 0.5)) {
+        manager.fail();
+        return;
+      }
+      manager.activate();
+    })
     .simultaneousWithExternalGesture(gate.native)
+    /**
+     * Anfang und Ende des Ziehens melden — GENAU ZWEIMAL, nicht pro Bild.
+     *
+     * Daran hängt der Sekundentakt der Abfahrtsliste: Er darf nicht mitten in
+     * ein Ziehen fallen, sonst zeichnet er die Liste unter dem Finger neu.
+     * `onBegin`/`onFinalize` statt `onStart`/`onEnd`, weil sie auch dann
+     * feuern, wenn die Geste die Acht-Punkte-Schwelle gar nicht überschreitet —
+     * ein Tipp, der zum Ziehen werden könnte, zählt schon dazu.
+     */
+    .onBegin(() => {
+      startDragHeal(stopSheetHeal);
+      runOnJS(setSheetDragging)(true);
+    })
     .onStart((e) => {
+      // Ein Blatt, das gerade schließt, lässt sich nicht fangen (`closing`).
+      if (closing.value) return;
+      grabbed.value = true;
       startY.value = translateY.value;
       base.value = e.translationY;
+      sheetMoved.value = false;
+      /**
+       * Stadt-Blatt: Springt die Geste an, gehört sie dem BLATT — bis zum
+       * Loslassen. Was der Liste gehört, hat schon `onTouchesMove` abgegeben.
+       *
+       * Einmal pro Geste entschieden, nicht Bild für Bild: Beim langsamen Ziehen
+       * wackelt der Finger um einen Punkt hin und her, und eine Entscheidung je
+       * Bild ließ abwechselnd die Liste scrollen und das Blatt fahren
+       * („die Elemente zittern").
+       */
+      listOwnsGesture.value = false;
+      sheetOwnsGesture.value = cityMode.value;
     })
     .onUpdate((e) => {
+      if (!grabbed.value || closing.value) return;
+      // Stadt-Blatt: Gehört die Geste der Liste, bleibt das Blatt stehen; der
+      // Nullpunkt wandert mit.
+      if (listOwnsGesture.value) {
+        startY.value = translateY.value;
+        base.value = e.translationY;
+        return;
+      }
       // `gate.onList`: nur eine Berührung, die AUF der Liste liegt (sonst
       // sperrte eine gescrollte Abfahrtsliste auch das Ziehen am Kopf).
       if (gate.onList.value && gate.scrollY.value > 0.5) {
@@ -1026,6 +1673,7 @@ function StopDetailSheetInner() {
       }
       const next = startY.value + (e.translationY - base.value);
       translateY.value = Math.max(snap.full, next);
+      if (Math.abs(translateY.value - startY.value) > 0.5) sheetMoved.value = true;
       /**
        * Liste festhalten, solange sich das Blatt WIRKLICH bewegt.
        *
@@ -1035,13 +1683,27 @@ function StopDetailSheetInner() {
        * geht weiter hoch, bewegt es sich nicht — dann gehört die Bewegung der
        * Liste, und festhalten dürfte man sie nicht.
        */
-      if (Math.abs(translateY.value - startY.value) > 0.5 && gate.ref()) {
+      if (
+        Math.abs(translateY.value - startY.value) > 0.5 &&
+        /**
+         * Nur korrigieren, wenn die Liste tatsächlich verrutscht IST.
+         *
+         * Hier stand der Aufruf unbedingt — also in jedem Bild eines Ziehens,
+         * auch wenn die Liste längst auf null stand. Das ist nicht nur
+         * überflüssig: Der native Scroller bekommt dieselbe Berührung ab, und
+         * ein „setze auf null" in jedem Bild arbeitet gegen ihn an, statt ihn
+         * einmal festzuhalten. Sichtbar wird daraus ein Zittern der Zeilen.
+         */
+        gate.scrollY.value > 0.5 &&
+        gate.ref()
+      ) {
         // Der Test auf die Verknüpfung gehört dazu: Ohne Abfahrten zeigt dieses
         // Blatt gar keine Liste, und Reanimated schriebe pro Bild eine Warnung.
         scrollTo(gate.ref, 0, 0, false);
       }
     })
     .onEnd((e) => {
+      if (!grabbed.value || closing.value) return;
       const final = startY.value + (e.translationY - base.value);
       const closeThreshold = snap.mid + (snap.sheetHeight - snap.mid) * 0.35;
       /**
@@ -1057,9 +1719,17 @@ function StopDetailSheetInner() {
         // Ausfahrt SOFORT von hier, auf dem UI-Strang — der Finger ist gerade
         // erst weg. Der Store wird daneben geleert; der Effekt oben hält sich
         // über `settlingRef` heraus.
+        // SOFORT als „schließt" markieren, hier auf dem UI-Strang: Bis der Store
+        // geleert und der Effekt gelaufen ist, vergehen je nach Last 50–200 ms.
+        // Griff man in diesem Fenster wieder zu, brach die Geste die Ausfahrt ab
+        // — und das logisch geschlossene Blatt blieb unter dem Finger stehen.
+        closing.value = true;
         translateY.value = withTiming(snap.sheetHeight, SWIPE_OUT, (finished) => {
           "worklet";
-          if (finished) runOnJS(setDisplayStop)(null);
+          if (finished) {
+            runOnJS(setDisplayStop)(null);
+            runOnJS(setDisplayCity)(null);
+          }
         });
         runOnJS(closeBySwipe)();
         return;
@@ -1074,21 +1744,41 @@ function StopDetailSheetInner() {
           closest = p;
         }
       }
+      // Hat nur die Liste gescrollt, bleibt das Blatt, wo es ist — sonst risse
+      // ein kräftiger Listen-Wisch es nach oben.
+      if (cityMode.value && !sheetMoved.value) return;
       if (e.velocityY < -800) closest = snap.full;
       else if (e.velocityY > 200 && final > snap.mid * 0.6) closest = snap.mid;
       translateY.value = withTiming(closest, { duration: 180, easing: Easing.out(Easing.quad) });
+      runOnJS(reportStopSheetTarget)(closest);
     })
     /**
-     * Merker „Finger liegt auf der Liste" beim Ende der Berührung löschen.
+     * EIN `onFinalize` für BEIDE Aufräumarbeiten — und das ist kein Stilfrage.
      *
-     * Der native Erkenner der Liste tut das selbst — aber nur, wenn es ihn beim
-     * Loslassen noch gibt. Wird sie mitten in einer Berührung abgebaut, bliebe
-     * er stehen und die Liste beanspruchte danach jede Geste.
+     * Ein zweiter Aufruf von `.onFinalize()` ERSETZT den ersten, er ergänzt ihn
+     * nicht. Das „Ziehen beendet" stand zwischenzeitlich in einem eigenen
+     * Aufruf weiter oben und wäre damit nie gelaufen: Der Merker wäre
+     * hängengeblieben, und der Sekundentakt der Abfahrtszeiten hätte nach jeder
+     * Berührung fünfzehn Sekunden lang ausgesetzt (so lange, bis der Merker von
+     * selbst verfällt). Ein Fehler, den man nicht sieht — man wartet nur
+     * vergeblich darauf, dass die Minuten weiterzählen.
+     *
+     * ERSTENS: den Merker „Finger liegt auf der Liste" löschen. Der native
+     * Erkenner der Liste tut das selbst — aber nur, wenn es ihn beim Loslassen
+     * noch gibt. Wird sie mitten in einer Berührung abgebaut, bliebe er stehen
+     * und die Liste beanspruchte danach jede Geste.
+     *
+     * ZWEITENS: das Ziehen abmelden, damit der Takt wieder laufen darf.
      */
     .onFinalize(() => {
+      grabbed.value = false;
       gate.onList.value = false;
+      sheetOwnsGesture.value = false;
+      listOwnsGesture.value = false;
+      stopDragHeal(stopSheetHeal);
+      runOnJS(setSheetDragging)(false);
     }),
-  [snap, startY, translateY, base, gate, closeBySwipe]);
+  [snap, startY, translateY, base, gate, closeBySwipe, sheetMoved, cityMode, sheetOwnsGesture, listOwnsGesture, touchStartY, decided, closing, grabbed]);
 
   // Sheet bleibt PERMANENT gemountet — auch wenn nichts ausgewählt ist
   // (translateY = sheetHeight = off-screen). Dadurch entfällt der React-
@@ -1096,22 +1786,18 @@ function StopDetailSheetInner() {
   // Inhalt nur rendern wenn stop existiert (spart Re-Renders der Liste etc.).
   return (
     <>
-      {/* Backdrop — fängt Taps außerhalb des Sheets. Reicht NUR bis kurz
-          über die FloatingTabBar, damit der User dort weiter tappen kann
-          ohne erst das Sheet schließen zu müssen. */}
-      {selectedStop && (
-        <Pressable
-          style={[
-            StyleSheet.absoluteFill,
-            { bottom: 96 + insets.bottom },
-          ]}
-          onPress={clearSelectedStop}
-          accessibilityLabel="Close stop details"
-        />
-      )}
+      {/* KEIN Hintergrund, der Tipps abfängt — weder bei der Stadt noch bei
+          der Haltestelle. Die Karte darüber bleibt bedienbar: verschieben,
+          heranzoomen, die nächste Haltestelle oder eine graue Alternative
+          antippen — wie bei Google. Geschlossen wird durch Herunterwischen
+          oder die Zurück-Taste.
+
+          Bei der Haltestelle lag hier bis eben eine Fläche bis knapp über die
+          Tab-Leiste, die jeden Tipp auf die Karte schluckte und das Blatt
+          schloss. Gemeldet als „vereinheitlichen, wie beim Stadt-Blatt". */}
       <GestureDetector gesture={pan}>
       <Animated.View
-        pointerEvents={selectedStop ? "auto" : "none"}
+        pointerEvents={target ? "auto" : "none"}
         style={[
           styles.sheet,
           { backgroundColor: palette.s1 },
@@ -1120,10 +1806,33 @@ function StopDetailSheetInner() {
             height: snap.sheetHeight,
             paddingBottom: insets.bottom + 12,
           },
+          covered ? styles.sheetCovered : null,
           sheetAnim,
         ]}
       >
-        {stop && (
+        {city ? (
+          <>
+            <View style={styles.handleZone}>
+              <View style={styles.handle} />
+            </View>
+            <CityTripBody
+              /**
+               * Je Stadt NEU aufgebaut. Sonst lief nach einem Stadtwechsel ein
+               * Durchgang mit dem Verkehrsmittel der vorigen Stadt (z. B. Flug) —
+               * und damit eine Suche, bevor der Wechsel auf Zug griff.
+               */
+              key={`${city.name}|${city.latitude.toFixed(4)}|${city.longitude.toFixed(4)}`}
+              city={city}
+              bodyReady={bodyReady}
+              gate={gate}
+              listProps={listProps}
+              // In der Mitte liegt dieser Teil des Blattes unter dem Bildrand —
+              // so viel Luft braucht die Liste unten, damit die letzte Zeile
+              // dort ganz heraufscrollt.
+              listBottomInset={snap.mid}
+            />
+          </>
+        ) : stop && (
           <>
             {/* Nur noch Zeichen, nicht mehr Griff: Der Erkenner sitzt am ganzen
                 Blatt (siehe `pan`). Der Strich bleibt, weil er ansagt, DASS
@@ -1142,6 +1851,16 @@ function StopDetailSheetInner() {
                 <Text style={styles.headerTitle} numberOfLines={1}>
                   {stop.label}
                 </Text>
+                {/* Nur bei gleichnamigem Halt daneben (zwei Straßenseiten,
+                    Steige eines Busbahnhofs): der Zusatz als dezente Plakette,
+                    wie ein Gleis — nie im Namen selbst. */}
+                {stopDetail ? (
+                  <View style={styles.headerDetail}>
+                    <Text style={styles.headerDetailText} numberOfLines={1}>
+                      {stopDetail}
+                    </Text>
+                  </View>
+                ) : null}
                 {(() => {
                   const primaryKind = kinds[0];
                   const venue = primaryKind ? t(`stop.venue.${primaryKind}`) : "";
@@ -1165,9 +1884,25 @@ function StopDetailSheetInner() {
                 const saved = asLocation
                   ? savedStations.some((s) => s.code === asLocation.code)
                   : false;
+                // Die unsichtbare Luft des Knopfes wieder herausziehen, damit
+                // der Stern an seiner SICHTBAREN Kante ausgerichtet ist —
+                // Begründung an `STAR_INSET`.
                 return (
-                  <View style={styles.headerFav}>
+                  <View style={{ marginTop: -STAR_INSET, marginRight: -STAR_INSET }}>
                     <SaveStarButton
+                      /**
+                       * Größen AUSDRÜCKLICH gesetzt, obwohl es die Vorgaben
+                       * sind — die Hülle rechnet mit ihnen.
+                       *
+                       * Der Knopf ist eine Trefferfläche von 46 mit einem
+                       * Symbol von 30 darin; die Differenz von 16 verteilt
+                       * sich als 8 Punkte Luft auf jede Seite. Genau diese 8
+                       * zieht `headerFav` wieder heraus. Stünden die Zahlen
+                       * nur als Vorgaben in der Komponente, ginge die
+                       * Rechnung beim nächsten Anfassen dort still kaputt.
+                       */
+                      size={STAR_BTN}
+                      starSize={STAR_ICON}
                       saved={saved}
                       onChange={(willSave) => {
                         if (!asLocation) return;
@@ -1197,24 +1932,13 @@ function StopDetailSheetInner() {
                   if (!Icon || !style) return null;
                   const active = activeKind === k;
                   return (
-                    <Pressable
+                    <ModePill
                       key={k}
+                      Icon={Icon}
+                      label={t(style.tKey)}
+                      active={active}
                       onPress={() => setActiveKind(k)}
-                      style={[
-                        styles.pill,
-                        active
-                          ? [styles.pillActive, { backgroundColor: accent.solid, borderColor: accent.solid }]
-                          : styles.pillInactive,
-                      ]}
-                    >
-                      <Icon size={17} color={active ? accent.textOnSolid : C.white} strokeWidth={2.2} />
-                      <Text style={[
-                        styles.pillText,
-                        active ? [styles.pillTextActive, { color: accent.textOnSolid }] : styles.pillTextInactive,
-                      ]}>
-                        {t(style.tKey)}
-                      </Text>
-                    </Pressable>
+                    />
                   );
                 })}
               </View>
@@ -1229,14 +1953,20 @@ function StopDetailSheetInner() {
                 {(["departures", "arrivals"] as const).map((b) => {
                   const active = tab === b;
                   return (
-                    <Pressable key={b} onPress={() => setTab(b)} style={styles.tab}>
+                    <RippleTouch key={b} onPress={() => setTab(b)} style={styles.tab}>
                       <Text style={[styles.tabText, active ? styles.tabActive : styles.tabInactive]}>
                         {t(b === "departures" ? "stop.tab.departures" : "stop.tab.arrivals")}
                       </Text>
                       {active && <View style={[styles.tabUnderline, { backgroundColor: accent.solid }]} />}
-                    </Pressable>
+                    </RippleTouch>
                   );
                 })}
+                {/* „Ortszeit (UTC+1)" — rechts in der Reiter-Zeile, leise. */}
+                {zoneHint ? (
+                  <Text style={styles.zoneHint} numberOfLines={1}>
+                    {zoneHint}
+                  </Text>
+                ) : null}
               </View>
             )}
 
@@ -1251,9 +1981,9 @@ function StopDetailSheetInner() {
                 <View style={styles.empty}>
                   <Text style={styles.emptyTitle}>{t("stop.error.title")}</Text>
                   <Text style={styles.emptyBody}>{t("results.error.body")}</Text>
-                  <Pressable onPress={() => void refetch()} style={[styles.retryBtn, { backgroundColor: palette.s3 }]} hitSlop={8}>
+                  <RippleTouch onPress={() => void refetch()} style={[styles.retryBtn, { backgroundColor: palette.s3 }]} hitSlop={8}>
                     <Text style={styles.retryText}>{t("results.retry")}</Text>
-                  </Pressable>
+                  </RippleTouch>
                 </View>
               ) : items.length === 0 ? (
                 <View style={styles.empty}>
@@ -1275,9 +2005,15 @@ function StopDetailSheetInner() {
               ) : (
                 <GestureDetector gesture={gate.native}>
                 <Animated.ScrollView
+                  // Neue Haltestelle oder anderer Reiter = neue Liste, oben
+                  // beginnend — passend zum zurückgesetzten Scroll-Stand
+                  // (siehe `gate.scrollY` weiter oben).
+                  key={`${stop.code}|${tab}`}
                   ref={gate.ref}
                   contentContainerStyle={styles.list}
                   showsVerticalScrollIndicator
+                  // Scrollt nur am oberen Rastpunkt — siehe `listProps`.
+                  animatedProps={listProps}
                   onScroll={gate.onScroll}
                   scrollEventThrottle={16}
                   // Kein Überzieh-Schimmer oben: Dort übernimmt das Blatt.
@@ -1287,14 +2023,28 @@ function StopDetailSheetInner() {
                   {/* Hero = nächste Abfahrt mit Countdown-Ring. „Danach"-Label
                       nur rendern wenn es noch weitere Items gibt, sonst wirkt
                       die Section-Headline einsam. */}
+                  {/* Zeiten eines anderen, nahen Halts — ehrlich sagen, von welchem. */}
+                  {data?.stop.servedBy ? (
+                    <Text style={styles.servedByHint} numberOfLines={2}>
+                      {t("stop.servedBy")
+                        .replace("{name}", data.stop.servedBy.name)
+                        .replace("{m}", String(data.stop.servedBy.distanceM))}
+                    </Text>
+                  ) : null}
                   <NextHero
                     item={items[0]!}
+                    tz={boardTz}
+                    dayLabel={boardDayLabel(items[0]!.plannedTime, boardTz, locale, t("stop.day.tomorrow"))}
+                    ringDayLabel={boardDayLabel(items[0]!.plannedTime, boardTz, locale, t("stop.day.tomorrow"), true)}
                     fetchedAt={data?.fetchedAt}
                     platformPrefix={t("stop.platform.prefix")}
                     nextLabel={t("stop.section.next")}
                     ontimeLabel={t("stop.section.ontime")}
                     loading={loadingDepartureId === items[0]!.id}
                     onPress={() => onSelectDeparture(items[0]!)}
+                    onLive={canLive(items[0]!) ? () => startLiveFor(items[0]!) : undefined}
+                    liveLabel={t("live.button")}
+                    liveClock={liveClock}
                   />
                   {items.length > 1 && (
                     <Text style={styles.danachLabel}>{t("stop.section.later")}</Text>
@@ -1303,9 +2053,14 @@ function StopDetailSheetInner() {
                     <StopBoardRow
                       key={`${it.id}-${i}`}
                       item={it}
+                      tz={boardTz}
+                      dayLabel={boardDayLabel(it.plannedTime, boardTz, locale, t("stop.day.tomorrow"))}
                       platformPrefix={t("stop.platform.prefix")}
                       loading={loadingDepartureId === it.id}
                       onPress={() => onSelectDeparture(it)}
+                      onLive={canLive(it) ? () => startLiveFor(it) : undefined}
+                      liveLabel={t("live.button")}
+                      liveClock={liveClock}
                     />
                   ))}
                 </Animated.ScrollView>
@@ -1349,6 +2104,21 @@ export const StopDetailSheet = memo(function StopDetailSheet() {
   return <StopDetailSheetInner />;
 });
 
+/**
+ * Die Maße des Stern-Knopfes — UNSKALIERT, und das ist der Punkt.
+ *
+ * Sie gehen als Eigenschaften an `SaveStarButton` und landen dort in einem
+ * eingebetteten Stil; `scaledStyles` fasst sie also nicht an. Der Ausgleich in
+ * `headerFav` muss deshalb genauso unskaliert sein — stünde er im Stilblatt,
+ * rechnete ihn die Geräte-Skalierung auf kleinen Bildschirmen herunter, während
+ * die Luft im Knopf unverändert bliebe. Ein Punkt Differenz, aber genau dieselbe
+ * Falle, die beim Schalter den Kreis aus der Pille hat laufen lassen.
+ */
+const STAR_BTN = 46;
+const STAR_ICON = 30;
+/** Die unsichtbare Luft je Seite — sie wird unten wieder herausgezogen. */
+const STAR_INSET = (STAR_BTN - STAR_ICON) / 2;
+
 const styles = scaledStyles({
   sheet: {
     position: "absolute",
@@ -1357,15 +2127,47 @@ const styles = scaledStyles({
     backgroundColor: C.bg,
     borderTopLeftRadius: 22,
     borderTopRightRadius: 22,
-    borderTopWidth: 1,
-    borderLeftWidth: 1,
-    borderRightWidth: 1,
-    borderColor: C.border,
     overflow: "hidden",
+    /**
+     * KEIN Rahmen mehr — und der Grund ist derselbe wie beim Umgebungs-Blatt,
+     * wo er längst steht.
+     *
+     * Hier lag eine Linie auf drei Seiten. Sie war nie Gestaltung, sondern ein
+     * Pflaster: Eine PARTIELLE Umrandung zusammen mit `borderRadius` zeichnet
+     * Android an den gerundeten Ecken fehlerhaft — dort fehlt der Hintergrund,
+     * und die Karte schimmert durch. Die Linie hat das Durchschimmern verdeckt,
+     * nicht behoben. Sichtbar blieb sie trotzdem, und kein anderes Blatt der App
+     * trägt eine.
+     *
+     * Die Trennung zum Kartenbild übernimmt jetzt der Schatten nach oben —
+     * Zeichen für Zeichen derselbe wie am Umgebungs-Blatt, damit die beiden
+     * Blätter, die sich abwechselnd über dieselbe Karte legen, nicht
+     * verschieden aussehen.
+     *
+     * EIN UNTERSCHIED BLEIBT, und er ist bewusst: Das Umgebungs-Blatt trägt
+     * kein `overflow: "hidden"`, dieses schon (es hat Inhalt, der sonst über
+     * die gerundeten Ecken liefe). Ob Android den Erhebungs-Schatten dann noch
+     * zeichnet, ist je nach Version verschieden.
+     *
+     * Das ist verkraftbar, weil der Schatten hier NICHT die Reparatur ist,
+     * sondern die Zugabe: Das Durchschimmern kam von der teilweisen Umrandung
+     * selbst — sie ist die Ursache, und sie ist weg. Fällt der Schatten auf
+     * einem Gerät aus, sieht die Kante flacher aus; die Karte schimmert
+     * deswegen nicht wieder durch. Wer das ändern will, braucht eine eigene
+     * Hülle für den Schatten, wie sie die Reisekarte benutzt — das wäre ein
+     * zusätzlicher Knoten in einem Blatt, das pro Bild bewegt wird, und den
+     * gibt man nicht für eine Zugabe aus.
+     */
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: -12 },
+    shadowOpacity: 0.5,
+    shadowRadius: 30,
     // hoch genug, dass das Sheet über FloatingTabBar + andere Overlays sitzt.
     zIndex: 100,
-    elevation: 16,
+    elevation: 20,
   },
+  /** Siehe `covered`: unter deckende Blätter, nach Reihenfolge statt Höhe. */
+  sheetCovered: { zIndex: 0, elevation: 0 },
   handleZone: { paddingTop: 10, paddingBottom: 8, alignItems: "center" },
   // Weißer Handle wie in den anderen Slides (vorher grau).
   handle: { width: 40, height: 4, borderRadius: 2, backgroundColor: C.white, opacity: 0.9 },
@@ -1383,7 +2185,18 @@ const styles = scaledStyles({
   // sitzt vertikal zentriert zum 14pt-Text durch alignItems:"center".
   headerSubtitleRow: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 6 },
   headerSubtitle: { color: C.g1, fontSize: 14, fontWeight: "500" },
-  headerFav: { paddingTop: 4 },
+  // Zusatz bei gleichnamigem Nachbarn („Rochdale Road · Stop RA") — Plakette
+  // im Ton der Gleis-Angaben, unter dem Namen.
+  headerDetail: {
+    alignSelf: "flex-start",
+    maxWidth: "100%",
+    marginTop: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 7,
+    backgroundColor: C.surface3,
+  },
+  headerDetailText: { color: C.g1, fontSize: 12, fontWeight: "600", letterSpacing: 0.1 },
 
   pillsRow: {
     flexDirection: "row",
@@ -1391,22 +2204,7 @@ const styles = scaledStyles({
     paddingHorizontal: 16,
     paddingBottom: 12,
   },
-  pill: {
-    flex: 1,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 9,
-    paddingVertical: 12,
-    borderRadius: 9999,
-    borderWidth: 1.5,
-  },
-  // backgroundColor/borderColor werden inline mit accent.solid gesetzt.
-  pillActive: {},
-  pillInactive: { backgroundColor: "transparent", borderColor: C.border },
-  pillText: { fontSize: 15, fontWeight: "700", letterSpacing: -0.15 },
-  pillTextActive: { color: "#000" },
-  pillTextInactive: { color: C.white },
+  // Die Pillen selbst stehen in `ModePill.tsx` — das Stadt-Blatt nimmt dieselben.
 
   tabsRow: {
     flexDirection: "row",
@@ -1414,6 +2212,22 @@ const styles = scaledStyles({
     gap: 24,
   },
   tab: { paddingVertical: 8, position: "relative" },
+  // Ortszeit-Hinweis rechts in der Reiter-Zeile — klein und grau, damit
+  // „15:33" in Oldham nicht für deutsche Zeit gehalten wird.
+  servedByHint: {
+    color: C.g2,
+    fontSize: 12,
+    fontWeight: "500",
+    marginBottom: 8,
+  },
+  zoneHint: {
+    marginLeft: "auto",
+    alignSelf: "center",
+    flexShrink: 1,
+    color: C.g2,
+    fontSize: 12,
+    fontWeight: "500",
+  },
   tabText: { fontSize: 17, fontWeight: "700" },
   tabActive: { color: C.white },
   tabInactive: { color: C.g3 },
@@ -1460,7 +2274,6 @@ const styles = scaledStyles({
     alignItems: "center",
     gap: 16,
   },
-  heroPressed: { backgroundColor: C.surface3, opacity: 0.92 },
   heroRing: { width: 84, height: 84, position: "relative" },
   heroRingCenter: {
     position: "absolute",
@@ -1479,8 +2292,17 @@ const styles = scaledStyles({
     lineHeight: 28,
   },
   heroRingLabel: { color: C.g2, fontSize: 10, fontWeight: "600" },
+  heroRingDay: {
+    color: C.white,
+    fontSize: 18,
+    fontWeight: "800",
+    letterSpacing: -0.3,
+  },
   heroBody: { flex: 1, minWidth: 0 },
   heroBadgeRow: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 6 },
+  // Rechts außen in der Plakettenzeile; die negative Kante gleicht die
+  // Tippfläche (28) an die Höhe der Plakette an, damit die Zeile nicht wächst.
+  heroLive: { marginLeft: "auto", marginVertical: -2, marginRight: -4 },
   heroNextLabel: {
     color: C.g2,
     fontSize: 9,
@@ -1517,8 +2339,13 @@ const styles = scaledStyles({
     paddingHorizontal: 14,
     marginBottom: 10,
   },
-  cardRowPressed: { backgroundColor: C.surface3, opacity: 0.92 },
   cardTime: { width: 58, flexShrink: 0 },
+  cardDay: {
+    color: C.g2,
+    fontSize: 11,
+    fontWeight: "600",
+    marginBottom: 1,
+  },
   cardTimeText: {
     color: C.white,
     fontSize: 18,

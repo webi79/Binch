@@ -33,6 +33,14 @@ const schema = z.object({
   // link). Anders als das db/dbnav-Profil NICHT geblockt (anderer Host), aber
   // ~60 req/min limitiert → Enrichment ist best-effort + gecacht.
   DBWEB_BASE_URL: z.string().default("http://localhost:3002"),
+  // Das Bahn-Kontingent (siehe services/dbQuota.ts): Anfragen pro Minute und
+  // ausgehender IP — bahn.de lässt rund 60 zu, 50 lassen Luft für Uhren-
+  // Versatz und Wiederholungen.
+  DB_QUOTA_PER_MIN: z.coerce.number().int().positive().default(50),
+  // Mehrere ausgehende IPs, je ein Sidecar-Paar — JSON-Liste
+  // `[{"id":"ip2","dbwebUrl":"…","dbrestUrl":"…","perMinute":50}]`. Leer = eine
+  // Spur aus DBWEB_BASE_URL/DBREST_BASE_URL.
+  DB_LANES: z.string().optional(),
   // bahn.de „Reise teilen" — Recon → vbid → Direkt-Buchungslink.
   BAHN_TEILEN_URL: z.string().default("https://www.bahn.de/web/api/angebote/verbindung/teilen"),
   // Provider an/aus schaltbar (falls Transitous mal zickt oder wir bewusst
@@ -94,6 +102,30 @@ const schema = z.object({
   // Partner-Tracking im Buchungslink, optional.
   FLIXBUS_AFFILIATE_ID: z.string().optional(),
   BUSBUD_API_KEY: z.string().optional(),
+  // Luftbilder mit kostenlosem Zugangsschlüssel (routes/tiles.ts) — ohne
+  // Schlüssel ist die jeweilige Quelle einfach aus.
+  NLS_FI_API_KEY: z.string().trim().optional(),
+  DATAFORSYNINGEN_TOKEN: z.string().trim().optional(),
+  LINZ_API_KEY: z.string().trim().optional(),
+  // Esri World Imagery (ArcGIS Location Platform) — nur in Gebieten ohne eigene
+  // amtliche Luftbilder (routes/imagery.ts). Freikontingent: 2 Mio. Kacheln im
+  // Monat; der Deckel schaltet Esri vorher ab, damit nichts berechnet wird.
+  ESRI_API_KEY: z.string().trim().optional(),
+  ESRI_MONTHLY_TILE_CAP: z.coerce.number().int().positive().default(1_900_000),
+  // Stichtag des Esri-Abrechnungszeitraums (Tag im Monat). Esri setzt das
+  // Freikontingent am Anlagetag des Kontos zurück, nicht am Monatsersten —
+  // nachzulesen auf der Abrechnungsseite der ArcGIS Location Platform.
+  ESRI_CYCLE_DAY: z.coerce.number().int().min(1).max(31).default(1),
+  // Eigenes Geheimnis für die Tages-Scheine (routes/imagery.ts). Ohne: vom
+  // Esri-Schlüssel abgeleitet — dann werden beim Tausch des Schlüssels alle
+  // Scheine ungültig (die App holt sich binnen 10 min neue).
+  ESRI_TICKET_SECRET: z.string().trim().min(16).optional(),
+  // Esri-Vertrag beendet: Die App wird angewiesen, ihren Kachelspeicher zu
+  // leeren (Rahmenvertrag: „clear any client-side data cache").
+  ESRI_TERMINATED: z
+    .string()
+    .optional()
+    .transform((v) => v === "true" || v === "1"),
   CRUISEDIRECT_API_KEY: z.string().optional(),
 
   // AeroDataBox via RapidAPI — Flughafen-Departures/Arrivals.

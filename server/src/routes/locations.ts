@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { inArray } from "drizzle-orm";
+import { inArray, sql } from "drizzle-orm";
 import { searchLocations } from "../services/locationService.js";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
@@ -29,14 +29,31 @@ export async function locationsRoutes(app: FastifyInstance) {
     if (!parsed.success) {
       return reply.code(400).send({ error: "Bad request", issues: parsed.error.flatten() });
     }
+    /**
+     * Auch das Gerät darf die Trefferliste behalten.
+     *
+     * Androids HTTP-Schicht hält GET-Antworten mit dieser Kopfzeile selbst vor,
+     * und zwar über den App-Start hinaus. Wer „berlin" schon einmal getippt
+     * hat, bekommt die Liste beim nächsten Mal ohne Netzaufruf — der Server
+     * sieht die Anfrage gar nicht erst.
+     *
+     * Fünf Minuten sind reichlich für eine Tipp-Sitzung und kurz genug, dass
+     * ein Datenimport zeitnah durchschlägt. Der Bestand ändert sich ohnehin nur
+     * dann.
+     */
+    reply.header("Cache-Control", "public, max-age=300");
     const results = await searchLocations(parsed.data.q, parsed.data.mode);
-    return { results };
+    // `matchLabel` ist nur für die Namensprüfung im Chat da (siehe ClientLocation).
+    return { results: results.map(({ matchLabel: _full, ...rest }) => rest) };
   });
 
   // Batch-Lookup für persistierte Recents/Saved-Stations. Pro Code liefern wir
   // `exists` (gibt's noch in der DB?) + `label` (aktuelle Anzeige). Client nutzt
   // das beim App-Start um stale Einträge zu prunen / Labels zu syncen — z.B.
   // wenn wir nach DB-Cleanup einen sta:-Code gelöscht oder umgelabelt haben.
+  // `label` ist der ANGEZEIGTE Name (offiziell, `display_name`), dazu `detail`
+  // wo ein gleichnamiger Halt daneben steht — so bekommen auch gespeicherte
+  // Stationen und der Verlauf beim nächsten Start den richtigen Namen.
   app.get("/api/locations/by-codes", { preHandler }, async (req, reply) => {
     const parsed = byCodesQuerySchema.safeParse(req.query);
     if (!parsed.success) {
@@ -53,15 +70,19 @@ export async function locationsRoutes(app: FastifyInstance) {
     if (codes.length === 0) return { results: [] };
 
     const rows = await db
-      .select({ code: locations.code, label: locations.label })
+      .select({
+        code: locations.code,
+        label: sql<string>`coalesce(${locations.displayName}, ${locations.label})`,
+        detail: locations.displayDetail,
+      })
       .from(locations)
       .where(inArray(locations.code, codes));
 
-    const byCode = new Map(rows.map((r) => [r.code, r.label]));
+    const byCode = new Map(rows.map((r) => [r.code, r]));
     const results = codes.map((code) => {
-      const label = byCode.get(code);
-      return label != null
-        ? { code, label, exists: true as const }
+      const row = byCode.get(code);
+      return row != null
+        ? { code, label: row.label, ...(row.detail ? { detail: row.detail } : {}), exists: true as const }
         : { code, exists: false as const };
     });
     return { results };

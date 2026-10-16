@@ -16,21 +16,27 @@ import Animated, {
   withTiming,
 } from "react-native-reanimated";
 import { GestureDetector } from "react-native-gesture-handler";
-import { format, parseISO } from "date-fns";
 import { de, enGB, es, fr } from "date-fns/locale";
-import { ChevronDown, Footprints, Clock, CircleDot, Map as MapIcon } from "lucide-react-native";
+import { ChevronDown, Footprints, Clock, CircleDot, Info, Map as MapIcon } from "lucide-react-native";
 import { useRouter, usePathname } from "expo-router";
 import { useSearchStore } from "@/stores/searchStore";
 import { useT } from "@/lib/i18n/useT";
-import { formatTimeInZone, shiftIsoByMinutes } from "@/lib/time-format";
+import { formatLocalizedDateInZone, formatTimeInZone, localTimeHint, shiftIsoByMinutes } from "@/lib/time-format";
+import { changesCaption, changesText } from "@/lib/format/routeMeta";
 import { LegInfo, SearchResult } from "@/types/search";
 import { buildRoutePlan } from "@/lib/routing/buildRoute";
-import { useSheetScrollGate, useSheetSwipe } from "@/lib/ui/sheetSwipe";
+import { dragHealOffset, snapToPixel, useSheetScrollGate, useSheetSwipe } from "@/lib/ui/sheetSwipe";
 import { fetchTripPolylines } from "@/lib/api/client";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import {
+  JOURNEY_WARNING_COLORS,
+  JourneyWarningBadge,
+  JourneyWarningIcon,
+} from "@/components/results/JourneyWarningBadge";
 import { useAccent } from "@/lib/theme/accent";
 import { scaledStyles } from "@/lib/ui/compact";
+import { LinePill, productLabel } from "@/components/results/LinePill";
 
 // Farbpalette aus dem App-Theme — die hellere Lime aus dem Mockup ist bewusst
 // auf unsere Brand-Lime gedimmt (#7FEA4D), Card/Surface-Stufen matchen
@@ -78,53 +84,8 @@ function timeOf(iso: string, tz?: string): string {
   }
 }
 
-function productLabel(product?: string): string | null {
-  if (!product) return null;
-  switch (product) {
-    case "national":
-    case "nationalExpress":
-      return "ICE";
-    case "regional":
-    case "regionalExpress":
-      return "RB";
-    case "suburban":
-      return "S";
-    case "subway":
-      return "U";
-    case "tram":
-      return "T";
-    case "bus":
-      return "Bus";
-    case "ferry":
-      return "F";
-    case "flight":
-      return "✈";
-    default:
-      return null;
-  }
-}
-
-function productColor(product?: string): string {
-  switch (product) {
-    case "suburban":
-      return "#1F8A37";
-    case "subway":
-      return "#0066CC";
-    case "national":
-    case "nationalExpress":
-      return "#EC0016";
-    case "tram":
-      return "#C13635";
-    case "bus":
-      return "#73D700";
-    case "ferry":
-      return "#0EA5E9";
-    case "flight":
-      return "#1F2A57";
-    default:
-      return "#2D2D31";
-  }
-}
+// productLabel/productColor und die Plakette stehen in `LinePill.tsx` — das
+// Stadt-Blatt zeigt dieselben Linien in denselben Farben.
 
 interface SyntheticLeg extends LegInfo {}
 
@@ -133,8 +94,9 @@ function buildFallbackLegs(result: SearchResult): SyntheticLeg[] {
     {
       origin: result.origin,
       destination: result.destination,
-      originLabel: result.originLabel?.split(",")[0]?.trim(),
-      destLabel: result.destLabel?.split(",")[0]?.trim(),
+      // Ganzer Name — „Enschede, Lindestraat" ist der Halt, nicht „Enschede".
+      originLabel: result.originLabel?.trim(),
+      destLabel: result.destLabel?.trim(),
       departTime: result.departTime,
       arriveTime: result.arriveTime,
       durationMinutes: result.durationMinutes,
@@ -301,8 +263,13 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
   // Startet unten außerhalb des Bildes — der Baum steht ab jetzt dauerhaft,
   // sichtbar wird er erst durch `open`.
   const translateY = useSharedValue(sheetHeight);
+  /**
+   * Ganze Gerätepixel + Selbstkorrektur beim Ziehen — beides erklärt in
+   * lib/ui/sheetSwipe.ts (`snapToPixel`, `startDragHeal`).
+   */
+  const heal = useSharedValue(0);
   const sheetAnim = useAnimatedStyle(() => ({
-    transform: [{ translateY: translateY.value }],
+    transform: [{ translateY: snapToPixel(translateY.value) + dragHealOffset(heal) }],
   }));
   /**
    * Die Verdunkelung hängt an der LAGE des Blattes, nicht an einem zweiten Wert.
@@ -430,15 +397,20 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
     onDismiss: dismissBySwipe,
     enabled: open,
     gate,
+    heal,
+    // Die Ausfahrt hängt am Offen-Sein — die Geste hält sich dann heraus.
+    closing: !open,
   });
 
   const dateLocale = DATE_LOCALES[locale] ?? enGB;
   const legs = result.legs && result.legs.length > 0 ? result.legs : buildFallbackLegs(result);
 
   // Kompakter Stat-Format „Do, 21. Mai" — Wochentags-Abkürzung + Tag + Monat.
+  // In der Zone des Abfahrtshalts, wie die Uhrzeit daneben: Mit der Gerätezone
+  // stand bei einer Abfahrt kurz nach Mitternacht Ortszeit der Vortag da.
   const summaryDateStr = (() => {
     try {
-      return format(parseISO(result.departTime), "EEE, d. MMM", { locale: dateLocale });
+      return formatLocalizedDateInZone(result.departTime, result.originTz, "EEE, d. MMM", dateLocale);
     } catch {
       return "";
     }
@@ -451,13 +423,20 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
     }
   })();
 
-  const stopLabel =
-    result.stops === 0
-      ? t("details.stop.zero")
-      : result.stops === 1
-      ? t("details.stop.one")
-      : t("details.stop.many").replace("{count}", String(result.stops));
+  // Umstiege der Verbindung (beim Flug: Stopps) — siehe `changesText`.
+  const stopLabel = changesText(result.mode, result.stops, t);
   const stopsAccent = result.stops === 0 ? accent.solid : C.amber;
+  /**
+   * „Ortszeit (UTC+1)" — nur, wenn die Zeiten der Halte NICHT der Uhr des
+   * Geräts entsprechen. Jede Zeit unten steht in der Zone IHRES Halts; wer in
+   * Deutschland eine Fahrt in Oldham ansieht, soll „15:33" nicht für deutsche
+   * Zeit halten.
+   */
+  const zoneHint = localTimeHint(
+    [result.originTz, result.destinationTz, ...legs.flatMap((l) => [l.originTz, l.destTz])],
+    t,
+    Date.parse(result.departTime) || Date.now(),
+  );
 
   return (
     <Animated.View
@@ -498,12 +477,20 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
           />
           <SummaryStat
             icon={<CircleDot size={14} color={stopsAccent} strokeWidth={2} />}
-            label={t("details.summary.stops")}
+            label={changesCaption(result.mode, t)}
             value={stopLabel}
             accentColor={stopsAccent}
             align="end"
           />
         </View>
+        {zoneHint ? (
+          <View style={styles.zoneHint}>
+            <Clock size={12} color={C.sub} strokeWidth={2} />
+            <Text style={styles.zoneHintText} numberOfLines={1}>
+              {zoneHint}
+            </Text>
+          </View>
+        ) : null}
 
         {/* Eigener nativer Erkenner um die Liste — sonst würgt das Ziehen am
             Blatt jedes Scrollen ab. */}
@@ -518,6 +505,14 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
           overScrollMode="never"
           bounces={false}
         >
+          {/* Rückfall des Abfahrts-Tipps (StopDetailSheet): Gesucht war ein
+              Ticket, gefunden nur die Fahrt. Dezent, aber gesagt. */}
+          {result.timelineNotice === "noTicketOffer" ? (
+            <View style={[styles.notice, { backgroundColor: palette.s2 }]}>
+              <Info size={15} color={C.sub} strokeWidth={2.2} />
+              <Text style={styles.noticeText}>{t("details.noTicketOffer")}</Text>
+            </View>
+          ) : null}
           <View style={styles.timeline}>
             {/* Vertical lime rail behind all dots — abs-positioned, exakt
                 ausgerichtet auf die Dot-Mitten via SIDE_PAD + TIME_COL_W + GAP + DOT/2 */}
@@ -525,13 +520,24 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
 
             {atRest ? legs.map((leg, idx) => {
               const next = legs[idx + 1];
+              const prev = legs[idx - 1];
+              // Gefährdeter Anschluss: am Umstieg-Block vor dieser Fahrt — gibt es
+              // keinen (ein Fußweg ist der Umstieg), dann an der Fahrt selbst.
+              const transferBefore = !!prev && !prev.walking && !leg.walking;
               const isFirstLeg = idx === 0;
               const isLastLeg = idx === legs.length - 1;
+              // Umstiegszeit aus den IST-Zeiten (Soll + Verspätung). Mit den
+              // Sollzeiten allein stand bei einem Anschluss, der nur dank
+              // Verspätung besteht, „0 min" — Werl → Greven: RB 59 an 20:28,
+              // RE 7 Soll 19:43, Ist 20:32 → echt 4 min.
               const transferMin = next
                 ? Math.max(
                     0,
                     Math.round(
-                      (Date.parse(next.departTime) - Date.parse(leg.arriveTime)) / 60000,
+                      (Date.parse(next.departTime) +
+                        Math.max(0, next.departDelayMinutes ?? 0) * 60000 -
+                        (Date.parse(leg.arriveTime) + Math.max(0, leg.arriveDelayMinutes ?? 0) * 60000)) /
+                        60000,
                     ),
                   )
                 : 0;
@@ -574,7 +580,10 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
                       terminal={isFirstLeg}
                     />
                   ) : null}
-                  <TransportSegment leg={leg} />
+                  <TransportSegment
+                    leg={leg}
+                    atRiskBadge={leg.warning === "connectionAtRisk" && !transferBefore}
+                  />
                   {showDest ? (
                     <StationRow
                       time={timeOf(leg.arriveTime, legArrTz)}
@@ -594,6 +603,7 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
                     <TransferSegment
                       minutes={transferMin}
                       isFlight={leg.product === "flight"}
+                      atRisk={next.warning === "connectionAtRisk"}
                     />
                   ) : null}
                 </View>
@@ -698,7 +708,7 @@ function PlatformChip({ value }: { value: string }) {
   );
 }
 
-function TransportSegment({ leg }: { leg: SyntheticLeg }) {
+function TransportSegment({ leg, atRiskBadge }: { leg: SyntheticLeg; atRiskBadge?: boolean }) {
   const accent = useAccent();
   const palette = usePalette();
   const t = useT();
@@ -734,7 +744,6 @@ function TransportSegment({ leg }: { leg: SyntheticLeg }) {
   }
 
   const lineLabel = leg.line ?? productLabel(leg.product) ?? "";
-  const lineColor = productColor(leg.product);
   const stops = leg.stops ?? 0;
   const stopovers = leg.stopovers ?? [];
   // Flug: „toward" = ZIEL-Flughafen dieses Legs (leg.direction ist bei Flügen
@@ -755,14 +764,19 @@ function TransportSegment({ leg }: { leg: SyntheticLeg }) {
         <View style={[styles.transportCard, { backgroundColor: palette.s2, borderColor: palette.border }]}>
           <View style={styles.transportHeader}>
             {lineLabel ? (
-              <View style={[styles.linePill, { backgroundColor: lineColor }]}>
-                <Text style={styles.linePillText}>{lineLabel}</Text>
-              </View>
+              <LinePill label={lineLabel} product={leg.product} />
             ) : null}
             {leg.fahrtNr && leg.fahrtNr !== leg.line ? (
               <Text style={styles.codeText}>({leg.fahrtNr})</Text>
             ) : null}
           </View>
+          {/* Laut Bahn fällt GENAU diese Fahrt aus bzw. ist der Umstieg in sie
+              gefährdet — direkt an ihr, nicht nur oben im Blatt. */}
+          {leg.warning === "cancelled" ? (
+            <JourneyWarningBadge warning="cancelled" label={t("results.warning.cancelled")} />
+          ) : atRiskBadge ? (
+            <JourneyWarningBadge warning="connectionAtRisk" label={t("results.warning.connectionAtRisk")} />
+          ) : null}
           {destinationLabel ? (
             <Text style={styles.destinationText}>
               <Text style={{ color: C.sub }}>{t("details.toward")} </Text>
@@ -770,7 +784,7 @@ function TransportSegment({ leg }: { leg: SyntheticLeg }) {
             </Text>
           ) : null}
           {stops > 0 ? (
-            <Pressable onPress={() => setOpen((v) => !v)} style={[styles.stopsToggle, { backgroundColor: palette.s3 }]} hitSlop={6}>
+            <RippleTouch onPress={() => setOpen((v) => !v)} style={[styles.stopsToggle, { backgroundColor: palette.s3 }]} hitSlop={6}>
               <View style={{ transform: [{ rotate: open ? "180deg" : "0deg" }] }}>
                 <ChevronDown size={13} color={accent.solid} strokeWidth={2.5} />
               </View>
@@ -779,7 +793,7 @@ function TransportSegment({ leg }: { leg: SyntheticLeg }) {
                   ? t("details.stop.one")
                   : t("details.stop.many").replace("{count}", String(stops))}
               </Text>
-            </Pressable>
+            </RippleTouch>
           ) : null}
           {open && stopovers.length > 0 ? (
             <View style={styles.stopList}>
@@ -799,7 +813,16 @@ function TransportSegment({ leg }: { leg: SyntheticLeg }) {
   );
 }
 
-function TransferSegment({ minutes, isFlight }: { minutes: number; isFlight?: boolean }) {
+function TransferSegment({
+  minutes,
+  isFlight,
+  atRisk,
+}: {
+  minutes: number;
+  isFlight?: boolean;
+  /** Laut Bahn voraussichtlich nicht zu schaffen (Ist-Zeiten, siehe Server). */
+  atRisk?: boolean;
+}) {
   const accent = useAccent();
   const palette = usePalette();
   const t = useT();
@@ -825,6 +848,14 @@ function TransferSegment({ minutes, isFlight }: { minutes: number; isFlight?: bo
               {formatDuration(minutes)}{" "}
               {isFlight ? t("details.transferwait") : t("details.transferwalk")}
             </Text>
+            {atRisk ? (
+              <View style={styles.transferRisk}>
+                <JourneyWarningIcon warning="connectionAtRisk" size={12} />
+                <Text style={[styles.transferRiskText, { color: JOURNEY_WARNING_COLORS.connectionAtRisk.fg }]}>
+                  {t("details.transfer.atRisk")}
+                </Text>
+              </View>
+            ) : null}
           </View>
         </View>
       </View>
@@ -857,7 +888,16 @@ const styles = scaledStyles({
     borderTopRightRadius: 28,
     paddingBottom: 32,
   },
-  handleWrap: { alignItems: "center", paddingTop: 12, paddingBottom: 14 },
+  /**
+   * 12 oben, 16 unten — dieselben Zahlen wie an JEDEM anderen Griff der App
+   * (`SheetModal`, Verlaufs-Blatt, Ticket-Dialog).
+   *
+   * Hier standen 14 unten. Zwei Punkte sieht niemand für sich genommen; sie
+   * fallen erst auf, wenn zwei Blätter nacheinander aufgehen und das eine
+   * minimal anders sitzt als das andere. Genau daraus entsteht der Eindruck,
+   * eine App sei „nicht ganz sauber", ohne dass man sagen könnte woran.
+   */
+  handleWrap: { alignItems: "center", paddingTop: 12, paddingBottom: 16 },
   handle: { width: 40, height: 4, borderRadius: 9999, backgroundColor: C.text },
 
   /* Stat-Box: Date | Departure | Stops */
@@ -872,6 +912,17 @@ const styles = scaledStyles({
     marginBottom: 16,
   },
   summaryStat: { flex: 1, flexDirection: "column", gap: 2, minWidth: 0 },
+  // Ortszeit-Hinweis unter dem Kasten — klein und grau, rückt mit dem
+  // eigenen Abstand an den Kasten heran (der hat unten 16).
+  zoneHint: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    marginHorizontal: SIDE_PAD,
+    marginTop: -8,
+    marginBottom: 12,
+  },
+  zoneHintText: { fontSize: 11, color: C.sub, fontWeight: "500", letterSpacing: 0.1 },
   summaryValueRow: { flexDirection: "row", alignItems: "center", gap: 5 },
   summaryValue: { fontSize: 14, fontWeight: "700", color: C.text, letterSpacing: -0.15 },
   summaryLabel: {
@@ -883,6 +934,18 @@ const styles = scaledStyles({
   },
 
   scrollContent: { paddingBottom: 32 },
+  notice: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+    marginHorizontal: SIDE_PAD,
+    marginTop: 4,
+    marginBottom: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 14,
+  },
+  noticeText: { flex: 1, fontSize: 12, lineHeight: 17, color: C.sub, fontWeight: "500" },
 
   /* Timeline scaffolding */
   timeline: { position: "relative", paddingTop: 4 },
@@ -983,8 +1046,6 @@ const styles = scaledStyles({
     gap: 10,
   },
   transportHeader: { flexDirection: "row", alignItems: "center", gap: 10 },
-  linePill: { paddingHorizontal: 11, paddingVertical: 6, borderRadius: 10 },
-  linePillText: { fontSize: 12, fontWeight: "800", color: C.text, letterSpacing: -0.2 },
   codeText: { fontSize: 13, color: C.sub, fontWeight: "600" },
   destinationText: { fontSize: 13, color: C.text, fontWeight: "500" },
   stopsToggle: {
@@ -1031,6 +1092,8 @@ const styles = scaledStyles({
   },
   transferTitle: { fontSize: 13, fontWeight: "700", color: C.text },
   transferMeta: { fontSize: 11, color: C.sub, fontWeight: "500" },
+  transferRisk: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 4 },
+  transferRiskText: { fontSize: 12, fontWeight: "700", flexShrink: 1 },
 
   /* Dotted spacer line zwischen Transfer-Stationen */
   dottedLineWrap: {

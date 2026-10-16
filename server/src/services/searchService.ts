@@ -5,15 +5,24 @@ import type { TravelMode } from "../db/schema.js";
 import { activeProvidersForMode, activeFallbackProvidersForMode } from "../providers/registry.js";
 import { enrichTrainResults } from "./trainPricing.js";
 import type {
+  JourneyWarning,
   LegInfo,
   NormalizedResult,
   ProviderResult,
   ProviderSearchInput,
   SearchProvider,
 } from "../providers/types.js";
-import { sha256 } from "../util/hash.js";
 import { issueRedirectToken, issueRedirectTokens } from "./tokenService.js";
 import { enqueueRefresh as enqueueDbVendoRefresh } from "./dbVendoQueue.js";
+import { currentDbPriority, dbHasRoom, wasDbDenied, withDbPriority } from "./dbQuota.js";
+import {
+  effectiveMs,
+  hasRealtime,
+  journeyDelaysFromLegs,
+  journeyWarningFromLegs,
+  timelineProblem,
+  warningRank,
+} from "../util/journeyTimeline.js";
 
 export interface SearchInput extends ProviderSearchInput {
   mode: TravelMode;
@@ -69,6 +78,9 @@ export interface ClientResult {
   operatedBy?: string;
   isRefundable?: boolean;
   baggageIncluded?: boolean;
+  /** Von der Quelle als gefährdet gemeldet (siehe JourneyWarning). Die Stelle
+   *  steht an der betroffenen Teilstrecke (`legs[].warning`). */
+  warning?: JourneyWarning;
 }
 
 export interface SearchOutput {
@@ -159,8 +171,62 @@ const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 h
  */
 const RESULT_SCHEMA_EPOCH = new Date("2026-07-14T00:01:00Z");
 
+/**
+ * Dasselbe NUR für Zugsuchen — Flug-, Bus- und Kreuzfahrt-Zwischenspeicher
+ * bleiben davon unberührt.
+ *
+ * 2026-09-27T14:20Z: Regionalzüge privater Betreiber tragen jetzt ihre Linie
+ *   („RB 59") statt Betreiber-Kürzel + Zugnummer („ERB 90339", siehe
+ *   util/line.ts). Gespeicherte Treffer haben nur den fertigen Text, nicht
+ *   DBs Kennung — nachträglich richtigstellen lässt er sich nicht.
+ *
+ * Gleiche Regel: nie in die Zukunft setzen.
+ */
+const TRAIN_RESULT_EPOCH = new Date("2026-09-27T14:20:00Z");
+
+/**
+ * Ab hier trägt jede gespeicherte Suche ihre Klasse (`travel_class`).
+ * Ältere Einträge haben keine — darunter auch Suchen in der 1. Klasse, deren
+ * Treffer sonst einer normalen Suche geliefert würden. Sie gelten nicht mehr.
+ */
+const CLASS_AWARE_SINCE = new Date("2026-09-27T17:40:00Z");
+
+/**
+ * Die STANDARD-Klasse je Verkehrsmittel (2. Klasse, Economy, Standard-Sitz)
+ * zählt als „keine": Genau die suchen die Anbieter ohnehin. Das Suchformular
+ * setzt sie aber immer — ohne diese Gleichsetzung wären normale Suchen und
+ * Suchen ohne Klasse (Stadt-Blatt, Karte) getrennte Cache-Einträge.
+ */
+const DEFAULT_TRAVEL_CLASSES = new Set([
+  "search.class.second",
+  "search.class.economy",
+  "search.seat.standard",
+]);
+
+export function normalizeTravelClass(travelClass?: string | null): string {
+  const c = travelClass?.trim() ?? "";
+  return DEFAULT_TRAVEL_CLASSES.has(c) ? "" : c;
+}
+
 /** In-Flight-Map: Schlüssel = cacheKey, Wert = Promise des laufenden Calls. */
 const inFlight = new Map<string, Promise<SearchOutput>>();
+
+/**
+ * Wie viele Suchen gerade live bei der BAHN fragen (Zug und Bus — dort läuft
+ * db-vendo). Nachrangige DB-Anfragen (Gleisverläufe der Karte, routes/trips.ts;
+ * Live-Ortssuche) warten, solange hier etwas läuft — das DB-Kontingent
+ * (~60/min) gehört der Suche.
+ *
+ * Flug- und Kreuzfahrtsuchen zählen NICHT: Sie fragen die Bahn nie, hielten
+ * das Tor bei laufendem Verkehr aber fast immer zu.
+ */
+export function liveSearchesInFlight(): number {
+  let n = 0;
+  for (const key of inFlight.keys()) {
+    if (key.startsWith("TRAIN|") || key.startsWith("BUS|")) n++;
+  }
+  return n;
+}
 
 function cacheKey(input: SearchInput): string {
   return [
@@ -173,7 +239,7 @@ function cacheKey(input: SearchInput): string {
     input.currency,
     // travelClass MUSS in den Key — sonst würde eine Economy-Suche eine
     // Business-Suche aus dem Cache bedienen (gleiche Strecke, andere Klasse).
-    input.travelClass ?? "",
+    normalizeTravelClass(input.travelClass),
     // departTime ebenso: der Surroundings-Departure-Tap verschiebt damit das
     // dbVendo-Suchfenster. Ohne Key-Anteil würde ein 09:00-Tap die gecachten
     // 14:00-Ergebnisse derselben Strecke/Tag serviert bekommen.
@@ -186,12 +252,10 @@ interface CachedHit {
   ageMs: number;
 }
 
-async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
-  // travelClass wird (noch) nicht in der DB-Tabelle gespeichert — daher
-  // können wir bei klassenspezifischen Suchen den DB-Cache nicht sicher
-  // bedienen (Economy-Resultate würden eine Business-Anfrage beantworten).
-  // Lieber live fetchen als falsche Klassenpreise liefern.
-  if (input.travelClass) return null;
+async function loadFromCache(input: SearchInput, maxAgeMs?: number): Promise<CachedHit | null> {
+  // Die Klasse ist seit `CLASS_AWARE_SINCE` Teil der gespeicherten Suche
+  // (Spalte `travel_class`) und damit der Cache-Identität — siehe unten.
+  const travelClass = normalizeTravelClass(input.travelClass);
 
   // Round-Trip: Rückfahrt-Treffer werden nicht persistiert (kein `direction`
   // im Schema). Ein Cache-Hit würde nur die Hinfahrten liefern, was den
@@ -201,7 +265,17 @@ async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
   const maxAge = Math.max(CACHE_TTL_BY_MODE[input.mode], CACHE_MAX_AGE_MS);
   const since = new Date(Date.now() - maxAge);
   // Nie älter als die Schema-Epoche servieren → alte Ergebnis-Struktur fällt raus.
-  const effectiveSince = since > RESULT_SCHEMA_EPOCH ? since : RESULT_SCHEMA_EPOCH;
+  let epoch =
+    input.mode === "TRAIN" && TRAIN_RESULT_EPOCH > RESULT_SCHEMA_EPOCH
+      ? TRAIN_RESULT_EPOCH
+      : RESULT_SCHEMA_EPOCH;
+  if (CLASS_AWARE_SINCE > epoch) epoch = CLASS_AWARE_SINCE;
+  let effectiveSince = since > epoch ? since : epoch;
+  // Nur ein Eintrag, dessen Echtzeit noch gilt (siehe `departTimePassed`).
+  if (maxAgeMs !== undefined) {
+    const youngest = new Date(Date.now() - maxAgeMs);
+    if (youngest > effectiveSince) effectiveSince = youngest;
+  }
 
   const [match] = await db
     .select({ id: searchRequests.id, createdAt: searchRequests.createdAt })
@@ -223,9 +297,20 @@ async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
         input.returnDate
           ? eq(searchRequests.returnDate, input.returnDate)
           : isNull(searchRequests.returnDate),
+        travelClass
+          ? eq(searchRequests.travelClass, travelClass)
+          : isNull(searchRequests.travelClass),
         eq(searchRequests.passengers, input.passengers),
         eq(searchRequests.currency, input.currency),
         gte(searchRequests.createdAt, effectiveSince),
+        /**
+         * Nur eine Anfrage MIT Ergebnissen. `runLive` legt seine Zeile an,
+         * bevor die Anbieter antworten — die neueste Zeile ist während eines
+         * Auffrischens also leer. Früher gab es dann „kein Cache", und der
+         * erste Nutzer in dieser Zeit startete eine komplette zweite
+         * Live-Suche (Bahn-Kontingent, bei Flügen bezahlte Abfragen).
+         */
+        sql`exists (select 1 from ${searchResults} where ${searchResults.requestId} = ${searchRequests.id})`,
       ),
     )
     .orderBy(desc(searchRequests.createdAt))
@@ -264,11 +349,12 @@ async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
     })),
   );
 
+  const ageMs = Date.now() - match.createdAt.getTime();
   const out: ClientResult[] = [];
   for (let ri = 0; ri < rows.length; ri++) {
     const row = rows[ri]!;
     const token = tokens[ri]!;
-    out.push({
+    out.push(withCachedRealtime({
       id: row.id,
       mode: row.mode,
       provider: row.provider,
@@ -286,6 +372,8 @@ async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
       stops: row.stops,
       stopLabels: row.stopLabels,
       legs: (row.legs as LegInfo[] | null) ?? undefined,
+      // Keine eigene Spalte — die Warnung steht an der Teilstrecke im JSON.
+      warning: journeyWarningFromLegs(row.legs as LegInfo[] | null),
       price: Number(row.price),
       currency: row.currency,
       redirectToken: token,
@@ -294,7 +382,7 @@ async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
       operatedBy: row.operatedBy ?? undefined,
       isRefundable: row.isRefundable ?? undefined,
       baggageIncluded: row.baggageIncluded ?? undefined,
-    });
+    }, ageMs));
   }
 
   const fresh = dropDeparted(out);
@@ -306,8 +394,43 @@ async function loadFromCache(input: SearchInput): Promise<CachedHit | null> {
       source: "cache",
       fetchedAt: match.createdAt.toISOString(),
     },
-    ageMs: Date.now() - match.createdAt.getTime(),
+    ageMs,
   };
+}
+
+/**
+ * So lange gilt die mitgespeicherte Echtzeit eines Cache-Eintrags noch als
+ * aktuell. Gleiche Größenordnung wie der dbweb-Zwischenspeicher der
+ * Preis-Anreicherung (trainPricing.ts, 5 min).
+ */
+const REALTIME_FRESH_MS = 5 * 60_000;
+
+/**
+ * Echtzeit eines Cache-Treffers: aktuell genug → zeigen, sonst → weglassen.
+ *
+ * Die Verspätung der Gesamtreise hat keine Spalte, die der Teilstrecken steckt
+ * aber im gespeicherten `legs`-JSON (db-vendo, MOTIS, dbweb-Anreicherung). Ohne
+ * diese Angleichung zeigte ein Cache-Treffer die Teilstrecken MIT, die Karte
+ * OHNE Verspätung — und die Dauer (in Ist-Zeit gespeichert) passte zu keinem
+ * von beiden.
+ *
+ *   - Junger Eintrag (≤ REALTIME_FRESH_MS): Verspätung der Gesamtreise aus den
+ *     Teilstrecken wiederherstellen — wie in der Live-Antwort Minuten zuvor.
+ *   - Älterer Eintrag: Die Prognose ist überholt. Reiner Fahrplan, wie es der
+ *     Cache schon immer wollte („Cache-Hits zeigen keinen veralteten Delay"),
+ *     Dauer aus den Sollzeiten. Eine Verbindung, die NUR dank einer Verspätung
+ *     bestand, ist dann eine unmögliche Zeitfolge — der Wächter in `runSearch`
+ *     liefert sie nicht mehr aus, statt den Nutzer auf einen längst anders
+ *     verspäteten Anschluss zu schicken.
+ */
+function withCachedRealtime(r: ClientResult, ageMs: number): ClientResult {
+  if ((r.mode !== "TRAIN" && r.mode !== "BUS") || !hasRealtime(r.legs)) return r;
+  if (ageMs <= REALTIME_FRESH_MS) {
+    return { ...r, ...journeyDelaysFromLegs(r.legs) };
+  }
+  const legs = r.legs?.map((l) => ({ ...l, departDelayMinutes: undefined, arriveDelayMinutes: undefined }));
+  const planned = Math.round((Date.parse(r.arriveTime) - Date.parse(r.departTime)) / 60_000);
+  return { ...r, legs, durationMinutes: Math.max(1, planned) };
 }
 
 /**
@@ -382,6 +505,24 @@ async function fillMissingLegCoords(candidates: Candidate[], input: SearchInput)
   }
 }
 
+/**
+ * Ein Auffrischen im Hintergrund, dem UNSER Bahn-Kontingent eine Anfrage
+ * verweigert hat, ist unvollständig (ohne db-vendo: keine Preise, falsche
+ * Gleise, womöglich nur eine halbe Liste). Gespeichert würde es der neueste
+ * Stand und verdrängte die gute Antwort für Stunden — also verwerfen, samt
+ * Anfrage-Eintrag (die Antworten der Anbieter hängen per Kaskade daran). Der
+ * nächste Zugriff reiht das Auffrischen neu ein.
+ *
+ * Damit das selten nötig wird (bei Bus sind die übrigen Anbieter schon bezahlt),
+ * fängt ein Auffrischen gar nicht erst an, wenn das Kontingent knapp ist
+ * (`REFRESH_MIN_DB_SLOTS`, siehe `triggerBackgroundRefresh`).
+ */
+async function discardIfDenied(requestId: string): Promise<void> {
+  if (currentDbPriority() !== "background" || !wasDbDenied()) return;
+  await db.delete(searchRequests).where(eq(searchRequests.id, requestId));
+  throw new Error("Auffrischen verschoben — kein Platz im Bahn-Kontingent");
+}
+
 async function runLive(input: SearchInput): Promise<SearchOutput> {
   const [request] = await db
     .insert(searchRequests)
@@ -397,13 +538,16 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
       returnDate: input.returnDate,
       passengers: input.passengers,
       currency: input.currency,
-      ipHash: input.ip ? sha256(input.ip) : null,
+      // Teil der Cache-Identität (siehe loadFromCache) — Standard = leer.
+      travelClass: normalizeTravelClass(input.travelClass) || null,
     })
     .returning({ id: searchRequests.id });
 
   if (!request) throw new Error("Failed to insert search request");
 
   const candidates: Candidate[] = [];
+  /** Treffer mit unmöglicher Zeitfolge — verworfen, aber protokolliert. */
+  const rejected: string[] = [];
   // Pagination-Token vom (ersten) Provider der einen liefert. Bei TRAIN ist
   // das dbVendo — andere Modes bleiben undefined.
   let paginationToken: string | undefined;
@@ -431,6 +575,17 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
             .returning({ id: providerResponses.id });
           if (!pr) return;
           for (const r of out.results) {
+            // VOR Dedupe und Reserve-Entscheidung prüfen: Der Dedupe behält je
+            // erstem Fahrzeug nur EINE Variante (die kürzeste). Eine unmögliche
+            // Zeitfolge ist scheinbar kurz (Werl → Greven: „17 min") und
+            // verdrängte jede echte Variante desselben Zuges — sie muss raus
+            // sein, bevor er wählt. Liefert die Primärquelle nur Unmögliches,
+            // springt so auch die Reserve (MOTIS) ein.
+            const problem = guardedProblem(r, input.mode);
+            if (problem) {
+              rejected.push(`${p.name}: ${problem}`);
+              continue;
+            }
             candidates.push({ result: r, provider: p.name, providerResponseId: pr.id });
           }
         } catch (e) {
@@ -447,6 +602,16 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
   };
 
   await runProviders(activeProvidersForMode(input.mode));
+
+  /**
+   * Ein Auffrischen im Hintergrund, dem UNSER Bahn-Kontingent eine Anfrage
+   * verweigert hat, ist unvollständig (ohne db-vendo: keine Preise, falsche
+   * Gleise, womöglich nur eine halbe Liste). Gespeichert würde es der neueste
+   * Stand und verdrängte die gute Antwort für Stunden — also verwerfen, samt
+   * Anfrage-Eintrag (die Antworten der Anbieter hängen per Kaskade daran). Der
+   * nächste Zugriff reiht das Auffrischen neu ein.
+   */
+  await discardIfDenied(request.id);
 
   // Fallback — zwei Auslöser.
   //
@@ -493,6 +658,8 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
     await runProviders(activeFallbackProvidersForMode(input.mode));
   }
 
+  logTimelineRejects(input, "Anbieter → verworfen", rejected);
+
   const deduped = dedupe(candidates, input.mode);
 
   // Endpunkt-Koordinaten für Provider ohne Leg-Geometrie (FlixBus & Co.):
@@ -520,9 +687,27 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
   // wäre ein weiterer int.bahn.de-Call, der nichts hinzufügt (und Kontingent wie
   // Sekunden kostet). Gebraucht wird sie nur noch, wenn MOTIS als Reserve
   // eingesprungen ist: dessen Treffer haben price=0.
-  const needsPricing = outboundCandidates.filter((c) => !(c.result.price > 0));
+  // Ausgefallene nicht: Für sie gibt es nichts zu kaufen, ein Preis wäre ein
+  // falsches Versprechen (und der Abruf kostete Bahn-Kontingent).
+  const needsPricing = outboundCandidates.filter(
+    (c) => !(c.result.price > 0) && c.result.warning !== "cancelled",
+  );
   if (input.mode === "TRAIN" && needsPricing.length > 0) {
+    // Die Anreicherung ERSETZT die Route (Zuordnung über Abfahrtsminute des
+    // ersten Zuges + Ankunft ±25 min). Ergibt der Tausch eine unmögliche
+    // Zeitfolge, gilt die unveränderte Verbindung der eigentlichen Quelle —
+    // lieber ohne Preis als falsch.
+    const untouched = new Map(needsPricing.map((c) => [c, structuredClone(c.result)]));
     await enrichTrainResults(needsPricing.map((c) => c.result), input);
+    const reverted: string[] = [];
+    for (const c of needsPricing) {
+      const problem = guardedProblem(c.result, input.mode);
+      const original = untouched.get(c);
+      if (!problem || !original) continue;
+      reverted.push(`${c.provider} nach Anreicherung: ${problem}`);
+      c.result = original;
+    }
+    logTimelineRejects(input, "Anreicherung → zurückgenommen", reverted);
     // NOCHMAL deduplizieren: Das Enrichment ersetzt Label und Route durch die
     // von bahn.de. Zwei MOTIS-Varianten desselben Zuges (z.B. „IC 63" aus DELFI
     // und „RJX 63" aus dem Referenz-Feed) überleben den ersten Dedup, weil ihre
@@ -530,6 +715,11 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
     // stünden doppelt in der Liste.
     outboundCandidates = dedupe(outboundCandidates, input.mode);
   }
+
+  // Nochmal unmittelbar vor dem Speichern: Auch die Preis-Anreicherung oben
+  // fragt bei der Bahn — verweigert, stünde eine Liste ohne Preise als neuester
+  // Stand da.
+  await discardIfDenied(request.id);
 
   const flatResults: ClientResult[] = [];
   if (outboundCandidates.length > 0) {
@@ -620,6 +810,7 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
         stops: row.stops,
         stopLabels: row.stopLabels,
         legs: (row.legs as LegInfo[] | null) ?? undefined,
+        warning: candidate?.warning,
         price: Number(row.price),
         currency: row.currency,
         redirectToken: token,
@@ -657,6 +848,11 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
       destLabel: c.result.destLabel,
       departTime: c.result.departTime,
       arriveTime: c.result.arriveTime,
+      // Wie bei der Hinfahrt: Ohne Echtzeit sähe eine Rückfahrt, die nur dank
+      // Verspätung besteht, unmöglich aus (und der Wächter in `runSearch` warf
+      // sie hinaus).
+      departDelayMinutes: c.result.departDelayMinutes,
+      arriveDelayMinutes: c.result.arriveDelayMinutes,
       originTz: c.result.originTz,
       destinationTz: c.result.destinationTz,
       dateOnly: c.result.dateOnly ?? false,
@@ -664,6 +860,7 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
       stops: c.result.stops,
       stopLabels: c.result.stopLabels,
       legs: c.result.legs,
+      warning: c.result.warning,
       price: c.result.price,
       currency: c.result.currency,
       // Direkter Bahn.de/FlixBus-URL — ResultCard.bookUrl fällt auf deepLink
@@ -702,21 +899,38 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
  *
  *  Coalescing-Map verhindert dass mehrere parallele Stale-Hits den gleichen
  *  Background-Refresh feuern. */
+/**
+ * Laufende Auffrischungen — getrennt von `inFlight`: Eine Nutzer-Suche hängt
+ * sich NICHT an eine Auffrischung. Die läuft mit niedrigerer Stufe im
+ * Bahn-Kontingent und kann abgebrochen werden (siehe `runLive`); der Nutzer
+ * bekam sonst deren schlechteres oder gar kein Ergebnis.
+ */
+const refreshing = new Set<string>();
+
+/** So viele freie Plätze (Stufe `background`) braucht ein Zug-/Bus-Auffrischen zum Start. */
+const REFRESH_MIN_DB_SLOTS = 3;
+
 function triggerBackgroundRefresh(input: SearchInput, key: string) {
-  if (inFlight.has(key)) return;
+  if (inFlight.has(key) || refreshing.has(key)) return;
 
   const refreshFn = () => {
-    if (inFlight.has(key)) return Promise.resolve();
-    const promise = runLive({ ...input, nocache: true })
+    if (inFlight.has(key) || refreshing.has(key)) return Promise.resolve();
+    // Zug und Bus fragen bei der Bahn (Station, Fahrten, ggf. Preise). Reicht
+    // das Kontingent dafür gerade nicht, gar nicht erst anfangen — ein halb
+    // verweigertes Auffrischen würde ohnehin verworfen (`discardIfDenied`), bei
+    // Bus samt den schon bezahlten Antworten der anderen Anbieter.
+    if ((input.mode === "TRAIN" || input.mode === "BUS") && !dbHasRoom("background", REFRESH_MIN_DB_SLOTS)) {
+      return Promise.resolve();
+    }
+    refreshing.add(key);
+    return runLive({ ...input, nocache: true })
+      .then(() => undefined)
       .catch((e) => {
         console.warn(`[search] background refresh failed for ${key}:`, e instanceof Error ? e.message : e);
-        return null as unknown as SearchOutput;
       })
       .finally(() => {
-        inFlight.delete(key);
+        refreshing.delete(key);
       });
-    inFlight.set(key, promise as Promise<SearchOutput>);
-    return promise;
   };
 
   if (input.mode === "TRAIN") {
@@ -734,7 +948,10 @@ function triggerBackgroundRefresh(input: SearchInput, key: string) {
     return;
   }
 
-  refreshFn();
+  // Auch Bus (dort läuft db-vendo mit) zählt als Hintergrund — ohne den
+  // Kontext galt das Auffrischen als Suche und wartete bis zu acht Sekunden
+  // auf einen Platz, den es einer echten Suche wegnahm.
+  void withDbPriority("background", refreshFn);
 }
 
 /**
@@ -838,7 +1055,7 @@ async function searchNearbyFallback(rawInput: SearchInput): Promise<SearchOutput
 
 export async function runSearch(rawInput: SearchInput): Promise<SearchOutput> {
   const out = await runSearchUncut(rawInput);
-  const primary = applyRequestedTime(out, rawInput);
+  const primary = guardTimelines(applyRequestedTime(out, rawInput), rawInput);
   if (rawInput.mode !== "FLIGHT" || primary.results.length > 0) return primary;
 
   if (!rawInput.allowNearby) return primary;
@@ -849,6 +1066,79 @@ export async function runSearch(rawInput: SearchInput): Promise<SearchOutput> {
     `[flights] ${rawInput.origin} ohne Treffer — ausgewichen auf ${fallback.results[0]?.origin ?? "?"} (${fallback.results.length} Treffer)`,
   );
   return applyRequestedTime(fallback, rawInput);
+}
+
+/**
+ * Nur Zug und Bus. Flüge tragen ihre Zeiten als Wandzeit mit Zone „UTC" (siehe
+ * Client, LegTimelineOverlay) — Ankunft gegen Abfahrt über Zeitzonen hinweg ist
+ * dort kein Vergleich zweier Zeitpunkte.
+ */
+function timelineGuarded(mode: TravelMode): boolean {
+  return mode === "TRAIN" || mode === "BUS";
+}
+
+/**
+ * Zeitfolgen-Prüfung für EINEN Treffer — außer, die Quelle hat ihn selbst als
+ * gefährdet markiert. Der Wächter fängt DATENFEHLER (eine unmögliche Folge, von
+ * der niemand etwas sagt). Eine Verbindung, deren Anschluss laut DB platzt, ist
+ * dagegen bekannt gefährdet: Sie darf eine negative Umstiegszeit haben, steht
+ * aber immer mit Warnung da (und hinter den funktionierenden).
+ */
+function guardedProblem(r: Parameters<typeof timelineProblem>[0] & { warning?: JourneyWarning }, mode: TravelMode): string | null {
+  if (!timelineGuarded(mode) || r.warning) return null;
+  return timelineProblem(r);
+}
+
+/** Verworfene Verbindungen protokollieren — ein Rückfall soll auffallen. */
+function logTimelineRejects(input: SearchInput, stage: string, rejected: string[]): void {
+  if (rejected.length === 0) return;
+  const sample = rejected.slice(0, 3).join(" | ") + (rejected.length > 3 ? " | …" : "");
+  console.warn(
+    `[search] ${input.mode} ${input.origin} → ${input.destination} (${stage}): ` +
+      `${rejected.length}× unmögliche Zeitfolge — ${sample}`,
+  );
+}
+
+/**
+ * LETZTE Stufe vor der Antwort, für Live UND Cache: Eine Verbindung, deren
+ * Anschluss abfährt, bevor der Zubringer ankommt (Ist-Zeiten, siehe
+ * util/journeyTimeline.ts), wird nie ausgeliefert.
+ *
+ * Live greift das schon vor dem Dedupe; hier landet vor allem, was im Cache
+ * liegt: Einträge aus der Zeit vor dem Echtzeit-Fix (nur Sollzeiten) und
+ * Verbindungen, die nur dank einer inzwischen überholten Verspätung bestanden
+ * (siehe `withCachedRealtime`). Lieber ein Treffer weniger als einer, der den
+ * Nutzer auf einen Zug schickt, der schon weg ist.
+ */
+function guardTimelines(out: SearchOutput, input: SearchInput): SearchOutput {
+  if (!timelineGuarded(input.mode)) return out;
+  const rejected: string[] = [];
+  const results = out.results.filter((r) => {
+    const problem = guardedProblem(r, input.mode);
+    if (problem) rejected.push(`${r.provider}: ${problem}`);
+    return !problem;
+  });
+  if (rejected.length === 0) return out;
+  logTimelineRejects(input, `${out.source === "cache" ? "Cache" : "Antwort"} → nicht ausgeliefert`, rejected);
+  return { ...out, results };
+}
+
+/**
+ * Liegt die gewünschte Abfahrt schon hinter uns? Dann fragt jemand nach einem
+ * Zug, der laut Fahrplan weg ist — praktisch immer der Abfahrts-Tipp auf einen
+ * VERSPÄTETEN Zug (Werl → Dortmund am 09.10.: Soll 16:46, Ist 16:51, getippt
+ * 16:50). Ob er noch fährt, weiß nur die Echtzeit; ein älterer Cache-Eintrag
+ * kennt sie nicht mehr (siehe `withCachedRealtime`) und sortierte ihn nach der
+ * Sollzeit aus.
+ *
+ * „Jetzt"-Suchen fallen NICHT darunter: Deren Uhrzeit liegt bei Ankunft am
+ * Server nur Sekunden zurück (gemessen, 14 Tage: 129 von 138 „vergangenen"
+ * Zugsuchen lagen unter einer Minute) — der Puffer von `dropDeparted` deckt das.
+ */
+function departTimePassed(input: SearchInput): boolean {
+  if (!input.departTime || !MODES_USING_DEPART_TIME.has(input.mode)) return false;
+  const t = Date.parse(input.departTime);
+  return Number.isFinite(t) && t < Date.now() - DEPARTED_GRACE_MS;
 }
 
 async function runSearchUncut(rawInput: SearchInput): Promise<SearchOutput> {
@@ -862,7 +1152,10 @@ async function runSearchUncut(rawInput: SearchInput): Promise<SearchOutput> {
   // 1. Cache-Lookup (außer ?nocache=1 ODER bei Pagination — da brauchen wir
   //    immer frische Provider-Daten, der laterRef-Token hat keinen Cache-Sinn).
   if (!input.nocache && !input.paginationToken) {
-    const cached = await loadFromCache(input);
+    // Abfahrt schon vorbei → nur ein Eintrag mit noch gültiger Echtzeit, sonst
+    // live. Wiederholte Tipps auf denselben Zug kommen so binnen fünf Minuten
+    // aus dem Cache und kosten kein weiteres Bahn-Kontingent.
+    const cached = await loadFromCache(input, departTimePassed(input) ? REALTIME_FRESH_MS : undefined);
     if (cached && cached.ageMs <= ttl + (CACHE_MAX_AGE_MS - ttl)) {
       const isStale = cached.ageMs > ttl * STALE_REFRESH_RATIO;
       if (isStale && cached.ageMs <= ttl) {
@@ -909,9 +1202,15 @@ async function runSearchUncut(rawInput: SearchInput): Promise<SearchOutput> {
  */
 const DEPARTED_GRACE_MS = 2 * 60_000;
 
-function dropDeparted<T extends { departTime: string; dateOnly?: boolean }>(rows: T[]): T[] {
+function dropDeparted<T extends { departTime: string; departDelayMinutes?: number; dateOnly?: boolean }>(
+  rows: T[],
+): T[] {
   const cutoff = Date.now() - DEPARTED_GRACE_MS;
-  return rows.filter((r) => r.dateOnly || Date.parse(r.departTime) >= cutoff);
+  // IST-Abfahrt, nicht Soll: Ein Zug mit Soll 16:46 und +5 fährt um 16:51 — um
+  // 16:50 aussortiert, sah der Nutzer „This connection is hiding" statt des
+  // Buchungsblatts. Ohne bekannte Verspätung bleibt es die Sollzeit (wie bisher);
+  // ausgefallene Fahrten kommen gar nicht erst hier an (dbVendo.ts).
+  return rows.filter((r) => r.dateOnly || effectiveMs(r.departTime, r.departDelayMinutes) >= cutoff);
 }
 
 /**
@@ -968,11 +1267,20 @@ function connectionScore(r: {
  * Gleichstand → frühere Abfahrt zuerst.
  */
 function sortResults<
-  T extends { price: number; durationMinutes: number; stops: number; departTime: string },
+  T extends {
+    price: number;
+    durationMinutes: number;
+    stops: number;
+    departTime: string;
+    warning?: JourneyWarning;
+  },
 >(results: T[], mode: TravelMode): void {
+  // Gefährdete und ausgefallene Verbindungen IMMER hinter die funktionierenden
+  // (warningRank) — auch wenn sie schneller oder billiger aussehen.
   if (mode === "TRAIN") {
     results.sort(
       (a, b) =>
+        warningRank(a) - warningRank(b) ||
         connectionScore(a) - connectionScore(b) ||
         Date.parse(a.departTime) - Date.parse(b.departTime),
     );
@@ -981,6 +1289,7 @@ function sortResults<
     // ENDE, nicht als vermeintlich Günstigste an die Spitze.
     results.sort(
       (a, b) =>
+        warningRank(a) - warningRank(b) ||
         effectivePrice(a) - effectivePrice(b) ||
         Date.parse(a.departTime) - Date.parse(b.departTime),
     );
@@ -1071,7 +1380,15 @@ function dedupe(candidates: Candidate[], mode: TravelMode): Candidate[] {
       continue;
     }
     let better: boolean;
-    if (mode === "TRAIN") {
+    const rank = warningRank(c.result);
+    const prevRank = warningRank(existing.result);
+    if (rank !== prevRank) {
+      // Eine markierte Variante (Anschluss platzt / fällt aus) verdrängt NIE eine
+      // funktionierende — egal wie kurz sie aussieht. Werl → Greven: die
+      // Variante mit geplatztem Anschluss teilt sich den Schlüssel mit der
+      // fahrbaren (RB 59 20:16).
+      better = rank < prevRank;
+    } else if (mode === "TRAIN") {
       // Züge: die qualitativ beste Variante behalten (weniger Umstiege /
       // schneller); bei Gleichstand die vertrauenswürdigere Quelle. Preise
       // taugen hier nicht als Tiebreak — MOTIS-Treffer sind ohne Anreicherung 0.
@@ -1185,7 +1502,9 @@ function fingerprint(r: NormalizedResult, mode: TravelMode): string {
   if (mode === "TRAIN" || mode === "BUS") {
     const firstTransit = r.legs?.find((l) => !l.walking);
     const vehicleDep = roundToMinute(firstTransit?.departTime ?? r.departTime);
-    const first = (r.flightNumber ?? r.operatedBy ?? "").toUpperCase();
+    // Ohne Leerzeichen: DB schreibt die Linie „RB 59" (siehe util/line.ts),
+    // MOTIS „RB59" — derselbe Zug, derselbe Schlüssel.
+    const first = (r.flightNumber ?? r.operatedBy ?? "").toUpperCase().replace(/\s+/g, "");
     return `${mode.toLowerCase()}:${first}|${vehicleDep}|${route}`;
   }
   if (mode === "FLIGHT" && r.flightNumber) {

@@ -21,8 +21,9 @@
  *   OVERPASS_URL     — Eigene Overpass-Instanz (Default: overpass-api.de)
  */
 import { sql } from "drizzle-orm";
-import { db } from "../src/db/client.js";
+import { db, pool } from "../src/db/client.js";
 import { locations } from "../src/db/schema.js";
+import { applyCountryNames } from "./lib/stopNames.js";
 
 const COUNTRY = (process.env.OSM_COUNTRY ?? "AT").toUpperCase();
 const OVERPASS_URL = process.env.OVERPASS_URL ?? "https://overpass-api.de/api/interpreter";
@@ -179,11 +180,35 @@ async function main(): Promise<void> {
 
   for (const node of nodes) {
     const tags = node.tags ?? {};
-    // Bevorzugt `name`, fallback uic_name (offizielle UIC-Bezeichnung) und
-    // schließlich ref (Linien-Kürzel). Stops ohne irgendeinen Namen skippen.
-    const name = (tags["name"] ?? tags["uic_name"] ?? tags["ref"] ?? "").trim();
-    if (!name) {
+    /**
+     * Der Name: `name`, sonst der NaPTAN-Name (Großbritannien), der amtliche
+     * oder der UIC-Name. Halte ohne Namen werden übersprungen.
+     *
+     * NICHT MEHR `ref`. Das ist die Mast-, Steig- oder Straßennummer, kein
+     * Name — so kamen 4 000 Haltestellen namens „1", „27" oder „09" in die
+     * Suche (vor allem Polen und Italien), dazu Straßennummern („B1066",
+     * „D406"), Codes („MO1046") und Steigbuchstaben („C", „X3"). Ein Name
+     * aus Ziffern allein wird aus demselben Grund verworfen.
+     *
+     * `naptan:CommonName` ist neu: In Großbritannien tragen viele importierte
+     * Haltestellen den Namen nur dort. Ohne ihn fehlten sie ganz — ganze
+     * Regionen (Blackpool, Neath Port Talbot, Middlesbrough) hatten weniger als
+     * ein Viertel ihrer Haltestellen.
+     */
+    const name = (
+      tags["name"] ??
+      tags["naptan:CommonName"] ??
+      tags["official_name"] ??
+      tags["uic_name"] ??
+      ""
+    ).replace(/\s+/g, " ").trim();
+    if (!name || /^[0-9]+[A-Za-z]?$/.test(name)) {
       skippedNoName++;
+      continue;
+    }
+    // Außer Betrieb, oder eine Parkeisenbahn — keine Haltestellen für die Suche.
+    if (tags["disused"] === "yes" || tags["abandoned"] === "yes" || tags["station"] === "miniature") {
+      skippedUnclassified++;
       continue;
     }
     if (!Number.isFinite(node.lat) || !Number.isFinite(node.lon)) {
@@ -238,6 +263,15 @@ async function main(): Promise<void> {
       console.log(`[osm:${COUNTRY}]   ${Math.min(i + CHUNK, rows.length)} / ${rows.length}`);
     }
   }
+
+  /**
+   * Offizielle Anzeigenamen gleich mitsetzen (`display_name`/`display_detail`,
+   * Regeln in lib/stopNames.ts) — für das GANZE Land, weil Fahrplan-Zwilling
+   * und Zusatz von den Nachbarn abhängen. Das Label oben bleibt der OSM-Name;
+   * angezeigt wird z. B. in Großbritannien der NaPTAN-Name aus dem Fahrplan.
+   */
+  const named = await applyCountryNames(pool, COUNTRY_NAME);
+  console.log(`[osm:${COUNTRY}] Anzeigenamen: ${named} geändert.`);
 
   console.log(`[osm:${COUNTRY}] done in ${((Date.now() - t0) / 1000).toFixed(1)}s.`);
   process.exit(0);

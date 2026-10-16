@@ -4,7 +4,7 @@ import {
   getBookingOptions,
   getBookingUrlByProviderToken,
 } from "../providers/flight/flightBookingDispatch.js";
-import { ipLimiter } from "../util/rateLimit.js";
+import { EXPENSIVE_IP_CEILING_FACTOR, ipLimiter } from "../util/rateLimit.js";
 
 /**
  * Zwei Endpoints für die Multi-Provider-Buchung von Flügen:
@@ -46,7 +46,9 @@ const urlQuerySchema = z.object({
 
 export async function flightBookingOptionsRoutes(app: FastifyInstance) {
   // Booking-Optionen/-URL: SerpAPI-2nd-stage — pay-per-call, deshalb gedeckelt.
-  const preHandler = ipLimiter("flight-booking", [{ limit: 40, windowMs: 60 * 1000 }]);
+  const preHandler = ipLimiter("flight-booking", [{ limit: 40, windowMs: 60 * 1000 }], {
+    ipCeilingFactor: EXPENSIVE_IP_CEILING_FACTOR,
+  });
   app.get("/api/flights/booking-options", { preHandler }, async (req, reply) => {
     const parsed = optionsQuerySchema.safeParse(req.query);
     if (!parsed.success) {

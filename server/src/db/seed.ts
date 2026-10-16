@@ -57,6 +57,10 @@ function buildRows(): Row[] {
       city: c.city,
       country: c.country,
       type: "ALL",
+      // Geprüfte Lage aus dem Seed (siehe `CitySeed.latitude`).
+      ...(c.latitude != null && c.longitude != null
+        ? { latitude: String(c.latitude), longitude: String(c.longitude) }
+        : {}),
     });
   }
 

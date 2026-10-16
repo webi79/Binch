@@ -11,6 +11,9 @@ import { saveAuthToken } from "@/lib/auth/tokenStorage";
 import type { AuthUser } from "@/lib/api/client";
 import { fetchLocationsByCodes } from "@/lib/api/client";
 import { trimPolyline } from "@/lib/routing/trimPolyline";
+import type { MapStyleChoice } from "@/lib/theme/mapStyleChoice";
+import { systemLocale } from "@/lib/i18n/systemLocale";
+import type { LiveSession } from "@/lib/live/types";
 
 export type Locale = "en" | "de" | "fr" | "es";
 
@@ -180,11 +183,131 @@ export type SavedToastPosition = "top" | "bottom";
 export interface SelectedStop {
   code: string;
   label: string;
+  /** Zusatz bei gleichnamigem Halt daneben — Plakette im Kopf des Blatts. */
+  detail?: string;
   /** Distanz in Metern zum User-Standort, falls vorhanden. */
   distanceMeters?: number;
   /** Mode-Kategorien an dem Stop (z.B. ["subway","bus"]). Steuert die
    *  Filter-Pillen im Detail-Sheet. */
   kinds?: ("train" | "subway" | "bus" | "tram" | "airport" | "cruise")[];
+  /** Lage der Haltestelle — für den Fußweg vom eigenen Standort dorthin. */
+  latitude?: number;
+  longitude?: number;
+}
+
+/**
+ * Eine auf der Karte angetippte Stadt — Ziel des Stadt-Blatts.
+ *
+ * Name und Lage kommen aus der Beschriftung der Karte (Ebene `place-city`),
+ * nicht aus einer Ortssuche. Der Start ist immer der eigene Standort; die Stadt
+ * ist immer das Ziel.
+ */
+export interface SelectedCity {
+  /** Der ÖRTLICHE Name — mit ihm ordnet der Server Bahnhöfe zu (`MapCityPress`). */
+  name: string;
+  /** Der Name, wie ihn die Karte zeigt (App-Sprache) — nur zur Anzeige. */
+  label?: string;
+  latitude: number;
+  longitude: number;
+  /** Der eigene Standort im Moment des Tippens — Start jeder Suche. `null`, wenn
+   *  die Ortung fehlt; dann sagt das Blatt das, statt irgendwo anzufangen. */
+  from: { latitude: number; longitude: number } | null;
+}
+
+/**
+ * Die Suche, die das Stadt-Blatt gerade zeigt — in derselben Form wie die
+ * Parameter der Ergebnisliste.
+ *
+ * Das Blatt rechnet sie aus (Verkehrsmittel-Pille, Stationen aus dem Vorlauf,
+ * Änderungen aus der Such-Slide) und legt sie hier ab. Gelesen wird sie vom
+ * Kasten oben auf der Karte (Strecke, Datum, Reisende) und von der Such-Slide
+ * und dem Preis-Alarm dahinter — alle drei hängen NICHT im Blatt, sondern im
+ * Karten-Tab bzw. am Wurzel-Layout.
+ *
+ * `origin`/`destination` sind leer, solange der Vorlauf lädt oder das
+ * Verkehrsmittel für diese Strecke nicht in Frage kommt.
+ */
+export interface CityQuery {
+  mode: TravelMode;
+  origin: string;
+  originLabel: string;
+  destination: string;
+  destLabel: string;
+  /** yyyy-MM-dd */
+  departDate: string;
+  /** UTC-ISO der gewählten Uhrzeit — leer heißt „ab jetzt". */
+  departTime: string;
+  /** yyyy-MM-dd, leer = einfache Fahrt. */
+  returnDate: string;
+  tripType: string;
+  passengers: number;
+  /** i18n-Schlüssel der Klasse oder leer. */
+  travelClass: string;
+}
+
+/**
+ * Ein in der Such-Slide gewählter Start oder Ziel — und für welches
+ * Verkehrsmittel er gewählt wurde.
+ */
+export interface CityEditPoint {
+  code: string;
+  label: string;
+  /**
+   * Für DIESES Verkehrsmittel gilt genau dieser Ort (wer „Münster-Hiltrup"
+   * wählt, meint Hiltrup, nicht den Hauptbahnhof). Die anderen suchen sich ihre
+   * Station bzw. ihren Flughafen dort — siehe `CityEdit`.
+   */
+  mode: TravelMode;
+}
+
+/**
+ * Was in der Such-Slide über dem Stadt-Blatt geändert wurde — gilt für ALLE
+ * Verkehrsmittel.
+ *
+ * Datum, Reisende und Klasse sowieso: Wer auf morgen stellt und dann von Zug
+ * auf Bus wechselt, will morgen mit dem Bus. Und auch START und ZIEL: Wer beim
+ * Zug ein neues Ziel wählt, will dorthin — nicht mit dem Zug nach Münster und
+ * mit dem Bus weiter in die angetippte Stadt. Der Vorlauf (`/api/trip-plan/city`)
+ * plant dafür alle drei neu und prüft jedes wieder (Bahnhof, Flughafen, zu nah
+ * zum Fliegen …). Nur für das Verkehrsmittel, in dem gewählt wurde, gilt der
+ * gewählte Ort selbst (`CityEditPoint.mode`).
+ *
+ * Bis eben galt eine geänderte Strecke nur für das eine Verkehrsmittel, und die
+ * anderen fuhren weiter in die angetippte Stadt — gemeldet als „gilt aktuell nur
+ * für das jeweilige Verkehrsmittel".
+ */
+export interface CityEdit {
+  /**
+   * Das Verkehrsmittel des ABGESCHICKTEN Formulars. Das Blatt übernimmt es —
+   * und nur wenn es „Flug" ist, gilt „Suchen" als Wunsch nach einer Flugsuche.
+   * Das Blatt kann inzwischen von selbst gewechselt haben (kein Zug, kein Bus
+   * → Flug), während die Slide noch das Zug-Formular zeigte.
+   */
+  mode?: TravelMode;
+  from: CityEditPoint | null;
+  to: CityEditPoint | null;
+  departDate: string;
+  departTime: string;
+  returnDate: string;
+  tripType: string;
+  passengers: number;
+  travelClass: string;
+}
+
+/**
+ * Die Verbindungen des Stadt-Blatts, wie die Karte sie zeichnet: die gewählte
+ * im Akzent, die übrigen grau dahinter, jede mit ihrer Dauer an der Linie.
+ */
+export interface CityRoutes {
+  /** Zu welcher Suche die Routen gehören — Modus und beide Stationen. Ein
+   *  verspätetes Ergebnis einer älteren Suche erkennt man daran. */
+  key: string;
+  plans: RoutePlan[];
+  /** Kennung des Suchergebnisses je Route — für Auswahl und Liste. */
+  resultIds: string[];
+  /** Kurzform der Dauer je Route („3h 12m") — für die Blase an der Linie. */
+  durations: string[];
+  selected: number;
 }
 
 /** Snapshot der UI-Stati der Surroundings-Tab-Overlays. Wird beim Show-on-
@@ -196,6 +319,17 @@ export interface SurroundingsStash {
   selectedPassengers: number;
   legTimelineOverlayOpen: boolean;
   directTripResult: SearchResult | null;
+  /**
+   * Das Stadt-Blatt samt seiner Suche — sonst blieb es bei „Auf Karte
+   * anzeigen" über der Route stehen, und beim Zurück war die Suche weg.
+   */
+  city: {
+    selectedCity: SelectedCity;
+    cityRoutes: CityRoutes | null;
+    cityQuery: CityQuery | null;
+    cityEdit: CityEdit | null;
+    cityCheapest: number;
+  } | null;
 }
 
 export interface SavedToast {
@@ -268,8 +402,37 @@ interface SearchStore {
   setCurrency: (code: string) => void;
   locale: Locale;
   setLocale: (l: Locale) => void;
+  /**
+   * Hat der Nutzer die Sprache SELBST gewählt?
+   *
+   * Nötig, weil „de" allein zwei Dinge bedeuten kann: „so wollte ich es" oder
+   * „das war mal die Vorgabe". Ohne diese Unterscheidung müsste die Übernahme
+   * der Telefonsprache entweder eine bewusste Wahl überschreiben oder auf
+   * ewig wirkungslos bleiben.
+   */
+  localeExplicit: boolean;
   theme: "light" | "dark" | "gray";
   setTheme: (t: "light" | "dark" | "gray") => void;
+  /**
+   * Der gewählte KARTEN-Stil — mit „auto" als Vorgabe.
+   *
+   * „auto" ist kein vierter Stil, sondern die Kopplung an das Thema: Bei „dark"
+   * und „gray" zeigt die Karte dunkel, bei „light" hell. Genau so war es
+   * verlangt — und es ist auch der einzige Wert, der einen NEUEN Nutzer nicht
+   * überrascht: Wer sein Thema umstellt, erwartet, dass die Karte mitgeht.
+   *
+   * Sobald jemand im Kartenblatt selbst wählt, steht hier der feste Stil, und
+   * die Kopplung ist für ihn beendet — eine eigene Wahl darf ein Themenwechsel
+   * nicht überschreiben. Zurück zu „auto" kommt man über denselben Weg
+   * (dieselbe Kachel noch einmal antippen).
+   *
+   * Aufgelöst wird das an EINER Stelle: `lib/theme/mapStyleChoice.ts`.
+   */
+  mapStyleChoice: MapStyleChoice;
+  setMapStyleChoice: (c: MapStyleChoice) => void;
+  /** Häuser mit Höhe auf der Karte — siehe `Buildings3DLayer`. */
+  mapBuildings3d: boolean;
+  setMapBuildings3d: (on: boolean) => void;
   /** Akzent-Farbe für UI (Tabs, Buttons, Line-Badges, …). Wird im Settings-
    *  Screen gewählt und propagiert über `useAccent()` hook in jeden Component
    *  der den Akzent nutzt. Default "lime" = die bisherige hardcoded Brand-Farbe. */
@@ -534,12 +697,71 @@ interface SearchStore {
   selectedResultPending: boolean;
   setSelectedResultPending: (pending: boolean) => void;
   clearSelectedResult: () => void;
+  /**
+   * Zählt JEDES Öffnen eines Ergebnisses — wie `assistantOpenSeq` bei Bo.
+   *
+   * Ein Wecker, der später fragt „ist noch DASSELBE offen?", kann das an der
+   * Kennung nicht ablesen: Wer dieselbe Verbindung schließt und wieder öffnet,
+   * hat wieder dieselbe Kennung, und der Wecker des alten Öffnens schloss das
+   * neue mitten in seiner Einfahrt. Der Zähler ändert sich bei jedem Öffnen.
+   */
+  selectedResultSeq: number;
+  /**
+   * Abfahrts-Tipp im Haltestellen-Blatt: Platzhalter öffnen, in EINEM
+   * Schreibvorgang (vorher `selectResult` + `setSelectedResultPending` — zwei
+   * Weckrufe an alle Abonnenten im Berührungs-Frame).
+   */
+  openPendingResult: (stub: SearchResult) => void;
+  /**
+   * Den Platzhalter auflösen — nur, wenn das Detail-Blatt noch GENAU diesen
+   * zeigt (Objekt-Identität, nicht Kennung: ein erneuter Tipp auf dieselbe
+   * Abfahrt baut einen neuen Platzhalter mit derselben Kennung).
+   *
+   *  - `{ result }`: Buchungstreffer ersetzt den Platzhalter.
+   *  - `{ directTrip }`: kein Buchungstreffer — die Fahrt selbst übernimmt als
+   *    Zeitleiste (Direkt-Weg), das Detail-Blatt fährt hinaus.
+   *  - `null`: schließen.
+   *
+   * @returns false, wenn der Platzhalter nicht mehr offen war (nichts geändert).
+   */
+  settlePendingResult: (
+    stub: SearchResult,
+    outcome: { result: SearchResult } | { directTrip: SearchResult } | null,
+  ) => boolean;
   /** Aktuell im Surroundings-Tab ausgewählter Stop — steuert das globale
    *  StopDetailSheet-Overlay. Wird in app/_layout.tsx gerendert damit es ÜBER
    *  der FloatingTabBar liegt. */
   selectedStop: SelectedStop | null;
   selectStop: (s: SelectedStop) => void;
   clearSelectedStop: () => void;
+  /**
+   * Das Stadt-Blatt — dieselbe Fläche wie das Haltestellen-Blatt, darum
+   * schließen sich beide aus: Wer eine Stadt antippt, schließt eine offene
+   * Haltestelle und umgekehrt. `clearSelectedCity` nimmt die Routen auf der
+   * Karte mit weg.
+   */
+  selectedCity: SelectedCity | null;
+  selectCity: (c: SelectedCity) => void;
+  clearSelectedCity: () => void;
+  /** Die Suche des Stadt-Blatts — siehe `CityQuery`. Nicht persistiert. */
+  cityQuery: CityQuery | null;
+  setCityQuery: (q: CityQuery | null) => void;
+  /** Günstigster echter Preis dieser Suche, 0 = keiner — für den Preis-Alarm. */
+  cityCheapest: number;
+  setCityCheapest: (price: number) => void;
+  /** Änderungen aus der Such-Slide — siehe `CityEdit`. Gehört zur Stadt. */
+  cityEdit: CityEdit | null;
+  setCityEdit: (e: CityEdit | null) => void;
+  /** Welches Blatt des Kastens offen ist: Such-Slide oder Preis-Alarm. */
+  cityPanel: "edit" | "alert" | null;
+  setCityPanel: (p: "edit" | "alert" | null) => void;
+  cityRoutes: CityRoutes | null;
+  setCityRoutes: (r: CityRoutes | null) => void;
+  selectCityRoute: (index: number) => void;
+  /** Echte Gleis-/Straßenverläufe nachtragen, sobald sie geladen sind. */
+  setCityRoutePolylines: (polylines: Record<string, [number, number][]>) => void;
+  /** Den Straßenverlauf EINER Fuß-Etappe nachtragen (Umstieg zu Fuß). */
+  setCityRouteLegCoords: (key: string, plan: number, leg: number, coords: [number, number][]) => void;
   /** Snapshot der Surroundings-UI-Stati für den "Show on Map"-Flow.
    *  Use-Case: User ist in Surroundings, hat irgendeine Kombo aus Slide
    *  (selectedStop), Booking-Overlay (selectedResult) und Trip-Details-
@@ -727,6 +949,18 @@ interface SearchStore {
   bypassResultsSlideOut: boolean;
   setBypassResultsSlideOut: (on: boolean) => void;
 
+  /**
+   * LIVE-ANSICHT — ein Fahrzeug auf der Karte verfolgen (Knopf an der
+   * Tafel-Zeile). Wie der Routen-Modus: Beim Start wird die Oberfläche der
+   * Karte geparkt (`stashSurroundingsForRoute`), beim Ende zurückgelegt. Nicht
+   * persistiert — eine Live-Ansicht überlebt keinen Neustart.
+   */
+  liveSession: LiveSession | null;
+  startLive: (s: LiveSession) => void;
+  stopLive: () => void;
+  /** Führt die Kamera dem Fahrzeug nach? Aus, sobald man die Karte selbst bewegt. */
+  liveFollow: boolean;
+  setLiveFollow: (on: boolean) => void;
   /** Aktuell auf der Karte angezeigte Route — null wenn keine. */
   pendingRoute: RoutePlan | null;
   setRoute: (r: RoutePlan) => void;
@@ -835,6 +1069,14 @@ function withPriceAlert(
   ].slice(0, 50);
 }
 
+/** Alles, was zur Suche des Stadt-Blatts gehört — fällt mit der Stadt weg. */
+const CITY_SEARCH_RESET = {
+  cityQuery: null,
+  cityCheapest: 0,
+  cityEdit: null,
+  cityPanel: null,
+} as const;
+
 export const useSearchStore = create<SearchStore>()(
   persist(
     (set, get) => ({
@@ -842,10 +1084,32 @@ export const useSearchStore = create<SearchStore>()(
       setActiveMode: (mode) => set({ activeMode: mode }),
       currency: "EUR",
       setCurrency: (code) => set({ currency: code.toUpperCase() }),
-      locale: "de",
-      setLocale: (l) => set({ locale: l }),
+      /**
+       * Die Sprache des TELEFONS als Anfangswert — und zwar hier und nirgends
+       * sonst.
+       *
+       * Diese Stelle ist die einzige richtige, und der Grund ist die
+       * Persistenz: Ihr Zusammenführen ist `{ ...aktuell, ...gespeichert }`,
+       * und das Ergebnis wird ERSETZEND gesetzt. Der Anfangswert steht also
+       * fest, BEVOR gelesen wird — ein gespeicherter Wert gewinnt danach Feld
+       * für Feld über ihn. Daraus folgt beides zugleich, ohne eine einzige
+       * zusätzliche Zeile: Beim allerersten Start (nichts gespeichert) greift
+       * die Telefonsprache; danach gewinnt immer, was der Nutzer gewählt hat.
+       *
+       * In einem Effekt („beim Start einmal setzen") wäre es falsch: Der
+       * Schreibvorgang fiele in das Fenster vor dem Ende der Hydrierung und
+       * würde überrollt — dieselbe Falle, gegen die bei `addAlertHit` steht.
+       */
+      locale: systemLocale(),
+      localeExplicit: false,
+      // Ab jetzt gehört die Sprache dem Nutzer — siehe `localeExplicit`.
+      setLocale: (l) => set({ locale: l, localeExplicit: true }),
       theme: "gray",
       setTheme: (t) => set({ theme: t }),
+      mapStyleChoice: "auto",
+      setMapStyleChoice: (c) => set({ mapStyleChoice: c }),
+      mapBuildings3d: false,
+      setMapBuildings3d: (on) => set({ mapBuildings3d: on }),
       accent: "lime",
       setAccent: (a) => set({ accent: a }),
       hapticsEnabled: true,
@@ -1093,8 +1357,76 @@ export const useSearchStore = create<SearchStore>()(
         if (get().recentHistoryOverlayOpen) set({ recentHistoryOverlayOpen: false });
       },
       selectedStop: null,
-      selectStop: (s) => set({ selectedStop: s }),
+      selectStop: (s) =>
+        set(
+          get().selectedCity
+            ? { selectedStop: s, selectedCity: null, cityRoutes: null, ...CITY_SEARCH_RESET }
+            : { selectedStop: s },
+        ),
       clearSelectedStop: () => set({ selectedStop: null }),
+      selectedCity: null,
+      // Eine andere Stadt ist eine neue Suche: Änderungen aus der Such-Slide
+      // gehören zur vorigen.
+      selectCity: (c) =>
+        set({ selectedCity: c, selectedStop: null, cityRoutes: null, ...CITY_SEARCH_RESET }),
+      clearSelectedCity: () => {
+        // Nur schreiben, wenn wirklich offen — jedes set() weckt alle Abonnenten.
+        if (get().selectedCity || get().cityRoutes || get().cityQuery) {
+          set({ selectedCity: null, cityRoutes: null, ...CITY_SEARCH_RESET });
+        }
+      },
+      cityQuery: null,
+      setCityQuery: (q) => set({ cityQuery: q }),
+      cityCheapest: 0,
+      setCityCheapest: (price) => {
+        if (get().cityCheapest !== price) set({ cityCheapest: price });
+      },
+      cityEdit: null,
+      setCityEdit: (e) => set({ cityEdit: e }),
+      cityPanel: null,
+      setCityPanel: (p) => {
+        if (get().cityPanel !== p) set({ cityPanel: p });
+      },
+      cityRoutes: null,
+      setCityRoutes: (r) => set({ cityRoutes: r }),
+      selectCityRoute: (index) => {
+        const r = get().cityRoutes;
+        if (!r || index === r.selected || index < 0 || index >= r.plans.length) return;
+        set({ cityRoutes: { ...r, selected: index } });
+      },
+      setCityRoutePolylines: (polylines) => {
+        const r = get().cityRoutes;
+        if (!r) return;
+        let changed = false;
+        const plans = r.plans.map((plan) => {
+          let planChanged = false;
+          const legs = plan.legs.map((leg) => {
+            const coords = leg.tripId ? polylines[leg.tripId] : undefined;
+            if (!coords || coords.length < 2 || leg.coords) return leg;
+            planChanged = true;
+            return { ...leg, coords };
+          });
+          if (!planChanged) return plan;
+          changed = true;
+          return { ...plan, legs };
+        });
+        if (changed) set({ cityRoutes: { ...r, plans } });
+      },
+      setCityRouteLegCoords: (key, planIdx, legIdx, coords) => {
+        const r = get().cityRoutes;
+        // Nur für die Suche, zu der der Weg gehört — eine neuere hat andere Etappen.
+        if (!r || r.key !== key || !r.plans[planIdx]?.legs[legIdx] || coords.length < 2) return;
+        // Und nur auf einen FUSSWEG: Wurde unter demselben Schlüssel neu
+        // gerechnet (andere Etappen, gleicher Index), landete eine späte
+        // Antwort sonst auf einer Fahrt.
+        if (!r.plans[planIdx]!.legs[legIdx]!.walking) return;
+        const plans = r.plans.map((p, i) =>
+          i !== planIdx
+            ? p
+            : { ...p, legs: p.legs.map((l, j) => (j === legIdx ? { ...l, coords } : l)) },
+        );
+        set({ cityRoutes: { ...r, plans } });
+      },
       stashedSurroundings: null,
       stashSurroundingsForRoute: () => {
         // Kompletten UI-State der Surroundings-Tab-Overlays in einen Snapshot
@@ -1106,7 +1438,7 @@ export const useSearchStore = create<SearchStore>()(
         const s = get();
         // No-op wenn nichts offen ist — sonst stashen wir leere Objects und
         // restoreSurroundings würde fälschlich zu „alles zu" führen.
-        if (!s.selectedStop && !s.selectedResult && !s.directTripResult) return;
+        if (!s.selectedStop && !s.selectedCity && !s.selectedResult && !s.directTripResult) return;
         set({
           stashedSurroundings: {
             selectedStop: s.selectedStop,
@@ -1114,11 +1446,23 @@ export const useSearchStore = create<SearchStore>()(
             selectedPassengers: s.selectedPassengers,
             legTimelineOverlayOpen: s.legTimelineOverlayOpen,
             directTripResult: s.directTripResult,
+            city: s.selectedCity
+              ? {
+                  selectedCity: s.selectedCity,
+                  cityRoutes: s.cityRoutes,
+                  cityQuery: s.cityQuery,
+                  cityEdit: s.cityEdit,
+                  cityCheapest: s.cityCheapest,
+                }
+              : null,
           },
           selectedStop: null,
           selectedResult: null,
           legTimelineOverlayOpen: false,
           directTripResult: null,
+          selectedCity: null,
+          cityRoutes: null,
+          ...CITY_SEARCH_RESET,
         });
       },
       restoreSurroundings: () => {
@@ -1130,6 +1474,15 @@ export const useSearchStore = create<SearchStore>()(
           selectedPassengers: stash.selectedPassengers,
           legTimelineOverlayOpen: stash.legTimelineOverlayOpen,
           directTripResult: stash.directTripResult,
+          ...(stash.city
+            ? {
+                selectedCity: stash.city.selectedCity,
+                cityRoutes: stash.city.cityRoutes,
+                cityQuery: stash.city.cityQuery,
+                cityEdit: stash.city.cityEdit,
+                cityCheapest: stash.city.cityCheapest,
+              }
+            : {}),
           stashedSurroundings: null,
         });
       },
@@ -1141,18 +1494,17 @@ export const useSearchStore = create<SearchStore>()(
       setResultsParams: (p) => set({ resultsParams: p }),
       selectedResultContext: null,
       selectResult: (r, passengers, context) =>
-        // Wenn ein vorheriger Stub-Result da war (Pending), wird er hier mit
-        // dem echten Result überschrieben — Pending bleibt true bis der
-        // Caller explizit `setSelectedResultPending(false)` aufruft. So kann
-        // der Caller den Übergang Stub → Real präzise steuern.
-        set({
+        // Den Platzhalter des Abfahrts-Tipps löst `settlePendingResult` ab;
+        // hier kommt jedes andere Öffnen an — und zählt als neues Öffnen.
+        set((s) => ({
           selectedResult: r,
           selectedPassengers: passengers,
+          selectedResultSeq: s.selectedResultSeq + 1,
           // Kontext nur überschreiben wenn der Caller einen mitschickt —
           // sonst beim Stub-→-Real-Übergang (gleiche Card-Quelle) bleibt der
           // ursprüngliche Kontext bestehen.
           ...(context ? { selectedResultContext: context } : {}),
-        }),
+        })),
       selectedResultPending: false,
       setSelectedResultPending: (pending) => set({ selectedResultPending: pending }),
       clearSelectedResult: () =>
@@ -1168,6 +1520,43 @@ export const useSearchStore = create<SearchStore>()(
           // State beim nächsten Open.
           selectedResultPending: false,
         }),
+      selectedResultSeq: 0,
+      openPendingResult: (stub) =>
+        set((s) => ({
+          selectedResult: stub,
+          selectedPassengers: 1,
+          // Geöffnet aus dem Haltestellen-Blatt, nicht aus einer Route — ein
+          // stehengebliebener Kontext hielte das Blatt sonst unsichtbar
+          // (`hiddenForRoute`).
+          selectedResultContext: null,
+          selectedResultPending: true,
+          selectedResultSeq: s.selectedResultSeq + 1,
+        })),
+      settlePendingResult: (stub, outcome) => {
+        // Gegenprobe frisch aus dem Speicher — der Aufrufer kommt aus einem
+        // `await` (siehe feedback_await_guard_stale_closure).
+        if (get().selectedResult !== stub) return false;
+        if (outcome && "result" in outcome) {
+          set({ selectedResult: outcome.result, selectedResultPending: false });
+        } else if (outcome) {
+          // EIN Schreibvorgang: Detail-Blatt fährt hinaus, Zeitleiste herein.
+          set({
+            selectedResult: null,
+            selectedResultContext: null,
+            selectedResultPending: false,
+            directTripResult: outcome.directTrip,
+            legTimelineOverlayOpen: true,
+          });
+        } else {
+          set({
+            selectedResult: null,
+            selectedResultContext: null,
+            legTimelineOverlayOpen: false,
+            selectedResultPending: false,
+          });
+        }
+        return true;
+      },
       legTimelineOverlayOpen: false,
       openLegTimelineOverlay: () => set({ legTimelineOverlayOpen: true }),
       // Beim Schließen des Timelines IMMER auch den Direct-Trip-Slot leeren —
@@ -1224,13 +1613,16 @@ export const useSearchStore = create<SearchStore>()(
         for (const c of suggestionCodes) codes.add(c);
 
         if (codes.size === 0) return;
-        let lookup: Map<string, { exists: boolean; label?: string }>;
+        let lookup: Map<string, { exists: boolean; label?: string; detail?: string }>;
         try {
           const results = await fetchLocationsByCodes(Array.from(codes));
           lookup = new Map(
             results.map((r) => [
               r.code,
-              r.exists ? { exists: true, label: r.label } : { exists: false },
+              // `label` ist der offizielle Name (Server: `display_name`) — so
+              // bekommen gespeicherte Stationen und der Verlauf beim nächsten
+              // Start den richtigen Namen, samt Zusatz bei gleichnamigem Nachbarn.
+              r.exists ? { exists: true, label: r.label, detail: r.detail } : { exists: false },
             ]),
           );
         } catch {
@@ -1279,7 +1671,9 @@ export const useSearchStore = create<SearchStore>()(
           const hit = lookup.get(s.code);
           if (hit && !hit.exists) continue;
           nextStations.push(
-            hit?.exists && hit.label ? { ...s, label: hit.label } : s,
+            hit?.exists && hit.label
+              ? { ...s, label: hit.label, ...(hit.detail ? { detail: hit.detail } : { detail: undefined }) }
+              : s,
           );
         }
           return nextStations;
@@ -1323,7 +1717,9 @@ export const useSearchStore = create<SearchStore>()(
             );
           const stationsChanged =
             nextStations.length !== cur.savedStations.length ||
-            nextStations.some((s, i) => s.label !== cur.savedStations[i]?.label);
+            nextStations.some(
+              (s, i) => s.label !== cur.savedStations[i]?.label || s.detail !== cur.savedStations[i]?.detail,
+            );
           const invalidChanged =
             invalid.length !== cur.invalidSuggestionCodes.length ||
             invalid.some((c, i) => c !== cur.invalidSuggestionCodes[i]);
@@ -1415,16 +1811,18 @@ export const useSearchStore = create<SearchStore>()(
           if (idx < 0) return state;
           const next = state.priceAlerts.slice();
           /**
-           * Beim ABSCHALTEN geht die Server-Kennung MIT.
+           * Die Server-Kennung BLEIBT — auch beim Abschalten.
            *
-           * Sie zeigt dann auf eine Zeile, die es nicht mehr gibt. Bliebe sie
-           * stehen, versuchte ein späteres Löschen sie noch einmal — und der
-           * Abgleich beim Start hielte den Alarm für angelegt, obwohl der
-           * Server ihn nicht kennt.
+           * Hier wurde sie gelöscht, und zwar mit gutem Grund: Abschalten hieß
+           * damals, die Zeile auf dem Server zu löschen, also zeigte die
+           * Kennung danach ins Leere.
+           *
+           * Seit der Schalter PAUSIERT, ist es umgekehrt: Die Zeile bleibt
+           * stehen, und die Kennung ist das Einzige, was noch zu ihr führt. Sie
+           * wegzuwerfen machte den pausierten Alarm unerreichbar — weder
+           * löschbar noch wieder einschaltbar, ohne ihn neu anzulegen.
            */
-          next[idx] = on
-            ? { ...next[idx], active: true, ...(serverId ? { serverId } : {}) }
-            : { ...next[idx], active: false, serverId: undefined };
+          next[idx] = { ...next[idx], active: on, ...(serverId ? { serverId } : {}) };
           return { priceAlerts: next };
         }),
       alertHits: [],
@@ -1708,6 +2106,19 @@ export const useSearchStore = create<SearchStore>()(
           return { savedStations: next, savedStationCodes: new Set(next.map((s) => s.code)) };
         }),
 
+      liveSession: null,
+      startLive: (session) => {
+        // Eine laufende Live-Ansicht wird nur ersetzt — die geparkte Oberfläche
+        // von ihrem Start bleibt die, zu der „Zurück" führt.
+        if (!get().liveSession) get().stashSurroundingsForRoute();
+        set({ liveSession: session, liveFollow: true });
+      },
+      stopLive: () => {
+        get().restoreSurroundings();
+        set({ liveSession: null, liveFollow: true });
+      },
+      liveFollow: true,
+      setLiveFollow: (on) => set({ liveFollow: on }),
       pendingRoute: null,
       setRoute: (r) => set({ pendingRoute: r }),
       setRoutePolylines: (polylines) =>
@@ -1734,13 +2145,52 @@ export const useSearchStore = create<SearchStore>()(
     }),
     {
       name: "binch-search",
+      /**
+       * Fassung 1 — damit die Telefonsprache auch bei BESTEHENDEN
+       * Installationen greift.
+       *
+       * Sonst täte die Neuerung dort gar nichts: Die Persistenz schreibt nach
+       * jeder beliebigen Zustandsänderung den ganzen Block, also steht auf
+       * jedem Gerät, das die App je geöffnet hat, längst `locale: "de"` — ohne
+       * dass jemand das je gewählt hätte. Der Zusammenführung ist nicht
+       * anzusehen, woher der Wert stammt; sie ließe die Vorgabe gewinnen, und
+       * von außen sähe es aus, als sei die Funktion kaputt.
+       *
+       * Die Migration wirft deshalb GENAU EINMAL ein gespeichertes „de" weg,
+       * wenn kein Merker für eine bewusste Wahl daneben steht. Danach fällt die
+       * Zusammenführung auf den Anfangswert durch, und der ist die
+       * Telefonsprache. Auf einem deutschen Telefon ändert sich dabei sichtbar
+       * nichts.
+       *
+       * Der Preis ist benannt und einmalig: Wer auf einem NICHT-deutschen
+       * Telefon bewusst Deutsch eingestellt hat, bevor es den Merker gab,
+       * bekommt einmal die Telefonsprache und muss es erneut einstellen. Für
+       * alle, die nie etwas eingestellt haben — die große Mehrheit —, tut die
+       * Funktion endlich das, was sie verspricht.
+       */
+      version: 1,
+      migrate: (persisted, version) => {
+        // `?? {}` statt eines Zweigs für „nichts gespeichert": Der leere Stand
+        // fällt beim Zusammenführen ohnehin auf die Anfangswerte durch.
+        const st = (persisted ?? {}) as Partial<SearchStore> & { locale?: Locale };
+        if (version < 1 && st.localeExplicit !== true && st.locale === "de") {
+          const { locale: _ererbt, ...rest } = st;
+          return rest as SearchStore;
+        }
+        return st as SearchStore;
+      },
       // Siehe createDeferredJSONStorage: serialisiert erst in der Ruhephase,
       // nicht bei jedem set().
       storage: createDeferredJSONStorage(AsyncStorage),
       partialize: (state) => ({
         currency: state.currency,
         locale: state.locale,
+        localeExplicit: state.localeExplicit,
         theme: state.theme,
+        // Die Karten-Wahl gehört zu den Einstellungen, nicht zur Sitzung: Wer
+        // Satellit wählt, will beim nächsten Start Satellit.
+        mapStyleChoice: state.mapStyleChoice,
+        mapBuildings3d: state.mapBuildings3d,
         accent: state.accent,
         hapticsEnabled: state.hapticsEnabled,
         notificationsEnabled: state.notificationsEnabled,

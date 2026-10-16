@@ -8,6 +8,7 @@ import {
 } from "react-native-reanimated";
 import { SHEET_IN, SHEET_OUT, markSheetMoving } from "./overlayCover";
 import { setSheetMoving } from "./searchHandoff";
+import { dragHealOffset, snapToPixel } from "@/lib/ui/sheetSwipe";
 
 /**
  * EINE Fahrt für alle Blätter — von unten wie von oben.
@@ -89,8 +90,13 @@ export function useSheetSlide(key: string, park: number) {
     adoptRef.current = null;
   }, []);
 
+  /**
+   * Auf ganze Gerätepixel, plus Selbstkorrektur beim Ziehen — beides erklärt
+   * in lib/ui/sheetSwipe.ts. `heal` geht an `useSheetSwipe` des Blattes.
+   */
+  const heal = useSharedValue(0);
   const style = useAnimatedStyle(() => ({
-    transform: [{ translateY: y.value }],
+    transform: [{ translateY: snapToPixel(y.value) + dragHealOffset(heal) }],
   }));
 
   /**
@@ -296,5 +302,5 @@ export function useSheetSlide(key: string, park: number) {
     [key],
   );
 
-  return { y, style, run, adopt, parkNow, warm };
+  return { y, style, run, adopt, parkNow, warm, heal };
 }

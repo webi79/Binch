@@ -11,6 +11,7 @@ import {
 } from "react-native";
 import { usePalette } from "@/lib/theme/appBg";
 import { ClearSearchHistoryAlert } from "@/components/ui/ClearSearchHistoryAlert";
+import { RippleTouch } from "@/components/ui/RippleTouch";
 import { SHEET_SUBTITLE, SHEET_TITLE } from "@/components/ui/SheetModal";
 import Animated, {
   FadeIn,
@@ -26,7 +27,7 @@ import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
 import { RecentCard } from "@/components/home/RecentCard";
 import { scaledStyles } from "@/lib/ui/compact";
-import { SWIPE_OUT, useSheetScrollGate, useSheetSwipe } from "@/lib/ui/sheetSwipe";
+import { dragHealOffset, snapToPixel, SWIPE_OUT, useSheetScrollGate, useSheetSwipe } from "@/lib/ui/sheetSwipe";
 
 /**
  * Bottom-sheet overlay showing the full recent-search history.
@@ -103,8 +104,15 @@ function RecentHistorySheet() {
   );
 
   const translateY = useSharedValue(sheetHeight);
+  /**
+   * Ganze Gerätepixel + Selbstkorrektur beim Ziehen — beides erklärt in
+   * lib/ui/sheetSwipe.ts (`snapToPixel`, `startDragHeal`).
+   */
+  const heal = useSharedValue(0);
+  /** Wird von woanders geschlossen — die Wisch-Geste hält sich dann heraus (`closing` in useSheetSwipe). */
+  const closingSv = useSharedValue(false);
   const sheetAnim = useAnimatedStyle(() => ({
-    transform: [{ translateY: translateY.value }],
+    transform: [{ translateY: snapToPixel(translateY.value) + dragHealOffset(heal) }],
   }));
   useEffect(() => {
     const id = requestAnimationFrame(() => {
@@ -118,6 +126,7 @@ function RecentHistorySheet() {
     if (closingRef.current) return;
     closingRef.current = true;
     markSheetMoving();
+    closingSv.value = true;
     translateY.value = withTiming(sheetHeight, SHEET_OUT);
     closeTimer.current = setTimeout(close, SHEET_OUT.duration);
   }, [close, sheetHeight, translateY]);
@@ -134,6 +143,7 @@ function RecentHistorySheet() {
     (afterMs: number = SHEET_OUT.duration) => {
       if (closingRef.current) return;
       closingRef.current = true;
+      closingSv.value = true;
       closeTimer.current = setTimeout(close, afterMs);
     },
     [close],
@@ -154,6 +164,8 @@ function RecentHistorySheet() {
     travel: sheetHeight,
     onDismiss: scheduleClose,
     gate,
+    heal,
+    closing: closingSv,
   });
 
   const [confirmVisible, setConfirmVisible] = useState(false);
@@ -189,19 +201,19 @@ function RecentHistorySheet() {
           </View>
           <View style={styles.titleRow}>
             <Text style={styles.title}>{t("home.recent.title")}</Text>
-            <Pressable
+            {/* Keine sichtbare Fläche, nur die Welle — dieselbe Begründung wie
+                am Papierkorb der Meldungs-Slide. Der abgeblendete Zustand
+                bleibt, er hängt an den Daten und nicht am Finger. */}
+            <RippleTouch
               onPress={handleClear}
               hitSlop={10}
+              borderless
               disabled={recentSearches.length === 0}
-              style={({ pressed }) => [
-                styles.trashBtn,
-                { backgroundColor: palette.s2 },
-                { opacity: recentSearches.length === 0 ? 0.35 : pressed ? 0.6 : 1 },
-              ]}
+              style={[styles.trashBtn, recentSearches.length === 0 && { opacity: 0.35 }]}
               accessibilityLabel={t("home.recent.clear.title")}
             >
               <Trash2 size={20} color="#FF3B5C" strokeWidth={2} />
-            </Pressable>
+            </RippleTouch>
           </View>
           <Text style={styles.subtitle}>{t("home.recent.subtitle")}</Text>
           {/* Eigener nativer Erkenner um die Liste — sonst würgt das Ziehen am

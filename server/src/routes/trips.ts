@@ -1,14 +1,24 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { eq } from "drizzle-orm";
+import { formatInTimeZone } from "date-fns-tz";
 import { config } from "../config.js";
-import { getMotisTripPolyline, motisFetch } from "../services/motisClient.js";
+import { decodePolyline, getMotisTripPolyline, motisFetch } from "../services/motisClient.js";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import { profileForStop, type HafasProfileKey } from "../services/countryProfile.js";
 import { fetchTrip as multiFetchTrip } from "../services/multiHafas.js";
 import { cleanPlatform } from "../util/platform.js";
-import { ipLimiter } from "../util/rateLimit.js";
+import { BoundedTtlCache } from "../util/boundedCache.js";
+import { EXPENSIVE_IP_CEILING_FACTOR, ipLimiter } from "../util/rateLimit.js";
+import { liveSearchesInFlight } from "../services/searchService.js";
+import { acquireDb, reportIfBlocked, tryAcquireDb, type DbLane } from "../services/dbQuota.js";
+import { FEED_ID_BY_COUNTRY, getScheduledTrip } from "../services/gtfsSchedule.js";
+import { dbStopTz, dbTimeToUtc } from "../util/dbTime.js";
+import { timetableStopName } from "../util/stopDisplayName.js";
+import { isoOffset } from "../util/isoOffset.js";
+import { matchStopIndices } from "../util/tripStopMatch.js";
+import { buildLiveShape, type LngLat } from "../util/liveShape.js";
 
 /**
  * Liefert die geographische Polyline (Route entlang der Schienen) für eine
@@ -76,19 +86,140 @@ const querySchema = z.object({
     .transform((s) => s.split(",").map((x) => x.trim()).filter(Boolean)),
 });
 
-async function fetchTripPolyline(tripId: string): Promise<[number, number][] | null> {
+/**
+ * Verläufe gemerkt — eine Fahrt fährt heute dieselbe Strecke wie vor fünf
+ * Minuten. Derselbe ICE steht in mehreren Verbindungen einer Suche (über
+ * Hamm, über Münster …) und würde sonst für jede einzeln bei der Bahn geholt.
+ * Leere Antworten werden NICHT gemerkt: Ein Aussetzer soll beim nächsten
+ * Öffnen neu versucht werden, nicht für Stunden als Gerade stehen bleiben.
+ */
+const polylineCache = new BoundedTtlCache<[number, number][]>(2000, 6 * 60 * 60 * 1000);
+
+/**
+ * Kennungen OHNE Verlauf — zehn Minuten gemerkt.
+ *
+ * Bisher wurde nur ein Treffer gemerkt. Eine Kennung, die nie einen Verlauf
+ * bekommt (Fahrten aus den Länder-Fahrplänen, siehe `isDbwebTripId`), ging
+ * damit bei JEDEM Öffnen einer Stadt erneut an die DB.
+ */
+const polylineMiss = new BoundedTtlCache<true>(2000, 10 * 60 * 1000);
+
+/**
+ * Nur DBs eigene Fahrt-Kennungen gehen an dbweb (int.bahn.de): Sie tragen
+ * `#VN#` („2|#VN#1#ST#…"). Alles andere — etwa die `trip_id`s der
+ * Länder-Fahrpläne (NL/BE/CZ/UK/FR/IT, services/transitSchedule.ts) — kennt
+ * die DB nicht; die Anfrage kostete Kontingent und scheiterte immer.
+ */
+function isDbwebTripId(tripId: string): boolean {
+  return tripId.includes("#VN#");
+}
+
+/**
+ * DAS DB-KONTINGENT GEHÖRT DER SUCHE — Gleisverläufe sind nachrangig.
+ *
+ * Eine Stadt auf der Karte zeichnet bis zu vier Strecken, zusammen leicht zehn
+ * bis sechzehn Fahrten, jede ein Abruf bei dbweb. Drei Städte in einer Minute
+ * hätten die ~60 Anfragen/Minute der Suche aufgebraucht.
+ *
+ * Deshalb die Stufe `background` im gemeinsamen Kontingent (services/
+ * dbQuota.ts) — und zusätzlich Vorrang für die Suche: Solange eine Suche live
+ * bei den Anbietern läuft, wartet jeder Verlaufs-Abruf. Wer zu lange wartet
+ * (10 s), bekommt keinen Verlauf und fragt später wieder; gemerkt wird so ein
+ * Ausfall nicht.
+ */
+const POLY_MAX_WAIT_MS = 10_000;
+
+async function waitForDbwebSlot(until = Date.now() + POLY_MAX_WAIT_MS): Promise<DbLane | null> {
+  for (;;) {
+    if (liveSearchesInFlight() === 0) {
+      const lane = tryAcquireDb("background");
+      if (lane) return lane;
+    }
+    if (Date.now() >= until) return null;
+    await new Promise((done) => setTimeout(done, 250));
+  }
+}
+
+/**
+ * Höchstens drei Abrufe gleichzeitig.
+ *
+ * Hier stand `Promise.all` über bis zu zehn Kennungen — zehn Anfragen im selben
+ * Augenblick an dieselbe Bahn-Schnittstelle, deren Kontingent (~60/min) der
+ * Suche gehört. Drei nebeneinander sind für ein Kartenbild schnell genug.
+ */
+async function polylinesThrottled(ids: string[]): Promise<Array<[number, number][] | null>> {
+  const out: Array<[number, number][] | null> = new Array(ids.length).fill(null);
+  /**
+   * EINE Wartefrist für den ganzen Abruf, nicht eine je Fahrt: Bei zehn
+   * Kennungen und drei Arbeitern summierte sich die Wartezeit sonst auf rund
+   * 40 s — für eine Anfrage, die niemand abbrechen kann.
+   */
+  const until = Date.now() + POLY_MAX_WAIT_MS;
+  let next = 0;
+  const worker = async () => {
+    while (next < ids.length) {
+      const i = next++;
+      const id = ids[i]!;
+      const hit = polylineCache.get(id);
+      if (hit) {
+        out[i] = hit;
+        continue;
+      }
+      if (polylineMiss.get(id)) continue;
+      const coords = await fetchTripPolyline(id, until);
+      if (coords) polylineCache.set(id, coords);
+      else if (coords === null) polylineMiss.set(id, true);
+      out[i] = coords ?? null;
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+  return out;
+}
+
+/**
+ * `null` = kein Verlauf (gemerkt), `undefined` = diesmal nicht abgerufen, weil
+ * das DB-Budget erschöpft war (NICHT gemerkt — beim nächsten Mal wieder).
+ */
+async function fetchTripPolyline(
+  tripId: string,
+  /** Bis wann auf einen Platz im Kontingent gewartet wird (siehe `polylinesThrottled`). */
+  until?: number,
+): Promise<[number, number][] | null | undefined> {
   // MOTIS-tripIds (Format YYYYMMDD_HH:MM_<feed>_<num>) → Geometrie direkt von
   // MOTIS (precision-6-Polyline).
   if (/^\d{8}_\d{2}:\d{2}_/.test(tripId)) {
     return getMotisTripPolyline(tripId);
   }
+  if (!isDbwebTripId(tripId)) return null;
+  const lane = await waitForDbwebSlot(until);
+  if (!lane) return undefined;
   // HAFAS-tripIds (2|#VN#...) kommen von dbweb (bahn.de-Routen) → gegen den
   // dbweb-Sidecar (int.bahn.de, UNBLOCKIERT), NICHT den geblockten db-Container.
   // Response-Format identisch (GeoJSON features[].geometry.coordinates=[lng,lat]).
-  const url = `${config.DBWEB_BASE_URL}/trips/${encodeURIComponent(tripId)}?polyline=true&stopovers=false`;
+  //
+  // `language=de` ist PFLICHT: Ohne gibt das `dbweb`-Profil seine Vorgabe
+  // „Accept-Language: en" weiter, und genau die sperrt Akamai auf
+  // int.bahn.de/…/fahrt mit 403 OPS_BLOCKED — nachgestellt Kopfzeile für
+  // Kopfzeile (Sept. 2026): „de" → 200, „en" → 403, alles andere egal. Die
+  // Suche (dbVendo.ts) und die Tafeln (stopInfoService.ts) setzen es längst;
+  // hier fehlte es, und jede Route auf der Karte fiel auf Geraden zwischen den
+  // Halten zurück.
+  const url = `${lane.dbwebUrl}/trips/${encodeURIComponent(tripId)}?polyline=true&stopovers=false&language=de`;
   try {
-    const res = await fetch(url, { headers: { Accept: "application/json" } });
-    if (!res.ok) return null;
+    const res = await fetch(url, {
+      headers: { Accept: "application/json" },
+      // Nicht länger warten als ein Nutzer auf eine graue Linie wartet.
+      signal: AbortSignal.timeout(8000),
+    });
+    /**
+     * Nur ein ECHTES „gibt es nicht" (404/410) wird als Fehltreffer gemerkt.
+     * Sperre, Drosselung, Serverfehler und Zeitüberschreitung sind
+     * vorübergehend — sie als „kein Verlauf" zehn Minuten festzuhalten, ließ
+     * die Linie auch dann gerade, wenn die Bahn eine Minute später wieder
+     * geantwortet hätte.
+     */
+    await reportIfBlocked(lane, res);
+    if (!res.ok) return res.status === 404 || res.status === 410 ? null : undefined;
     const data = (await res.json()) as DbTripResponse;
     const fc = data.trip?.polyline ?? data.polyline;
     if (!fc || !Array.isArray(fc.features)) return null;
@@ -99,7 +230,7 @@ async function fetchTripPolyline(tripId: string): Promise<[number, number][] | n
     }
     return coords.length > 1 ? coords : null;
   } catch {
-    return null;
+    return undefined;
   }
 }
 
@@ -130,6 +261,9 @@ interface TripDetailLeg {
   stops?: number;
   stopovers?: TripStopover[];
   tripId?: string;
+  /** Ortszeit-Zone von Ab- und Ankunft (IANA oder „+01:00") — siehe `stopTz`. */
+  originTz?: string;
+  destTz?: string;
 }
 
 interface TripStopover {
@@ -283,9 +417,22 @@ async function fetchTripBody(
     return motisTripToBody(tripId);
   }
   if (profile === "db") {
-    const url = `${config.DBREST_BASE_URL}/trips/${encodeURIComponent(tripId)}?stopovers=true&polyline=false&remarks=false`;
+    // Nur HAFAS-Kennungen („1|…", „2|#VN#…") kennt die Bahn. Kennungen der
+    // Länder-Fahrpläne („16_17447_260829") kosteten sonst einen Platz im
+    // Kontingent und scheiterten immer.
+    if (!tripId.includes("|")) return null;
+    // `language=de` — sonst 403 OPS_BLOCKED, siehe `fetchTripPolyline`.
+    // Ein Platz aus dem Bahn-Kontingent (Stufe `detail`): Jemand wartet auf die
+    // Zeitleiste, also kurz warten — aber nie der Suche den Platz nehmen.
+    const lane = await acquireDb("detail", 3_000);
+    if (!lane) return null;
+    const url = `${lane.dbrestUrl}/trips/${encodeURIComponent(tripId)}?stopovers=true&polyline=false&remarks=false&language=de`;
     try {
-      const res = await fetch(url, { headers: { Accept: "application/json" } });
+      const res = await fetch(url, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(10_000),
+      });
+      await reportIfBlocked(lane, res);
       if (!res.ok) return null;
       const data = (await res.json()) as DbTripResponse;
       // db-vendo wickelt manchmal in `.trip`, manchmal nicht — beide Shapes
@@ -308,15 +455,140 @@ async function fetchTripBody(
 
 async function fetchTripDetail(
   tripId: string,
-  fromStopId: string | undefined,
-  fromStopLabel: string | undefined,
-  fromStopLat: number | undefined,
-  fromStopLng: number | undefined,
-  boardDirection: string | undefined,
+  slice: TripSlice,
   profile: HafasProfileKey,
 ): Promise<TripDetailResponse | null> {
   const trip = await fetchTripBody(profile, tripId);
   if (!trip) return null;
+  // Nur der dbrest-Weg (db-vendo) hängt an jeden Halt den Offset des
+  // STARTORTS — siehe util/dbTime.ts. MOTIS liefert UTC, die übrigen
+  // HAFAS-Profile stimmige Offsets.
+  const localClock = profile === "db" && !/^\d{8}_\d{2}:\d{2}_/.test(tripId);
+  return buildTripDetail(trip, tripId, slice, localClock);
+}
+
+/**
+ * Die Fahrt eines Länder-Fahrplans (GTFS: NL/BE/CZ/UK …) in derselben Form wie
+ * ein dbrest-Fahrtverlauf — damit Schnitt, Namen und Zeiten unten dieselbe
+ * Logik durchlaufen. null, wenn der Feed die Kennung nicht kennt.
+ */
+async function gtfsTripToBody(
+  country: string,
+  tripId: string,
+  stopCode: string | undefined,
+  near: { latitude: number; longitude: number } | null,
+  atTime: string | undefined,
+): Promise<DbTripBody | null> {
+  const trip = await getScheduledTrip({ country, tripId, stopCode, near, atTime });
+  if (!trip) return null;
+  /**
+   * Zeiten mit dem Offset des Feeds statt „Z" — derselbe Zeitpunkt.
+   *
+   * `stopTz` nimmt die Zone eines Halts aus seiner Lage, sonst aus dem Offset
+   * des Zeitstempels. Halte ohne Lage (0/0 → null, im niederländischen Feed
+   * 126 ausländische wie Berlin Südkreuz oder Dortmund Hbf, oft Endhalt eines
+   * Fernzugs) bekamen mit „Z" die Zone UTC: Ankunft eine bis zwei Stunden zu
+   * früh angezeigt. Die Ortszeit des Feeds stimmt für sie fast immer.
+   */
+  const local = (iso: string) => formatInTimeZone(new Date(iso), trip.tz, "yyyy-MM-dd'T'HH:mm:ssxxx");
+  const stopovers: DbTripStopover[] = trip.stops.map((s) => ({
+    stop: {
+      id: s.stopId,
+      // Derselbe Name wie im Kopf des Halt-Blatts — in Großbritannien ohne
+      // Netz-Zusatz, Postbezirk, Richtung oder Steignummer (siehe
+      // util/stopDisplayName.ts). Andere Länder: der Fahrplan-Name, wie er ist.
+      name: s.name ? timetableStopName(country, s.name) : undefined,
+      location: { latitude: s.latitude ?? undefined, longitude: s.longitude ?? undefined },
+    },
+    arrival: local(s.arrival),
+    plannedArrival: local(s.arrival),
+    departure: local(s.departure),
+    plannedDeparture: local(s.departure),
+  }));
+  const first = stopovers[0]!;
+  const last = stopovers[stopovers.length - 1]!;
+  return {
+    id: tripId,
+    origin: first.stop,
+    destination: last.stop,
+    departure: first.departure,
+    plannedDeparture: first.plannedDeparture,
+    arrival: last.arrival,
+    plannedArrival: last.plannedArrival,
+    line: { name: trip.line ?? undefined, product: trip.product },
+    direction: trip.headsign ?? undefined,
+    stopovers,
+  };
+}
+
+/**
+ * Die Ortszeit-Zone eines Halts: aus seiner Lage (tz-lookup), sonst aus dem
+ * Offset des Zeitstempels, sonst Berlin.
+ *
+ * Hier stand für JEDE Fahrt fest „Europe/Berlin". Die Zeitleiste rechnet damit
+ * um — eine Abfahrt in London um 14:05 stand dort als 15:05, in Lissabon zwei
+ * Stunden daneben genauso. Die Tafel davor (richtig) und die Zeitleiste
+ * dahinter (falsch) widersprachen sich um genau den Zonenabstand.
+ */
+function stopTz(stop: DbTripStopover | undefined, raw: string | undefined): string {
+  return dbStopTz(stop?.stop) ?? isoOffset(raw) ?? "Europe/Berlin";
+}
+
+/** Woran das Detail die Fahrt zuschneidet — alles aus der getippten Tafel-Zeile. */
+interface TripSlice {
+  /** Kennung des Halts, an dem der Nutzer steht (aus der Tafel). */
+  fromStopId?: string;
+  /** Name dieses Halts — Rückfall, wenn weder Kennung noch Lage greifen. */
+  fromStopLabel?: string;
+  /** Lage dieses Halts aus unserer DB. */
+  fromStopLat?: number;
+  fromStopLng?: number;
+  /** Die Richtung der Zeile („Werl, Bf."). Auf der Ankunftstafel die HERKUNFT. */
+  boardDirection?: string;
+  /** Zeile der Ankunftstafel: gezeigt wird die Fahrt BIS zum Halt, nicht ab ihm. */
+  arrivals?: boolean;
+  /** Planzeit der Zeile (ISO) — welches Vorkommen des Halts gemeint ist. */
+  atTime?: string;
+}
+
+/** Luftlinie in Metern zwischen zwei Halten — null, wenn einer keine Lage hat. */
+function stopDistanceMeters(a: DbTripStopover | undefined, b: DbTripStopover | undefined): number | null {
+  const p = a?.stop?.location;
+  const q = b?.stop?.location;
+  if (p?.latitude == null || p.longitude == null || q?.latitude == null || q.longitude == null) return null;
+  const rad = Math.PI / 180;
+  const dLat = (q.latitude - p.latitude) * rad;
+  const dLon = (q.longitude - p.longitude) * rad;
+  const h = Math.sin(dLat / 2) ** 2
+    + Math.cos(p.latitude * rad) * Math.cos(q.latitude * rad) * Math.sin(dLon / 2) ** 2;
+  return 2 * 6_371_000 * Math.asin(Math.sqrt(h));
+}
+
+/**
+ * Fährt die Fahrt nach Halt `idx` zurück zum Startpunkt — eine Ringlinie
+ * (oder ein Hin-und-zurück) also, deren Kopfschild den Wendepunkt nennt?
+ * Der letzte Halt muss dem ersten weniger als halb so fern sein wie `idx`.
+ * Ein kleiner Haken am Ende reicht nicht: Ein Schulbus nach „Cromer" wendet
+ * in Sheringham an der „Cromer Road" und hält danach noch dreimal, 600 m
+ * zurück — der Ring-Fall ist das nicht. Ohne Lagen: nein, die Fahrt bleibt ganz.
+ */
+function turnsBackAfter(stops: DbTripStopover[], idx: number): boolean {
+  const first = stops[0];
+  const toTurn = stopDistanceMeters(first, stops[idx]);
+  const toLast = stopDistanceMeters(first, stops[stops.length - 1]);
+  return toTurn != null && toLast != null && toLast * 2 < toTurn;
+}
+
+function buildTripDetail(
+  trip: DbTripBody,
+  tripId: string,
+  slice: TripSlice,
+  localClock: boolean,
+): TripDetailResponse | null {
+  const { fromStopId, fromStopLabel, fromStopLat, fromStopLng, boardDirection, arrivals, atTime } = slice;
+  /** Zeitstempel eines Halts → ISO-UTC (bei dbrest in der Zone DES Halts). */
+  const timeOf = (v: string | undefined, s: DbTripStopover | undefined): string | null =>
+    localClock ? dbTimeToUtc(v, dbStopTz(s?.stop)) : toIso(v);
 
   // Raw stopovers aus HAFAS — beinhaltet IMMER origin + alle Zwischenhalte +
   // destination (alle Stops chronologisch). Daraus bauen wir die User-zentrierte
@@ -325,88 +597,14 @@ async function fetchTripDetail(
 
   // Slice die Stop-Liste auf den User-Halt (Beispiel: Bus 245 fährt 17:56→18:34,
   // User steigt um 18:08 ein → wir wollen 18:08→18:34 anzeigen, nicht die volle
-  // Linie inklusive der Stops vor dem User). Mehrere Match-Strategien probiert,
-  // weil HAFAS-IDs zwischen Stop-Board und Trip-Stopovers nicht immer 1:1
-  // matchen (Stops haben oft Station-vs-Platform-Hierarchie):
-  //   1. Exakter Stop-ID-Match
-  //   2. ID-Prefix-Match (parent_station vs platform_id Variation)
-  //   3. Name-Match (fuzzy, lowercase) — case der User-Stop kein hafas_id hat
-  //      oder die IDs einfach nicht übereinstimmen (passiert bei Berlin BVG-
-  //      Bus-Stops wo VBB-IDs anders sind als BVG-Trip-IDs)
-  // Common city-name-Varianten zwischen englisch (in unseren GTFS-Labels)
-  // und deutsch (in HAFAS-Trip-Bodies). Müssen normalisiert werden sonst
-  // matched „Munich Chiemgaustraße" nicht „München, Chiemgaustraße".
-  const cityAliases: Record<string, string> = {
-    munich: "münchen",
-    cologne: "köln",
-    vienna: "wien",
-    nuremberg: "nürnberg",
-    geneva: "genf",
-    zurich: "zürich",
-    prague: "prag",
-    warsaw: "warschau",
-    // „Hauptbahnhof" → „hbf" damit beide Schreibweisen denselben Token
-    // erzeugen. Praxis-Bug: User-Label „Berlin Hbf" tokenized zu [berlin, hbf],
-    // HAFAS-Trip-Stop „Berlin Hauptbahnhof" → ohne Alias zu [berlin, …] und
-    // matched nicht — wir landen stattdessen auf „Berlin Mahlsdorf" das auch
-    // „berlin" hat aber 22 km woanders ist.
-    hauptbahnhof: "hbf",
-  };
-  // Tokenizer: lowercase, Sonderzeichen (inkl. Bindestriche, Slashes, Punkte)
-  // zu Whitespace, in Wörter splitten, City-Aliase normalisieren.
-  // Bindestriche MÜSSEN gesplittet werden — sonst wird „Hamm-Westtünnen" zu
-  // einem einzigen Token „hamm-westtünnen" der weder „hamm" noch „westtünnen"
-  // matched. Praxis-Bug: User tippte „Hamm Westtünnen Bahnhof" im Surroundings,
-  // Trip-Stops hatten „Hamm-Westtünnen" — kein Match → falscher Slice-Start.
-  // Stop-Words wie „bahnhof"/„station" filtern wir weg sonst pollen sie die
-  // Match-Scores: „Hessen Bahnhof Hamm Westf" hätte sonst auf {hamm, bahnhof}
-  // = 2 Tokens gematched obwohl Bahnhof ein Generic-Qualifier ist.
-  // ABER: „Hbf" / „Hauptbahnhof" BEHALTEN wir als Token — die sind so spezifisch
-  // dass sie zwischen sub-Stops in einer Stadt unterscheiden (Berlin Hbf vs
-  // Berlin Mahlsdorf). Via cityAliases werden die zwei Schreibweisen unifiziert.
-  const STOP_WORDS = new Set([
-    "bahnhof", "bahnhst", "bahnsteig", "bahnsteige",
-    "station", "stop", "stops", "haltestelle", "halt",
-    "gleis", "platform", "platt",
-    // DB-/regional-Qualifier („Hamm Westf", „Bad Münster a Stein")
-    "westf", "westfalen", "westfälisch",
-    // Generische Straßen-/Wege-/Brücken-Bezeichner — zu unscharf um zwischen
-    // Stops zu unterscheiden. Praxis-Bug: „Tegeler Weg/Jungfernheide" matched
-    // fälschlich „Gandenitzer Weg, Berlin" auf {weg, berlin} = 2 Tokens und
-    // gewinnt damit den ersten Iterations-Slot, „Jungfernheide Bahnhof"
-    // verliert via > statt >=.
-    "weg", "wege",
-    "str", "straße", "strasse",
-    "brücke", "brucke",
-    "platz",
-    "allee",
-    "gasse",
-    "ring",
-    "ufer",
-    // Romanische/weitere Generika — die Liste war deutsch/englisch-zentrisch.
-    // Ohne sie matched z.B. „Estación de Autobuses de Sevilla" auf „Estación
-    // de Autobuses de Granada" über {estación, autobuses} = 2 Tokens und der
-    // Slice startet an einer fremden Station (Spanien-Bugklasse). Akzent-
-    // Varianten doppelt, der Tokenizer strippt keine Diakritika.
-    "estación", "estacion", "estació", "estacio", "estação", "estacao",
-    "autobuses", "autobús", "autobus", "autocares",
-    "gare", "routière", "routiere",
-    "stazione", "autostazione", "fermata",
-    "paragem", "rodoviária", "rodoviaria",
-    "dworzec", "przystanek", "nádraží", "nadrazi", "zastávka", "zastavka",
-    "calle", "avenida", "avda", "carrer", "avinguda",
-    "rue", "avenue", "boulevard",
-    "praça", "praca", "plaça", "placa",
-  ]);
-  const tokenize = (s: string): string[] => {
-    const cleaned = s.toLowerCase().replace(/[,()./\-]/g, " ").replace(/\s+/g, " ").trim();
-    return cleaned
-      .split(" ")
-      .map((w) => cityAliases[w] ?? w)
-      .filter((w) => w.length > 2 && !STOP_WORDS.has(w));
-  };
+  // Linie inklusive der Stops vor dem User). Der Halt des Nutzers, in dieser
+  // Reihenfolge:
+  //   1. Exakte Stop-ID, dann ID-Prefix (parent_station vs. platform_id)
+  //   2. Lage: nächster Halt der Fahrt, höchstens 500 m entfernt
+  //   3. Name (util/tripStopMatch.ts) — nur wenn er EINDEUTIG ist
+  // Wird er nicht gefunden: die ganze Fahrt, nie ein geratener Halt.
 
-  // Haversine in Metern — für den Coord-Fallback unten. Ein bisschen
+  // Haversine in Metern — für den Coord-Match unten. Ein bisschen
   // overkill für kurze Distanzen (man könnte auch dx²+dy² in Lat/Lon nehmen)
   // aber die korrekte Form ist hier schnell genug (200 stops × 1 Trig-Calc).
   const haversineMeters = (la1: number, lo1: number, la2: number, lo2: number): number => {
@@ -417,104 +615,117 @@ async function fetchTripDetail(
       + Math.cos((la1 * Math.PI) / 180) * Math.cos((la2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
     return 2 * R * Math.asin(Math.sqrt(a));
   };
+  const names = rawStops.map((s) => s.stop?.name);
 
-  let startIdx = 0;
+  // Abfahren kann man nie am Endhalt, ankommen nie am ersten Halt. Eine
+  // Ringlinie hat am Start-/Endhalt zwei Einträge (oft zwei Steige gleich
+  // nebeneinander); lag der letzte näher, war er der „Einstieg", und das
+  // Detail zeigte eine Fahrt aus einem einzigen Halt.
+  const possible = (i: number) => (arrivals ? i > 0 : i < rawStops.length - 1);
+  // Derselbe Halt kann in einer Fahrt ZWEIMAL vorkommen: Die 621 in Werl fährt
+  // ab Schulzentrum, ist 11:30 am Bahnhof, dreht ihre Runde und ist 12:06
+  // wieder am Bahnhof. Welches Vorkommen die getippte Zeile meint, sagt ihre
+  // Uhrzeit — ohne sie zeigte die Ankunft um 12:06 die Fahrt bis 11:30.
+  const atMs = atTime ? Date.parse(atTime) : NaN;
+  const eventMs = (i: number): number => {
+    const s = rawStops[i]!;
+    const dep = timeOf(s.plannedDeparture ?? s.departure, s);
+    const arr = timeOf(s.plannedArrival ?? s.arrival, s);
+    const iso = arrivals ? (arr ?? dep) : (dep ?? arr);
+    return iso ? Date.parse(iso) : NaN;
+  };
+  const pick = (candidates: number[]): number => {
+    const ok = candidates.filter(possible);
+    if (ok.length <= 1 || !Number.isFinite(atMs)) return ok[0] ?? -1;
+    let best = ok[0]!;
+    let bestGap = Infinity;
+    for (const i of ok) {
+      const t = eventMs(i);
+      const gap = Number.isFinite(t) ? Math.abs(t - atMs) : Infinity;
+      if (gap < bestGap) {
+        bestGap = gap;
+        best = i;
+      }
+    }
+    return best;
+  };
+  const indicesWhere = (test: (s: DbTripStopover, i: number) => boolean): number[] =>
+    rawStops.flatMap((s, i) => (test(s, i) ? [i] : []));
+
+  let userIdx = -1;
   if (fromStopId) {
-    const idx = rawStops.findIndex((s) => s.stop?.id === fromStopId);
-    if (idx >= 0) startIdx = idx;
-    else {
-      // Prefix-Match: trip-stops könnten Platform-IDs sein (parentId + Suffix)
-      const idx2 = rawStops.findIndex((s) => s.stop?.id?.startsWith(fromStopId + ":")
-        || (s.stop?.id && fromStopId.startsWith(s.stop.id + ":")));
-      if (idx2 >= 0) startIdx = idx2;
+    userIdx = pick(indicesWhere((s) => s.stop?.id === fromStopId));
+    // Prefix-Match: trip-stops könnten Platform-IDs sein (parentId + Suffix)
+    if (userIdx < 0) {
+      userIdx = pick(indicesWhere((s) => !!s.stop?.id && (s.stop.id.startsWith(fromStopId + ":")
+        || fromStopId.startsWith(s.stop.id + ":"))));
     }
   }
   // Coord-Match (PRIMARY-SIGNAL wenn beide Coords vorhanden): finde den
-  // Trip-Stop der am nächsten zu unseren DB-Coords liegt. Token-Match
-  // unten ist ein guter Fallback, scheitert aber bei generischen Namen.
-  // Coords sind zuverlässig weil Bus-/Bahn-Stops geographisch eindeutig
-  // sind. Schwelle 500 m: HAFAS-Trip-Bodies enthalten oft nicht JEDEN
-  // physischen Stop sondern nur die wichtigsten (z.B. M21 listet
-  // „Jungfernheide Bahnhof" aber nicht „Tegeler Weg" 360m daneben — der
-  // User steht aber an Tegeler Weg). 500m fängt diesen Fall und ist eng
-  // genug um nicht zwischen 2 echten Stops zu verwechseln (urban inter-
-  // stop-distance liegt typisch 200-500m).
-  if (startIdx === 0 && fromStopLat != null && fromStopLng != null) {
-    let bestIdx = -1;
+  // Trip-Stop der am nächsten zu unseren DB-Coords liegt. Coords sind
+  // zuverlässig weil Bus-/Bahn-Stops geographisch eindeutig sind. Schwelle
+  // 500 m: HAFAS-Trip-Bodies enthalten oft nicht JEDEN physischen Stop sondern
+  // nur die wichtigsten (z.B. M21 listet „Jungfernheide Bahnhof" aber nicht
+  // „Tegeler Weg" 360m daneben — der User steht aber an Tegeler Weg). 500m
+  // fängt diesen Fall und ist eng genug um nicht zwischen 2 echten Stops zu
+  // verwechseln (urban inter-stop-distance liegt typisch 200-500m). Als
+  // „derselbe Halt" zählt alles bis 30 m über dem nächsten (Steige).
+  if (userIdx < 0 && fromStopLat != null && fromStopLng != null) {
+    const dist = rawStops.map((s) => {
+      const loc = s.stop?.location;
+      return loc?.latitude == null || loc.longitude == null
+        ? Infinity
+        : haversineMeters(fromStopLat, fromStopLng, loc.latitude, loc.longitude);
+    });
     let bestDist = Infinity;
-    for (let i = 0; i < rawStops.length; i++) {
-      const loc = rawStops[i]!.stop?.location;
-      if (!loc || loc.latitude == null || loc.longitude == null) continue;
-      const d = haversineMeters(fromStopLat, fromStopLng, loc.latitude, loc.longitude);
-      if (d < bestDist) {
-        bestDist = d;
-        bestIdx = i;
-      }
-    }
-    if (bestIdx >= 0 && bestDist <= 500) startIdx = bestIdx;
-  }
-  if (startIdx === 0 && fromStopLabel) {
-    // Token-Set-Match: wir vergleichen distinktive Wörter, nicht Substrings.
-    // Beispiel: User-Label "Munich Chiemgaustraße" → tokens [munich→münchen,
-    // chiemgaustraße]. HAFAS-Stop "München, Chiemgaustraße" → tokens [münchen,
-    // chiemgaustraße]. Beide haben dieselbe Token-Menge → Match.
-    // Robust gegen Sprache (DE/EN-Stadtnamen) und Format-Variationen
-    // (Komma vs. Klammer-Klammer-Format).
-    const wantedTokens = new Set(tokenize(fromStopLabel));
-    if (wantedTokens.size > 0) {
-      // Bester Match = meiste überlappende Tokens. Bei Gleichstand: erster
-      // im Trip (kommt früher).
-      let bestIdx = -1;
-      let bestOverlap = 0;
-      for (let i = 0; i < rawStops.length; i++) {
-        const name = rawStops[i]!.stop?.name;
-        if (!name) continue;
-        const stopTokens = tokenize(name);
-        let overlap = 0;
-        for (const tok of stopTokens) if (wantedTokens.has(tok)) overlap++;
-        // Mindestens 1 token muss überlappen UND es muss ein "wirklicher"
-        // Match sein (nicht nur ein zufälliges "münchen" das in 100 Stops
-        // vorkommt). Wir verlangen Overlap >= min(2, wantedTokens.size) — also
-        // bei kurzen Labels (1 Token) reicht 1, bei längeren mind. 2.
-        const required = Math.min(2, wantedTokens.size);
-        if (overlap >= required && overlap > bestOverlap) {
-          bestOverlap = overlap;
-          bestIdx = i;
-        }
-      }
-      if (bestIdx >= 0) startIdx = bestIdx;
+    dist.forEach((d, i) => {
+      if (possible(i) && d < bestDist) bestDist = d;
+    });
+    if (bestDist <= 500) {
+      // Nach Abstand sortiert: Ohne Uhrzeit (oder bei gleicher) gewinnt der nächste.
+      userIdx = pick(
+        indicesWhere((_, i) => dist[i]! <= Math.min(500, bestDist + 30)).sort((a, b) => dist[a]! - dist[b]!),
+      );
     }
   }
-  // END-Slice auf die Board-Richtung: bei RINGLINIEN (Start=Ende, z.B. C1 in
-  // Werl: Bahnhof→…→Justus-Liebig-Platz→…→Bahnhof) und generell wenn der
-  // Headsign NICHT die Endstation ist, ist der operative letzte Halt (Werl
-  // Bahnhof) ein ANDERER Ort als wohin der User laut Board fährt (Justus-
-  // Liebig-Platz). Ohne End-Slice zeigte der Header das Richtungs-Label, aber
-  // die Ziel-Koordinaten wären die der Endstation → Marker an falscher Stelle.
-  // Wir suchen die Board-Richtungs-Haltestelle AB dem User-Halt und schneiden
-  // dort ab. Gleiche Token-Match-Logik wie beim Start-Slice.
+  // Name: „Munich Chiemgaustraße" (unser GTFS-Label) findet „München,
+  // Chiemgaustraße" (HAFAS) — aber „Werl, Bahnhof" findet unter lauter
+  // „Werl, …"-Halten nur den einen, der auch „Bahnhof" heißt, sonst keinen.
+  if (userIdx < 0 && fromStopLabel) userIdx = pick(matchStopIndices(names, fromStopLabel));
+
+  let startIdx = 0;
   let endIdx = rawStops.length - 1;
-  let endMatched = false;
-  if (boardDirection?.trim()) {
-    const wanted = new Set(tokenize(boardDirection));
-    if (wanted.size > 0) {
-      let bestIdx = -1;
-      let bestOverlap = 0;
-      for (let i = startIdx + 1; i < rawStops.length; i++) {
-        const name = rawStops[i]!.stop?.name;
-        if (!name) continue;
-        let overlap = 0;
-        for (const tok of tokenize(name)) if (wanted.has(tok)) overlap++;
-        const required = Math.min(2, wanted.size);
-        if (overlap >= required && overlap > bestOverlap) {
-          bestOverlap = overlap;
-          bestIdx = i;
-        }
-      }
-      if (bestIdx > startIdx) {
-        endIdx = bestIdx;
-        endMatched = true;
-      }
+  if (arrivals) {
+    // ANKUNFTSTAFEL: Die Zeile sagt „aus Unna, an 16:33" — ihre Richtung ist
+    // die Herkunft. Gezeigt wird die Fahrt von dort BIS HIER. Vorher lief
+    // auch diese Zeile durch den Abfahrts-Schnitt: ab hier bis zu dem Halt,
+    // dessen Name dem HERKUNFTSORT ähnelte — eine Fahrt, die es so nicht gibt.
+    if (userIdx > 0) endIdx = userIdx;
+  } else {
+    if (userIdx >= 0) startIdx = userIdx;
+    // END-Slice auf die Board-Richtung — NUR für RINGLINIEN (Start=Ende, z.B.
+    // C1 in Werl: Bahnhof→…→Justus-Liebig-Platz→…→Bahnhof). Dort ist der
+    // letzte Halt (Werl Bahnhof) ein ANDERER Ort als wohin der User laut Board
+    // fährt (Justus-Liebig-Platz), und das Detail endet am Richtungs-Halt.
+    //
+    // Sonst NIE: Das Kopfschild nennt das Ziel der Fahrt, und ein Halt
+    // unterwegs, der ähnlich heißt, ist ein anderer Ort. Nachgestellt an 17 000
+    // Fahrten der Länder-Fahrpläne: „Nottingham" endete an „Nottingham Road",
+    // 24 Halte vor dem Ziel; „Reading Station" an „Reading West Station";
+    // „Amersfoort CS" an „Amersfoort, Prins Frederiklaan" — in den
+    // Niederlanden fast jede zweite Fahrt. Und „Werl, Bf." auf der 522, die gar
+    // nicht am Bahnhof hält, endete eine Minute nach dem Einstieg am nächsten
+    // „Werl, …"-Halt. Darum: Der Name muss genau einen Halt meinen (siehe
+    // util/tripStopMatch.ts), UND die Fahrt muss danach zurück Richtung
+    // Startpunkt fahren — sonst die ganze Fahrt bis zum echten Endhalt.
+    // Nennt das Kopfschild den Endhalt SELBST (Ring „Palmovka" ab Palmovka
+    // zurück nach Palmovka, mit einem zweiten Steig „Palmovka" gleich danach),
+    // ist die ganze Runde gemeint — nicht der nächste gleichnamige Steig.
+    if (boardDirection?.trim()) {
+      const hits = matchStopIndices(names, boardDirection);
+      const idx = hits.find((i) => i > startIdx) ?? -1;
+      const namesTerminal = hits.includes(rawStops.length - 1);
+      if (idx > startIdx && !namesTerminal && turnsBackAfter(rawStops, idx)) endIdx = idx;
     }
   }
   const slicedStops = rawStops.slice(startIdx, endIdx + 1);
@@ -528,12 +739,14 @@ async function fetchTripDetail(
   // letzten Stops (Endstation). Falls die Felder fehlen (z.B. Endstation hat
   // kein departure), fallen wir auf den jeweils anderen Wert zurück.
   const departTime =
-    toIso(firstStop.plannedDeparture ?? firstStop.departure) ??
-    toIso(firstStop.plannedArrival ?? firstStop.arrival);
+    timeOf(firstStop.plannedDeparture ?? firstStop.departure, firstStop) ??
+    timeOf(firstStop.plannedArrival ?? firstStop.arrival, firstStop);
   const arriveTime =
-    toIso(lastStop.plannedArrival ?? lastStop.arrival) ??
-    toIso(lastStop.plannedDeparture ?? lastStop.departure);
+    timeOf(lastStop.plannedArrival ?? lastStop.arrival, lastStop) ??
+    timeOf(lastStop.plannedDeparture ?? lastStop.departure, lastStop);
   if (!departTime || !arriveTime) return null;
+  const originTz = stopTz(firstStop, firstStop.plannedDeparture ?? firstStop.departure);
+  const destinationTz = stopTz(lastStop, lastStop.plannedArrival ?? lastStop.arrival);
 
   const durationMinutes = Math.max(
     1,
@@ -549,8 +762,8 @@ async function fetchTripDetail(
   const stopovers: TripStopover[] = middleRaw
     .map((s) => ({
       name: s.stop?.name,
-      arrival: toIso(s.plannedArrival ?? s.arrival) ?? undefined,
-      departure: toIso(s.plannedDeparture ?? s.departure) ?? undefined,
+      arrival: timeOf(s.plannedArrival ?? s.arrival, s) ?? undefined,
+      departure: timeOf(s.plannedDeparture ?? s.departure, s) ?? undefined,
       platform:
         s.plannedArrivalPlatform ??
         s.arrivalPlatform ??
@@ -558,8 +771,6 @@ async function fetchTripDetail(
         s.departurePlatform,
     }))
     .filter((s) => s.name);
-
-  const stopLabels = stopovers.map((s) => s.name).filter((n): n is string => !!n);
 
   const mode = productToMode(trip.line?.product);
   const product = trip.line?.product;
@@ -570,24 +781,17 @@ async function fetchTripDetail(
   const originId = firstStop.stop?.id ?? trip.origin?.id ?? "";
   const destinationId = lastStop.stop?.id ?? trip.destination?.id ?? "";
   const originName = firstStop.stop?.name ?? trip.origin?.name ?? "";
-  // destinationName: bevorzugt `trip.direction` (der Headsign-Name den der
-  // User auf dem Bus-Display sieht — z.B. „S+U Pankow"), nicht der operative
-  // letzte Halt (z.B. „Hadlichstr." wo die M27 nur wendet). Der User wählt
-  // den Bus nach Headsign aus, das soll konsistent in der Trip-Detail-Header
-  // sein. Stop-Liste selbst zeigt unverändert ALLE realen Stops bis zum
-  // technischen Endhalt.
-  // WICHTIG: Label MUSS zu den Ziel-Koordinaten (lastStop) passen, sonst sitzt
-  // der Marker falsch. Wenn der End-Slice die Board-Richtungs-Haltestelle
-  // gefunden hat, ist lastStop genau dieser Halt → Board-Direction als Label ok
-  // (schöner, ohne „Werl,"-Präfix). Wenn NICHT gefunden, ist lastStop die echte
-  // Endstation → dann deren Namen nehmen (nicht den Headsign, der woanders
-  // liegt), damit Label und Koordinaten konsistent bleiben.
+  // destinationName: der Name des Halts, an dem das Detail endet — derselbe,
+  // dessen Koordinaten den Marker setzen. Die Richtung der Tafel („Werl, Bf.")
+  // stand hier, sobald der End-Schnitt einen Halt „gefunden" hatte; war es der
+  // falsche, trug ein Halt eine Minute nach dem Einstieg den Namen des
+  // Bahnhofs. Die Richtung selbst zeigt die Zeitleiste ohnehin („Richtung …",
+  // `leg.direction`), der Halt heißt jetzt so, wie er heißt.
   const destinationName =
-    (endMatched ? boardDirection?.trim() : undefined) ??
     lastStop.stop?.name ??
     trip.direction?.trim() ??
     trip.destination?.name ??
-    boardDirection?.trim() ??
+    (arrivals ? undefined : boardDirection?.trim()) ??
     "";
   const originLat = firstStop.stop?.location?.latitude ?? trip.origin?.location?.latitude;
   const originLng = firstStop.stop?.location?.longitude ?? trip.origin?.location?.longitude;
@@ -621,6 +825,8 @@ async function fetchTripDetail(
     stops: Math.max(0, stopovers.length),
     stopovers: stopovers.length > 0 ? stopovers : undefined,
     tripId,
+    originTz,
+    destTz: destinationTz,
   };
 
   return {
@@ -633,15 +839,19 @@ async function fetchTripDetail(
     departTime,
     arriveTime,
     durationMinutes,
-    stops: stopovers.length,
-    stopLabels,
+    // Auf Ebene der VERBINDUNG zählt `stops` die Umstiege (so liefern es alle
+    // Suchanbieter, und so beschriftet die App das Feld). Eine einzelne Fahrt
+    // hat keine — die Zwischenhalte stehen am Leg. Vorher stand hier deren
+    // Zahl, und der Kopf der Zeitleiste zeigte „29 Stopps · Umstieg".
+    stops: 0,
+    stopLabels: [],
     line: lineName,
     product,
     fahrtNr,
     direction,
     legs: [leg],
-    originTz: "Europe/Berlin",
-    destinationTz: "Europe/Berlin",
+    originTz,
+    destinationTz,
   };
 }
 
@@ -671,11 +881,249 @@ const tripDetailQuerySchema = z.object({
    *  ein anderer Headsign-Wert als der Board-Eintrag (z.B. M21 zeigt im
    *  Board „Goerdelersteg" aber im Trip-Body steht „S+U Jungfernheide"). */
   direction: z.string().optional(),
+  /** Optional: von welcher Tafel die Zeile stammt. Bei `arrivals` ist
+   *  `direction` die HERKUNFT, und das Detail zeigt die Fahrt bis zum Halt. */
+  board: z.enum(["departures", "arrivals"]).optional(),
+  /** Optional: Zeit der getippten Zeile (ISO) — legt bei Fahrten aus den
+   *  Länder-Fahrplänen den Betriebstag fest. Ohne: der nächstliegende. */
+  atTime: z.string().max(40).optional(),
 });
+
+// ---------------------------------------------------------------------------
+// Live-Ansicht
+// ---------------------------------------------------------------------------
+/**
+ * EINE Antwort je Fahrt: jeder Halt mit Lage und Zeiten (Plan und erwartet)
+ * und die Linienführung samt der Stelle jedes Halts darauf. Wo das Fahrzeug
+ * gerade ist, rechnet die App selbst aus (lib/live/) — Bild für Bild, ohne
+ * weitere Anfrage. Echte Positionsdaten (GPS) haben wir nicht; die Ansicht sagt
+ * das auch so.
+ */
+
+/** Wie das Fahrzeug aussieht — die App baut daraus Wagenkette, Tram oder Bus. */
+type LiveVehicle = "train" | "subway" | "tram" | "bus" | "ferry";
+
+interface LiveTripStop {
+  name: string;
+  lat: number;
+  lon: number;
+  /** Ankunft/Abfahrt laut Plan (…P) und wie erwartet (…E, mit Verspätung, falls bekannt), ISO-UTC. */
+  arrP: string | null;
+  arrE: string | null;
+  depP: string | null;
+  depE: string | null;
+  /** Stelle auf der Linie, Meter ab ihrem Anfang. */
+  d: number;
+}
+
+interface LiveTripResponse {
+  tripId: string;
+  vehicle: LiveVehicle;
+  product: string | null;
+  line: string | null;
+  direction: string | null;
+  /** Kommen die erwarteten Zeiten aus Echtzeitdaten? Sonst sind sie der Plan. */
+  realtime: boolean;
+  /** Echte Linienführung — oder gerade Stücke von Halt zu Halt (Länder-Fahrpläne). */
+  shape: "geometry" | "straight";
+  coords: LngLat[];
+  /** Länge bis zu jedem Punkt der Linie, Meter. */
+  cum: number[];
+  stops: LiveTripStop[];
+  /**
+   * Der Halt der Tafel, von der aus geöffnet wurde — Index in `stops`, oder
+   * null, wenn er sich nicht sicher finden lässt. Die App nennt damit, wann das
+   * Fahrzeug „bei dir" ist.
+   */
+  boardIndex: number | null;
+  fetchedAt: string;
+}
+
+type RawLiveStop = Omit<LiveTripStop, "d">;
+
+/** So weit darf der Halt der Tafel von seinem Gegenstück in der Fahrt liegen. */
+const BOARD_STOP_RADIUS_M = 400;
+
+/**
+ * Der Halt der Tafel in der Fahrt — über die LAGE, nicht den Namen: Namen
+ * weichen zwischen Tafel und Fahrt ab („Werl" / „Werl, Bahnhof"), und ein
+ * blinder Namensabgleich hat schon falsche Orte geliefert. In Frage kommt
+ * jeder Halt bis 400 m um den der Tafel; berührt eine Ringlinie ihn zweimal,
+ * entscheidet die Zeit der Tafel-Zeile (Sekunden Abweichung + Meter).
+ */
+function boardStopIndex(
+  stops: LiveTripStop[],
+  lat: number | undefined,
+  lng: number | undefined,
+  atTime: string | undefined,
+): number | null {
+  if (lat == null || lng == null) return null;
+  const at = atTime ? Date.parse(atTime) : NaN;
+  const here = { stop: { location: { latitude: lat, longitude: lng } } } as DbTripStopover;
+  let best: number | null = null;
+  let bestScore = Infinity;
+  stops.forEach((s, i) => {
+    const dist = stopDistanceMeters(here, { stop: { location: { latitude: s.lat, longitude: s.lon } } } as DbTripStopover);
+    if (dist == null || dist > BOARD_STOP_RADIUS_M) return;
+    let dt = 0;
+    if (Number.isFinite(at)) {
+      const times = [s.depP, s.arrP].map((t) => (t ? Date.parse(t) : NaN)).filter(Number.isFinite);
+      dt = times.length ? Math.min(...times.map((t) => Math.abs(t - at))) / 1000 : 0;
+    }
+    const score = dt + dist;
+    if (score < bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  });
+  return best;
+}
+
+function liveVehicle(product: string | null | undefined): LiveVehicle {
+  const p = (product ?? "").toLowerCase();
+  if (/bus|coach/.test(p)) return "bus";
+  if (/tram|cable|funicular|aerial|light/.test(p)) return "tram";
+  if (/subway|metro|underground/.test(p)) return "subway";
+  if (/ferry|ship|boat/.test(p)) return "ferry";
+  return "train";
+}
+
+/**
+ * MOTIS mit EINER Anfrage: Halte (`arrival` ist dort schon die erwartete
+ * Zeit, `scheduledArrival` der Plan) und die Linienführung derselben Fahrt.
+ */
+async function motisLiveRaw(tripId: string): Promise<{
+  stops: RawLiveStop[];
+  geometry: LngLat[] | null;
+  product: string | null;
+  line: string | null;
+  direction: string | null;
+  realtime: boolean;
+} | null> {
+  type Leg = MotisTripLeg & { legGeometry?: { points?: string; precision?: number }; realTime?: boolean };
+  let raw: { legs?: Leg[] };
+  try {
+    raw = (await motisFetch(`/v6/trip?tripId=${encodeURIComponent(tripId)}`)) as { legs?: Leg[] };
+  } catch {
+    return null;
+  }
+  const leg = (raw.legs ?? []).find((l) => l.mode && l.mode !== "WALK");
+  if (!leg?.from || !leg.to) return null;
+  const stops = [leg.from, ...(leg.intermediateStops ?? []), leg.to]
+    .filter((s) => s.lat != null && s.lon != null)
+    .map((s) => ({
+      name: s.name ?? "",
+      lat: s.lat!,
+      lon: s.lon!,
+      arrP: toIso(s.scheduledArrival ?? s.arrival),
+      arrE: toIso(s.arrival ?? s.scheduledArrival),
+      depP: toIso(s.scheduledDeparture ?? s.departure),
+      depE: toIso(s.departure ?? s.scheduledDeparture),
+    }));
+  const g = leg.legGeometry;
+  const longDist = leg.mode === "HIGHSPEED_RAIL" || leg.mode === "LONG_DISTANCE" || leg.mode === "NIGHT_RAIL";
+  const line =
+    (longDist ? leg.tripShortName || leg.routeShortName : leg.routeShortName || leg.tripShortName) || null;
+  return {
+    stops,
+    geometry: g?.points ? decodePolyline(g.points, g.precision ?? 6) : null,
+    product: leg.mode ?? null,
+    line,
+    direction: leg.headsign ?? null,
+    realtime: leg.realTime === true,
+  };
+}
+
+/** Halte aus einem dbrest-/HAFAS-/Länder-Fahrplan-Verlauf (Zeiten → ISO-UTC wie im Fahrt-Detail). */
+function bodyLiveRaw(trip: DbTripBody, localClock: boolean): RawLiveStop[] {
+  const timeOf = (v: string | undefined, s: DbTripStopover): string | null =>
+    localClock ? dbTimeToUtc(v, dbStopTz(s.stop)) : toIso(v);
+  return (trip.stopovers ?? [])
+    .filter((s) => s.stop?.location?.latitude != null && s.stop.location.longitude != null)
+    .map((s) => ({
+      name: s.stop?.name ?? "",
+      lat: s.stop!.location!.latitude!,
+      lon: s.stop!.location!.longitude!,
+      arrP: timeOf(s.plannedArrival ?? s.arrival, s),
+      arrE: timeOf(s.arrival ?? s.plannedArrival, s),
+      depP: timeOf(s.plannedDeparture ?? s.departure, s),
+      depE: timeOf(s.departure ?? s.plannedDeparture, s),
+    }));
+}
+
+function liveResponse(
+  tripId: string,
+  stops: RawLiveStop[],
+  geometry: LngLat[] | null,
+  meta: { product: string | null; line: string | null; direction: string | null; realtime: boolean },
+): LiveTripResponse | null {
+  if (stops.length < 2) return null;
+  const shape = buildLiveShape(geometry, stops.map((s) => [s.lon, s.lat] as LngLat));
+  return {
+    tripId,
+    vehicle: liveVehicle(meta.product),
+    product: meta.product,
+    line: meta.line,
+    direction: meta.direction,
+    realtime: meta.realtime || stops.some((s) => s.arrE !== s.arrP || s.depE !== s.depP),
+    shape: shape.source,
+    coords: shape.coords,
+    cum: shape.cum,
+    stops: stops.map((s, i) => ({ ...s, d: shape.stopD[i]! })),
+    boardIndex: null,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+/** Kurz aufheben: Die App fragt einmal je Minute nach (Verspätungen), mehrere Nutzer dieselbe Fahrt. */
+const liveCache = new BoundedTtlCache<LiveTripResponse>(400, 30_000);
+
+const liveQuerySchema = z.object({
+  tripId: z.string().min(1),
+  /** Halt, von dem aus die Fahrt angetippt wurde — bestimmt Quelle und Land (wie beim Fahrt-Detail). */
+  stopCode: z.string().optional(),
+  /** Zeit der Tafel-Zeile — Betriebstag bei Länder-Fahrplänen. */
+  atTime: z.string().max(40).optional(),
+});
+
+/**
+ * Woher eine Fahrt kommt, hängt am Halt, von dem aus sie angetippt wurde:
+ * Profil (DE → dbrest/MOTIS, AT/PL/LU/DK → hafas-client), Land (Länder-
+ * Fahrplan?) und Lage (Abgleich im Fahrtverlauf). Ein Abruf über den
+ * Primärschlüssel — billig.
+ *
+ * Bei AT-Halten braucht das Profil zusätzlich die Lage, um aufs richtige
+ * Verbund-Profil zu kommen (vor/vvt/svv/…). Die Lage dient außerdem im
+ * Fahrtverlauf als stärkstes Zeichen für den Halt des Nutzers: Namen weichen
+ * zwischen den Quellen ab (Praxis-Bug: „Kolschitzkygasse" passte zu nichts im
+ * HAFAS-Verlauf, und das Detail begann in „Wien Liesing Bahnhof").
+ */
+async function stopContext(stopCode: string | undefined): Promise<{
+  profile: HafasProfileKey;
+  stopLat: number | undefined;
+  stopLng: number | undefined;
+  stopCountry: string | null;
+}> {
+  if (!stopCode) return { profile: "db", stopLat: undefined, stopLng: undefined, stopCountry: null };
+  const row = await db
+    .select({ country: locations.country, latitude: locations.latitude, longitude: locations.longitude })
+    .from(locations)
+    .where(eq(locations.code, stopCode))
+    .limit(1);
+  const r = row[0];
+  const stopLat = r?.latitude != null ? Number(r.latitude) : undefined;
+  const stopLng = r?.longitude != null ? Number(r.longitude) : undefined;
+  const profile =
+    profileForStop({ code: stopCode, country: r?.country ?? null, latitude: stopLat ?? null, longitude: stopLng ?? null }) ||
+    "db";
+  return { profile, stopLat, stopLng, stopCountry: r?.country ?? null };
+}
 
 export async function tripsRoutes(app: FastifyInstance) {
   // Trips: bis zu 10 Polyline-/Detail-Calls pro Request (MOTIS/HAFAS) → DB-Quota.
-  const preHandler = ipLimiter("trips", [{ limit: 40, windowMs: 60 * 1000 }]);
+  const preHandler = ipLimiter("trips", [{ limit: 40, windowMs: 60 * 1000 }], {
+    ipCeilingFactor: EXPENSIVE_IP_CEILING_FACTOR,
+  });
   /**
    * GET /api/trips/polyline?ids=id1,id2,id3
    * → { polylines: { [tripId]: [[lng, lat], ...] } }
@@ -686,7 +1134,7 @@ export async function tripsRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: "Bad request", issues: parsed.error.flatten() });
     }
     const ids = parsed.data.ids.slice(0, 10); // safety cap
-    const results = await Promise.all(ids.map((id) => fetchTripPolyline(id)));
+    const results = await polylinesThrottled(ids);
     const polylines: Record<string, [number, number][]> = {};
     for (let i = 0; i < ids.length; i++) {
       const id = ids[i];
@@ -708,51 +1156,101 @@ export async function tripsRoutes(app: FastifyInstance) {
     if (!parsed.success) {
       return reply.code(400).send({ error: "Bad request", issues: parsed.error.flatten() });
     }
-    // Profile aus dem (optionalen) stopCode ableiten. Bei AT-Stops brauchen
-    // wir zusätzlich Lat/Lon um aufs richtige Verbund-Profile zu routen
-    // (vor/vvt/svv/etc.) — die holen wir per DB-Lookup. Ein extra Query pro
-    // Trip-Detail-Call, aber das ist billig (indizierter Primary-Key).
-    let profile: HafasProfileKey = "db";
-    // Stop-Coords aus unserer DB — werden im Slice-Match als Coord-Primary-
-    // Signal benutzt. Geographische Match-Strategie ist robuster als Namens-
-    // Tokens (Praxis-Bug: User-Stop „Kolschitzkygasse" matched nichts im
-    // Trip-Body weil HAFAS andere Schreibweise nutzt → wir landen auf dem
-    // Trip-Start „Wien Liesing Bahnhof" statt Kolschitzkygasse).
-    let stopLat: number | undefined;
-    let stopLng: number | undefined;
-    if (parsed.data.stopCode) {
-      const row = await db
-        .select({
-          country: locations.country,
-          latitude: locations.latitude,
-          longitude: locations.longitude,
-        })
-        .from(locations)
-        .where(eq(locations.code, parsed.data.stopCode))
-        .limit(1);
-      const r = row[0];
-      stopLat = r?.latitude != null ? Number(r.latitude) : undefined;
-      stopLng = r?.longitude != null ? Number(r.longitude) : undefined;
-      profile =
-        profileForStop({
-          code: parsed.data.stopCode,
-          country: r?.country ?? null,
-          latitude: stopLat ?? null,
-          longitude: stopLng ?? null,
-        }) || "db";
+    const { profile, stopLat, stopLng, stopCountry } = await stopContext(parsed.data.stopCode);
+    /**
+     * Fahrten aus den Länder-Fahrplänen (GTFS) ZUERST — ihre Kennungen kennt
+     * weder MOTIS noch HAFAS. Nur wenn das Land einen Feed hat und die Kennung
+     * nicht nach MOTIS („YYYYMMDD_HH:MM_…") oder HAFAS („…|…") aussieht; findet
+     * der Feed sie nicht, geht es unverändert weiter.
+     */
+    const tripId = parsed.data.tripId;
+    const slice: TripSlice = {
+      fromStopId: parsed.data.fromStopId,
+      fromStopLabel: parsed.data.fromStopLabel,
+      fromStopLat: stopLat,
+      fromStopLng: stopLng,
+      boardDirection: parsed.data.direction,
+      arrivals: parsed.data.board === "arrivals",
+      atTime: parsed.data.atTime,
+    };
+    const looksForeign = /^\d{8}_\d{2}:\d{2}_/.test(tripId) || tripId.includes("|");
+    let detail: TripDetailResponse | null = null;
+    if (stopCountry && FEED_ID_BY_COUNTRY[stopCountry] && !looksForeign) {
+      const body = await gtfsTripToBody(
+        stopCountry,
+        tripId,
+        parsed.data.stopCode,
+        stopLat != null && stopLng != null ? { latitude: stopLat, longitude: stopLng } : null,
+        parsed.data.atTime,
+      );
+      if (body) detail = buildTripDetail(body, tripId, slice, false);
     }
-    const detail = await fetchTripDetail(
-      parsed.data.tripId,
-      parsed.data.fromStopId,
-      parsed.data.fromStopLabel,
-      stopLat,
-      stopLng,
-      parsed.data.direction,
-      profile,
-    );
+    detail ??= await fetchTripDetail(tripId, slice, profile);
     if (!detail) {
       return reply.code(404).send({ error: "Trip not found" });
     }
     return detail;
+  });
+
+  /**
+   * GET /api/live/trip?tripId=...&stopCode=...&atTime=...
+   * → Halte mit Lage und Zeiten + Linienführung (siehe `LiveTripResponse`).
+   * Quellen wie beim Fahrt-Detail: Länder-Fahrplan, MOTIS, HAFAS. Den
+   * Verlauf einer DB-Fahrt (dbweb) gibt es nur über das Hintergrund-Kontingent;
+   * fehlt er, zeichnet die App gerade Stücke.
+   */
+  app.get("/api/live/trip", { preHandler }, async (req, reply) => {
+    const parsed = liveQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "Bad request", issues: parsed.error.flatten() });
+    }
+    const { tripId, stopCode, atTime } = parsed.data;
+    const key = `${tripId}|${stopCode ?? ""}|${(atTime ?? "").slice(0, 10)}`;
+    const { profile, stopLat, stopLng, stopCountry } = await stopContext(stopCode);
+    const hit = liveCache.get(key);
+    if (hit) return { ...hit, boardIndex: boardStopIndex(hit.stops, stopLat, stopLng, atTime) };
+
+    const looksMotis = /^\d{8}_\d{2}:\d{2}_/.test(tripId);
+    const looksForeign = looksMotis || tripId.includes("|");
+    let res: LiveTripResponse | null = null;
+    if (stopCountry && FEED_ID_BY_COUNTRY[stopCountry] && !looksForeign) {
+      const body = await gtfsTripToBody(
+        stopCountry,
+        tripId,
+        stopCode,
+        stopLat != null && stopLng != null ? { latitude: stopLat, longitude: stopLng } : null,
+        atTime,
+      );
+      if (body) {
+        res = liveResponse(tripId, bodyLiveRaw(body, false), null, {
+          product: body.line?.product ?? null,
+          line: body.line?.name ?? null,
+          direction: body.direction ?? null,
+          realtime: false,
+        });
+      }
+    }
+    if (!res && looksMotis) {
+      const m = await motisLiveRaw(tripId);
+      if (m) res = liveResponse(tripId, m.stops, m.geometry, m);
+    }
+    if (!res) {
+      const body = await fetchTripBody(profile, tripId);
+      if (body) {
+        const localClock = profile === "db" && !looksMotis;
+        const geometry = isDbwebTripId(tripId) ? ((await polylinesThrottled([tripId]))[0] ?? null) : null;
+        res = liveResponse(tripId, bodyLiveRaw(body, localClock), geometry, {
+          product: body.line?.product ?? null,
+          line: body.line?.name ?? null,
+          direction: body.direction ?? null,
+          realtime: false,
+        });
+      }
+    }
+    if (!res) return reply.code(404).send({ error: "Trip not found" });
+    liveCache.set(key, res);
+    // Je Anfrage, nicht im Zwischenspeicher: Der Schlüssel kennt nur den Tag
+    // der Tafel-Zeile, eine Ringlinie hat am selben Halt aber zwei Zeiten.
+    return { ...res, boardIndex: boardStopIndex(res.stops, stopLat, stopLng, atTime) };
   });
 }

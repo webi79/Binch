@@ -1094,6 +1094,47 @@ export function SearchHeroOverlay() {
   // ausschließlich splashStyle via transform:scale. Oberecken fix rund (Geräte-
   // Eckenradius); die Unterecken animiert splashStyle zweiphasig (rund→eckig am
   return (
+    /**
+     * WEG IM SELBEN COMMIT WIE DER HIMMEL — die schwarze Fläche beim Tab-Wechsel.
+     *
+     * Gemeldet als: „SearchHero → Karte: wo Himmel und Sonne waren, wird es
+     * erst schwarz, dann kommt die Karte." Per Bildschirmaufnahme vermessen
+     * (September 2026): Im Bild des Tipps verschwanden Himmel und Zurück-Pfeil,
+     * das Formular blieb stehen — zur Karte 241 bis 257 ms lang, zu Saved und
+     * Profile ein Bild lang, einmal zu Saved 6,9 Sekunden.
+     *
+     * Der Sofort-Zweig beim Tab-Wechsel räumt auf zwei Wegen ab: Das Blatt
+     * blendet `overlayVisible` aus (Reanimated, UI-Strang), Himmel und Pfeil
+     * nimmt ein React-Commit weg (`searchContentVisible`, `active`). Deren
+     * Reihenfolge ist nicht garantiert — und der Commit trägt die Werte des
+     * Blattes mit, wie sie beim Rechnen galten: Deckkraft 1, Lage im Bild. Kommt
+     * er nach Reanimated an, setzt er das Blatt wieder sichtbar hin, jetzt ohne
+     * Himmel. Richtiggestellt wird das erst vom NÄCHSTEN Commit irgendwo in der
+     * App — beim Auftauen der Karte nach einer Viertelsekunde, auf der ruhigen
+     * Saved-Seite gar nicht, bis man wieder etwas antippt.
+     *
+     * Diese Hülle macht das Ausblenden unabhängig davon: Sie hängt an derselben
+     * Angabe wie der Himmel, verschwindet also im selben Commit wie er. Ohne
+     * Inhalt ist das geschlossene Blatt nie zu sehen — beim normalen Schließen
+     * fällt die Angabe erst, wenn es draußen steht.
+     *
+     * Solange die Suche OFFEN ist, bleibt die Hülle in jedem Fall sichtbar:
+     * `openSearchOverlay` setzt den Inhalt für einen Commit auf aus, und der
+     * Öffnungs-Effekt schaltet ihn erst danach wieder ein. Hinge die Hülle nur
+     * am Inhalt, könnte sie das erste Bild der Einfahrt verschlucken.
+     *
+     * `collapsable={false}`: Mit Deckkraft 1 ist die Hülle für Fabric reine
+     * Anordnung und würde weggefaltet — jedes Umschalten hinge das Blatt dann
+     * nativ um.
+     */
+    <View
+      style={[
+        StyleSheet.absoluteFill,
+        { opacity: contentRequested || mode != null ? 1 : 0 },
+      ]}
+      pointerEvents="box-none"
+      collapsable={false}
+    >
     <Animated.View
       // Sichtbarkeit über `overlayVisible` (UI-Thread) statt über React: Der
       // Ausgangswert der Bewegung und das Sichtbarschalten liegen damit im
@@ -1219,6 +1260,7 @@ export function SearchHeroOverlay() {
       ) : null}
       </ClipContent>
     </Animated.View>
+    </View>
   );
 }
 

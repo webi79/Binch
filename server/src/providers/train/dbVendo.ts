@@ -1,10 +1,17 @@
 import { eq, sql } from "drizzle-orm";
+import { acquireDb, currentDbPriority, reportIfBlocked } from "../../services/dbQuota.js";
 import { config } from "../../config.js";
 import { db } from "../../db/client.js";
 import { locations } from "../../db/schema.js";
 import { BoundedTtlCache } from "../../util/boundedCache.js";
 import { cleanPlatform } from "../../util/platform.js";
+import { fromZonedTime } from "date-fns-tz";
 import { dbStopTz, dbTimeToUtc } from "../../util/dbTime.js";
+import {
+  effectiveDurationMinutes,
+  journeyWarningFromLegs,
+  markAtRiskTransfer,
+} from "../../util/journeyTimeline.js";
 import { lineLabel } from "../../util/line.js";
 import type {
   SearchProvider,
@@ -39,6 +46,8 @@ interface DbStop {
 }
 
 interface DbLine {
+  /** DBs Kennung der Fahrt, z. B. „rb59-90339" — trägt die Linie, siehe util/line.ts. */
+  id?: string;
   name?: string;
   product?: string;
   productName?: string;
@@ -73,7 +82,14 @@ interface DbLeg {
   tripId?: string;
   line?: DbLine;
   walking?: boolean;
+  /** Echtzeit: Diese Fahrt (bzw. ihr Abschnitt) fällt aus. */
+  cancelled?: boolean;
   stopovers?: DbStopover[];
+}
+
+interface DbRemark {
+  code?: string;
+  text?: string;
 }
 
 interface DbJourney {
@@ -81,6 +97,7 @@ interface DbJourney {
   legs?: DbLeg[];
   refreshToken?: string;
   price?: { amount?: number; currency?: string; hint?: string | null };
+  remarks?: DbRemark[];
 }
 
 interface DbJourneysResponse {
@@ -293,6 +310,21 @@ function initialDepartureTime(date: string): string {
   return date === todayInBerlin() ? nowFloor5MinBerlin() : "05:00";
 }
 
+/**
+ * Suchbeginn als EINDEUTIGER Zeitpunkt (UTC-ISO mit „Z").
+ *
+ * Bis hierhin ging `2026-10-09T19:50` ohne Offset an den dbweb-Sidecar. Der liest
+ * das mit `new Date(…)` — also in SEINER Zone, und der Container läuft auf UTC.
+ * Aus 19:50 Berliner Zeit wurde 19:50 UTC = 21:50 Berlin: Wer „ab jetzt" suchte,
+ * bekam erst die Züge ab zwei Stunden später (Werl → Greven um 19:50 ohne
+ * Uhrzeit: erste Verbindung 22:16, die 20:16 und 21:16 fehlten). An künftigen
+ * Tagen begann die Liste um 07:00 statt 05:00.
+ */
+function initialDeparture(date: string): string {
+  const local = `${date}T${initialDepartureTime(date)}:00`;
+  return fromZonedTime(local, DEFAULT_TZ).toISOString();
+}
+
 async function fetchJourneys(
   fromId: string,
   toId: string,
@@ -305,7 +337,15 @@ async function fetchJourneys(
   // HAFAS-`laterThan`. Pagination („gesamter Tag") explizit user-getriggered
   // via separatem Endpoint (search.ts route) — kein eager loop hier, sonst
   // würde ein einzelner Such-Klick 5 User-Slots verbrennen.
-  const url = new URL(`${config.DBWEB_BASE_URL}/journeys`);
+  //
+  // Ein Platz aus dem gemeinsamen Bahn-Kontingent (services/dbQuota.ts): Eine
+  // echte Suche wartet bis zu acht Sekunden darauf, ein Auffrischen im
+  // Hintergrund gar nicht. Kein Platz = diese Quelle fällt diesmal aus (MOTIS
+  // läuft parallel) — besser als die Sperre von bahn.de für alle.
+  const priority = currentDbPriority();
+  const lane = await acquireDb(priority, priority === "search" ? 8_000 : 0, signal);
+  if (!lane) return { ok: false, raw: null, statusCode: 429 };
+  const url = new URL(`${lane.dbwebUrl}/journeys`);
   url.searchParams.set("from", fromId);
   url.searchParams.set("to", toId);
   if (laterRef) {
@@ -320,21 +360,20 @@ async function fetchJourneys(
     if (Number.isFinite(targetMs)) {
       url.searchParams.set("departure", new Date(targetMs - 5 * 60_000).toISOString());
     } else {
-      const d = date.slice(0, 10);
-      url.searchParams.set("departure", `${d}T${initialDepartureTime(d)}`);
+      url.searchParams.set("departure", initialDeparture(date.slice(0, 10)));
     }
   } else {
     // `date` kommt als volle ISO (input.departDate, z.B. 2026-07-08T08:00:00.000Z)
     // rein — hier brauchen wir aber NUR den Datumsteil, sonst entsteht
     // `2026-07-08T08:00:00.000ZT05:00` → db-vendo-client wirft SyntaxError.
-    const d = date.slice(0, 10);
-    url.searchParams.set("departure", `${d}T${initialDepartureTime(d)}`);
+    url.searchParams.set("departure", initialDeparture(date.slice(0, 10)));
   }
   url.searchParams.set("results", "10");
   url.searchParams.set("language", "de");
   url.searchParams.set("stopovers", "true");
 
   const res = await fetch(url, { headers: { Accept: "application/json" }, signal });
+  await reportIfBlocked(lane, res);
   const raw = (await res.json().catch(() => null)) as unknown;
   return { ok: res.ok && raw !== null, raw, statusCode: res.status };
 }
@@ -394,6 +433,17 @@ async function resolveStationId(
   // keinen 7-stelligen Treffer und landet beim Bahnhof „Werl" (HAFAS kennt die
   // Bushaltestelle nur als 6-stellige id 414408 „Markt, Werl").
   let allowBusStops = false;
+  /**
+   * Lage der Bushaltestelle, die wir auflösen — Treffer der DB-Ortssuche
+   * müssen in ihrer Nähe liegen.
+   *
+   * Haltestellen heißen überall gleich („Marktplatz", „Rathaus"). Die Suche
+   * über den Namen allein, mit „kürzester Name gewinnt" bei Gleichstand, konnte
+   * so im gleichnamigen Nachbarort landen — und das Ergebnis lag dann einen
+   * Tag lang für alle im Zwischenspeicher. Seit das Stadt-Blatt bei Städten
+   * ohne Bahnhof die zentrale Haltestelle ansteuert, kommt das oft vor.
+   */
+  let busStopAt: { lat: number; lng: number } | null = null;
 
   // GTFS-Import: einige Stop-IDs sind direkt UIC-konform (7-stellig).
   // Manche haben aber Hyphen-Format wie "de:01:5100:1:1" — in dem Fall haben
@@ -404,6 +454,8 @@ async function resolveStationId(
         hafasId: locations.hafasId,
         type: locations.type,
         country: locations.country,
+        latitude: locations.latitude,
+        longitude: locations.longitude,
       })
       .from(locations)
       .where(eq(locations.code, code))
@@ -425,7 +477,14 @@ async function resolveStationId(
     if (dbHit[0]?.country === "Germany" && stored) return stored;
     storedFallback = stored;
 
-    if (dbHit[0]?.type === "BUS") allowBusStops = true;
+    if (dbHit[0]?.type === "BUS") {
+      allowBusStops = true;
+      const lat = Number(dbHit[0].latitude);
+      const lng = Number(dbHit[0].longitude);
+      if (Number.isFinite(lat) && Number.isFinite(lng) && dbHit[0].latitude != null) {
+        busStopAt = { lat, lng };
+      }
+    }
     // Kein hafas_id beim Import → fällt durch zum Live-Lookup via Name.
   }
 
@@ -475,21 +534,38 @@ async function resolveStationId(
   const candidates = [localized, label, code]
     .filter((x, i, arr): x is string => typeof x === "string" && x.length > 0 && arr.indexOf(x) === i);
   for (const candidate of candidates) {
-    const key = candidate.toLowerCase();
+    // Eine Haltestelle hängt an IHRER Lage — derselbe Name woanders ist ein
+    // anderer Halt, also auch ein anderer Eintrag im Zwischenspeicher.
+    const key = busStopAt ? `${code}|${candidate.toLowerCase()}` : candidate.toLowerCase();
     const cached = stationCache.get(key);
     if (cached) return cached;
 
     // /locations (HAFAS) statt /stations (nur DE-Stationsdaten) — auf diese Art
     // werden auch internationale Bahnhöfe wie Amsterdam Centraal, Paris Gare
     // du Nord, Wien Hbf etc. gefunden.
-    const url = new URL(`${config.DBWEB_BASE_URL}/locations`);
+    // Auch die Stationsauflösung ist eine Anfrage an bahn.de — Platz nehmen wie
+    // die Suche selbst (siehe `fetchJourneys`).
+    const priority = currentDbPriority();
+    const lane = await acquireDb(priority, priority === "search" ? 8_000 : 0, signal);
+    /**
+     * Kein Platz: null, NICHT `storedFallback`. Der ist im Ausland die Nummer
+     * der dortigen Bahn, die DB oft einem ANDEREN Halt zuordnet (siehe oben,
+     * Basel Bad Bf) — er ist nur als Rückfall gedacht, wenn DBs eigene
+     * Ortssuche wirklich nichts fand. Mit null fällt die Suche sauber auf
+     * MOTIS zurück, statt womöglich ab dem falschen Bahnhof zu suchen.
+     */
+    if (!lane) return null;
+    const url = new URL(`${lane.dbwebUrl}/locations`);
     url.searchParams.set("query", candidate);
     url.searchParams.set("results", "5");
     url.searchParams.set("stops", "true");
     url.searchParams.set("addresses", "false");
     url.searchParams.set("poi", "false");
+    // `language=de` wie bei den Fahrten — die Vorgabe „en" sperrt Akamai teils (403).
+    url.searchParams.set("language", "de");
 
     const res = await fetch(url, { headers: { Accept: "application/json" }, signal });
+    await reportIfBlocked(lane, res);
     if (!res.ok) continue;
     const data = (await res.json().catch(() => null)) as Record<string, DbStation> | DbStation[] | null;
     if (!data) continue;
@@ -513,7 +589,8 @@ async function resolveStationId(
         typeof s?.id === "string" &&
         idPattern.test(s.id) &&
         typeof s.name === "string" &&
-        matchAll(s.name),
+        matchAll(s.name) &&
+        (busStopAt === null || nearStop(s, busStopAt)),
     );
     if (matches.length === 0) continue;
 
@@ -557,6 +634,22 @@ async function resolveStationId(
 /** Lowercase + Diakritika-Entfernung für robusten Name-Vergleich.
  *  z.B. "Köln Hbf" → "koln hbf", "Höfingen" → "hofingen", "Hoefkade" → "hoefkade".
  *  Diakritika werden via NFD-Zerlegung + Combining-Marks-Strip entfernt. */
+/** Höchstabstand eines Namens-Treffers zur gesuchten Bushaltestelle. */
+const BUS_STOP_MATCH_KM = 2;
+
+/** Liegt der DB-Treffer bei unserer Haltestelle? Ohne Lage: kein Treffer. */
+function nearStop(s: DbStation, at: { lat: number; lng: number }): boolean {
+  const lat = s.location?.latitude;
+  const lng = s.location?.longitude;
+  if (typeof lat !== "number" || typeof lng !== "number") return false;
+  const dLat = ((lat - at.lat) * Math.PI) / 180;
+  const dLng = ((lng - at.lng) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((at.lat * Math.PI) / 180) * Math.cos((lat * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+  return 6371 * 2 * Math.asin(Math.sqrt(a)) <= BUS_STOP_MATCH_KM;
+}
+
 function normalizeForMatch(s: string): string {
   return s
     .normalize("NFD")
@@ -650,6 +743,43 @@ function isBusOnly(r: NormalizedResult): boolean {
   return transit.length > 0 && transit.every((l) => l.product === "bus");
 }
 
+/**
+ * Verspätung in Minuten (Ist − Soll), nur echte Verspätung — wie `legDelay` in
+ * trainPricing.ts. Beide Zeitstempel in derselben Zone lesen (siehe dbTimeToUtc).
+ */
+function dbDelayMinutes(
+  planned: string | undefined,
+  actual: string | undefined,
+  tz: string | undefined,
+): number | undefined {
+  const p = dbTimeToUtc(planned, tz);
+  const a = dbTimeToUtc(actual, tz);
+  if (!p || !a) return undefined;
+  const d = Math.round((Date.parse(a) - Date.parse(p)) / 60_000);
+  return d > 0 ? d : undefined;
+}
+
+/**
+ * Meldet DB selbst, dass diese Verbindung gefährdet ist?
+ *
+ * bahn.de liefert auch Verbindungen, deren Anschluss wegen Verspätung platzt
+ * („Der Anschluss kann voraussichtlich nicht erreicht werden") oder deren Zug
+ * ausfällt („Verbindung fällt aus"), und zeigt sie dort MIT Warnhinweis. Bisher
+ * kamen sie bei uns als gewöhnliche Treffer an (gespeicherte Rohantworten, erste
+ * Seiten bis 09.10.: 16 von 365 Zugverbindungen bzw. 5). Jetzt tragen sie die
+ * Warnung — gezeigt, aber markiert und hinter den funktionierenden.
+ *
+ * „fällt aus" hängt in den Daten immer zusätzlich an der Teilstrecke
+ * (`cancelled`), „Anschluss" nur an der Reise (siehe `markAtRiskTransfer`).
+ */
+function dbRemarkFlags(journey: DbJourney): { brokenTrip: boolean; cancelled: boolean } {
+  const codes = new Set((journey.remarks ?? []).map((r) => r?.code));
+  return {
+    brokenTrip: codes.has("text.realtime.connection.brokentrip"),
+    cancelled: codes.has("text.realtime.connection.cancelled"),
+  };
+}
+
 function parseJourneys(
   raw: unknown,
   input: ProviderSearchInput,
@@ -658,6 +788,8 @@ function parseJourneys(
   const r = raw as DbJourneysResponse;
   const journeys = r.journeys ?? [];
   const out: NormalizedResult[] = [];
+  /** Von DB als gefährdet gemeldet — gezeigt, aber protokolliert. */
+  const flagged: string[] = [];
 
   for (let i = 0; i < journeys.length; i++) {
     const journey = journeys[i];
@@ -689,10 +821,26 @@ function parseJourneys(
     const arriveIso = dbTimeToUtc(last.plannedArrival ?? last.arrival, tripDestTz);
     if (!departIso || !arriveIso) continue;
 
-    const durationMinutes = Math.max(
-      1,
-      Math.round((Date.parse(arriveIso) - Date.parse(departIso)) / 60000),
-    );
+    // ECHTZEIT. DB routet auf Ist-Zeiten — eine Verbindung kann also NUR dank
+    // einer Verspätung bestehen: Werl → Greven am 09.10. nahm den RE 7 mit
+    // Soll 19:43, Ist 20:32 (+49) als Anschluss an den RB 59 (an 20:28). Hier
+    // wurden bisher nur die Sollzeiten gelesen und die Verspätung weggeworfen.
+    // Angezeigt wurde ein Zug, der 45 Minuten VOR der Ankunft des Zubringers
+    // fährt, und „17 min" Reisedauer (Soll 20:16 bis Soll 20:33, echt 64 min).
+    //
+    // departTime/arriveTime bleiben SOLL (Vertrag in types.ts), die Verspätung
+    // kommt dazu — der Client streicht die Sollzeit durch und zeigt die Ist-Zeit.
+    // Die DAUER zählt dagegen in Ist-Zeit: Sie ist das, was der Reisende erlebt,
+    // und das Ranking (connectionScore) soll nicht einer Soll-Dauer folgen, die
+    // es so nie gibt.
+    const departDelayMinutes = dbDelayMinutes(first.plannedDeparture, first.departure, tripOriginTz);
+    const arriveDelayMinutes = dbDelayMinutes(last.plannedArrival, last.arrival, tripDestTz);
+    const durationMinutes = effectiveDurationMinutes({
+      departTime: departIso,
+      arriveTime: arriveIso,
+      departDelayMinutes,
+      arriveDelayMinutes,
+    });
 
     const stops = Math.max(0, trainLegs.length - 1);
     const stopLabels: string[] = [];
@@ -735,6 +883,10 @@ function parseJourneys(
         destLng: seg.destination?.location?.longitude,
         departTime: segDep,
         arriveTime: segArr,
+        // Ohne sie sieht die Zeitleiste nur Sollzeiten — und ein Anschluss, der
+        // nur verspätet erreichbar ist, wie ein unmöglicher (siehe oben).
+        departDelayMinutes: dbDelayMinutes(seg.plannedDeparture, seg.departure, segOriginTz),
+        arriveDelayMinutes: dbDelayMinutes(seg.plannedArrival, seg.arrival, segDestTz),
         durationMinutes: segDuration,
         departPlatform: cleanPlatform(seg.plannedDeparturePlatform ?? seg.departurePlatform),
         arrivePlatform: cleanPlatform(seg.plannedArrivalPlatform ?? seg.arrivalPlatform),
@@ -750,7 +902,22 @@ function parseJourneys(
         stops: stopovers.length,
         stopovers: stopovers.length > 0 ? stopovers : undefined,
         tripId: seg.tripId,
+        warning: seg.cancelled ? "cancelled" : undefined,
       });
+    }
+
+    // DBs eigene Warnungen an die betroffene Stelle hängen (siehe dbRemarkFlags).
+    const flags = dbRemarkFlags(journey);
+    if (flags.brokenTrip) markAtRiskTransfer(legs);
+    // „Verbindung fällt aus" ohne ausgefallene Teilstrecke kommt in den Daten
+    // nicht vor — falls doch, trägt die erste Fahrt die Warnung, damit die Reise
+    // nicht als buchbar durchrutscht.
+    if (flags.cancelled && !legs.some((l) => l.warning === "cancelled") && legs[0]) {
+      legs[0].warning = "cancelled";
+    }
+    const warning = journeyWarningFromLegs(legs);
+    if (warning) {
+      flagged.push(`${lineLabel(first.line) ?? "?"} ab ${first.plannedDeparture?.slice(11, 16) ?? "?"}: ${warning}`);
     }
 
     // db-rest liefert für Regional-/Verbund-Verbindungen oft keinen Preis
@@ -762,7 +929,10 @@ function parseJourneys(
     // passengers-Param, der die Suche selbst beeinflusst. Damit `passengers`
     // im UI nicht ignoriert wirkt, skalieren wir den Gesamtpreis hier.
     const pax = Math.max(1, input.passengers ?? 1);
-    const priceNum = perPaxPrice > 0 ? Math.round(perPaxPrice * pax * 100) / 100 : 0;
+    // Fällt die Verbindung aus, gibt es nichts zu kaufen: kein Preis — sonst
+    // stünde er in der Liste, im Preis-Sortieren und in den Preis-Alarmen.
+    const priceNum =
+      perPaxPrice > 0 && warning !== "cancelled" ? Math.round(perPaxPrice * pax * 100) / 100 : 0;
 
     const operatedBy =
       first.line?.operator?.name ??
@@ -785,6 +955,9 @@ function parseJourneys(
       destLabel: last.destination?.name ?? input.destLabel,
       departTime: departIso,
       arriveTime: arriveIso,
+      departDelayMinutes,
+      arriveDelayMinutes,
+      warning,
       // Zonen aus den Koordinaten der ECHTEN Endhalte dieser Verbindung — genauer
       // als die Auflösung über den gesuchten Ort (der User sucht „Köln", der Zug
       // fährt ab „Köln Messe/Deutz"). Fällt die Koordinate aus, greift die
@@ -815,6 +988,13 @@ function parseJourneys(
       operatedBy,
       providerLogo: "https://www.bahn.de/web-app/favicons/bahn-favicon.svg",
     });
+  }
+  if (flagged.length > 0) {
+    // Protokollieren, damit es auffällt, wenn DB plötzlich ganze Listen so markiert.
+    console.log(
+      `[db-vendo] ${flagged.length} von ${journeys.length} Verbindungen von DB als gefährdet markiert ` +
+        `(${input.origin} → ${input.destination}): ${flagged.join("; ")}`,
+    );
   }
   return input.mode === "BUS" ? out.filter(isBusOnly) : out;
 }

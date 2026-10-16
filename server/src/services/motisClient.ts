@@ -25,10 +25,18 @@ export interface MotisPlace {
 // Label → aufgelöster MOTIS-Stop. Mapping ist stabil → 24h.
 const geocodeCache = new BoundedTtlCache<MotisPlace | null>(2000, 24 * 60 * 60 * 1000);
 
+/**
+ * Obergrenze für Aufrufe OHNE eigenes Abbruchsignal (Fußwege, Gleisverläufe,
+ * Tafeln). Transitous ist ein öffentlicher Dienst; hängt er, darf keine
+ * Anfrage der App ewig offen bleiben — sie hielte den Aufrufer (und dessen
+ * Zwischenspeicher) fest. Die Suche bringt ihr eigenes Signal mit.
+ */
+const MOTIS_DEFAULT_TIMEOUT_MS = 15_000;
+
 export async function motisFetch(path: string, signal?: AbortSignal): Promise<unknown> {
   const res = await fetch(`${config.MOTIS_BASE_URL}${path}`, {
     headers: { accept: "application/json", "user-agent": UA },
-    signal,
+    signal: signal ?? AbortSignal.timeout(MOTIS_DEFAULT_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`MOTIS ${res.status} ${res.statusText}`);
   return res.json();
@@ -39,7 +47,7 @@ export async function motisFetch(path: string, signal?: AbortSignal): Promise<un
  * (nicht den Google-Standard 5!). Gibt [lng, lat]-Paare zurück (GeoJSON-/
  * MapLibre-Reihenfolge, identisch zum dbrest-Polyline-Endpoint).
  */
-function decodePolyline(str: string, precision = 6): [number, number][] {
+export function decodePolyline(str: string, precision = 6): [number, number][] {
   const factor = 10 ** precision;
   let index = 0;
   let lat = 0;

@@ -1,5 +1,7 @@
 import Constants from "expo-constants";
 import { Location, SearchParams, SearchResponse, TravelMode } from "@/types/search";
+import { clientIdHeader } from "./clientId";
+import type { LiveFlightInfo, LiveTrip } from "@/lib/live/types";
 
 export const API_BASE_URL: string =
   (Constants.expoConfig?.extra as { apiBaseUrl?: string })?.apiBaseUrl ?? "http://localhost:3000";
@@ -73,10 +75,16 @@ async function fetchWithTimeout(
   init: RequestInit,
   timeoutMs: number,
 ): Promise<Response> {
+  const idHeader = await clientIdHeader();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    return await fetch(url, {
+      ...init,
+      // Die Installations-Kennung für die Rate-Limits (siehe clientId.ts).
+      headers: { ...(init.headers as Record<string, string> | undefined), ...idHeader },
+      signal: controller.signal,
+    });
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
       throw new Error(`Request timeout after ${timeoutMs}ms — Server nicht erreichbar (${url})`);
@@ -119,11 +127,13 @@ async function getJson<T>(
   timeoutMs = 20_000,
 ): Promise<T> {
   const url = buildUrl(path, params);
+  const idHeader = await clientIdHeader();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
-      headers: { Accept: "application/json" },
+      // Die Installations-Kennung für die Rate-Limits (siehe clientId.ts).
+      headers: { Accept: "application/json", ...idHeader },
       signal: controller.signal,
     });
     if (!res.ok) throw new Error(`API ${res.status} ${res.statusText} for ${url}`);
@@ -211,7 +221,7 @@ export function fetchLocations(query: string, mode: TravelMode | "ALL" = "ALL"):
 }
 
 export type LocationByCode =
-  | { code: string; label: string; exists: true }
+  | { code: string; label: string; detail?: string; exists: true }
   | { code: string; exists: false };
 
 /** Batch-Lookup: holt für eine Liste von Codes den aktuellen Label-Stand aus
@@ -240,12 +250,16 @@ export interface SurroundingsMarker {
   latitude: number;
   longitude: number;
   selected?: boolean;
+  /** Offizieller Name des Halts. */
   label?: string;
+  /** Zusatz, nur bei gleichnamigem Halt daneben (zwei Straßenseiten, Steige). */
+  detail?: string;
 }
 
 export interface SurroundingsListItem {
   id: string;
   name: string;
+  detail?: string;
   kinds: SurroundingsKind[];
   distance: string;
   lines?: { id: string; color: string }[];
@@ -324,12 +338,26 @@ export interface TripDetailResponse {
       platform?: string;
     }>;
     tripId?: string;
+    /** Ortszeit-Zone von Ab- und Ankunft dieses Legs (IANA oder „+01:00"). */
+    originTz?: string;
+    destTz?: string;
   }>;
 }
 
 export function fetchTripDetail(
   tripId: string,
-  opts: { fromStopId?: string; fromStopLabel?: string; stopCode?: string; direction?: string } = {},
+  opts: {
+    fromStopId?: string;
+    fromStopLabel?: string;
+    stopCode?: string;
+    direction?: string;
+    /** Tafel der getippten Zeile. Bei `arrivals` ist `direction` die Herkunft,
+     *  und der Server zeigt die Fahrt BIS zum Halt statt ab ihm. */
+    board?: "departures" | "arrivals";
+    /** Zeit der getippten Tafel-Zeile (ISO). Legt bei Fahrten aus den
+     *  Länder-Fahrplänen (NL/BE/CZ/UK) den Betriebstag fest. */
+    atTime?: string;
+  } = {},
 ): Promise<TripDetailResponse> {
   // tripId muss als Query-Param gesendet werden — Path-Param funktioniert
   // nicht weil HAFAS-IDs `#`/`|`/Padding-Spaces enthalten, an denen Fastify's
@@ -350,6 +378,28 @@ export function fetchTripDetail(
       ...(opts.fromStopLabel ? { fromStopLabel: opts.fromStopLabel } : {}),
       ...(opts.stopCode ? { stopCode: opts.stopCode } : {}),
       ...(opts.direction ? { direction: opts.direction } : {}),
+      ...(opts.board === "arrivals" ? { board: opts.board } : {}),
+      ...(opts.atTime ? { atTime: opts.atTime } : {}),
+    },
+    12_000,
+  );
+}
+
+/**
+ * Live-Ansicht: Halte mit Lage und Zeiten plus Linienführung einer Fahrt
+ * (`server/src/routes/trips.ts`). Wo das Fahrzeug gerade ist, rechnet die App
+ * daraus selbst (`lib/live/motion.ts`).
+ */
+export function fetchLiveTrip(
+  tripId: string,
+  opts: { stopCode?: string; atTime?: string } = {},
+): Promise<LiveTrip> {
+  return getJson<LiveTrip>(
+    "/api/live/trip",
+    {
+      tripId,
+      ...(opts.stopCode ? { stopCode: opts.stopCode } : {}),
+      ...(opts.atTime ? { atTime: opts.atTime } : {}),
     },
     12_000,
   );
@@ -388,13 +438,28 @@ export interface StopBoardItem {
   direction: string;
   platform: string | null;
   cancelled: boolean;
+  /** Nur Flugtafeln: beide Enden des Fluges mit Plan- und erwarteten Zeiten —
+   *  daraus rechnet die Live-Ansicht, wo das Flugzeug gerade ist. */
+  flight?: LiveFlightInfo;
 }
 
 export interface StopBoardResponse {
   results: StopBoardItem[];
   fetchedAt: string;
   validUntil: string;
-  stop: { code: string; label: string; hafasId: string | null };
+  stop: {
+    code: string;
+    /** Offizieller Name des Halts (derselbe wie in der Zeitleiste). */
+    label: string;
+    hafasId: string | null;
+    /** Zusatz, nur bei gleichnamigem Halt daneben („Rochdale Road · Stop RA"). */
+    detail?: string;
+    /** Ortszeit-Zone des Halts (IANA) — die Zeiten der Tafel werden in IHR gezeigt. */
+    tz?: string;
+    /** Die Zeiten stammen von einem ANDEREN Halt in der Nähe (> 30 m, anderer
+     *  Name) — die Tafel sagt das über der Liste. */
+    servedBy?: { name: string; distanceM: number };
+  };
 }
 
 export function fetchStopDepartures(code: string): Promise<StopBoardResponse> {
@@ -403,6 +468,133 @@ export function fetchStopDepartures(code: string): Promise<StopBoardResponse> {
 
 export function fetchStopArrivals(code: string): Promise<StopBoardResponse> {
   return getJson<StopBoardResponse>(`/api/stops/${encodeURIComponent(code)}/arrivals`, undefined, 10_000);
+}
+
+/** Antwort von `/api/tiles/aerial/abdeckung` — siehe dort (server/src/routes/tiles.ts). */
+export interface AerialCoverage {
+  /** Liegt an dieser Stelle ein amtliches Orthofoto (nicht nur Copernicus)? */
+  amtlich: boolean;
+  /** Welcher Landesdienst, oder `null`. */
+  quelle: string | null;
+  /** Wie tief die Satellitenkarte hier zoomen darf. */
+  maxZoom: number;
+  /** Eine Landesquelle war gerade nicht erreichbar — die Antwort ist unsicher. */
+  vorlaeufig?: boolean;
+}
+
+export function fetchAerialCoverage(latitude: number, longitude: number): Promise<AerialCoverage> {
+  return getJson<AerialCoverage>(
+    "/api/tiles/aerial/abdeckung",
+    { lat: latitude.toFixed(5), lon: longitude.toFixed(5) },
+    10_000,
+  );
+}
+
+/** Antwort von `/api/imagery/esri` — siehe server/src/routes/imagery.ts. */
+export interface EsriImagery {
+  /** Darf diese App gerade Esri zeigen (Schlüssel da, Deckel nicht erreicht, nicht gesperrt)? */
+  enabled: boolean;
+  /** Kachel-Pfad mit Kennung und Tages-Schein, ohne Rechnername (`/api/tiles/esri/{z}/{x}/{y}?…`). */
+  tilePath?: string;
+  minzoom?: number;
+  maxzoom?: number;
+  attribution?: string;
+  remainingToday?: number;
+  reason?: string;
+}
+
+export function fetchEsriImagery(): Promise<EsriImagery> {
+  return getJson<EsriImagery>("/api/imagery/esri", undefined, 10_000);
+}
+
+/** Ein Fußweg entlang der Straßen — siehe `server/src/routes/walk.ts`. */
+export interface WalkRoute {
+  /** [lng, lat] — GeoJSON-Reihenfolge. */
+  coords: [number, number][];
+  durationMinutes: number;
+  distanceMeters: number;
+}
+
+/**
+ * Fußweg von A nach B. `null`, wenn es keinen gibt oder das Ziel zu weit ist
+ * (über rund 5 km Luftlinie fragt der Server gar nicht erst).
+ */
+export function fetchWalkRoute(
+  from: { latitude: number; longitude: number },
+  to: { latitude: number; longitude: number },
+): Promise<WalkRoute | null> {
+  return getJson<{ route: WalkRoute | null }>(
+    "/api/walk",
+    {
+      fromLat: from.latitude.toFixed(5),
+      fromLng: from.longitude.toFixed(5),
+      toLat: to.latitude.toFixed(5),
+      toLng: to.longitude.toFixed(5),
+    },
+    12_000,
+  ).then((r) => r.route);
+}
+
+/** Warum ein Verkehrsmittel für eine Stadt nicht angeboten wird — siehe `server/src/routes/tripPlan.ts`. */
+export type CityModeReason =
+  | "same_place"
+  | "too_close"
+  | "too_far"
+  | "no_land_link"
+  | "no_airport"
+  | "no_station";
+
+export type CityModePlan =
+  | { available: true; origin: Location & { latitude: number; longitude: number }; destination: Location & { latitude: number; longitude: number } }
+  | { available: false; reason: CityModeReason };
+
+export type CityTripMode = "TRAIN" | "BUS" | "FLIGHT";
+
+export interface CityTripPlan {
+  distanceKm: number;
+  destination: { name: string; country: string | null };
+  modes: Record<CityTripMode, CityModePlan>;
+}
+
+/**
+ * Vorlauf des Stadt-Blatts: Welche Verkehrsmittel sind vom eigenen Standort in
+ * diese Stadt sinnvoll, und von welcher Station zu welcher? Fragt KEINEN
+ * Anbieter — die Suche danach läuft über `searchByMode`, nur für das gewählte
+ * Verkehrsmittel.
+ */
+export function fetchCityTripPlan(
+  from: { latitude: number; longitude: number } | null,
+  to: { name: string; latitude: number; longitude: number },
+  /**
+   * In der Such-Slide gewählte Orte (Kennungen). Sie ersetzen Standort bzw.
+   * angetippte Stadt — der Server plant damit ALLE Verkehrsmittel neu.
+   */
+  codes?: {
+    fromCode?: string | null;
+    fromLabel?: string | null;
+    toCode?: string | null;
+    toLabel?: string | null;
+  },
+): Promise<CityTripPlan> {
+  const params: Record<string, string> = {};
+  // Die Beschriftung reist mit: Steht die Kennung nicht in der Orts-Tabelle
+  // (Treffer der Live-Suche), löst der Server über sie auf.
+  if (codes?.fromCode) {
+    params.fromCode = codes.fromCode;
+    if (codes.fromLabel) params.fromLabel = codes.fromLabel;
+  } else if (from) {
+    params.fromLat = from.latitude.toFixed(5);
+    params.fromLng = from.longitude.toFixed(5);
+  }
+  if (codes?.toCode) {
+    params.toCode = codes.toCode;
+    if (codes.toLabel) params.toLabel = codes.toLabel;
+  } else {
+    params.toLat = to.latitude.toFixed(5);
+    params.toLng = to.longitude.toFixed(5);
+    params.toName = to.name;
+  }
+  return getJson<CityTripPlan>("/api/trip-plan/city", params, 15_000);
 }
 
 /**
@@ -703,9 +895,52 @@ export interface CreatePriceAlertInput {
   notifyOnRise: boolean;
 }
 
+/**
+ * Die Zeitgrenze der drei Alarm-BEDIENWEGE — deutlich kürzer als die 20s.
+ *
+ * WARUM ÜBERHAUPT KÜRZER: An diesen dreien steht ein Mensch und sieht auf einen
+ * Schalter. Läuft der Server nicht, während das WLAN steht, antwortet niemand —
+ * und es kommt auch kein „Verbindung abgelehnt" zurück, das sofort da wäre: Die
+ * Verbindung HÄNGT. Nachgemessen gegen einen Rechner, der Pakete schluckt: Bis
+ * zu 10,5 Sekunden dauert es, bis Android von sich aus aufgibt; bleibt er
+ * länger stumm, schlägt bei 20 Sekunden unsere eigene Grenze zu. Der Schalter
+ * sprang also um, und erst zehn bis zwanzig Sekunden später kam die Meldung,
+ * dass es nicht geklappt hat. Genau so wurde es berichtet.
+ *
+ * WARUM AUSGERECHNET FÜNF: Diese Aufrufe schicken ein paar Dutzend Bytes und
+ * lesen eine leere Antwort. Selbst über eine schlechte Mobilfunkstrecke ist das
+ * in ein bis zwei Sekunden erledigt; fünf lassen Luft für das Doppelte. Wer
+ * länger braucht, hat kein langsames Netz, sondern keines.
+ *
+ * WARUM DAS GEFAHRLOS IST: Alle drei sind WIEDERHOLBAR. Kommt ein abgebrochener
+ * Aufruf beim Server doch noch an, ist der zweite Versuch derselbe Vorgang:
+ * Pausieren setzt denselben Merker; Löschen trifft eine Zeile, die es nicht mehr
+ * gibt (der Server sagt „Unknown alert", und das gilt hier als Erfolg); Anlegen
+ * ERSETZT den bestehenden Alarm derselben Strecke, statt einen zweiten daneben
+ * zu legen. Ohne diese Eigenschaft wäre eine kurze Grenze nicht zu verantworten.
+ *
+ * `listPriceAlerts` bleibt bei 20 Sekunden: Der Abgleich läuft beim App-Start im
+ * Hintergrund, dort wartet niemand — und was er nicht schafft, holt der nächste
+ * Start nach. Eine kurze Grenze wäre dort nur eine zusätzliche Gelegenheit zu
+ * scheitern.
+ */
+export const ALERT_ACTION_TIMEOUT_MS = 5000;
+
+/**
+ * @param timeoutMs Wie lange gewartet wird. Vorgabe sind 20 Sekunden — der
+ *   ABGLEICH beim App-Start läuft im Hintergrund, dort wartet niemand, und ein
+ *   früher Abbruch wäre nur eine zusätzliche Gelegenheit zu scheitern. Wer den
+ *   Alarm im Blatt anlegt oder wieder einschaltet, sieht dagegen auf den
+ *   Bildschirm und bekommt `ALERT_ACTION_TIMEOUT_MS` mitgegeben.
+ *
+ *   Hier stand die kurze Grenze fest verdrahtet — und traf damit auch den
+ *   Abgleich, der genau davon ausgenommen sein sollte (siehe die Begründung an
+ *   der Konstante).
+ */
 export async function createPriceAlert(
   input: CreatePriceAlertInput,
   authToken?: string | null,
+  timeoutMs: number = 20000,
 ): Promise<{ id: string }> {
   const url = buildUrl("/api/alerts");
   const res = await fetchWithTimeout(
@@ -719,7 +954,7 @@ export async function createPriceAlert(
       },
       body: JSON.stringify(input),
     },
-    20000,
+    timeoutMs,
   );
   if (!res.ok) throw new Error(`API ${res.status} ${res.statusText} for ${url}`);
   return (await res.json()) as { id: string };
@@ -785,6 +1020,54 @@ export async function listPriceAlerts(
 }
 
 /**
+ * Einen Alarm PAUSIEREN oder wieder aufnehmen.
+ *
+ * Der Unterschied zum Löschen ist der ganze Punkt: Der Schalter auf der Karte
+ * rief bisher `deletePriceAlert`, „aus" war also eine Kündigung. Gemeint ist
+ * eine Pause — die Zeile bleibt mit Kennung, Schwelle und zuletzt gesehenem
+ * Preis stehen, nur die Prüfung überspringt sie.
+ *
+ * Die Push-Kennung geht im Kopf mit: Sie ist auf dem Server die Berechtigung,
+ * genau wie beim Löschen.
+ *
+ * Rückgabe statt Ausnahme, weil der Aufrufer die beiden Fälle verschieden
+ * behandeln muss:
+ *  • `"ok"` — umgelegt.
+ *  • `"gone"` — die Zeile liegt dort nicht (mehr). Beim EINSCHALTEN muss sie
+ *    dann neu angelegt werden; beim Ausschalten ist nichts mehr zu tun.
+ * Alles andere (kein Netz, unbekanntes Gerät, 5xx) wirft — dort wäre ein
+ * stiller Erfolg genau die Lüge, gegen die hier mehrfach geschrieben wurde.
+ */
+export async function updatePriceAlertActive(
+  id: string,
+  pushToken: string,
+  active: boolean,
+): Promise<"ok" | "gone"> {
+  const url = buildUrl(`/api/alerts/${encodeURIComponent(id)}`);
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "X-Push-Token": pushToken },
+      body: JSON.stringify({ active }),
+    },
+    ALERT_ACTION_TIMEOUT_MS,
+  );
+  if (res.ok) return "ok";
+  if (res.status === 404) {
+    const detail = (await res.json().catch(() => null)) as { error?: string } | null;
+    /**
+     * Nur der unbekannte ALARM heißt „weg". Die unbekannte KENNUNG heißt, dass
+     * gar nichts erreicht wurde — dieselbe Unterscheidung wie beim Löschen, und
+     * aus demselben Grund: Die zweite als Erfolg zu lesen hieße, einen Alarm
+     * für pausiert zu halten, der munter weitermeldet.
+     */
+    if (detail?.error === "Unknown alert") return "gone";
+  }
+  throw new Error(`API ${res.status} ${res.statusText} for ${url}`);
+}
+
+/**
  * Einen Preis-Alarm löschen.
  *
  * Die Push-Kennung geht MIT, und zwar nicht als Beifang: Sie ist auf dem Server
@@ -807,7 +1090,7 @@ export async function deletePriceAlert(id: string, pushToken: string): Promise<v
        */
       headers: { "X-Push-Token": pushToken },
     },
-    20000,
+    ALERT_ACTION_TIMEOUT_MS,
   );
   if (res.ok) return;
   /**

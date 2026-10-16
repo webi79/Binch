@@ -71,7 +71,16 @@ export interface LegInfo {
   stopovers?: StopoverInfo[];
   /** HAFAS Trip-ID — vom Client zur Polyline-Abruf weitergereicht. */
   tripId?: string;
+  /** Gefährdung an GENAU dieser Stelle (laut Quelle, z. B. DB):
+   *  "cancelled" = diese Teilstrecke fällt aus,
+   *  "connectionAtRisk" = der Umstieg IN diese Teilstrecke ist voraussichtlich
+   *  nicht zu schaffen. */
+  warning?: JourneyWarning;
 }
+
+/** Von der Quelle gemeldete Gefährdung einer Verbindung. Solche Treffer stehen
+ *  hinter den funktionierenden; ausgefallene kommen ohne Preis. */
+export type JourneyWarning = "connectionAtRisk" | "cancelled";
 
 export interface SearchResult {
   id: string;
@@ -99,6 +108,12 @@ export interface SearchResult {
   stops: number;
   stopLabels: string[];
   legs?: LegInfo[];
+  /** Gefährdet laut Quelle — die betroffene Stelle steht an `legs[].warning`. */
+  warning?: JourneyWarning;
+  /** NUR Client: Hinweis über der Zeitleiste. "noTicketOffer" setzt der
+   *  Abfahrts-Tipp, wenn die Buchungssuche den Zug nicht fand und stattdessen
+   *  die Fahrt selbst gezeigt wird (StopDetailSheet). Kommt nie vom Server. */
+  timelineNotice?: "noTicketOffer";
   price: number;
   currency: string;
   deepLink?: string; // server-side only — frontend uses redirectToken
@@ -115,7 +130,14 @@ export interface SearchResult {
 
 export interface Location {
   code: string;
+  /** Offizieller Name — so, wie ihn der Nutzer sehen soll (Server: `display_name`). */
   label: string;
+  /**
+   * Unterscheidungs-Zusatz („Rochdale Road · Stop RA"), nur wenn ein
+   * gleichnamiger Halt derselben Art daneben steht. Dezent neben dem Namen
+   * zeigen, nie im Namen.
+   */
+  detail?: string;
   city: string;
   country: string;
   type: TravelMode | "ALL";
