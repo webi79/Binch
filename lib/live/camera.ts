@@ -27,11 +27,16 @@ export interface CameraTarget {
   pitch: number;
 }
 
+/**
+ * Nah genug, dass die vorgerenderten Modelle (echte Proportionen, nur
+ * maßvoll kräftiger) als Zug bzw. Bus zu lesen sind — die alten Klötze waren
+ * viermal überbreit und vertrugen mehr Abstand.
+ */
 const FOLLOW: Record<LiveVehicleKind, { zoom: number; pitch: number }> = {
-  train: { zoom: 15.4, pitch: 58 },
-  subway: { zoom: 16, pitch: 58 },
-  tram: { zoom: 16.5, pitch: 58 },
-  bus: { zoom: 17, pitch: 58 },
+  train: { zoom: 16.6, pitch: 58 },
+  subway: { zoom: 17.0, pitch: 58 },
+  tram: { zoom: 17.4, pitch: 58 },
+  bus: { zoom: 17.8, pitch: 58 },
   ferry: { zoom: 14.6, pitch: 55 },
 };
 const PLANE_PITCH = 50;
@@ -84,8 +89,9 @@ export function cameraTarget(model: LiveModel, f: LiveFrame, bearing: number, ma
     return { latitude: c[1], longitude: c[0], zoom, bearing, pitch: PLANE_PITCH };
   }
   const cfg = FOLLOW[model.kind];
-  // Fernzüge sind doppelt so lang und schnell — eine halbe Stufe weiter weg.
-  const zoom = model.kind === "train" && isLongDistance(model.product) ? cfg.zoom - 0.6 : cfg.zoom;
+  // Fernzüge sind doppelt so lang und schnell — etwas weiter weg (nicht mehr:
+  // darunter werden die Wagen-Modelle vergrößert, der Zug würde überlang).
+  const zoom = model.kind === "train" && isLongDistance(model.product) ? cfg.zoom - 0.2 : cfg.zoom;
   return { latitude: f.position[1], longitude: f.position[0], zoom, bearing, pitch: cfg.pitch };
 }
 

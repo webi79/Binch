@@ -165,8 +165,12 @@ export function LiveOverlay({
     const cut = map?.isFar(glideTarget.latitude, glideTarget.longitude, glideTarget.zoom) ?? false;
     const first = cut ? target(Date.now() + 60) ?? glideTarget : glideTarget;
     const approach = map?.followTo({ ...first, padding: padding(), cut }) ?? 0;
-    if (approach > 0) zoom.glide(first.zoom, approach);
-    else zoom.jump(first.zoom);
+    if (approach > 0) {
+      zoom.glide(first.zoom, approach);
+    } else {
+      zoom.setView(first.bearing, first.pitch);
+      zoom.jump(first.zoom);
+    }
     let last = first;
     const tick = () => {
       // Den Schalter im Store prüfen, nicht nur das Abräumen des Effekts: Das

@@ -5,19 +5,25 @@
  * Teilen, deren Umriss sich mit der Höhe ändert.
  *
  * Vorbild sind die Low-Poly-Bilder des Nutzers (Okt. 2026), in den Farben der
- * App:
- *   Bahn: weißer Wagenkasten, ein Zierstreifen in der Farbe der Verkehrsart
- *   (Zug gelb, U-Bahn blau, Tram dunkel), dunkles Fensterband — nah dran mit
- *   einzelnen Fenstern zwischen weißen Stegen —, graues Dach mit Aufbau,
- *   dunkles Fahrwerk, Übergänge zwischen den Wagen. Die Nase steigt schräg an
- *   (jede höhere Schicht endet weiter hinten), die Frontscheibe ist dunkel;
- *   Fernzüge spitz an beiden Enden, Regional- und Stadtbahnen rund.
- *   Bus: Reisebus, oben weiß, unten in Lila, große Fenster mit Stegen,
- *   Frontscheibe, Außenspiegel, dunkle Räder, Klimabox auf dem Dach.
+ * App — bewusst mit WENIGEN, großen Teilen:
+ *   Bahn: je Wagen sechs Schichten — dunkles Fahrwerk, weißer Kasten, ein
+ *   Zierstreifen in der Farbe der Verkehrsart (Zug gelb, U-Bahn blau, Tram
+ *   dunkel), hohes dunkles Fensterband, weißer Kasten, schmaleres graues Dach;
+ *   Übergänge zwischen den Wagen. Die Nase steigt schräg an (jede höhere Schicht endet
+ *   weiter hinten); Fernzüge spitz an beiden Enden, Regional- und Stadtbahnen
+ *   rund.
+ *   Bus: Räder, unten in Lila, Heckwand, ein Fensterband bis vorn, weißer
+ *   Abschluss, graues Dach.
  *   Fähre: Rumpf mit spitzem Bug, weißer Aufbau mit Fensterband.
- *   Flugzeug: weißer Rumpf mit rundem Querschnitt und abgeschrägter Nase,
- *   dunkle Fensterreihe und Cockpitscheiben, Winglets und Seitenleitwerk im
- *   Akzent, graue Triebwerke mit dunklem Einlauf.
+ *   Flugzeug: kein Körper hier — es ist ein vorgerendertes 3D-Modell
+ *   (`server/scripts/build-plane-sprites.mjs`, siehe `planePoint` in
+ *   features.ts); hier nur sein Schatten am Boden.
+ *
+ * KEINE KLEINTEILE (Fensterstege, Spiegel, Dachaufbauten, Winglets, Stufen):
+ * Sie kamen erst nah dran dazu und lagen hauchdünn über dem Fensterband — die
+ * fast deckungsgleichen Flächen flackerten gegeneinander („beim Reinzoomen
+ * glitcht alles"), und jedes Teil kostete bei jedem Takt. Teile liegen nur
+ * übereinander oder nebeneinander, nie ineinander.
  *
  * Die Ebene zeichnet ohne senkrechten Verlauf
  * (`fill-extrusion-vertical-gradient: false`), sonst bekäme jedes Teil einen
@@ -45,8 +51,8 @@ export interface VehicleLook {
 }
 
 const WHITE = "#F2F4F7";
-const ROOF = "#D3D9E0";
-const ROOF_BOX = "#AEB6C1";
+/** Dach: schmaler und grau — so liest man den Kasten als gerundet, nicht als weiße Platte. */
+const ROOF = "#C5CCD4";
 const GLASS = "#1C2229";
 const UNDER = "#2F343B";
 const TYRE = "#1F2329";
@@ -183,8 +189,11 @@ function profile(front: Front, w: number, L: number, headEnd: boolean, tailEnd: 
   const dense = (from: number, to: number, n: number) => {
     for (let i = 0; i <= n; i++) xs.add(from + ((to - from) * i) / n);
   };
-  if (headEnd) dense(L - noseLen, L, front === "box" ? 4 : 8);
-  if (tailEnd) dense(0, tailLen, front === "box" ? 4 : 8);
+  // Genug für eine runde Nase im Bild, nicht mehr — jede Stützstelle sind
+  // vier Ecken je Schicht und Takt.
+  const n = front === "box" ? 3 : front === "round" ? 5 : 6;
+  if (headEnd) dense(L - noseLen, L, n);
+  if (tailEnd) dense(0, tailLen, n);
   const samples = [...xs].filter((x) => x >= 0 && x <= L).sort((a, b) => a - b);
   return { hw, samples, noseLen, tailLen };
 }
@@ -206,21 +215,8 @@ const sym = (hw: (x: number) => number, f: number) => ({
   right: (x: number) => hw(x) * f,
 });
 
-/** Stege zwischen Fenstern: Positionen im geraden Teil, ~`pitch` Meter auseinander. */
-function pillarSpans(a: number, b: number, pitch: number, width: number): Array<[number, number]> {
-  const n = Math.floor((b - a) / pitch);
-  if (n < 1) return [];
-  const step = (b - a) / n;
-  const out: Array<[number, number]> = [];
-  for (let i = 1; i < n; i++) {
-    const c = a + i * step;
-    out.push([c - width / 2, c + width / 2]);
-  }
-  return out;
-}
-
-/** Bahn (Zug, U-Bahn, Tram): Teile eines Wagens. */
-function railParts(look: VehicleLook, L: number, w: number, s: BodyScale, head: boolean, tail: boolean, prof: ReturnType<typeof profile>): Part[] {
+/** Bahn (Zug, U-Bahn, Tram): sechs Schichten eines Wagens. */
+function railParts(look: VehicleLook, L: number, head: boolean, tail: boolean, prof: ReturnType<typeof profile>): Part[] {
   const { hw, noseLen } = prof;
   // Schräge Front: je höher, desto weiter zurück (Anteil der Nasenlänge).
   const slope = look.front === "sleek" ? 0.72 : 0.36;
@@ -230,31 +226,21 @@ function railParts(look: VehicleLook, L: number, w: number, s: BodyScale, head: 
     const [x0, x1] = span((from + to) / 2);
     return { from, to, x0, x1, ...sym(hw, f), color };
   };
-  const parts: Part[] = [
-    layer(0, 0.13, 0.8, UNDER),
-    layer(0.13, 0.36, 1, WHITE),
-    layer(0.36, 0.42, 1, look.accent),
-    layer(0.42, 0.72, 1, GLASS),
-    layer(0.72, 0.9, 1, WHITE),
+  // Das Fensterband hoch genug, dass es auch schräg von oben (Folge-Kamera,
+  // 58°) als Band zu sehen ist.
+  return [
+    layer(0, 0.12, 0.8, UNDER),
+    layer(0.12, 0.34, 1, WHITE),
+    layer(0.34, 0.4, 1, look.accent),
+    layer(0.4, 0.76, 1, GLASS),
+    layer(0.76, 0.9, 1, WHITE),
     layer(0.9, 1, 0.84, ROOF),
   ];
-  // Dachaufbau (Stromabnehmer-Abdeckung, Klima) — auf jedem Wagen mittig.
-  parts.push({ from: 1, to: 1.07, x0: 0.38 * L, x1: 0.62 * L, ...sym(hw, 0.5), color: ROOF_BOX });
-  if (s.detail) {
-    // Fensterstege: weiße, hauchdünn breitere Scheiben quer durch das Band.
-    const a = tail ? noseLen * 1.05 : 0.04 * L;
-    const b = head ? L - noseLen * 1.05 : 0.96 * L;
-    for (const [x0, x1] of pillarSpans(a, b, 2.4 * s.len, 0.45 * s.len)) {
-      parts.push({ from: 0.44, to: 0.7, x0, x1, ...sym(hw, 1.03), color: WHITE });
-    }
-  }
-  return parts;
 }
 
-/** Reisebus: ein Glied. */
+/** Reisebus: ein Glied, sechs Teile. */
 function busParts(look: VehicleLook, L: number, w: number, s: BodyScale, prof: ReturnType<typeof profile>): Part[] {
   const { hw } = prof;
-  const fx = L - 0.4 * s.len; // hinter der Front: Scheibe und Stoßfänger
   const parts: Part[] = [];
   // Räder: dunkle Blöcke an den Achsen, eine Spur breiter als der Wagen.
   for (const axle of [0.2 * L, 0.8 * L]) {
@@ -263,30 +249,13 @@ function busParts(look: VehicleLook, L: number, w: number, s: BodyScale, prof: R
     parts.push({ from: 0, to: 0.3, x0: axle - half, x1: axle + half, left: () => -o, right: () => o, color: TYRE });
   }
   parts.push(
-    { from: 0.08, to: 0.4, x0: 0, x1: fx, ...sym(hw, 1), color: look.accent },
-    { from: 0.08, to: 0.26, x0: fx, x1: L, ...sym(hw, 1), color: look.accent },
-    // Frontscheibe, tief heruntergezogen
-    { from: 0.26, to: 0.84, x0: fx, x1: L, ...sym(hw, 1), color: GLASS },
-    // Heckwand, darauf das Seitenfensterband
+    { from: 0.08, to: 0.4, x0: 0, x1: L, ...sym(hw, 1), color: look.accent },
+    // Heckwand, davor ein Fensterband bis in die Frontscheibe
     { from: 0.4, to: 0.84, x0: 0, x1: 0.06 * L, ...sym(hw, 1), color: WHITE },
-    { from: 0.4, to: 0.84, x0: 0.06 * L, x1: fx, ...sym(hw, 1), color: GLASS },
-    { from: 0.84, to: 0.94, x0: 0, x1: L, ...sym(hw, 1), color: WHITE },
-    { from: 0.94, to: 1, x0: 0, x1: L, ...sym(hw, 0.94), color: "#E9ECF0" },
-    // Klimabox auf dem Dach
-    { from: 1, to: 1.07, x0: 0.34 * L, x1: 0.66 * L, ...sym(hw, 0.6), color: "#C3CAD3" },
+    { from: 0.4, to: 0.84, x0: 0.06 * L, x1: L, ...sym(hw, 1), color: GLASS },
+    { from: 0.84, to: 0.93, x0: 0, x1: L, ...sym(hw, 1), color: WHITE },
+    { from: 0.93, to: 1, x0: 0, x1: L, ...sym(hw, 0.9), color: ROOF },
   );
-  if (s.detail) {
-    for (const [x0, x1] of pillarSpans(0.06 * L, fx, 1.7 * s.len, 0.22 * s.len)) {
-      parts.push({ from: 0.42, to: 0.82, x0, x1, ...sym(hw, 1.03), color: WHITE });
-    }
-    // Außenspiegel vorn an beiden Seiten
-    const m0 = fx - 0.3 * s.len;
-    const out = w + 0.26 * s.wid;
-    parts.push(
-      { from: 0.56, to: 0.74, x0: m0, x1: fx, left: () => -out, right: () => -w, color: TYRE },
-      { from: 0.56, to: 0.74, x0: m0, x1: fx, left: () => w, right: () => out, color: TYRE },
-    );
-  }
   return parts;
 }
 
@@ -327,7 +296,7 @@ export function vehicleBody(
     const parts =
       look.build === "bus" ? busParts(look, L, w, scale, prof) :
       look.build === "ferry" ? ferryParts(look, L, prof) :
-      railParts(look, L, w, scale, head, tail, prof);
+      railParts(look, L, head, tail, prof);
     for (const p of parts) {
       if (p.x1 - p.x0 < 0.05) continue;
       const xs = [p.x0, ...prof.samples.filter((x) => x > p.x0 && x < p.x1), p.x1];
@@ -356,19 +325,6 @@ const FUSELAGE_HALF: XY = [
 ];
 const WING: XY = [[1.9, 4.2], [6.4, 1.6], [17.4, -4.7], [17.9, -5.5], [17.9, -6.9], [17.2, -7.3], [6.8, -4.6], [1.9, -3.6]];
 const STABILIZER: XY = [[1.15, -13.7], [6.2, -17.1], [6.4, -17.8], [6.2, -18.5], [1.0, -17.7]];
-/** Triebwerk unter dem Flügel: Gondel mit runder Lippe vorn; vorn der dunkle Einlauf. */
-const ENGINE: XY = [[5.0, 2.2], [5.35, 2.6], [6.25, 2.6], [6.6, 2.2], [6.6, -1.4], [6.2, -2.1], [5.4, -2.1], [5.0, -1.4]];
-const INTAKE: XY = [[5.0, 2.2], [5.35, 3.0], [6.25, 3.0], [6.6, 2.2]];
-/**
- * Seitenleitwerk, gepfeilt. Eine senkrechte Fläche kann nicht schräg stehen —
- * die Pfeilung entsteht aus acht dünnen Stufen, je höher, desto weiter hinten
- * (bei vier sah man die Treppe).
- */
-const FIN_STEPS: Array<{ y0: number; y1: number; from: number; to: number }> = Array.from({ length: 8 }, (_, i) => {
-  const u = i / 8;
-  return { y0: -11.4 - u * 5.0, y1: -18.5 - u * 0.45, from: 1.0 + u * 1.4, to: 1.0 + (u + 1 / 8) * 1.4 };
-});
-
 const mirrorX = (pts: XY): XY => pts.map(([x, y]) => [-x, y] as [number, number]).reverse();
 /** Ganzer Umriss aus der rechten Hälfte (Nase oben, im Uhrzeigersinn). */
 const fullOutline = (half: XY, widthFactor = 1): XY => [
@@ -377,34 +333,6 @@ const fullOutline = (half: XY, widthFactor = 1): XY => [
   // endet stumpf und braucht beide Ecken.
   ...half.slice(1).reverse().map(([x, y]) => [-x * widthFactor, y] as [number, number]),
 ];
-/**
- * Der Rumpfumriss, vorn und hinten gestaucht — für die oberen Schichten
- * (Nase steigt schräg an) und die untere (Heck hebt sich zum Konus).
- */
-const shaped = (noseKeep: number, tailKeep: number, widthFactor: number): XY =>
-  fullOutline(
-    FUSELAGE_HALF.map(([x, y]) => [x, y > 13 ? 13 + (y - 13) * noseKeep : y < -9 ? -9 + (y + 9) * tailKeep : y] as [number, number]),
-    widthFactor,
-  );
-/** Nur ein Abschnitt des Rumpfs (y von–bis) — für Fensterreihe und Cockpit. */
-function section(y0: number, y1: number, widthFactor: number): XY {
-  const halfAt = (y: number) => {
-    for (let i = 1; i < FUSELAGE_HALF.length; i++) {
-      const [xa, ya] = FUSELAGE_HALF[i - 1]!;
-      const [xb, yb] = FUSELAGE_HALF[i]!;
-      if ((y <= ya && y >= yb) || (y >= ya && y <= yb)) {
-        const f = ya === yb ? 0 : (y - ya) / (yb - ya);
-        return xa + (xb - xa) * f;
-      }
-    }
-    return 0;
-  };
-  const ys = [y1, ...FUSELAGE_HALF.map(([, y]) => y).filter((y) => y < y1 && y > y0), y0];
-  const right = ys.map((y) => [halfAt(y) * widthFactor, y] as [number, number]);
-  const left = [...ys].reverse().map((y) => [-halfAt(y) * widthFactor, y] as [number, number]);
-  return [...right, ...left];
-}
-
 function placed(center: LngLat, headingDeg: number, scale: number, pts: XY): Ring {
   const a = (headingDeg * Math.PI) / 180;
   const s = Math.sin(a);
@@ -418,53 +346,6 @@ function placed(center: LngLat, headingDeg: number, scale: number, pts: XY): Rin
 }
 
 export const PLANE_LENGTH_M = 37.6;
-
-/** Das Flugzeug in der Luft — Unterkante des Rumpfs bei `altitude`. */
-export function planeBody(
-  center: LngLat,
-  headingDeg: number,
-  altitude: number,
-  scale: number,
-  colors: { fin: string },
-): ExtrusionFeature[] {
-  const t = 4.1 * scale; // Rumpfhöhe
-  const at = (p: XY) => placed(center, headingDeg, scale, p);
-  const z = (f: number) => altitude + f * t;
-  const BODY = "#F4F6F8";
-  const WING_C = "#E3E7EC";
-  const out: ExtrusionFeature[] = [
-    // Rumpf mit rundem Querschnitt: Bauch schmaler (Heck hebt sich), Mitte voll,
-    // Rücken schmaler (Nase steigt an).
-    poly(at(shaped(0.92, 0.7, 0.8)), z(0), z(0.28), "#D5DAE1"),
-    poly(at(shaped(1, 1, 1)), z(0.28), z(0.5), BODY),
-    // Fensterhöhe, lückenlos von vorn nach hinten: Nasenspitze, Cockpit-
-    // scheiben, Türbereich, die Reihe der Kabinenfenster, Heck.
-    poly(at(section(17.4, 18.8, 1)), z(0.5), z(0.66), BODY),
-    poly(at(section(15.6, 17.4, 1.004)), z(0.5), z(0.66), GLASS),
-    poly(at(section(13.2, 15.6, 1)), z(0.5), z(0.66), BODY),
-    poly(at(section(-10, 13.2, 1)), z(0.5), z(0.53), BODY),
-    poly(at(section(-10, 13.2, 1.004)), z(0.53), z(0.63), "#2B3037"),
-    poly(at(section(-10, 13.2, 1)), z(0.63), z(0.66), BODY),
-    poly(at(section(-18.8, -10, 1)), z(0.5), z(0.66), BODY),
-    poly(at(shaped(0.86, 1, 1)), z(0.66), z(0.76), BODY),
-    poly(at(shaped(0.72, 1, 0.74)), z(0.76), z(1), "#FFFFFF"),
-    // Tiefdecker: Flügel unten am Rumpf, dünn und glatt bis zur Spitze.
-    poly(at(WING), z(0.16), z(0.3), WING_C),
-    poly(at(mirrorX(WING)), z(0.16), z(0.3), WING_C),
-    // Triebwerke unter dem Flügel, vorn der dunkle Einlauf.
-    poly(at(ENGINE), z(-0.12), z(0.2), "#9CA3AE"),
-    poly(at(mirrorX(ENGINE)), z(-0.12), z(0.2), "#9CA3AE"),
-    poly(at(INTAKE), z(-0.12), z(0.2), "#2B3037"),
-    poly(at(mirrorX(INTAKE)), z(-0.12), z(0.2), "#2B3037"),
-    poly(at(STABILIZER), z(0.62), z(0.72), WING_C),
-    poly(at(mirrorX(STABILIZER)), z(0.62), z(0.72), WING_C),
-  ];
-  for (const s of FIN_STEPS) {
-    const fin: XY = [[0.3, s.y0], [0.3, s.y1], [-0.3, s.y1], [-0.3, s.y0]];
-    out.push(poly(at(fin), z(s.from), z(s.to), colors.fin));
-  }
-  return out;
-}
 
 /** Dieselbe Silhouette flach am Boden — der Schatten unter dem Flugzeug. */
 export function planeShadow(center: LngLat, headingDeg: number, scale: number): Ring[] {

@@ -1,7 +1,7 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { prepareLayer } from "@/lib/nav/transitionLayer";
 import { preloadLocationPicker } from "@/lib/nav/pickerPreload";
-import { PICKER_IN, SHEET_OUT } from "@/lib/nav/overlayCover";
+import { PICKER_IN, SHEET_IN, SHEET_OUT } from "@/lib/nav/overlayCover";
 import {
   View,
   StyleSheet,
@@ -54,6 +54,7 @@ import { LiveOverlay } from "@/components/live/LiveOverlay";
 import { useAppActive, useLiveModel } from "@/lib/live/useLiveModel";
 import { PLANE_MAX_ZOOM } from "@/lib/live/camera";
 import { createZoomTrack } from "@/lib/live/zoomTrack";
+import { probeFrames, probeMark } from "@/lib/live/probe";
 import { RouteBanner } from "@/components/surroundings/RouteBanner";
 import { LocateFab, MapFabs } from "@/components/surroundings/MapFabs";
 import { CitySearchMorph, SEARCH_BAR_BARE } from "@/components/surroundings/CitySearchMorph";
@@ -227,6 +228,8 @@ export default function SurroundingsScreen() {
    * kündigt ihre Fahrten an. Siehe `lib/live/zoomTrack.ts`.
    */
   const liveZoom = useMemo(() => createZoomTrack(15), []);
+  /** Kennung der nativen Karte — die 3D-Ebene der Live-Ansicht hängt sich dort ein. */
+  const liveNativeTag = useCallback(() => mapRef.current?.nativeTag() ?? null, []);
   const onMapTouchStart = useCallback(() => {
     mapTouchRef.current = true;
   }, []);
@@ -272,6 +275,7 @@ export default function SurroundingsScreen() {
       // das die Wartezeit dann neu startet.)
       clearPendingViewport();
       liveZoom.report(zoom, false);
+      liveZoom.setView(bearing, pitch);
       const last = lastCameraRef.current;
       if (Math.abs(bearing - last.bearing) > 0.05) {
         last.bearing = bearing;
@@ -878,12 +882,41 @@ export default function SurroundingsScreen() {
   const liveRunning = liveActive && isFocused && appActive;
   const { model: liveModel, status: liveStatus } = useLiveModel(liveSession, liveRunning);
   useEffect(() => {
+    probeMark(liveActive ? "live-committed" : "close-committed");
+  }, [liveActive]);
+  useEffect(() => {
     if (!liveActive) return;
     // Die Kamera gehört jetzt dem Fahrzeug, nicht mehr dem eigenen Standort.
     followUserRef.current = false;
     // Im Nur-Karte-Modus gestartet (Tafel über Bo): Banner und Karte zeigen.
     if (isMapChromeHidden()) showMapChrome();
   }, [liveActive]);
+  /**
+   * DAS AUSWAHLFENSTER KOMMT NACH DEM ZURÜCK EINEN MOMENT SPÄTER, wenn dabei
+   * das Haltestellen-Blatt hereinfährt: Es liegt dann ohnehin darunter (das
+   * Blatt hängt über allem, `app/_layout.tsx`). Sein Aufbau — Liste mit Zeilen,
+   * Symbole, Gesten — fiel sonst in denselben Commit wie der Abbau der
+   * Live-Ansicht und mitten in die Einfahrt des Blatts und die Überblendung des
+   * Kamera-Schnitts („Beenden laggt immer noch spürbar"). Danach baut es sich
+   * unsichtbar darunter auf. Der Standort-Knopf, den es trägt, erscheint
+   * dadurch erst, wenn das Blatt steht.
+   */
+  const [surroundingsHeld, setSurroundingsHeld] = useState(false);
+  const surroundingsHoldRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const holdSurroundingsSheet = useCallback(() => {
+    setSurroundingsHeld(true);
+    if (surroundingsHoldRef.current) clearTimeout(surroundingsHoldRef.current);
+    surroundingsHoldRef.current = setTimeout(() => {
+      surroundingsHoldRef.current = null;
+      setSurroundingsHeld(false);
+    }, SHEET_IN.duration + SURROUNDINGS_HOLD_EXTRA_MS);
+  }, []);
+  useEffect(
+    () => () => {
+      if (surroundingsHoldRef.current) clearTimeout(surroundingsHoldRef.current);
+    },
+    [],
+  );
   /**
    * Zurück aus der Live-Ansicht — wie aus dem Routen-Modus: die geparkte
    * Oberfläche zurücklegen und das Blatt wieder hereinfahren. Die Karte wird
@@ -903,10 +936,15 @@ export default function SurroundingsScreen() {
    * Bild, bevor Ebenen wechseln.
    */
   const closeLive = useCallback(() => {
+    probeMark("close-tap");
+    probeFrames("close");
     haptic("button");
     const st = useSearchStore.getState();
     const stash = st.stashedSurroundings;
-    if (stash && (stash.selectedStop || stash.city)) openStopSheet();
+    if (stash && (stash.selectedStop || stash.city)) {
+      openStopSheet();
+      holdSurroundingsSheet();
+    }
     const at = stash?.selectedStop;
     const map = mapRef.current;
     if (at?.latitude != null && at.longitude != null) {
@@ -925,8 +963,10 @@ export default function SurroundingsScreen() {
     } else {
       map?.resetNorth();
     }
+    probeMark("close-cam");
     st.stopLive();
-  }, [mode, visiblePadding]);
+    probeMark("close-state");
+  }, [mode, visiblePadding, holdSurroundingsSheet]);
   useEffect(() => {
     if (!isFocused || !liveActive) return;
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
@@ -1894,6 +1934,7 @@ export default function SurroundingsScreen() {
     // Die Bewegung ist zu Ende — wartende Kartendaten dürfen jetzt (`whenMapQuiet`).
     setMapMoving(false);
     liveZoom.report(r.zoom, true);
+    liveZoom.setView(r.bearing, r.pitch);
     /**
      * Bis zur FERNSTEN Ecke. Der gemeldete Mittelpunkt ist der des freien
      * Ausschnitts (Kamera-Rand für Leiste und Blatt), nicht der des Bildes —
@@ -2198,7 +2239,7 @@ export default function SurroundingsScreen() {
             </>
           )}
           {liveActive && liveModel ? (
-            <LiveVehicleLayer model={liveModel} zoom={liveZoom} running={liveRunning} />
+            <LiveVehicleLayer model={liveModel} zoom={liveZoom} running={liveRunning} nativeTag={liveNativeTag} />
           ) : null}
           {userCoord ? <UserPin coord={userCoord} /> : null}
         </MapSurface>
@@ -2413,7 +2454,7 @@ export default function SurroundingsScreen() {
           <LocateFab onPress={onLocate} locating={locating} />
         </View>
       ) : null}
-      {!routeActive && !liveActive && (
+      {!routeActive && !liveActive && !surroundingsHeld && (
         <SurroundingsSheet
           mode={mode}
           setMode={handleModeChange}
@@ -2435,6 +2476,13 @@ export default function SurroundingsScreen() {
  * zweite Fahrt startet erst danach (siehe `cityRouteKey`).
  */
 const CITY_FIT_MS = 820;
+
+/**
+ * So lange (ms) nach der Einfahrt des Haltestellen-Blatts wartet das
+ * Auswahlfenster beim Zurück aus Live noch — bis auch die Überblendung des
+ * Kamera-Schnitts durch ist (mindestens 90 + 280 ms, siehe `coverCut`).
+ */
+const SURROUNDINGS_HOLD_EXTRA_MS = 300;
 
 /** Zoom für eine Stadt ohne zweiten Punkt (kein Standort) — die Stadt im Überblick. */
 const SINGLE_POINT_ZOOM = 11;

@@ -226,6 +226,8 @@ export interface MapSurfaceHandle {
   }) => number;
   /** Wäre eine Fahrt dorthin ein Bogenflug (weiter Weg oder viele Stufen Zoom)? */
   isFar: (latitude: number, longitude: number, zoom: number) => boolean;
+  /** Kennung der nativen Karte (für die 3D-Ebene der Live-Ansicht, `modules/live-models`). */
+  nativeTag: () => number | null;
 }
 
 /** Verdeckter Rand der Karte in Punkten — siehe `flyTo`. */
@@ -1008,6 +1010,7 @@ const MapSurfaceInner = forwardRef<MapSurfaceHandle, Props>(function MapSurface(
         return duration;
       },
       isFar: (latitude, longitude, zoom) => cameraMove(baseCam(), latitude, longitude, zoom).easing === "fly",
+      nativeTag: () => mapViewRef.current?.getNativeTag() ?? null,
       followTo: ({ latitude, longitude, zoom, bearing, pitch, padding, duration, cut }) => {
         if (cut) {
           /**

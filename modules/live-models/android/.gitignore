@@ -1,0 +1,5 @@
+# Build-Ausgabe des live-models Native-Moduls (inkl. C++ in .cxx/) — gehört nie
+# ins Repo, siehe modules/device-heading/android/.gitignore.
+build/
+.gradle/
+.cxx/

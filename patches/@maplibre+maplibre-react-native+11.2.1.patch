@@ -1207,6 +1207,30 @@ index 961d649..45e6f20 100644
              it.takeSnap(output == "file") { payload ->
                  promise.resolve(payload)
              }
+diff --git a/node_modules/@maplibre/maplibre-react-native/lib/commonjs/components/map/Map.js b/node_modules/@maplibre/maplibre-react-native/lib/commonjs/components/map/Map.js
+index 67fcdb2..d2d760f 100644
+--- a/node_modules/@maplibre/maplibre-react-native/lib/commonjs/components/map/Map.js
++++ b/node_modules/@maplibre/maplibre-react-native/lib/commonjs/components/map/Map.js
+@@ -57,6 +57,7 @@ const Map = exports.Map = /*#__PURE__*/(0, _react.memo)(({
+   const [isReady, setIsReady] = (0, _react.useState)(false);
+   const nativeRef = (0, _react.useRef)(null);
+   (0, _react.useImperativeHandle)(ref, () => ({
++    getNativeTag: () => (0, _findNodeHandle.findNodeHandle)(nativeRef.current),
+     getCenter: () => _NativeMapViewModule.default.getCenter((0, _findNodeHandle.findNodeHandle)(nativeRef.current)),
+     getZoom: () => _NativeMapViewModule.default.getZoom((0, _findNodeHandle.findNodeHandle)(nativeRef.current)),
+     getBearing: () => _NativeMapViewModule.default.getBearing((0, _findNodeHandle.findNodeHandle)(nativeRef.current)),
+diff --git a/node_modules/@maplibre/maplibre-react-native/lib/module/components/map/Map.js b/node_modules/@maplibre/maplibre-react-native/lib/module/components/map/Map.js
+index ee4ada4..b42ab17 100644
+--- a/node_modules/@maplibre/maplibre-react-native/lib/module/components/map/Map.js
++++ b/node_modules/@maplibre/maplibre-react-native/lib/module/components/map/Map.js
+@@ -52,6 +52,7 @@ export const Map = /*#__PURE__*/memo(({
+   const [isReady, setIsReady] = useState(false);
+   const nativeRef = useRef(null);
+   useImperativeHandle(ref, () => ({
++    getNativeTag: () => findNodeHandle(nativeRef.current),
+     getCenter: () => NativeMapViewModule.getCenter(findNodeHandle(nativeRef.current)),
+     getZoom: () => NativeMapViewModule.getZoom(findNodeHandle(nativeRef.current)),
+     getBearing: () => NativeMapViewModule.getBearing(findNodeHandle(nativeRef.current)),
 diff --git a/node_modules/@maplibre/maplibre-react-native/lib/typescript/commonjs/components/camera/Camera.d.ts b/node_modules/@maplibre/maplibre-react-native/lib/typescript/commonjs/components/camera/Camera.d.ts
 index f112d58..185774c 100644
 --- a/node_modules/@maplibre/maplibre-react-native/lib/typescript/commonjs/components/camera/Camera.d.ts
@@ -1220,6 +1244,19 @@ index f112d58..185774c 100644
  /**
   * Animation timing options for camera transitions.
   */
+diff --git a/node_modules/@maplibre/maplibre-react-native/lib/typescript/commonjs/components/map/Map.d.ts b/node_modules/@maplibre/maplibre-react-native/lib/typescript/commonjs/components/map/Map.d.ts
+index 20bfebd..6d5a34a 100644
+--- a/node_modules/@maplibre/maplibre-react-native/lib/typescript/commonjs/components/map/Map.d.ts
++++ b/node_modules/@maplibre/maplibre-react-native/lib/typescript/commonjs/components/map/Map.d.ts
+@@ -68,6 +68,8 @@ export interface MapRef {
+      * await mapRef.current?.getCenter();
+      * ```
+      */
++    /** Binch: Kennung der nativen Karte (modules/live-models). */
++    getNativeTag(): number | null;
+     getCenter(): Promise<LngLat>;
+     /**
+      * Returns the current zoom level of the map
 diff --git a/node_modules/@maplibre/maplibre-react-native/lib/typescript/module/components/camera/Camera.d.ts b/node_modules/@maplibre/maplibre-react-native/lib/typescript/module/components/camera/Camera.d.ts
 index f112d58..185774c 100644
 --- a/node_modules/@maplibre/maplibre-react-native/lib/typescript/module/components/camera/Camera.d.ts
@@ -1233,6 +1270,19 @@ index f112d58..185774c 100644
  /**
   * Animation timing options for camera transitions.
   */
+diff --git a/node_modules/@maplibre/maplibre-react-native/lib/typescript/module/components/map/Map.d.ts b/node_modules/@maplibre/maplibre-react-native/lib/typescript/module/components/map/Map.d.ts
+index 20bfebd..6d5a34a 100644
+--- a/node_modules/@maplibre/maplibre-react-native/lib/typescript/module/components/map/Map.d.ts
++++ b/node_modules/@maplibre/maplibre-react-native/lib/typescript/module/components/map/Map.d.ts
+@@ -68,6 +68,8 @@ export interface MapRef {
+      * await mapRef.current?.getCenter();
+      * ```
+      */
++    /** Binch: Kennung der nativen Karte (modules/live-models). */
++    getNativeTag(): number | null;
+     getCenter(): Promise<LngLat>;
+     /**
+      * Returns the current zoom level of the map
 diff --git a/node_modules/@maplibre/maplibre-react-native/src/components/camera/Camera.tsx b/node_modules/@maplibre/maplibre-react-native/src/components/camera/Camera.tsx
 index fbd228e..b5c7178 100644
 --- a/node_modules/@maplibre/maplibre-react-native/src/components/camera/Camera.tsx
@@ -1246,3 +1296,25 @@ index fbd228e..b5c7178 100644
  
  /**
   * Animation timing options for camera transitions.
+diff --git a/node_modules/@maplibre/maplibre-react-native/src/components/map/Map.tsx b/node_modules/@maplibre/maplibre-react-native/src/components/map/Map.tsx
+index d8ccd4e..febab0e 100644
+--- a/node_modules/@maplibre/maplibre-react-native/src/components/map/Map.tsx
++++ b/node_modules/@maplibre/maplibre-react-native/src/components/map/Map.tsx
+@@ -101,6 +101,8 @@ export interface MapRef {
+    * await mapRef.current?.getCenter();
+    * ```
+    */
++  /** Binch: Kennung der nativen Karte (modules/live-models). */
++  getNativeTag(): number | null;
+   getCenter(): Promise<LngLat>;
+ 
+   /**
+@@ -559,6 +561,8 @@ export const Map = memo(
+     >(null);
+ 
+     useImperativeHandle(ref, () => ({
++      // Binch: Kennung der nativen Karte — für die eigene 3D-Ebene (modules/live-models).
++      getNativeTag: () => findNodeHandle(nativeRef.current),
+       getCenter: () =>
+         NativeMapViewModule.getCenter(findNodeHandle(nativeRef.current)),
+ 

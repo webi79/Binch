@@ -55,6 +55,7 @@ import { WalkIcon } from "@/components/ui/WalkIcon";
 import { iconForProduct } from "@/components/results/LinePill";
 import type { SharedValue } from "react-native-reanimated";
 import { LiveButton, useLiveClock } from "@/components/live/LiveButton";
+import { probeFrames, probeMark } from "@/lib/live/probe";
 import { airportByIata } from "@/lib/live/model";
 import type { LiveSession } from "@/lib/live/types";
 import { router } from "expo-router";
@@ -992,6 +993,8 @@ function StopDetailSheetInner() {
     return !!it.id;
   };
   const startLiveFor = (it: StopBoardItem) => {
+    probeMark("start-tap");
+    probeFrames("start", 4000);
     if (!stop) return;
     haptic("button");
     // Auf der Ankunftstafel ist `direction` die HERKUNFT — dann lieber das

@@ -5,12 +5,23 @@ import { useAccent } from "@/lib/theme/accent";
 import { useResolvedMapStyle } from "@/lib/theme/mapStyleChoice";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import { LINE_SOURCE_MAXZOOM } from "@/components/surroundings/lineSourceTuning";
-import { metersPerPixel, sliceLine } from "@/lib/live/geo";
-import { cameraTarget } from "@/lib/live/camera";
+import { metersPerPixel } from "@/lib/live/geo";
+import { cameraTarget, viewHeading } from "@/lib/live/camera";
 import { useSearchStore } from "@/stores/searchStore";
 import type { LiveModel } from "@/lib/live/model";
-import { compact, stopsCollection, threeDZoom, vehicleCollection } from "@/lib/live/features";
+import {
+  compact,
+  DOT_RADIUS_PX,
+  hiddenHalfM,
+  lineFeature,
+  liveModelConfig,
+  stopsCollection,
+  threeDZoom,
+  vehicleCollection,
+} from "@/lib/live/features";
+import { LiveModels } from "@/modules/live-models";
 import type { ZoomTrack } from "@/lib/live/zoomTrack";
+import { probeTick } from "@/lib/live/probe";
 import { ARC_LAYER_PREFIX } from "@/lib/routing/flightArcs3d";
 
 /**
@@ -19,34 +30,41 @@ import { ARC_LAYER_PREFIX } from "@/lib/routing/flightArcs3d";
  *
  * Die Strecke sieht aus wie eine Route (`RouteLayer`): Akzentlinie, 4 breit,
  * darunter der dunkle Schatten bzw. auf der hellen Karte der Rand im
- * abgedunkelten Akzent. Was schon gefahren ist, liegt grau darüber — wie bei
+ * abgedunkelten Akzent. Wo das Fahrzeug schon war, wird sie grau — wie bei
  * einer Navigation.
  *
  * DAS FAHRZEUG hat zwei Gestalten, je nach Zoom:
- *   • nah: ein 3D-Körper (`fill-extrusion`, `lib/live/shapes.ts`) — ein Zug als
- *     Wagenkette, die sich in Kurven biegt; ein Flugzeug schwebt in seiner
- *     Höhe, mit Schatten am Boden und einem dünnen Lot dazwischen.
- *   • weit: ein Punkt in der Farbe der Verkehrsart mit Richtungspfeil (bzw. das
- *     Flugzeug von oben, gedreht nach Kurs).
+ *   • nah: echte 3D-Modelle in einer eigenen Ebene IN der Karte
+ *     (`modules/live-models`) — Bahn als Wagenkette, Bus, Flugzeug auf seinem
+ *     Bogen, jeweils mit Schatten am Boden. Lage, Größe und Bewegung zwischen
+ *     zwei Takten rechnet die Ebene in jedem Bild selbst. Nur die Fähre ist
+ *     noch ein hochgezogener Körper (`fill-extrusion`, `lib/live/shapes.ts`).
+ *   • weit: ein Punkt in der Farbe der Verkehrsart mit Richtungspfeil.
  * Der Wechsel ist eine Überblendung über den Zoom — die rechnet die Karte
  * selbst, ohne einen Durchgang hier.
  *
- * DER TAKT: Das Fahrzeug wird so oft neu gesetzt, dass es je Schritt höchstens
- * gut einen halben Bildpunkt vorankommt — bis zu 20-mal je Sekunde, im Stand
- * einmal. Vorher waren es anderthalb Bildpunkte bei höchstens 20 Hz: Ein Bus
- * auf Zoom 17 oder ein Zug auf 15,4 (beide ~13 Punkte/s) bekamen so nur neun
- * Schritte je Sekunde, und unter der gleichmäßig gleitenden Kamera sah man sie
- * ticken. Gerechnet wird für einen Augenblick 35 ms voraus — so lange braucht
- * ein neues Bild der Quelle bis auf den Schirm. Ändert sich der Zoom (Fahrt,
- * Geste vorbei, Schnitt), wird sofort und dann im vollen Takt neu gebaut
- * (`zoomTrack`), damit die Größe nie zu einem anderen Zoom gehört.
+ * DAS GRAUE ENDET UNTER DER MITTE DES FAHRZEUGS. Vorher endete es an seinem
+ * Heck, und weil es nur mit dem Takt nachkam, während die 3D-Ebene jedes Bild
+ * weiterfährt, öffnete und schloss sich dort ein Spalt — „eine graue Linie,
+ * die du drüberlegst". Unter der Mitte verdeckt das Fahrzeug den Übergang;
+ * solange das Ende darunter bleibt, darf es hinterherkommen (`hiddenHalfM`).
+ * Es liegt etwas breiter als die Akzentlinie, damit deren Kantenglättung
+ * nicht als farbiger Saum am Grau stehen bleibt.
+ *
+ * DER TAKT: Mit der 3D-Ebene bekommt sie alle 300 ms den Weg der nächsten
+ * 800 ms (`LiveModels.setMotion`, ohne Durchgang hier) — und das Ende des
+ * Grauen nur so oft, wie es nötig ist, um unter dem Fahrzeug zu bleiben (beim
+ * langen Zug etwa einmal je Sekunde). Jeder Durchgang hier ist ein Commit,
+ * jede neue Quelle ein neuer Kachelschnitt — beides fiel genau in die Gesten
+ * („Navigieren ruckelt, vor allem wenn sich das Ding bewegt"). Nur was die
+ * Karte selbst zeichnet (Punkt weit draußen, Fähre), wird wie bisher so oft
+ * neu gesetzt, dass es je Schritt höchstens anderthalb Punkte vorankommt.
  *
  * Jeder Durchgang betrifft nur DIESES Bauteil (eigener Zustand), und darin nur
  * die Fahrzeug-Quelle — die übrigen Quellen sind als fertige Elemente
  * vorgehalten und werden nicht neu durchlaufen. Die Strecke liegt in einer
- * eigenen Quelle, die sich nie ändert; das schon Gefahrene wird in Stücken von
- * einem halben Kilometer „eingefroren", und nur das letzte Stück fährt mit dem
- * Fahrzeug mit.
+ * eigenen Quelle, die sich nie ändert; das schon Gefahrene wird in Stücken
+ * eingefroren, und nur das letzte Stück fährt mit.
  *
  * Eingehängt wird alles auf einmal, solange die Live-Ansicht offen ist, und
  * nichts davon wechselt dazwischen (keine bedingten Ebenen) — eine abgebaute
@@ -63,14 +81,35 @@ type ExtrusionProps = Extract<LayerProps, { type: "fill-extrusion" }>;
 
 /** Über so viele Zoomstufen blendet 2D in 3D über. */
 const FADE = 0.6;
-/** Ab so vielen Metern Rückstand wird das Gefahrene eingefroren. */
-const FREEZE_M = 500;
-/** Takt: höchstens so oft je Sekunde … */
-const MAX_HZ = 20;
+/**
+ * Das Gefahrene wird in Stücken dieser Länge (m) eingefroren; das letzte Stück
+ * fährt in der Fahrzeug-Quelle mit und beginnt ein Stück VOR dem Eingefrorenen.
+ * Die zwei Quellen kommen nicht im selben Bild an — ohne Überlappung blitzte
+ * beim Nachrücken für ein Bild die Akzentfarbe durch. Nachgerückt wird deshalb
+ * auch nie weiter als um eine Stücklänge auf einmal.
+ */
+const FREEZE_M = 1200;
+/** Takt ohne 3D-Ebene: höchstens so oft je Sekunde … */
+const MAX_HZ = 10;
 /** … und so weit (Bildpunkte) kommt das Fahrzeug je Schritt höchstens voran. */
-const STEP_PX = 0.6;
+const STEP_PX = 1.5;
+/**
+ * So weit voraus bekommt die 3D-Ebene den Weg (`LiveModels.setMotion`) — sie
+ * rechnet dazwischen jedes Bild selbst. Der Takt kommt dafür, solange es
+ * fährt, spätestens alle `NATIVE_TICK_MS` (Luft für einen hängenden Strang).
+ */
+const MOTION_AHEAD_MS = 800;
+const NATIVE_TICK_MS = 300;
 /** Vorlauf für den Weg der Daten bis auf den Schirm (Quelle → Kachel → Bild). */
 const LEAD_MS = 35;
+/** So lange (ms) braucht eine neue Quelle ungefähr, bis sie im Bild ist. */
+const SOURCE_LAG_MS = 120;
+/**
+ * Breite des Grauen — etwas mehr als die Akzentlinie (4): Deren Kanten sind
+ * geglättet (rund ein Gerätepixel), unter gleich breitem Grau blieb davon ein
+ * farbiger Saum stehen, und das Grau sah aufgelegt aus statt eingefärbt.
+ */
+const DONE_WIDTH = 4.7;
 /**
  * Der regelmäßige Takt beginnt erst, wenn die Karte unten eingeblendet ist
  * (220 ms) — jeder Durchgang schreibt laufende Reanimated-Werte verspätet
@@ -129,14 +168,43 @@ interface Props {
   zoom: ZoomTrack;
   /** false = Takt anhalten (Tab nicht im Bild, App im Hintergrund). */
   running: boolean;
+  /** Kennung der nativen Karte — für die 3D-Ebene (`modules/live-models`). */
+  nativeTag: () => number | null;
 }
 
-export const LiveVehicleLayer = memo(function LiveVehicleLayer({ model, zoom, running }: Props) {
+export const LiveVehicleLayer = memo(function LiveVehicleLayer({ model, zoom, running, nativeTag }: Props) {
   const accent = useAccent();
   const style = useResolvedMapStyle();
   const light = style === "light";
   const z3d = useMemo(() => threeDZoom(model), [model]);
   const plane = model.kind === "plane";
+  /**
+   * DIE 3D-EBENE IN DER KARTE (`modules/live-models`): Bahn, Bus und Flugzeug
+   * als echte Netze, fest in der Welt nach Fahrtrichtung — einmal eingehängt,
+   * dann bekommt sie Strecke, Fahrzeug und mit jedem Takt den Weg der nächsten
+   * halben Sekunde; Lage, Wagenkette und Größe rechnet sie jedes Bild selbst.
+   * Ohne das Modul (iOS) bleibt es beim 2D-Punkt.
+   */
+  const native = LiveModels.available && liveModelConfig(model, accent.solid) != null;
+  const nativeTagRef = useRef(nativeTag);
+  nativeTagRef.current = nativeTag;
+  useEffect(() => {
+    if (!native) return;
+    const tag = nativeTagRef.current();
+    if (tag == null) return;
+    // Unter die Beschriftung der Halte — sie bleibt über dem Fahrzeug lesbar.
+    void LiveModels.attach(tag, "live-stop-label");
+    return () => {
+      void LiveModels.detach();
+    };
+  }, [native]);
+  useEffect(() => {
+    if (!native) return;
+    const cfg = liveModelConfig(model, accent.solid);
+    if (!cfg) return;
+    if (model.kind !== "plane") LiveModels.setRoute(model.coords.flat(), model.cum);
+    LiveModels.setVehicle(cfg.kind, cfg.head, cfg.mid, cfg.params);
+  }, [native, model, accent.solid]);
 
   /** Die Strecke — fest für die ganze Sitzung (bis neue Daten kommen). */
   const lineJson = useMemo(
@@ -152,35 +220,52 @@ export const LiveVehicleLayer = memo(function LiveVehicleLayer({ model, zoom, ru
   const first = useMemo(() => model.frameAt(Date.now()), [model]);
   const { height } = useWindowDimensions();
   const [stopsJson, setStopsJson] = useState(() => stopsCollection(model, first));
-  const [doneJson, setDoneJson] = useState(() => compact({ type: "FeatureCollection", features: [] }));
   /**
    * Das erste Bild schon für den Zoom, auf dem das Fahrzeug zuerst zu sehen
    * ist: Die Ansicht beginnt mit dem Folgen, und die Kamera springt (Schnitt)
    * oder gleitet auf dessen Stufe (`LiveOverlay`). Mit dem Zoom der Tafel
-   * gebaut, stünde nach dem Schnitt kurz ein zu großes Fahrzeug da — der
+   * gebaut, stünde nach dem Schnitt kurz ein zu großer Fährenkörper da — der
    * Neubau wartet, solange das Blatt noch hinausfährt (`isTransitionBusy`).
+   * Das Gefahrene ist schon im ersten Bild da (eingefroren bis kurz davor).
    */
-  const [initialVeh] = useState(() => {
-    const z = useSearchStore.getState().liveFollow
-      ? cameraTarget(model, first, 0, height).zoom
+  const [initial] = useState(() => {
+    const z0 = useSearchStore.getState().liveFollow
+      ? cameraTarget(model, first, viewHeading(model, first), height).zoom
       : zoom.at(Date.now());
-    return vehicleCollection(model, first, z, 0, accent.solid);
+    const frozen = Math.max(0, first.d - FREEZE_M);
+    return {
+      frozen,
+      done: lineFeature(model, 0, frozen),
+      veh: vehicleCollection(model, first, z0, { from: frozen - FREEZE_M, to: first.d }, !native),
+    };
   });
-  const [vehJson, setVehJson] = useState(initialVeh.json);
-  const [ptJson, setPtJson] = useState(initialVeh.ptJson);
+  const [doneJson, setDoneJson] = useState(initial.done);
+  const [vehJson, setVehJson] = useState(initial.veh.json);
+  const [ptJson, setPtJson] = useState(initial.veh.ptJson);
 
-  const accentRef = useRef(accent.solid);
-  accentRef.current = accent.solid;
   const mountedAtRef = useRef(Date.now());
+  /**
+   * Bis wohin eingefroren ist — über einen Neustart des Takts hinweg (frische
+   * Daten jede Minute, Tab zurück). Gilt das Eingefrorene einer früheren
+   * Fassung der Fahrt, wird es aus der neuen geschnitten.
+   */
+  const frozenRef = useRef(initial.frozen);
+  const doneModelRef = useRef(model);
 
   useEffect(() => {
     if (!running) return;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let stopped = false;
-    let frozenD = 0;
+    let frozen = frozenRef.current;
+    if (doneModelRef.current !== model) {
+      doneModelRef.current = model;
+      setDoneJson(lineFeature(model, 0, frozen));
+    }
     let stage = "";
     let lastVeh = "";
     let lastPt = "";
+    /** Wann das Ende des Grauen wieder fällig ist (mit 3D-Ebene). */
+    let tailAt = 0;
     const step = () => {
       if (stopped) return;
       if (timer) {
@@ -193,55 +278,97 @@ export const LiveVehicleLayer = memo(function LiveVehicleLayer({ model, zoom, ru
         return;
       }
       const now = Date.now();
+      const p0 = performance.now();
       const frame = model.frameAt(now + LEAD_MS);
       const z = zoom.at(now);
-      const mpp = metersPerPixel(z, frame.position[1]);
-      const { json, ptJson: pt, rear } = vehicleCollection(model, frame, z, frozenD, accentRef.current);
-      // Rückwärts (neue Daten mit anderer Verspätung): neu einfrieren.
-      if (rear < frozenD - 1 || rear - frozenD > Math.max(FREEZE_M, 40 * mpp)) {
-        frozenD = Math.max(0, rear);
-        setDoneJson(
-          compact({
-            type: "Feature",
-            geometry: { type: "LineString", coordinates: sliceLine(model.coords, model.cum, 0, frozenD) },
-            properties: {},
-          }),
+      const lat = frame.position[1];
+      const mpp = metersPerPixel(z, lat);
+      const moving = frame.speed > 0.1;
+      // Die 3D-Ebene: wo es jetzt ist und gleich — dazwischen rechnet sie selbst.
+      if (native) {
+        const t1 = now + MOTION_AHEAD_MS;
+        const f0 = model.frameAt(now);
+        const f1 = model.frameAt(t1);
+        LiveModels.setMotion(
+          plane
+            ? [now, f0.position[0], f0.position[1], f0.drawAltitude, f0.heading, t1, f1.position[0], f1.position[1], f1.drawAltitude, f1.heading]
+            : [now, f0.d, t1, f1.d],
         );
       }
-      if (json !== lastVeh) {
-        lastVeh = json;
-        setVehJson(json);
+      /**
+       * Was die Karte aus diesem Takt zeichnet, braucht jeden Takt: der Punkt
+       * weit draußen, der Körper der Fähre, ohne 3D-Ebene der Schatten des
+       * Flugzeugs. Sonst geht es nur um das Ende des Grauen unter der Mitte —
+       * es kommt so oft, dass es um höchstens 35 % der verdeckten Hälfte
+       * vor- oder nachläuft, und gerechnet für die Mitte der Zeit, in der es
+       * zu sehen sein wird. Durchgespielt an echten Fahrten (Bus: kürzestes
+       * Fahrzeug, Stop-and-go): bis 250 ms Verzug der Quelle bleibt es darunter.
+       */
+      const perTick = !native || model.kind === "ferry" || z < z3d;
+      const tailEvery = moving
+        ? Math.min(1000, Math.max(150, (700 * hiddenHalfM(model, z, lat, z3d)) / frame.speed))
+        : 1000;
+      let doneTo = frame.d;
+      let send = perTick;
+      if (!perTick && now >= tailAt) {
+        send = true;
+        tailAt = now + tailEvery;
+        doneTo = model.frameAt(now + SOURCE_LAG_MS + tailEvery / 2).d;
       }
-      // Der Punkt nur, solange die 2D-Gestalt zu sehen ist: Er trägt Symbole,
-      // und jede neue Symbol-Quelle lässt die Karte alle Beschriftungen neu
-      // platzieren (siehe `vehicleCollection`).
-      if (z < z3d && pt !== lastPt) {
-        lastPt = pt;
-        setPtJson(pt);
+      if (send) {
+        if (doneTo < frozen - 1) {
+          // Rückwärts (neue Daten mit anderer Verspätung): neu einfrieren.
+          frozen = frozenRef.current = Math.max(0, doneTo - FREEZE_M);
+          setDoneJson(lineFeature(model, 0, frozen));
+        } else if (doneTo - frozen > 2 * FREEZE_M) {
+          frozen = frozenRef.current = frozen + FREEZE_M;
+          setDoneJson(lineFeature(model, 0, frozen));
+        }
+        const { json, ptJson: pt } = vehicleCollection(model, frame, z, { from: frozen - FREEZE_M, to: doneTo }, !native);
+        if (json !== lastVeh) {
+          lastVeh = json;
+          setVehJson(json);
+        }
+        // Der 2D-Punkt nur, solange er zu sehen ist — er trägt Symbole, und jede
+        // neue Symbol-Quelle lässt die Karte alle Beschriftungen neu platzieren.
+        if (z < z3d && pt !== lastPt) {
+          lastPt = pt;
+          setPtJson(pt);
+        }
       }
       const nextStage = `${frame.stopIndex}|${frame.nextIndex}|${frame.phase}`;
       if (nextStage !== stage) {
         stage = nextStage;
         setStopsJson(stopsCollection(model, frame));
       }
-      // So oft, dass ein Schritt höchstens STEP_PX weit ist (siehe oben).
-      const pxPerS = frame.speed / mpp;
-      const hz = zoom.changing(now)
-        ? MAX_HZ
-        : frame.speed > 0.1
-          ? Math.max(2, Math.min(MAX_HZ, pxPerS / STEP_PX))
-          : 1;
-      timer = setTimeout(step, 1000 / hz);
+      probeTick(performance.now() - p0);
+      let next: number;
+      if (perTick) {
+        // So oft, dass ein Schritt höchstens STEP_PX weit ist (siehe oben).
+        const hz = zoom.changing(now)
+          ? MAX_HZ
+          : moving
+            ? Math.max(4, Math.min(MAX_HZ, frame.speed / mpp / STEP_PX))
+            : 1;
+        next = 1000 / hz;
+      } else {
+        next = moving ? Math.min(NATIVE_TICK_MS, tailAt - now) : 1000;
+      }
+      timer = setTimeout(step, Math.max(16, next));
     };
-    // Sprung oder Übergang der Kamera: sofort neu bauen, auch vor dem Takt.
-    const unsubscribe = zoom.subscribe(step);
+    // Sprung oder Übergang der Kamera: sofort neu — auch das Ende des Grauen,
+    // denn hineingezoomt verdeckt das Fahrzeug weniger Strecke.
+    const unsubscribe = zoom.subscribe(() => {
+      tailAt = 0;
+      step();
+    });
     timer = setTimeout(step, Math.max(0, mountedAtRef.current + ARM_MS - Date.now()));
     return () => {
       stopped = true;
       unsubscribe();
       if (timer) clearTimeout(timer);
     };
-  }, [model, running, zoom, z3d]);
+  }, [model, running, zoom, native, plane, z3d]);
 
   /**
    * DER FLUG IN DER LUFT — die Linie als Bogen, wie die Flugbögen der Routen
@@ -288,7 +415,7 @@ export const LiveVehicleLayer = memo(function LiveVehicleLayer({ model, zoom, ru
   const donePaint = useMemo<LineProps["paint"]>(
     () => ({
       "line-color": light ? "#A3A8AE" : style === "satellite" ? "#B9B9BE" : "#5A5A60",
-      "line-width": 4,
+      "line-width": DONE_WIDTH,
       "line-opacity": groundOpacity,
     }),
     [light, style, groundOpacity],
@@ -399,7 +526,7 @@ export const LiveVehicleLayer = memo(function LiveVehicleLayer({ model, zoom, ru
   const dotPaint = useMemo<CircleProps["paint"]>(
     () => ({
       // Kein Punkt unter dem Flugzeug — es zeigt seine Richtung selbst.
-      "circle-radius": plane ? 0 : 15,
+      "circle-radius": plane ? 0 : DOT_RADIUS_PX,
       "circle-color": dot.fill,
       "circle-stroke-color": "#F4F4F5",
       "circle-stroke-width": plane ? 0 : 2.5,
@@ -412,8 +539,8 @@ export const LiveVehicleLayer = memo(function LiveVehicleLayer({ model, zoom, ru
     () =>
       plane
         ? {
+            // Weit draußen das Flugzeug von oben, gedreht nach Kurs (nah: 3D-Ebene).
             "icon-image": "live-plane",
-            // 30 Punkte — mit 20 ging es im Hof (48) unter.
             "icon-size": 0.75,
             "icon-rotate": ["get", "hdg"],
             "icon-rotation-alignment": "map",
