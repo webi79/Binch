@@ -12,6 +12,8 @@
  * oder null wenn der Punkt außerhalb aller modellierten Länder liegt.
  */
 
+import tzLookup from "tz-lookup";
+
 type Polygon = Array<[number, number]>; // [lng, lat]
 
 /** Ray-Casting-Algorithmus: schneidet eine waagerechte Linie vom Punkt nach
@@ -188,4 +190,32 @@ export function countryFromCoord(lat: number, lng: number): string | null {
     if (pointInPolygon(lng, lat, polygon)) return country;
   }
   return null;
+}
+
+/** Zeitzone (IANA) → Land, wie es in `locations.country` steht. */
+export const ZONE_COUNTRY: Record<string, string> = {
+  "Europe/Paris": "France", "Europe/Berlin": "Germany", "Europe/Busingen": "Germany", "Europe/Warsaw": "Poland",
+  "Europe/Brussels": "Belgium", "Europe/Amsterdam": "Netherlands", "Europe/Luxembourg": "Luxembourg",
+  "Europe/Vienna": "Austria", "Europe/Zurich": "Switzerland", "Europe/Prague": "Czech Republic",
+  "Europe/Bratislava": "Slovakia", "Europe/Budapest": "Hungary", "Europe/Rome": "Italy", "Europe/Madrid": "Spain",
+  "Atlantic/Canary": "Spain", "Europe/Lisbon": "Portugal", "Atlantic/Madeira": "Portugal", "Atlantic/Azores": "Portugal",
+  "Europe/London": "United Kingdom", "Europe/Dublin": "Ireland", "Europe/Copenhagen": "Denmark",
+  "Europe/Vaduz": "Liechtenstein", "Europe/Ljubljana": "Slovenia", "Europe/Zagreb": "Croatia",
+  "Europe/Stockholm": "Sweden", "Europe/Oslo": "Norway", "Europe/Monaco": "Monaco",
+};
+
+/**
+ * Land über die ZEITZONE der Lage (tz-lookup) — an Grenzen viel genauer als
+ * die Polygone oben, die auf 5–15 km danebenliegen: Die Vollprüfung vom
+ * 22.10.2026 fand Lam und Spiegelau (Bayerischer Wald) als „Czech Republic",
+ * Goch als „Netherlands", Irrhausen (Eifel) als „Belgium" und Niedaltdorf
+ * (Saarland) als „France" — der Import warf solche Halte als „fremd" weg.
+ * `null`, wenn die Zone keinem bekannten Land gehört.
+ */
+export function countryFromZone(lat: number, lng: number): string | null {
+  try {
+    return ZONE_COUNTRY[tzLookup(lat, lng)] ?? null;
+  } catch {
+    return null;
+  }
 }

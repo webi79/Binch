@@ -282,6 +282,12 @@ export async function boardStopIds(
     label?: string | null;
     type?: string | null;
     kinds?: readonly string[] | null;
+    /**
+     * Ein einzelner Bus-Steig einer Station (scripts/lib/gtfsStands.ts): nur
+     * der GTFS-Halt genau dort, nicht seine ganze Station — sonst zeigte der
+     * Mast auf der einen Straßenseite auch die Busse der anderen.
+     */
+    standOnly?: boolean;
   },
 ): Promise<string[]> {
   const wanted = wantedFamilies(args.kinds, args.type);
@@ -333,7 +339,7 @@ export async function boardStopIds(
     const familyExpr = ROUTE_FAMILY_SQL(sql`r.type`);
     const nearbyRows = (await db.execute(sql`
       WITH cand AS (
-        SELECT stop_id, parent_station, location_type, name,
+        SELECT stop_id, parent_station, location_type, name, latitude::float8 AS lat, longitude::float8 AS lon,
                (latitude::float8 - ${lat}) * (latitude::float8 - ${lat})
                  + ((longitude::float8 - ${lon}) * ${cosLat}) * ((longitude::float8 - ${lon}) * ${cosLat}) AS d2
         FROM gtfs_stops
@@ -344,7 +350,7 @@ export async function boardStopIds(
         ORDER BY d2
         LIMIT 12
       )
-      SELECT c.stop_id, c.parent_station, c.location_type, c.name, c.d2,
+      SELECT c.stop_id, c.parent_station, c.location_type, c.name, c.lat, c.lon, c.d2,
         ARRAY(
           SELECT DISTINCT ${familyExpr}
           FROM (
@@ -370,12 +376,16 @@ export async function boardStopIds(
         parent_station: string | null;
         location_type: number | null;
         name: string | null;
+        lat: number;
+        lon: number;
         d2: number;
         families: string[] | null;
       }>;
     };
     const wantsRail = (wanted?.has("train") || wanted?.has("metro")) ?? false;
-    let best: { stopId: string; parent: string | null; score: number } | null = null;
+    let best: { stopId: string; parent: string | null; score: number; lat: number; lon: number } | null = null;
+    /** Passende Halte mit Lage — für den Steig-Modus (alle am selben Punkt). */
+    const fitting: Array<{ stopId: string; lat: number; lon: number; locType: number | null }> = [];
     for (const c of nearbyRows.rows ?? []) {
       const fams = c.families ?? [];
       // Ohne eine einzige Fahrt ergäbe der Halt nur eine leere Tafel.
@@ -385,12 +395,28 @@ export async function boardStopIds(
       const nameMatch = sameStopName(args.label, c.name);
       const limitM = nameMatch || wantsRail ? radiusM : 150;
       if (distM > limitM) continue;
+      fitting.push({ stopId: c.stop_id, lat: Number(c.lat), lon: Number(c.lon), locType: c.location_type });
       let score = distM;
       if (nameMatch) score -= 150;
       if (wantsRail && c.location_type === 1) score -= 60;
-      if (!best || score < best.score) best = { stopId: c.stop_id, parent: c.parent_station, score };
+      if (!best || score < best.score) {
+        best = { stopId: c.stop_id, parent: c.parent_station, score, lat: Number(c.lat), lon: Number(c.lon) };
+      }
     }
     if (!best) return [];
+    /**
+     * Steig-Modus: alle Bahnsteig-Halte bis 5 m um den gewählten — Feeds führen
+     * dieselbe Bucht mehrfach (Abbekerk Busstation, Steig B: zwei Kennungen
+     * auf demselben Punkt, eine mit 14, eine mit 321 Fahrten); der Import fasst
+     * sie ebenso zu EINEM Steig zusammen (STAND_MERGE_M in gtfsStands.ts).
+     */
+    if (args.standOnly) {
+      const b = best;
+      const near = fitting
+        .filter((f) => f.locType !== 1 && 111_000 * Math.hypot(f.lat - b.lat, (f.lon - b.lon) * cosLat) <= 5)
+        .map((f) => f.stopId);
+      return near.length > 0 ? near : [b.stopId];
+    }
     const parentOrSelf = best.parent ?? best.stopId;
     const idsRows = (await db.execute(sql`
       SELECT stop_id FROM gtfs_stops
@@ -459,6 +485,8 @@ export async function getScheduledStopBoard(args: {
   label?: string | null;
   type?: string | null;
   kinds?: readonly string[] | null;
+  /** Nur dieser Steig, nicht seine Station (siehe `boardStopIds`). */
+  standOnly?: boolean;
 }): Promise<StopBoardResponse | null> {
   if (!args.country) return null;
   const feedId = FEED_ID_BY_COUNTRY[args.country];

@@ -357,11 +357,15 @@ export function BinchTabBar() {
    * da gilt die Reihenfolge im Layout, und die Leiste lag plötzlich ÜBER der
    * Haltestelle: Beim Tipp auf eine Abfahrt tauchte sie auf, solange die Details
    * von rechts hereinglitten. Dieselbe Bedingung wie `covered` dort, nur mit
-   * offener Haltestelle — ein Wahrheitswert, also ein Durchgang je Wechsel.
+   * offenem Blatt — ein Wahrheitswert, also ein Durchgang je Wechsel.
+   *
+   * Dasselbe Blatt zeigt auch eine STADT (Verbindungen dorthin). Die fehlte
+   * hier: Beim Öffnen einer Verbindung aus dem Stadt-Blatt kam die Leiste
+   * während der Einfahrt der Details hervor.
    */
   const underCoveredStop = useSearchStore(
     (st) =>
-      st.selectedStop != null &&
+      (st.selectedStop != null || st.selectedCity != null) &&
       (st.selectedResult != null ||
         st.legTimelineOverlayOpen ||
         st.directTripResult != null ||

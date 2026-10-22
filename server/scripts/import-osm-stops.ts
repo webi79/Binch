@@ -238,7 +238,22 @@ async function main(): Promise<void> {
     });
   }
 
-  console.log(`[osm:${COUNTRY}] kept ${rows.length} stops (skipped: ${skippedNoName} no-name, ${skippedNoCoords} no-coords, ${skippedUnclassified} unclassified)`);
+  /**
+   * Bewusst entfernte Masten (`location_replacements`, meist OSM-Dubletten neben
+   * dem Fahrplan-Halt — scripts/apply-stop-replacements.ts) nicht wieder anlegen:
+   * Sonst stünden nach jedem Import wieder zwei Marker am selben Mast.
+   */
+  const replaced = new Set(
+    (
+      await pool.query<{ old_code: string }>(`SELECT old_code FROM location_replacements WHERE old_code LIKE 'osm:%'`)
+    ).rows.map((r) => r.old_code),
+  );
+  const before = rows.length;
+  const kept = rows.filter((r) => !replaced.has(r.code));
+  rows.length = 0;
+  rows.push(...kept);
+
+  console.log(`[osm:${COUNTRY}] kept ${rows.length} stops (skipped: ${skippedNoName} no-name, ${skippedNoCoords} no-coords, ${skippedUnclassified} unclassified, ${before - rows.length} entfernt/ersetzt)`);
 
   for (let i = 0; i < rows.length; i += CHUNK) {
     const batch = rows.slice(i, i + CHUNK);

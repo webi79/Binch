@@ -30,6 +30,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { pool } from "../src/db/client.js";
 import tzLookup from "tz-lookup";
+import { ZONE_COUNTRY } from "../src/lib/country-from-coord.js";
 import { normalizeName, dedupCategory, haversineMeters } from "./lib/locationDedup.js";
 import { buildMunicipalityResolver, type PlacePoint } from "./lib/stopMunicipality.js";
 
@@ -345,7 +346,7 @@ async function sectionDups(): Promise<Change[]> {
     WITH a AS (
       SELECT code, latitude, longitude, latitude::float8 AS lat, longitude::float8 AS lon, country,
              trim(regexp_replace(lower(label_fold), '[^[:alnum:]]+', ' ', 'g')) AS nl
-      FROM locations WHERE type IN ('BUS', 'TRAIN') AND latitude IS NOT NULL
+      FROM locations WHERE type IN ('BUS', 'TRAIN') AND latitude IS NOT NULL AND parent_code IS NULL
     )
     SELECT a.code AS a, b.code AS b
     FROM a JOIN LATERAL (
@@ -354,6 +355,9 @@ async function sectionDups(): Promise<Change[]> {
       WHERE l.latitude BETWEEN a.latitude - 0.00028 AND a.latitude + 0.00028
         AND l.longitude BETWEEN a.longitude - 0.0005 AND a.longitude + 0.0005
         AND l.type IN ('BUS', 'TRAIN') AND l.code > a.code AND l.country IS NOT DISTINCT FROM a.country
+        -- Steige (scripts/lib/gtfsStands.ts) sind nie Dubletten: Sie stehen
+        -- gewollt dicht beieinander und auf der Lage ihrer Station.
+        AND l.parent_code IS NULL
         AND 111320 * sqrt(power(l.latitude::float8 - a.lat, 2) + power((l.longitude::float8 - a.lon) * cos(radians(a.lat)), 2)) <= 30
         AND (trim(regexp_replace(lower(l.label_fold), '[^[:alnum:]]+', ' ', 'g')) = a.nl
              OR similarity(trim(regexp_replace(lower(l.label_fold), '[^[:alnum:]]+', ' ', 'g')), a.nl) >= 0.5)
@@ -580,16 +584,6 @@ async function sectionGbCaps(): Promise<Change[]> {
 // ---------------------------------------------------------------------------
 // country
 // ---------------------------------------------------------------------------
-const ZONE_COUNTRY: Record<string, string> = {
-  "Europe/Paris": "France", "Europe/Berlin": "Germany", "Europe/Busingen": "Germany", "Europe/Warsaw": "Poland",
-  "Europe/Brussels": "Belgium", "Europe/Amsterdam": "Netherlands", "Europe/Luxembourg": "Luxembourg",
-  "Europe/Vienna": "Austria", "Europe/Zurich": "Switzerland", "Europe/Prague": "Czech Republic",
-  "Europe/Bratislava": "Slovakia", "Europe/Budapest": "Hungary", "Europe/Rome": "Italy", "Europe/Madrid": "Spain",
-  "Atlantic/Canary": "Spain", "Europe/Lisbon": "Portugal", "Atlantic/Madeira": "Portugal", "Atlantic/Azores": "Portugal",
-  "Europe/London": "United Kingdom", "Europe/Dublin": "Ireland", "Europe/Copenhagen": "Denmark",
-  "Europe/Vaduz": "Liechtenstein", "Europe/Ljubljana": "Slovenia", "Europe/Zagreb": "Croatia",
-  "Europe/Stockholm": "Sweden", "Europe/Oslo": "Norway", "Europe/Monaco": "Monaco",
-};
 /**
  * Halte mit falschem Land. Nachgezählt über die Zeitzone der Lage: rund 40 000
  * — 6 730 der 7 605 OSM-Halte mit Land „Germany" liegen gar nicht in

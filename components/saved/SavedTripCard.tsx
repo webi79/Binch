@@ -27,6 +27,7 @@ import { changesText } from "@/lib/format/routeMeta";
 import { displayCode } from "@/lib/results/logos";
 import { haptic } from "@/lib/haptics";
 import { scaledStyles } from "@/lib/ui/compact";
+import { isLongDistance, TRANSIT_COLOR } from "@/lib/theme/transitColors";
 
 const C = {
   card: "#171719",
@@ -38,12 +39,14 @@ const C = {
 };
 
 const MODE_ICON = { FLIGHT: Plane, TRAIN: Train, BUS: Bus, CRUISE: Ship };
-const MODE_COLOR: Record<TravelMode, { bg: string; fg: string }> = {
-  FLIGHT: { bg: "#7FEA4D", fg: "#000000" },
-  TRAIN: { bg: "#FFD60A", fg: "#000000" },
-  BUS: { bg: "#9D5FE0", fg: "#FFFFFF" },
-  CRUISE: { bg: "#6B95B5", fg: "#FFFFFF" },
+/** Wie `ResultCard`: die Farben der Verkehrsmittel der ganzen App, Flug im Akzent. */
+const MODE_COLOR: Record<Exclude<TravelMode, "FLIGHT">, { bg: string; fg: string }> = {
+  TRAIN: { bg: TRANSIT_COLOR.regional, fg: "#FFFFFF" },
+  BUS: { bg: TRANSIT_COLOR.bus, fg: "#FFFFFF" },
+  CRUISE: { bg: TRANSIT_COLOR.ferry, fg: "#FFFFFF" },
 };
+/** Fernverkehr in DB-Rot — wie `ResultCard`. */
+const LONG_DISTANCE_COLOR = { bg: TRANSIT_COLOR.longDistance, fg: "#FFFFFF" };
 
 function formatDuration(minutes: number): string {
   const h = Math.floor(minutes / 60);
@@ -62,7 +65,12 @@ function SavedTripCardInner({ trip }: Props) {
   const t = useT();
   const accent = useAccent();
   const ModeIcon = MODE_ICON[trip.mode] ?? Plane;
-  const modeColor = MODE_COLOR[trip.mode];
+  const modeColor =
+    trip.mode === "FLIGHT"
+      ? { bg: accent.dark, fg: "#FFFFFF" }
+      : trip.mode === "TRAIN" && trip.legs?.some((l) => isLongDistance(l.product))
+        ? LONG_DISTANCE_COLOR
+        : MODE_COLOR[trip.mode];
 
   // Alle abgeleiteten Werte einmalig pro Trip berechnen.
   const { departStr, arriveStr, dateStr, originLabel, destLabel, stopLabel } =

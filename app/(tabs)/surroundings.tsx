@@ -45,7 +45,7 @@ import { EsriImageryLayer } from "@/components/surroundings/EsriImageryLayer";
 import { refreshEsriImagery, useEsriImagery } from "@/lib/imagery/esriImagery";
 import { haptic } from "@/lib/haptics";
 import { useResolvedMapStyle } from "@/lib/theme/mapStyleChoice";
-import { openStopSheet, stopSheetSnap } from "@/components/surroundings/stopSheetAnimation";
+import { openStopSheet, stopSheetOpenTarget, stopSheetSnap } from "@/components/surroundings/stopSheetAnimation";
 import { CityRouteLayers } from "@/components/surroundings/CityRouteLayers";
 import { WalkPathLayer } from "@/components/surroundings/WalkPathLayer";
 import { RouteLayer } from "@/components/surroundings/RouteLayer";
@@ -60,11 +60,12 @@ import { LocateFab, MapFabs } from "@/components/surroundings/MapFabs";
 import { CitySearchMorph, SEARCH_BAR_BARE } from "@/components/surroundings/CitySearchMorph";
 import { MapSkeleton } from "@/components/surroundings/MapSkeleton";
 import { SurroundingsSheet } from "@/components/surroundings/SurroundingsSheet";
+import { standDetail } from "@/lib/surroundings/standLabel";
 import { SearchBar } from "@/components/SearchBar";
 import { POPULAR_LOCATIONS } from "@/lib/data/popularLocations";
 import { useT } from "@/lib/i18n/useT";
 import type { Location } from "@/types/search";
-import { useSearchStore } from "@/stores/searchStore";
+import { useSearchStore, type SelectedStop } from "@/stores/searchStore";
 import {
   markersForMode,
   listForMode,
@@ -138,6 +139,43 @@ function resolveLocationCoord(loc: Location): { latitude: number; longitude: num
     if (hit) return hit.coord;
   }
   return null;
+}
+
+/**
+ * Ein Suchtreffer als Haltestelle fürs Blatt — mit derselben Kennung und
+ * Beschriftung wie seine Nadel auf der Karte (`airport:FRA`, `cruise:…`, sonst
+ * der Code der Tabelle, siehe lib/surroundings/mockData.ts und
+ * server/src/routes/surroundings.ts), damit das Blatt dasselbe zeigt wie nach
+ * einem Tipp auf die Nadel. Städte (`ALL`) haben keine Tafel.
+ */
+function stopForLocation(
+  loc: Location,
+  coord: { latitude: number; longitude: number },
+  here: { latitude: number; longitude: number } | null,
+): SelectedStop | null {
+  if (loc.type === "ALL") return null;
+  const dist = here ? distanceMeters(here, coord) : null;
+  const at = {
+    distanceMeters: dist == null ? undefined : Math.round(dist),
+    latitude: coord.latitude,
+    longitude: coord.longitude,
+  };
+  if (loc.type === "FLIGHT") {
+    const pin = AIRPORT_PINS.find((p) => p.iata === loc.code);
+    return {
+      code: `airport:${loc.code}`,
+      label: pin ? `${pin.name} (${pin.iata})` : loc.label,
+      kinds: ["airport"],
+      ...at,
+    };
+  }
+  if (loc.type === "CRUISE") {
+    const pin = CRUISE_PORT_PINS.find((p) => p.code === loc.code);
+    return { code: `cruise:${loc.code}`, label: pin?.name ?? loc.label, kinds: ["cruise"], ...at };
+  }
+  const kind =
+    loc.kind === "ferry" ? "cruise" : loc.kind ?? (loc.type === "BUS" ? "bus" : "train");
+  return { code: loc.code, label: loc.label, detail: loc.detail, platform: loc.platform, kinds: [kind], ...at };
 }
 
 /**
@@ -501,7 +539,8 @@ export default function SurroundingsScreen() {
    * unten die Tab-Leiste. Ist ein Blatt ganz aufgezogen, bleibt kaum Karte —
    * dann gar kein Rand statt eines Streifens.
    */
-  const visiblePadding = useCallback((): CameraPadding | undefined => {
+  /** `withStopSheet`: so, als stünde das Haltestellen-Blatt schon offen (siehe `flyAndShow`). */
+  const visiblePadding = useCallback((withStopSheet = false): CameraPadding | undefined => {
     const hidden = isMapChromeHidden();
     const fullTop = Math.max(60, insets.top + 12);
     const top = hidden ? 0 : (topBarBottomRef.current ?? 0);
@@ -514,7 +553,8 @@ export default function SurroundingsScreen() {
         bottomEdge = fullTop + targets.surroundings;
       }
     }
-    if (targets.stop != null) bottomEdge = Math.min(bottomEdge, fullTop + targets.stop);
+    const stopTarget = targets.stop ?? (withStopSheet ? stopSheetOpenTarget() : null);
+    if (stopTarget != null) bottomEdge = Math.min(bottomEdge, fullTop + stopTarget);
     if (bottomEdge - top < 160) return undefined;
     return { top, bottom: Math.max(0, screenHeight - bottomEdge), left: 0, right: 0 };
   }, [insets.top, insets.bottom, screenHeight]);
@@ -764,18 +804,43 @@ export default function SurroundingsScreen() {
    * Also erst anhalten, wenn die Einfahrt durch ist. Der Zuschlag deckt das
    * Bild ab, in dem die Kurve endet.
    */
-  const pickerOpen = useSearchStore((st) => st.locationPickerRequest !== null);
   const [pickerCoversMap, setPickerCoversMap] = useState(false);
+  /**
+   * Als Abonnement, nicht als Zustand — sonst rendert dieser ganze Bildschirm
+   * im Startbild der Einfahrt neu, nur um einen Zeitgeber zu stellen.
+   *
+   * Hier stand `useSearchStore((st) => st.locationPickerRequest !== null)`:
+   * Jedes Öffnen schickte damit den größten Bildschirm der App durch React,
+   * und sein Commit fiel in die ersten Bilder der Fahrt — wo er die Lage des
+   * Blattes verspätet zurückschreibt (feedback_reanimated_commit_race).
+   * Gemeldet als „die Such-Slide laggt beim Hochfahren". Gebraucht wird der
+   * Wert erst NACH der Fahrt.
+   */
   useEffect(() => {
-    // Beim Schließen SOFORT freigeben — dort ist es umgekehrt: Das Blatt fährt
-    // hinaus und die Karte soll schon wieder da sein, wenn es den Blick freigibt.
-    if (!pickerOpen) {
-      setPickerCoversMap(false);
-      return;
-    }
-    const id = setTimeout(() => setPickerCoversMap(true), PICKER_IN.duration + 40);
-    return () => clearTimeout(id);
-  }, [pickerOpen]);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const apply = (open: boolean) => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      // Beim Schließen SOFORT freigeben — dort ist es umgekehrt: Das Blatt fährt
+      // hinaus und die Karte soll schon wieder da sein, wenn es den Blick freigibt.
+      if (!open) {
+        setPickerCoversMap(false);
+        return;
+      }
+      timer = setTimeout(() => setPickerCoversMap(true), PICKER_IN.duration + 40);
+    };
+    apply(useSearchStore.getState().locationPickerRequest !== null);
+    const unsubscribe = useSearchStore.subscribe((st, prev) => {
+      const open = st.locationPickerRequest !== null;
+      if (open !== (prev.locationPickerRequest !== null)) apply(open);
+    });
+    return () => {
+      unsubscribe();
+      if (timer) clearTimeout(timer);
+    };
+  }, []);
   const pickerOverMap = pickerCoversMap;
   /** Liegt die Suche darüber? Dann ist die Karte sicher nicht zu sehen. */
   const searchOverMap = useSearchStore((st) => st.searchOverlayMode != null);
@@ -934,6 +999,18 @@ export default function SurroundingsScreen() {
    * darunter zum Halt (dessen Kacheln kennt die Karte noch), Überblendung.
    * Die Kamera geht VOR dem Zurücklegen des Zustands los — eingefroren wird das
    * Bild, bevor Ebenen wechseln.
+   *
+   * DAS BLATT ZWEI BILDER SPÄTER. Es fuhr bisher als Erstes los — und danach
+   * kamen auf denselben UI-Strang die beiden schwersten Brocken des Schließens:
+   * das Einfrieren des Bildes für den Schnitt (die Karte wird von der
+   * Grafikkarte zurückgelesen) und der Umbau (Banner, Karte, sechs Quellen und
+   * rund fünfzehn Ebenen der Live-Ansicht raus, sechzehn Marker-Ebenen wieder
+   * an). Beides fiel in die ersten Bilder der Einfahrt — gemeldet als „kleine
+   * Lags beim Schließen, wenn das Fahrzeug fährt": Dann ist der Halt meist weit
+   * weg, also ein Schnitt. Jetzt liegt beides VOR dem ersten Bild der Fahrt;
+   * eine Fahrt, die später anfängt, ruckelt nicht — eine, die unterwegs
+   * aufgehalten wird, schon. Den Rand fürs Blatt kennt die Kamera trotzdem
+   * schon (`visiblePadding(true)`).
    */
   const closeLive = useCallback(() => {
     probeMark("close-tap");
@@ -941,10 +1018,7 @@ export default function SurroundingsScreen() {
     haptic("button");
     const st = useSearchStore.getState();
     const stash = st.stashedSurroundings;
-    if (stash && (stash.selectedStop || stash.city)) {
-      openStopSheet();
-      holdSurroundingsSheet();
-    }
+    const reopen = !!(stash && (stash.selectedStop || stash.city));
     const at = stash?.selectedStop;
     const map = mapRef.current;
     if (at?.latitude != null && at.longitude != null) {
@@ -957,15 +1031,27 @@ export default function SurroundingsScreen() {
         pitch: 0,
         // Immer einen Rand mitgeben: Ohne behielte MapLibre den der Live-Ansicht
         // (Banner + Karte unten), und der Halt säße außerhalb der Mitte.
-        padding: visiblePadding() ?? { top: 0, bottom: 0, left: 0, right: 0 },
+        padding: visiblePadding(reopen) ?? { top: 0, bottom: 0, left: 0, right: 0 },
         cut: map.isFar(at.latitude, at.longitude, zoom),
       });
     } else {
       map?.resetNorth();
     }
     probeMark("close-cam");
+    // Im selben Durchgang wie das Ende der Live-Ansicht — sonst stünde das
+    // Auswahlfenster ein Bild lang da.
+    if (reopen) holdSurroundingsSheet();
     st.stopLive();
     probeMark("close-state");
+    if (reopen) {
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => {
+          // Inzwischen etwas anderes geöffnet (eine neue Live-Ansicht, Route)?
+          if (liveActiveRef.current || routeActiveRef.current) return;
+          openStopSheet();
+        }),
+      );
+    }
   }, [mode, visiblePadding, holdSurroundingsSheet]);
   useEffect(() => {
     if (!isFocused || !liveActive) return;
@@ -1378,6 +1464,7 @@ export default function SurroundingsScreen() {
         coord: { latitude: m.latitude, longitude: m.longitude },
         label: m.label,
         detail: m.detail,
+        platform: m.platform,
         selected: m.selected,
       }));
     }
@@ -1398,9 +1485,10 @@ export default function SurroundingsScreen() {
         kinds: l.kinds,
         distance: l.distance,
         lines: l.lines,
-        // Zusatz nur bei gleichnamigem Halt daneben („Stop RA") — als die
-        // vorhandene leise Plakette der Zeile, nicht im Namen.
-        badge: l.detail,
+        // Zusatz nur bei gleichnamigem Halt daneben („Stop RA") bzw. der
+        // Steig („Steig 3") — als die vorhandene leise Plakette der Zeile,
+        // nicht im Namen.
+        badge: standDetail(t, l.platform, l.detail),
         selected: l.selected,
       }));
     }
@@ -1454,6 +1542,7 @@ export default function SurroundingsScreen() {
         code: m.id,
         label: m.label ?? "",
         detail: m.detail,
+        platform: m.platform,
         distanceMeters: dist == null ? undefined : Math.round(dist),
         kinds: m.kinds && m.kinds.length > 0 ? m.kinds : [m.type],
         // Für den Fußweg vom Standort dorthin (WalkPathLayer).
@@ -1530,17 +1619,79 @@ export default function SurroundingsScreen() {
    * dass sie fertig gezeichnet ist. Ist sie ohnehin wach (schnelle Auswahl,
    * bevor der Riegel greift), fliegt sie sofort.
    */
-  const pendingFlyRef = useRef<{ lat: number; lng: number; zoom: number } | null>(null);
-  const flyToOrRemember = useCallback((lat: number, lng: number, zoom: number) => {
+  const pendingFlyRef = useRef<{ lat: number; lng: number; zoom: number; stop?: SelectedStop } | null>(null);
+  /**
+   * Mit `stop` öffnet sich danach das Blatt dieser Haltestelle — ERST die
+   * Kamera, DANN das Blatt, nacheinander.
+   *
+   * Erst lief beides im selben Moment, wie beim Tipp in der Liste
+   * (`focusStop`). Beim Suchtreffer kam aber noch mehr dazu: Die Karte wacht in
+   * genau dem Moment unter dem Wähler auf, und das Ziel liegt meist weit weg —
+   * also ein Bogenflug, hinaus bis auf den Globus und wieder hinein, mit
+   * Kacheln jeder Zwischenstufe. Darunter fuhr das Blatt herein: gemeldet als
+   * „sehr laggy, die Kamera rotiert". Jetzt ist ein weiter Weg ein SCHNITT
+   * (das alte Bild blendet über der neuen Stelle aus, `cut`), ein kurzer eine
+   * Gleitfahrt — beide schon auf den Ausschnitt über dem Blatt, das danach
+   * kommt (`visiblePadding(true)`). Das Blatt fährt auf eine ruhende Karte.
+   *
+   * Steht schon ein Blatt (eine andere Haltestelle), bleibt es stehen, und
+   * sein Inhalt wechselt erst, wenn die Kamera angekommen ist.
+   */
+  const showStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (showStopTimerRef.current) clearTimeout(showStopTimerRef.current);
+    },
+    [],
+  );
+  const flyAndShow = useCallback(
+    (lat: number, lng: number, zoom: number, stop?: SelectedStop) => {
+      if (showStopTimerRef.current) {
+        clearTimeout(showStopTimerRef.current);
+        showStopTimerRef.current = null;
+      }
+      const map = mapRef.current;
+      if (!stop) {
+        map?.flyTo(lat, lng, zoom, visiblePadding());
+        return;
+      }
+      const padding = visiblePadding(true);
+      let wait = 0;
+      if (map?.isFar(lat, lng, zoom)) {
+        map.followTo({
+          latitude: lat,
+          longitude: lng,
+          zoom,
+          bearing: cameraBearing.value,
+          pitch: cameraPitch.value,
+          padding,
+          cut: true,
+        });
+        wait = CUT_SETTLE_MS;
+      } else if (map) {
+        wait = map.flyTo(lat, lng, zoom, padding);
+      }
+      showStopTimerRef.current = setTimeout(() => {
+        showStopTimerRef.current = null;
+        // Inzwischen etwas anderes vor der Karte (Wähler, Suche, Live, Route)?
+        // Dann kommt das Blatt nicht mehr ungefragt dazwischen.
+        if (frozenRef.current || liveActiveRef.current || routeActiveRef.current) return;
+        if (sheetTargets().stop == null) openStopSheet();
+        selectStop(stop);
+      }, wait);
+    },
+    [selectStop, visiblePadding, cameraBearing, cameraPitch],
+  );
+  const flyToOrRemember = useCallback((lat: number, lng: number, zoom: number, stop?: SelectedStop) => {
     followUserRef.current = false;
     lastCityFitRef.current = null;
     if (!frozenRef.current) {
       pendingFlyRef.current = null;
-      mapRef.current?.flyTo(lat, lng, zoom, visiblePadding());
+      flyAndShow(lat, lng, zoom, stop);
       return;
     }
-    pendingFlyRef.current = { lat, lng, zoom };
-  }, [visiblePadding]);
+    pendingFlyRef.current = { lat, lng, zoom, stop };
+  }, [flyAndShow]);
   useEffect(() => {
     if (frozen || !mapTilesRendered) return;
     const target = pendingFlyRef.current;
@@ -1548,8 +1699,8 @@ export default function SurroundingsScreen() {
     pendingFlyRef.current = null;
     // Die Fahrt setzt den Rand ohnehin neu — eine offene Angleichung entfällt.
     pendingRealignRef.current = false;
-    mapRef.current?.flyTo(target.lat, target.lng, target.zoom, visiblePadding());
-  }, [frozen, mapTilesRendered, visiblePadding]);
+    flyAndShow(target.lat, target.lng, target.zoom, target.stop);
+  }, [frozen, mapTilesRendered, flyAndShow]);
 
   // Beim ersten GPS-Fix auf den Standort fliegen — Zoom je nach Modus.
   // Wird übersprungen wenn eine Route aktiv ist (dann fitten wir auf die Route).
@@ -2411,7 +2562,14 @@ export default function SurroundingsScreen() {
                   // Bushaltestelle näher dran (Stadt-Detail), bei Häfen mittel.
                   const zoom =
                     loc.type === "FLIGHT" ? 11 : loc.type === "CRUISE" ? 12 : 14;
-                  flyToOrRemember(coord.latitude, coord.longitude, zoom);
+                  // Eine Haltestelle öffnet dazu ihr Blatt, wie ein Tipp auf
+                  // ihre Nadel — sonst stand man nur vor ihr auf der Karte.
+                  flyToOrRemember(
+                    coord.latitude,
+                    coord.longitude,
+                    zoom,
+                    stopForLocation(loc, coord, latestCoordRef.current) ?? undefined,
+                  );
                 },
               })
             }
@@ -2483,6 +2641,14 @@ const CITY_FIT_MS = 820;
  * Kamera-Schnitts durch ist (mindestens 90 + 280 ms, siehe `coverCut`).
  */
 const SURROUNDINGS_HOLD_EXTRA_MS = 300;
+
+/**
+ * So lange (ms) nach einem Kamera-Schnitt zum Suchtreffer, bis das Blatt der
+ * Haltestelle hereinfährt (`flyAndShow`): Das alte Bild hält, bis die neue
+ * Stelle gezeichnet ist, höchstens 350 ms, und blendet dann in 280 ms aus
+ * (`coverCut`). Das Blatt beginnt im Ausblenden, über der fertigen Stelle.
+ */
+const CUT_SETTLE_MS = 520;
 
 /** Zoom für eine Stadt ohne zweiten Punkt (kein Standort) — die Stadt im Überblick. */
 const SINGLE_POINT_ZOOM = 11;

@@ -391,6 +391,23 @@ export const locations = pgTable(
      * als `detail`.
      */
     displayDetail: text("display_detail"),
+    /**
+     * Der Name des Halts im AKTUELLEN Fahrplan, geschrieben vom Monatsabgleich
+     * (`import-gtfs.ts`). `label` schreibt der Abgleich nie (teils von Hand
+     * korrigiert, und darüber gleichen Abgleich und Suche ab) — so hießen alte
+     * Zeilen weiter „Hbf Nord", obwohl der Fahrplan längst „Hauptbahnhof Nord"
+     * sagt. Grundlage für `displayName` (scripts/lib/stopNames.ts). NULL = Quelle
+     * ohne Abgleich (OSM, StaDa) — dann zählt `label`.
+     */
+    sourceName: text("source_name"),
+    /**
+     * Seit wann hier laut Fahrplan nichts mehr hält: kein Mast dieser Verkehrsart in der Nähe,
+     * geprüft nur gegen vollständige Fahrpläne (DE, NL, CH, England) und nur für Bus und Tram.
+     * Karte und Suche zeigen solche Halte nicht — gespeicherte Stationen, Verlauf und Tafeln
+     * finden sie weiter über den Code. NULL = bedient bzw. nicht prüfbar. Gesetzt (und bei neuer
+     * Bedienung wieder geleert) von `scripts/mark-unserved-stops.ts`.
+     */
+    unservedAt: timestamp("unserved_at", { withTimezone: true }),
     city: text("city"),
     country: text("country"),
     /**
@@ -435,6 +452,16 @@ export const locations = pgTable(
     kinds: text("kinds").array(),
     /** Datenquelle — für Updates und Debugging. "stada", "gtfs", "iata", "port", "local". */
     source: varchar("source", { length: 16 }),
+    /**
+     * Nur bei STEIGEN (Bussteig, Bahnsteig, Mast): der Code ihrer Station.
+     * Eine Station mit Steigen erscheint nicht selbst auf der Karte, sondern
+     * über ihre Steige — jeder Bus-Steig mit eigener Tafel. Die Suche zeigt
+     * dagegen nur die Station; deren Tafel umfasst alle Steige. Gesetzt von
+     * `scripts/lib/gtfsStands.ts` (Monatsabgleich).
+     */
+    parentCode: varchar("parent_code", { length: 64 }),
+    /** Steig-/Gleisbezeichnung aus dem Fahrplan („3", „A") — nur bei Steigen. */
+    platform: varchar("platform", { length: 16 }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
@@ -448,8 +475,28 @@ export const locations = pgTable(
     // Seq-Scan über ~400k Rows — der Surroundings-Call dauert dann mehrere
     // Sekunden, Map-Marker flackern weil der Client mit Cache-Daten arbeitet.
     geoIdx: index("idx_locations_geo").on(t.latitude, t.longitude),
+    // Steige einer Station; trägt auch die Frage der Karte „hat diese Station Steige?".
+    parentCodeIdx: index("idx_locations_parent_code").on(t.parentCode).where(sql`${t.parentCode} IS NOT NULL`),
   }),
 );
+
+/**
+ * Entfernte Haltestellen und ihr Ersatz (Okt. 2026): veraltete Zeilen, die kein
+ * aktueller Fahrplan mehr führt, und Kopien desselben Halts aus einem zweiten
+ * Fahrplan (Verbund neben gtfs.de) — jeweils mit dem Halt, der am selben Ort
+ * an ihre Stelle tritt. Gespeicherte Stationen, Suchverlauf und Tafeln, die die
+ * alte Kennung noch tragen, landen so beim Ersatz statt im Leeren; der
+ * Monatsabgleich legt eine entfernte Kennung nicht wieder an, solange ihr
+ * Ersatz daneben steht.
+ * Angelegt von `scripts/apply-stop-replacements.ts`.
+ */
+export const locationReplacements = pgTable("location_replacements", {
+  oldCode: varchar("old_code", { length: 64 }).primaryKey(),
+  newCode: varchar("new_code", { length: 64 }).notNull(),
+  /** „veraltet" (nicht mehr im Fahrplan) oder „doppelt" (Kopie aus einem zweiten Fahrplan). */
+  reason: varchar("reason", { length: 16 }).notNull(),
+  replacedAt: timestamp("replaced_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 /**
  * Städte aus GeoNames cities5000. Wird genutzt um Stops administrativ einer

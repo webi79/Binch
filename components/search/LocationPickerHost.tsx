@@ -8,7 +8,8 @@ import { useSearchStore } from "@/stores/searchStore";
 import { LocationPicker } from "./LocationPicker";
 import { subscribeLocationPreload } from "@/lib/nav/pickerPreload";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
-import { SHEET_IN, SHEET_OUT } from "@/lib/nav/overlayCover";
+import { PICKER_KEYBOARD_WAIT, SHEET_IN, SHEET_OUT } from "@/lib/nav/overlayCover";
+import { Keyboard } from "react-native";
 
 /** Stabile Vorgabe — ein Literal am Ort hebelt die Merk-Schranke des Wählers aus. */
 const NO_SUGGESTED: never[] = [];
@@ -237,8 +238,11 @@ export function LocationPickerHost() {
       // +80, nicht +20: Die Kurve ENDET bei `duration`, das letzte Bild wird
       // aber erst danach gezeichnet. Mit 20ms Abstand fiele der Commit noch in
       // dieses Bild — dieselbe Marge, die `markSheetMoving` für die Anmeldung
-      // benutzt.
-      (open ? SHEET_IN.duration : SHEET_OUT.duration) + 80,
+      // benutzt. Beim Schließen mit offener Tastatur startet die Fahrt erst,
+      // wenn sie unten ist (`PICKER_KEYBOARD_WAIT`) — so viel später also auch.
+      (open
+        ? SHEET_IN.duration
+        : SHEET_OUT.duration + (Keyboard.isVisible() ? PICKER_KEYBOARD_WAIT : 0)) + 80,
     );
     return () => clearTimeout(id);
   }, [request]);

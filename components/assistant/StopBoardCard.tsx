@@ -172,7 +172,12 @@ function StopBoardCardInner({ stop, initialBoard, initialData }: Props) {
       <Pressable
         onPress={() => {
           haptic("button");
-          useSearchStore.getState().selectStop({ code: stop.code, label: stop.label, detail: data?.stop?.detail });
+          useSearchStore.getState().selectStop({
+            code: stop.code,
+            label: stop.label,
+            detail: data?.stop?.detail,
+            platform: data?.stop?.platform,
+          });
           openStopSheet();
         }}
         style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}

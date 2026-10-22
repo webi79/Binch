@@ -1238,9 +1238,10 @@ function providerCode(name: string): string {
   return (parts[0]![0]! + parts[1]![0]!).toUpperCase();
 }
 
-/** Heuristische BG-Farbe pro Provider — DB-Rot für Bahn, Lime für Standard,
- *  bunt für die geläufigen OTAs. Damit hat jede Card visuell Wiedererkennung. */
-function providerColor(name: string): string {
+/** Heuristische BG-Farbe pro Provider — DB-Rot für Bahn, bunt für die
+ *  geläufigen OTAs, sonst `null`: dann die Akzentfarbe der App (früher fest
+ *  Lime, auch bei Mint). Damit hat jede Card visuell Wiedererkennung. */
+function providerColor(name: string): string | null {
   const n = name.toLowerCase();
   if (n.includes("expedia")) return "#FFC107";
   if (n.includes("kiwi")) return "#00A991";
@@ -1250,7 +1251,7 @@ function providerColor(name: string): string {
   if (n.includes("kayak")) return "#FF690F";
   if (n.includes("flix")) return "#73D700"; // FlixBus-Grün
   if (n.includes("bahn") || n.includes("db ") || n === "db") return "#E0394A"; // DB-Rot
-  return "#7FEA4D";
+  return null;
 }
 
 function CityRow({ head, tail }: { head: string; tail: string | null }) {
@@ -1295,8 +1296,10 @@ function ProviderCard({
   // (oft mit eigenem Hintergrund) ohne farbigen Rahmen daherkommt. Nur beim
   // Fallback ohne Logo nutzen wir die brand-getönte Box mit 2-Letter-Code.
   const hasLogo = !!provider.logo && !logoErrored;
-  const bgColor = hasLogo ? "transparent" : providerColor(provider.name);
-  const usesDarkText = bgColor === "#FFC107" || bgColor === "#7FEA4D";
+  const brand = hasLogo ? "transparent" : providerColor(provider.name);
+  const bgColor = brand ?? accent.solid;
+  // Dunkle Schrift auf den hellen Flächen: Expedia-Gelb und der Akzent.
+  const usesDarkText = brand === null || bgColor === "#FFC107";
   const isRec = provider.recommended === true;
   const showSupport = provider.support === true;
   const showBaggage = provider.carryOn !== undefined || provider.checked !== undefined;

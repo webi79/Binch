@@ -7,11 +7,12 @@ import { getStopBoard, resolveHafasByCoord, type StopBoardResponse, type StopBoa
 import { profileForStop, isAtRegionalProfile, type HafasProfileKey } from "../services/countryProfile.js";
 import { getFlightBoard } from "../services/flightInfoService.js";
 import { getScheduledStopBoard } from "../services/gtfsSchedule.js";
-import { getMotisStopBoard } from "../services/motisStops.js";
+import { getMotisStandBoard, getMotisStopBoard } from "../services/motisStops.js";
 import { ipLimiter } from "../util/rateLimit.js";
 import { AIRPORTS } from "../data/airports.js";
 import tzLookup from "tz-lookup";
 import { sameStopByName } from "../util/tripStopMatch.js";
+import { resolveReplacement } from "../services/locationReplacements.js";
 
 /**
  * Liefert die nächsten Abfahrten/Ankünfte einer Haltestelle. Wird vom
@@ -47,6 +48,11 @@ interface StopBoardApiResponse extends StopBoardResponse {
     detail?: string;
     tz?: string;
     servedBy?: { name: string; distanceM: number };
+    /**
+     * Steig-Bezeichnung („3") — nur bei einem einzelnen Bus- oder Tram-Steig einer
+     * Station (`isSingleStand`). Die App setzt ihr Wort davor („Steig 3").
+     */
+    platform?: string;
   };
 }
 
@@ -101,14 +107,29 @@ async function loadStopRow(code: string) {
       // (Frontend-Kategorien wie "tram"/"bus"/"subway"/"train"/"ferry").
       // Wird genutzt um Departures strikt nach Stop-Profile zu filtern.
       kinds: locations.kinds,
+      subtype: locations.subtype,
       latitude: locations.latitude,
       longitude: locations.longitude,
       country: locations.country,
+      parentCode: locations.parentCode,
+      platform: locations.platform,
     })
     .from(locations)
     .where(eq(locations.code, code))
     .limit(1);
   return rows[0] ?? null;
+}
+
+/**
+ * Ein einzelner Bus- oder Tram-Steig einer Station (scripts/lib/gtfsStands.ts)
+ * — seine Tafel zeigt nur, was an diesem Mast bzw. Gleis hält; die Karte zeigt
+ * beide einzeln. U-Bahn- und Bahn-Gleise zeigt sie je Station als EINEN
+ * Marker; deren Tafel bleibt die der Station (alle Gleise, beide Richtungen).
+ */
+function isSingleStand(stop: { parentCode: string | null; subtype: string | null; type: string | null }): boolean {
+  if (!stop.parentCode) return false;
+  if (stop.subtype) return stop.subtype === "BUS" || stop.subtype === "COACH" || stop.subtype === "TRAM";
+  return stop.type === "BUS";
 }
 
 /** Mappt ein HAFAS-Product (z.B. „regional", „tram", „bus", „suburban") auf
@@ -217,9 +238,10 @@ async function motisFallback(
   stop: { kinds: unknown; type: string | null },
 ): Promise<StopBoardApiResponse> {
   try {
-    const motis = await getMotisStopBoard(code, label, board);
+    const motis = await getMotisStopBoard(code, label, board, 25, (stop.kinds ?? null) as string[] | null);
     if (motis && motis.results.length > 0) {
-      return { ...motis, results: filterToStopKinds(motis.results, stop), stop: { code, label, hafasId } };
+      const { modeFiltered: _f, ...data } = motis;
+      return { ...data, results: filterToStopKinds(data.results, stop), stop: { code, label, hafasId } };
     }
   } catch {
     /* fällt unten auf empty */
@@ -274,7 +296,11 @@ export async function loadStopBoard(
   if (flight) return flight;
 
   const stop = await loadStopRow(code);
-  if (!stop) return null;
+  if (!stop) {
+    // Entfernter Halt (veraltet/doppelt) → die Tafel seines Ersatzes am selben Ort.
+    const replacement = await resolveReplacement(code);
+    return replacement && replacement !== code ? loadStopBoard(replacement, board, log) : null;
+  }
   const { source, ...data } = await boardForStop(code, stop, board, log);
   const tz = zoneAt(
     stop.latitude != null ? Number(stop.latitude) : null,
@@ -289,6 +315,9 @@ export async function loadStopBoard(
       ...(stop.displayDetail ? { detail: stop.displayDetail } : {}),
       ...(tz ? { tz } : {}),
       ...(servedBy ? { servedBy } : {}),
+      ...(isSingleStand(stop) && (stop.platform ?? data.stop.platform)
+        ? { platform: (stop.platform ?? data.stop.platform)! }
+        : {}),
     },
   };
 }
@@ -337,12 +366,41 @@ async function boardForStop(
     label: stop.label,
     type: stop.type,
     kinds: (stop.kinds ?? null) as string[] | null,
+    standOnly: isSingleStand(stop),
   });
   if (scheduled) {
     return {
       ...scheduled,
       stop: { code: code, label: stop.label, hafasId: stop.hafasId },
     } satisfies StopBoardApiResponse;
+  }
+
+  /**
+   * Ein Bus- oder Tram-Steig: nur SEINE Abfahrten (MOTIS, auf den Steig beschränkt). Auch
+   * eine leere Tafel endet hier — der Steig ist gefunden, es fährt nur gerade
+   * nichts; die Bahn fragen hieße das Kontingent der Suche verbrauchen und
+   * bekäme ohnehin die ganze Station. Kennt MOTIS den Steig nicht, geht es
+   * unten weiter: Tafel der Station, jede Zeile mit ihrem Steig.
+   */
+  if (isSingleStand(stop) && stop.latitude != null && stop.longitude != null) {
+    const stand = await getMotisStandBoard(code, stop.label, Number(stop.latitude), Number(stop.longitude), board)
+      .catch(() => null);
+    if (stand) {
+      const { platform, ...data } = stand;
+      return {
+        ...data,
+        // Kein Filter nach Verkehrsart: Die Tafel kommt genau von diesem Mast
+        // (MOTIS, Umkreis 5 m) — was dort hält, gehört auf seine Tafel.
+        results: data.results,
+        // Steig-Bezeichnung: unsere, sonst die von MOTIS (gtfs.de kennt sie oft nicht).
+        stop: {
+          code: code,
+          label: stop.label,
+          hafasId: stop.hafasId,
+          ...((stop.platform ?? platform) ? { platform: (stop.platform ?? platform)! } : {}),
+        },
+      };
+    }
   }
 
   // Country-Routing: ÖPNV-Coverage hängt am richtigen HAFAS-Profile.
@@ -382,15 +440,18 @@ async function boardForStop(
   // Köln Hbf „Gleis 85-91" statt 1-11 → wir verwerfen solche Werte lieber,
   // siehe util/platform.ts). DB bleibt der Rückfall, wenn MOTIS nichts hat.
   if (profile === "db") {
-    const motis = await getMotisStopBoard(code, stop.label, board).catch(() => null);
-    if (motis && motis.results.length > 0) {
+    const motis = await getMotisStopBoard(code, stop.label, board, 25, (stop.kinds ?? null) as string[] | null)
+      .catch(() => null);
+    if (motis && (motis.results.length > 0 || motis.modeFiltered)) {
       // Gefiltert wie der HAFAS-Zweig. Bleibt danach NICHTS übrig, trotzdem
       // hier enden (leere Tafel) und nicht zur DB weiterreichen: MOTIS hat den
       // Halt gefunden, er hat nur gerade keine Abfahrt dieser Verkehrsart —
-      // eine DB-Anfrage ginge nur aufs Kontingent der Suche.
+      // eine DB-Anfrage ginge nur aufs Kontingent der Suche. Seit MOTIS schon
+      // nach Art filtert, heißt eine leere Antwort dasselbe.
+      const { modeFiltered: _f, ...data } = motis;
       return {
-        ...motis,
-        results: filterToStopKinds(motis.results, stop),
+        ...data,
+        results: filterToStopKinds(data.results, stop),
         stop: { code: code, label: stop.label, hafasId: stop.hafasId },
       };
     }

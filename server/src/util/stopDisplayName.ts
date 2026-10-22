@@ -322,6 +322,21 @@ const GENERIC_TAIL: Array<{ re: RegExp; countries?: string[]; keepPart?: boolean
     keepPart: false,
   },
   { re: /\s*\[\s*\]$/, keepPart: false },
+  // Deutscher Fahrplan: Datenstand-Vermerk („12 Apostel (Oschersleben)
+  // [INSA-Version 20250312]") — kein Teil des Namens.
+  { re: /\s*\[\s*(INSA-Version[^\]]*)\]$/i, countries: ["Germany"], keepPart: false },
+  // … und Hinweise in eckigen Klammern (VBB: „Berlin ZOB [Fernbus]", „Berlin,
+  // Haeckelstr. [Ausstieg]", „… [Tram]") — unterscheiden gleichnamige Halte.
+  { re: /\s*\[\s*([^[\]]{1,40}?)\s*\]$/, countries: ["Germany"] },
+  // RMV (Hessen): Richtung hinter einem Strich, „N" = nach, „V" = von („Bad
+  // Hersfeld Ziegelei | NNiederaula"); „| Nxxx" ist ein Platzhalter.
+  { re: /\s*\|\s*(N\s*xxx)$/i, countries: ["Germany"], keepPart: false },
+  {
+    re: /\s*\|\s*([NV]\s*[A-ZÄÖÜ][^|]*)$/,
+    countries: ["Germany"],
+    part: (p) => `${p[0] === "N" ? "Richtung" : "von"} ${p.slice(1).trim()}`,
+  },
+  { re: /\s*\|\s*([^|]+)$/, countries: ["Germany"] },
   // … Steige in eckigen Klammern trennen dagegen gleichnamige Halte:
   // „Szent Gellért utca [A]", „Mecseknádasd, Ófalui elágazás [6]" (Ungarn),
   // „Stacja Mława [stan. 2]" (Polen)

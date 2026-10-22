@@ -30,7 +30,7 @@
  * eigenen dunklen Fuß und der Körper sähe gestreift aus.
  */
 import { bearingAt, offsetM, pointAt } from "./geo";
-import { isLongDistance } from "./motion";
+import { isLongDistance, TRANSIT_COLOR } from "@/lib/theme/transitColors";
 import type { LiveVehicleKind, LngLat } from "./types";
 
 /** Kopfform eines Bodenfahrzeugs. */
@@ -60,18 +60,18 @@ const TYRE = "#1F2329";
 export function lookFor(kind: LiveVehicleKind, product: string | null): VehicleLook {
   switch (kind) {
     case "bus":
-      return { units: 1, unitLength: 12.5, gap: 0, width: 2.55, height: 3.4, accent: "#9D5FE0", front: "box", build: "bus" };
+      return { units: 1, unitLength: 12.5, gap: 0, width: 2.55, height: 3.4, accent: TRANSIT_COLOR.bus, front: "box", build: "bus" };
     case "tram":
-      return { units: 3, unitLength: 10, gap: 0.5, width: 2.4, height: 3.4, accent: "#3A3F47", front: "round", build: "rail" };
+      return { units: 3, unitLength: 10, gap: 0.5, width: 2.4, height: 3.4, accent: TRANSIT_COLOR.tram, front: "round", build: "rail" };
     case "subway":
-      return { units: 4, unitLength: 18, gap: 0.8, width: 2.65, height: 3.5, accent: "#4C7BF0", front: "round", build: "rail" };
+      return { units: 4, unitLength: 18, gap: 0.8, width: 2.65, height: 3.5, accent: TRANSIT_COLOR.subway, front: "round", build: "rail" };
     case "ferry":
-      return { units: 1, unitLength: 60, gap: 0, width: 14, height: 9, accent: "#6B95B5", front: "bow", build: "ferry" };
+      return { units: 1, unitLength: 60, gap: 0, width: 14, height: 9, accent: TRANSIT_COLOR.ferry, front: "bow", build: "ferry" };
     case "train":
     default:
       return isLongDistance(product)
-        ? { units: 8, unitLength: 25, gap: 1.2, width: 2.95, height: 4.0, accent: "#FFD60A", front: "sleek", build: "rail" }
-        : { units: 4, unitLength: 26, gap: 1.2, width: 2.95, height: 4.3, accent: "#FFD60A", front: "round", build: "rail" };
+        ? { units: 8, unitLength: 25, gap: 1.2, width: 2.95, height: 4.0, accent: TRANSIT_COLOR.longDistance, front: "sleek", build: "rail" }
+        : { units: 4, unitLength: 26, gap: 1.2, width: 2.95, height: 4.3, accent: TRANSIT_COLOR.regional, front: "round", build: "rail" };
   }
 }
 

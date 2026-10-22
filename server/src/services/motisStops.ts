@@ -1,6 +1,8 @@
 import { motisFetch } from "./motisClient.js";
 import { cleanPlatform } from "../util/platform.js";
 import { resolveMotisStopId } from "./motisPlaces.js";
+import { BoundedTtlCache } from "../util/boundedCache.js";
+import { sameStopByName } from "../util/tripStopMatch.js";
 import type { StopBoard, StopBoardItem, StopBoardResponse } from "./stopInfoService.js";
 
 /**
@@ -172,12 +174,39 @@ function dedupeBoard(items: StopBoardItem[]): StopBoardItem[] {
  * @returns StopBoardResponse oder null, wenn der Stop bei MOTIS nicht auflösbar
  *          ist (dann soll der Aufrufer sein eigenes Empty-Result liefern).
  */
+/**
+ * Unsere Verkehrsarten → MOTIS-`mode` für `/v6/stoptimes`. Die Bahn einzeln:
+ * „RAIL" fasst bei MOTIS die U-Bahn mit ein (München Hbf: 18 von 31).
+ */
+const MOTIS_MODES: Record<string, string[]> = {
+  train: ["HIGHSPEED_RAIL", "LONG_DISTANCE", "NIGHT_RAIL", "REGIONAL_FAST_RAIL", "REGIONAL_RAIL", "SUBURBAN"],
+  subway: ["SUBWAY"],
+  tram: ["TRAM", "FUNICULAR", "CABLE_CAR", "AREAL_LIFT"],
+  bus: ["BUS", "COACH"],
+  ferry: ["FERRY"],
+};
+
+/** `mode`-Liste zu den Verkehrsarten eines Halts — null, wenn keine bekannt ist (dann alle). */
+export function motisModesFor(kinds: readonly string[] | null | undefined): string | null {
+  const modes = new Set<string>();
+  for (const k of kinds ?? []) for (const m of MOTIS_MODES[k] ?? []) modes.add(m);
+  return modes.size > 0 ? [...modes].join(",") : null;
+}
+
+/**
+ * @param kinds  Verkehrsarten des Halts — MOTIS liefert dann nur diese. Ohne
+ *               den Filter an der Quelle blieben an gemischten Stationen von
+ *               25 Abfahrten oft eine Handvoll übrig: am U-Bahnhof München Hbf
+ *               7 (U2/U4/U5/U7), weil Tram, S-Bahn und Bus den Rest füllten —
+ *               U1 und U8 fehlten (Prüfung 22.10.2026).
+ */
 export async function getMotisStopBoard(
   code: string,
   label: string,
   board: StopBoard,
   limit = 25,
-): Promise<StopBoardResponse | null> {
+  kinds?: readonly string[] | null,
+): Promise<(StopBoardResponse & { modeFiltered: boolean }) | null> {
   // Vorher stand hier `motisGeocode(label)` — das nimmt schlicht den ERSTEN
   // STOP-Treffer. Für „Köln Hbf" ist das ein Bahnsteig-Knoten aus dem
   // Referenzdaten-Feed, an dem Stadtbahn-Halte mit hängen: die Tafel zeigte
@@ -208,23 +237,9 @@ export async function getMotisStopBoard(
    * (nachgemessen: mit und ohne identisch): Die Kopplung an `arriveBy` ist die
    * Falle. Wer sie einmal übersieht, baut sie wieder ein.
    */
-  // Doppelt so viele roh holen — der Feed-Dedup halbiert die Liste grob.
-  const url =
-    `/v6/stoptimes?stopId=${encodeURIComponent(stop.id)}` +
-    `&n=${Math.min(limit * 2, 60)}&direction=LATER` +
-    `${board === "arrivals" ? "&arriveBy=true" : ""}`;
-  let raw: { stopTimes?: MotisStopTime[] };
-  try {
-    raw = (await motisFetch(url)) as { stopTimes?: MotisStopTime[] };
-  } catch {
-    return null;
-  }
-
-  const mapped = (raw.stopTimes ?? [])
-    .map((st, i) => toItem(st, board, i))
-    .filter((r): r is StopBoardItem => r !== null);
-  const results = dedupeBoard(mapped).slice(0, limit);
-
+  const modes = motisModesFor(kinds);
+  const results = await fetchStopTimes(stop.id, modes ? `&mode=${modes}` : "", board, limit);
+  if (!results) return null;
   const now = Date.now();
   return {
     results,
@@ -233,5 +248,138 @@ export async function getMotisStopBoard(
     validUntil: new Date(now + 60_000).toISOString(),
     // Der Halt, den MOTIS gewählt hat — ohne Namenstreffer der nächste.
     source: { name: stop.name, latitude: stop.lat ?? null, longitude: stop.lon ?? null },
+    modeFiltered: modes != null,
+  };
+}
+
+/** `/v6/stoptimes` eines Halts → Tafelzeilen; null bei MOTIS-Fehler. */
+async function fetchStopTimes(
+  stopId: string,
+  extra: string,
+  board: StopBoard,
+  limit: number,
+): Promise<StopBoardItem[] | null> {
+  // Doppelt so viele roh holen — der Feed-Dedup halbiert die Liste grob.
+  const url =
+    `/v6/stoptimes?stopId=${encodeURIComponent(stopId)}` +
+    `&n=${Math.min(limit * 2, 60)}&direction=LATER${extra}` +
+    `${board === "arrivals" ? "&arriveBy=true" : ""}`;
+  let raw: { stopTimes?: MotisStopTime[] };
+  try {
+    raw = (await motisFetch(url)) as { stopTimes?: MotisStopTime[] };
+  } catch {
+    return null;
+  }
+  const mapped = (raw.stopTimes ?? [])
+    .map((st, i) => toItem(st, board, i))
+    .filter((r): r is StopBoardItem => r !== null);
+  return dedupeBoard(mapped).slice(0, limit);
+}
+
+// ---------------------------------------------------------------------------
+// Tafel EINES Steigs
+// ---------------------------------------------------------------------------
+
+/**
+ * So weit um den Steig zählen Abfahrten noch zu ihm. Derselbe Wert, mit dem
+ * der Import gleichnamige Steige zu einem zusammenfasst (scripts/lib/
+ * gtfsStands.ts): DELFI führt manche Bucht doppelt, 2–4 m nebeneinander
+ * („Hörde Bf" 1:01 und 1:11).
+ */
+const STAND_RADIUS_M = 5;
+
+interface MotisMapStop {
+  stopId?: string;
+  name?: string;
+  lat?: number;
+  lon?: number;
+  track?: string;
+}
+
+/** Der Steig bei MOTIS: Kennung und Steig-Bezeichnung („03" → „3"). */
+interface MotisStand {
+  id: string;
+  platform: string | null;
+}
+
+/** Steig-Code → der Steig bei MOTIS (auch „nicht gefunden"). Stabil → 24 h. */
+const standIdCache = new BoundedTtlCache<MotisStand | null>(4000, 24 * 60 * 60 * 1000);
+
+function metersBetween(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const x = (lon2 - lon1) * Math.cos((((lat1 + lat2) / 2) * Math.PI) / 180) * 111_320;
+  const y = (lat2 - lat1) * 110_574;
+  return Math.hypot(x, y);
+}
+
+/**
+ * Die MOTIS-Kennung eines Steigs — über seine LAGE. Der Fahrplan unserer
+ * Steige (gtfs.de) und der von Transitous (DELFI) beschreiben dieselben
+ * Masten mit denselben Koordinaten, aber anderen Nummern; `/v1/map/stops`
+ * liefert alle Halte eines kleinen Ausschnitts samt Steigen
+ * (`de-DELFI_de:05913:228:3:03` für Hörde Bf, Steig 03).
+ *
+ * Genommen wird der nächste Halt bis `STAND_RADIUS_M` mit passendem Namen —
+ * ohne Namenstreffer nur, was praktisch auf dem Punkt steht (≤ 2 m).
+ */
+async function resolveMotisStand(code: string, label: string, lat: number, lon: number): Promise<MotisStand | null> {
+  const cached = standIdCache.get(code);
+  if (cached !== undefined) return cached;
+  const dLat = 0.0002;
+  const dLon = 0.0002 / Math.max(Math.cos((lat * Math.PI) / 180), 0.01);
+  let stops: MotisMapStop[];
+  try {
+    const raw = await motisFetch(
+      `/v1/map/stops?min=${(lat - dLat).toFixed(6)},${(lon - dLon).toFixed(6)}` +
+        `&max=${(lat + dLat).toFixed(6)},${(lon + dLon).toFixed(6)}`,
+    );
+    stops = Array.isArray(raw) ? (raw as MotisMapStop[]) : [];
+  } catch {
+    // Vorübergehender Fehler: nicht als „gibt es nicht" merken.
+    return null;
+  }
+  let best: { stand: MotisStand; d: number } | null = null;
+  for (const s of stops) {
+    if (!s.stopId || s.lat == null || s.lon == null) continue;
+    const d = metersBetween(lat, lon, s.lat, s.lon);
+    const ok = d <= 2 || (d <= STAND_RADIUS_M && !!s.name && sameStopByName(label, s.name));
+    if (ok && (!best || d < best.d)) best = { stand: { id: s.stopId, platform: cleanPlatform(s.track) ?? null }, d };
+  }
+  const stand = best?.stand ?? null;
+  standIdCache.set(code, stand);
+  return stand;
+}
+
+/**
+ * Tafel EINES Steigs einer Station — nur die Abfahrten, die an diesem Mast
+ * halten (Hörde Bf, Steig 03: 400/430/439/451), nicht die der Nachbarsteige.
+ * `radius` + `exactRadius=true` beschränken `/v6/stoptimes` auf Halte, die
+ * physisch im Umkreis des Steigs stehen; ohne sie liefert MOTIS die ganze
+ * Station.
+ *
+ * @returns null, wenn MOTIS den Steig nicht kennt — der Aufrufer zeigt dann
+ *          die Tafel der Station (jede Zeile mit ihrem Steig). Sonst die Tafel
+ *          samt Steig-Bezeichnung von MOTIS (`platform`) — gtfs.de führt sie
+ *          bei vielen Steigen nicht (Hörde Bf), DELFI bei Transitous schon.
+ */
+export async function getMotisStandBoard(
+  code: string,
+  label: string,
+  lat: number,
+  lon: number,
+  board: StopBoard,
+  limit = 25,
+): Promise<(StopBoardResponse & { platform: string | null }) | null> {
+  const stand = await resolveMotisStand(code, label, lat, lon);
+  if (!stand) return null;
+  const results = await fetchStopTimes(stand.id, `&radius=${STAND_RADIUS_M}&exactRadius=true`, board, limit);
+  if (!results) return null;
+  const now = Date.now();
+  return {
+    results,
+    fetchedAt: new Date(now).toISOString(),
+    validUntil: new Date(now + 60_000).toISOString(),
+    // Der Steig selbst — liegt per Definition auf unserem Punkt.
+    source: { name: label, latitude: lat, longitude: lon },
+    platform: stand.platform,
   };
 }

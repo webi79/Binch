@@ -108,6 +108,15 @@ export function openStopSheet(): void {
   reportStopSheetTarget(controller.getMid());
 }
 
+/**
+ * Wohin das Blatt beim Öffnen fährt (`openStopSheet`) — für eine Kamerafahrt,
+ * die schon VOR dem Blatt den Ausschnitt darüber ansteuert (Suchtreffer im
+ * Karten-Tab). `null`, solange das Blatt nicht angelegt ist.
+ */
+export function stopSheetOpenTarget(): number | null {
+  return controller ? controller.getMid() : null;
+}
+
 /** Ohne Aufrufer — bleibt als Gegenstück stehen, benutzt aber dieselbe Vorgabe. */
 export function closeStopSheet(): void {
   if (!controller) return;

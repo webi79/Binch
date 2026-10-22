@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { and, eq, gte, isNotNull, lte, or, sql } from "drizzle-orm";
+import { and, eq, gte, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import { ipLimiter } from "../util/rateLimit.js";
@@ -29,11 +29,10 @@ type MarkerKind = "train" | "subway" | "bus" | "tram" | "airport";
 
 /**
  * Art eines Halts für die Frage „derselbe Halt?" auf der Karte (siehe `MERGE_M`).
- * Tram und U-Bahn sind EINE Art — wie in services/gtfsSchedule.ts: Wie eine
- * Stadtbahn eingestuft wird, regelt jede Quelle anders („Köln Dom/Hbf" steht
- * einmal als Tram, einmal als U-Bahn in der Tabelle — dieselbe Station).
+ * U-Bahn und Tram getrennt: Die U-Bahn zeigt die Karte je Station als EINEN
+ * Marker, Tram-Steige dagegen einzeln wie Bus-Steige (Nutzer, 22.10.2026).
  */
-type StopFamily = "rail" | "metro" | "bus" | "ferry";
+type StopFamily = "rail" | "subway" | "tram" | "bus" | "ferry";
 
 function familyOf(subtype: string | null, type: string): StopFamily {
   switch (subtype) {
@@ -42,8 +41,9 @@ function familyOf(subtype: string | null, type: string): StopFamily {
     case "SUBURBAN":
       return "rail";
     case "SUBWAY":
+      return "subway";
     case "TRAM":
-      return "metro";
+      return "tram";
     case "FERRY":
       return "ferry";
     case "BUS":
@@ -96,6 +96,11 @@ interface SurroundingsMarker {
   label?: string;
   /** Unterscheidungs-Zusatz, nur bei gleichnamigem Nachbarn (`display_detail`). */
   detail?: string;
+  /**
+   * Steig-Bezeichnung („3", „A") — nur bei einem einzelnen Bus- oder Tram-Steig einer
+   * Station. Die App setzt ihr Wort davor („Steig 3", „Stand 3", „Quai 3").
+   */
+  platform?: string;
 }
 
 interface LineBadge {
@@ -107,6 +112,8 @@ interface SurroundingsListItem {
   id: string;
   name: string;
   detail?: string;
+  /** Wie beim Marker: Steig-Bezeichnung eines einzelnen Bus- oder Tram-Steigs. */
+  platform?: string;
   kinds: MarkerKind[];
   distance: string;
   lines?: LineBadge[];
@@ -204,6 +211,10 @@ async function fetchTransitNearby(
       source: locations.source,
       latitude: locations.latitude,
       longitude: locations.longitude,
+      parentCode: locations.parentCode,
+      platform: locations.platform,
+      /** Angezeigter Name der Station eines Steigs — gruppiert wird nach ihm (siehe unten). */
+      parentName: sql<string | null>`(SELECT coalesce(p.display_name, p.label) FROM locations p WHERE p.code = ${locations.parentCode})`,
     })
     .from(locations)
     .where(
@@ -215,6 +226,15 @@ async function fetchTransitNearby(
         gte(locations.longitude, String(longitude - lngDelta)),
         lte(locations.longitude, String(longitude + lngDelta)),
         typeFilter,
+        /**
+         * Eine Station mit Steigen zeigt die Karte über ihre Steige, nicht
+         * selbst: In Hörde fünf Bus-Steige (je eigene Tafel) und ein „U" aus
+         * den beiden Gleisen — statt eines Bus-Markers für alles. Die Station
+         * bleibt für die Suche (Tafel über alle Steige).
+         */
+        sql`NOT EXISTS (SELECT 1 FROM locations s WHERE s.parent_code = ${locations.code})`,
+        // Halte, an denen laut Fahrplan nichts mehr hält (scripts/mark-unserved-stops.ts).
+        isNull(locations.unservedAt),
       ),
     )
     // Pre-Sortierung über euklidischen Quadratabstand (kein sqrt, schnell) —
@@ -322,19 +342,31 @@ async function fetchTransitNearby(
    * Bahnhof waren auf der Karte nicht zu erreichen.
    *
    * Jetzt nur noch innerhalb derselben ART (`familyOf`) und nah beieinander:
-   *   • Bahnhof, Stadtbahn (Tram/U-Bahn), Fähre: gleicher Name bis `MERGE_M` —
-   *     derselbe Bahnhof aus mehreren Quellen (StaDa, Fahrplan, OSM), 30–100 m
-   *     versetzt.
-   *   • Bus: gleichnamige Halte sind fast immer die beiden Fahrtrichtungen,
-   *     jede mit eigener Tafel — eigene Marker. Nur exakt deckungsgleiche
-   *     Zeilen (≤ 2 m) gelten als doppelt eingelesen. Echte Dubletten entfernt
-   *     ohnehin die Bereinigung (scripts/fix-stop-data.ts).
+   *   • Bahnhof, U-Bahn, Fähre: gleicher Name bis `MERGE_M` — derselbe
+   *     Bahnhof aus mehreren Quellen (StaDa, Fahrplan, OSM), 30–100 m versetzt,
+   *     bzw. die Gleise einer Station (scripts/lib/gtfsStands.ts).
+   *   • Bus und Tram: gleichnamige Halte sind die Steige bzw. beiden
+   *     Fahrtrichtungen, jeder mit eigener Tafel — eigene Marker. Nur exakt
+   *     deckungsgleiche Zeilen (≤ 2 m) gelten als doppelt eingelesen. Tram
+   *     einzeln seit 22.10.2026 (Nutzer: „Bussteige einzeln, Tram einzeln,
+   *     U-Bahn und Zug können so bleiben").
    */
-  const MERGE_M: Record<StopFamily, number> = { rail: 400, metro: 200, ferry: 200, bus: 2 };
+  const MERGE_M: Record<StopFamily, number> = { rail: 400, subway: 200, tram: 2, ferry: 200, bus: 2 };
   const groups: Item[][] = [];
   const groupsByKey = new Map<string, number[]>();
   for (const item of candidates) {
-    const norm = normalizeName(item.row.label);
+    /**
+     * Verglichen wird der ANGEZEIGTE Name, nicht der Quellname: In München
+     * heißen die Fahrplan-Zeilen noch „Munich München Hbf" (alter Orts-Vorsatz),
+     * StaDa „München Hbf" — zwei Bahn-Marker auf demselben Bahnhof.
+     *
+     * Und ein Steig zählt mit dem Namen SEINER STATION: Übernommene Zeilen (MVG
+     * „Hbf" unter „Hbf (U, Tram)", OSM-Masten) behalten ihren eigenen Namen —
+     * die Gleise einer U-Bahn-Station wurden sonst zwei Marker. Bleibt vom
+     * Namen nichts übrig („Hbf"), zählt der Quellname.
+     */
+    const norm =
+      normalizeName(item.row.parentName ?? item.row.displayName ?? item.row.label) || normalizeName(item.row.label);
     if (!norm) {
       groups.push([item]);
       continue;
@@ -398,8 +430,20 @@ async function fetchTransitNearby(
     .sort((a, b) => a.canonical.dist - b.canonical.dist)
     .slice(0, effectiveLimit);
 
+  /**
+   * Die Steig-Bezeichnung nur dort, wo der Marker GENAU EIN Bus- oder Tram-Steig
+   * ist — ein U-Bahn-Marker steht für alle Gleise seiner Station, sein
+   * „Gleis 21" wäre nur das zufällig gewählte.
+   */
+  const platformOf = (s: MergedMarker): string | undefined => {
+    const row = s.canonical.row;
+    const family = familyOf(row.subtype, row.type);
+    return row.parentCode && row.platform && (family === "bus" || family === "tram") ? row.platform : undefined;
+  };
+
   const markers: SurroundingsMarker[] = sorted.map((s, i) => {
     const primaryKind = s.kinds[0] ?? subtypeToKind(s.canonical.row.subtype, s.canonical.row.type);
+    const platform = platformOf(s);
     return {
       id: s.canonical.row.code,
       type: primaryKind,
@@ -410,6 +454,7 @@ async function fetchTransitNearby(
       // Stationsnamen im Detail-Sheet zeigen kann (ohne extra Roundtrip).
       label: s.canonical.row.displayName ?? s.canonical.row.label,
       ...(s.canonical.row.displayDetail ? { detail: s.canonical.row.displayDetail } : {}),
+      ...(platform ? { platform } : {}),
       selected: i === 0,
     };
   });
@@ -418,6 +463,7 @@ async function fetchTransitNearby(
     id: s.canonical.row.code,
     name: s.canonical.row.displayName ?? s.canonical.row.label,
     ...(s.canonical.row.displayDetail ? { detail: s.canonical.row.displayDetail } : {}),
+    ...(platformOf(s) ? { platform: platformOf(s) } : {}),
     kinds: s.kinds,
     distance: formatDistance(s.canonical.dist),
     selected: i === 0,

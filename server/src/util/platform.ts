@@ -49,11 +49,14 @@ export function cleanPlatform(raw?: string | null): string | undefined {
   if (!stripped) return undefined;
 
   // Ohne jede Ziffer ist es keine Gleisangabe (z.B. „SEinw") → lieber nichts.
-  if (!/\d/.test(stripped)) return undefined;
+  // Ausnahme: EIN Buchstabe — so heißen Bus-Steige („A", „K"; Prag, britische
+  // Busbahnhöfe). Zwei und mehr bleiben verdächtig.
+  if (!/\d/.test(stripped)) return /^[A-Za-z]$/.test(stripped) ? stripped.toUpperCase() : undefined;
 
   // Unplausibel hohe Nummer → Quelldaten-Müll, nicht anzeigen (siehe oben).
   const asNumber = Number(stripped);
   if (Number.isFinite(asNumber) && asNumber >= MAX_PLAUSIBLE_PLATFORM) return undefined;
 
-  return stripped;
+  // „03" ist Steig 3 — DELFI schreibt Bus-Steige zweistellig.
+  return /^0+\d/.test(stripped) ? stripped.replace(/^0+/, "") : stripped;
 }

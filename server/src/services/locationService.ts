@@ -35,6 +35,35 @@ export interface ClientLocation {
   /** HAFAS-Station-ID (UIC 7-stellig). Wenn gesetzt → Trip-Search kann die
    *  Station direkt verwenden, ohne db-rest-Live-Lookup für die ID-Auflösung. */
   hafasId?: string;
+  /**
+   * Genaue Verkehrsart eines Halts (aus `subtype`) — für das Symbol in der
+   * Trefferliste: Eine U-Bahn-Station steht in den Daten oft als `BUS`, wenn
+   * an ihr auch Busse fahren, und zwei gleichnamige Treffer (S-Bahnhof und
+   * Bushaltestelle „Dortmund Universität") müssen sich unterscheiden lassen.
+   */
+  kind?: StopKind;
+}
+
+export type StopKind = "train" | "subway" | "tram" | "bus" | "ferry";
+
+function stopKindOf(subtype: string | null, type: LocationType): StopKind | undefined {
+  switch (subtype) {
+    case "LONG_DISTANCE":
+    case "REGIONAL":
+    case "SUBURBAN":
+      return "train";
+    case "SUBWAY":
+      return "subway";
+    case "TRAM":
+      return "tram";
+    case "FERRY":
+      return "ferry";
+    case "BUS":
+    case "COACH":
+      return "bus";
+    default:
+      return type === "TRAIN" ? "train" : type === "BUS" ? "bus" : undefined;
+  }
 }
 
 /**
@@ -485,7 +514,15 @@ async function searchLocalDb(
    * Flughäfen betrifft das nicht — dort bleibt es, wie es war.
    */
   const hasPlace = sql`(${locations.type} NOT IN ('TRAIN', 'BUS') OR ${locations.latitude} IS NOT NULL)`;
-  const where = and(textFilter, hasPlace, typeFilter);
+  /**
+   * Steige nicht vorschlagen — die Suche zeigt ihre STATION („Dortmund Hörde
+   * Bf"), deren Tafel alle Steige umfasst. Die Steige selbst gibt es auf der
+   * Karte, jeder mit eigener Tafel (scripts/lib/gtfsStands.ts).
+   */
+  const notStand = sql`${locations.parentCode} IS NULL`;
+  /** Halte ohne Bedienung laut Fahrplan (scripts/mark-unserved-stops.ts) — ihre Tafel bliebe leer. */
+  const served = sql`${locations.unservedAt} IS NULL`;
+  const where = and(textFilter, hasPlace, notStand, served, typeFilter);
 
   // Ranking-Logik (von oben nach unten priorisiert):
   //   1. EXAKTER Label-Match (Query = Label, case-insensitive) — Stadt
@@ -693,6 +730,7 @@ function toClientLocation(r: typeof locations.$inferSelect): ClientLocation {
     latitude: r.latitude !== null ? Number(r.latitude) : undefined,
     longitude: r.longitude !== null ? Number(r.longitude) : undefined,
     hafasId: r.hafasId ?? undefined,
+    ...(stopKindOf(r.subtype, r.type) ? { kind: stopKindOf(r.subtype, r.type) } : {}),
   };
 }
 
@@ -744,6 +782,7 @@ function sourceRank(loc: ClientLocation): number {
 /** Erkennt ob zwei Locations praktisch derselbe physische Stop sind:
  *    - Gleicher Name (case-insensitive)
  *    - Selbes Land
+ *    - Dieselbe ART (`familyOf`): Bahn, Stadtbahn (U-Bahn/Tram), Bus, Fähre
  *    - Coords innerhalb ~1km (oder Coords fehlen)
  *  Großzügiger Radius weil große Bahnhof-Plätze (Wien Hbf, Köln Hbf) mehrere
  *  hundert m messen — Plattform-OSM-Nodes und das StaDa-Zentrum müssen alle
@@ -768,9 +807,40 @@ function sameStopLabel(a: ClientLocation, b: ClientLocation): boolean {
   return x.length > 0 && x === core(b);
 }
 
+/**
+ * Art eines Treffers für die Frage „derselbe Halt?" — wie `familyOf` in
+ * routes/surroundings.ts (U-Bahn und Tram eine Art: Quellen stufen dieselbe
+ * Stadtbahn verschieden ein). Ohne Unterart (Live-Treffer) entscheidet der Typ.
+ */
+function familyOf(l: ClientLocation): string {
+  switch (l.kind ?? stopKindOf(null, l.type)) {
+    case "train":
+      return "rail";
+    case "subway":
+    case "tram":
+      return "metro";
+    case "ferry":
+      return "ferry";
+    case "bus":
+      return "bus";
+    default:
+      return String(l.type);
+  }
+}
+
+/**
+ * VERSCHIEDENE Verkehrsarten sind nie derselbe Halt, auch bei gleichem Namen:
+ * Der S-Bahnhof „Dortmund Universität" und die gleichnamige Bushaltestelle
+ * daneben haben je eine eigene Tafel. Vorher zählte nur der Name — der
+ * Bushalt verschwand aus der Suche (und damit auch für Bo und den
+ * Routenplaner), europaweit rund elftausend Namen. Gleichnamige Halte
+ * DERSELBEN Art (zwei Bussteige „Dortmund Hörde") bleiben ein Treffer; auf der
+ * Karte stehen sie weiterhin einzeln (routes/surroundings.ts).
+ */
 function isSameStop(a: ClientLocation, b: ClientLocation): boolean {
   if (!sameStopLabel(a, b)) return false;
   if (a.country !== b.country) return false;
+  if (familyOf(a) !== familyOf(b)) return false;
   if (a.latitude == null || b.latitude == null || a.longitude == null || b.longitude == null) {
     // Ohne Coords: gleicher Label+Country reicht (passiert selten, vor allem
     // bei Cities und Airports mit unklarem Hauptzentrum).

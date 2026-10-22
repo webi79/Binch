@@ -23,13 +23,17 @@
  * Zierstreifen, Frontscheibe) — wie die vorgerenderten Bilder vorher, aber
  * je Bildpunkt scharf.
  *
- * SCHATTEN: dasselbe Netz noch einmal, entlang des Lichts flach auf den Boden
- * gedrückt (beim Flugzeug senkrecht darunter, wie vorher sein Umriss aus JS) —
- * ein Durchgang mehr je Teil mit einem Shader, der nur Schwarz schreibt. Damit
- * sich Dreiecke nicht doppelt abdunkeln, liegt jeder Schatten auf EINER festen
- * Tiefe knapp hinter dem Band der Körper: Der erste Bildpunkt schreibt sie, jeder
- * weitere an derselben Stelle fällt durch den Tiefentest. Die Körper liegen
- * davor und decken ihn zu.
+ * SCHATTEN der Bodenfahrzeuge: je Wagen eine glatte Form am Boden — ein
+ * abgerundetes Rechteck, entlang des Lichts gezogen, mit weichem Rand (eigenes
+ * kleines Programm, ein Viereck je Wagen). Vorher war es das ganze Netz, flach
+ * gedrückt: Drehgestelle, Dachkästen und Bälge wurden dabei zu haarfeinen
+ * Streifen, die beim Wischen pixelweise auf- und zuflackerten („grisselig"),
+ * dazu Treppenkanten. An den Kupplungen schneiden sich die Schatten zweier
+ * Wagen weich an derselben Linie (Winkelhalbierende der Fuge) — kein Spalt,
+ * keine doppelte Abdunkelung, auch in Kurven.
+ * Das Flugzeug wirft weiter seinen Umriss senkrecht nach unten (Netz flach,
+ * auf EINER festen Tiefe knapp hinter den Körpern, damit sich Dreiecke nicht
+ * doppelt abdunkeln).
  */
 #include "live_models_core.hpp"
 
@@ -110,6 +114,8 @@ struct Store {
     std::unordered_map<std::string, Mesh> meshes;
     uint64_t meshVersion = 1;
     std::vector<double> lng, lat, cum;
+    /** Stellen (m), an denen die Strecke wendet (Kopfbahnhof) — siehe `setRoute`. */
+    std::vector<double> tips;
     Vehicle veh;
     bool hasVehicle = false;
     Motion mot;
@@ -129,11 +135,35 @@ struct LngLat {
     double lng;
     double lat;
 };
+/** Für die Richtung über das Ende hinaus: so weit (m) nach innen messen. */
+constexpr double EXTEND_DIR_M = 20;
+/** Wendepunkte der Strecke: Richtung über so viele Meter davor und danach. */
+constexpr double TIP_WIN_M = 30;
+/**
+ * Punkt bei `d` Metern. Vor dem Anfang und hinter dem Ende geht die Linie
+ * GERADE weiter (Richtung der letzten Meter): Am Start- und am Endhalt steht
+ * der Zug mit der Mitte am Halt, seine halbe Länge ragt über die Linie
+ * hinaus. Geklemmt lagen die Wagen dort alle auf dem Endpunkt — ineinander und
+ * quer gedreht, weil ihre Richtung aus zwei gleichen Punkten kam.
+ */
 LngLat pointAt(const Store& s, double d) {
     const size_t n = s.cum.size();
     if (n == 0) return {0, 0};
-    if (n == 1 || d <= s.cum[0]) return {s.lng[0], s.lat[0]};
-    if (d >= s.cum[n - 1]) return {s.lng[n - 1], s.lat[n - 1]};
+    if (n == 1) return {s.lng[0], s.lat[0]};
+    if (d < s.cum[0] || d > s.cum[n - 1]) {
+        const bool before = d < s.cum[0];
+        const size_t a = before ? 0 : n - 1;
+        size_t b = a;
+        if (before) {
+            while (b + 1 < n && s.cum[b] - s.cum[0] < EXTEND_DIR_M) b++;
+        } else {
+            while (b > 0 && s.cum[n - 1] - s.cum[b] < EXTEND_DIR_M) b--;
+        }
+        const double span = std::abs(s.cum[a] - s.cum[b]);
+        if (span <= 0) return {s.lng[a], s.lat[a]};
+        const double f = (before ? s.cum[0] - d : d - s.cum[n - 1]) / span;
+        return {s.lng[a] + (s.lng[a] - s.lng[b]) * f, s.lat[a] + (s.lat[a] - s.lat[b]) * f};
+    }
     size_t lo = 0;
     size_t hi = n - 1;
     while (hi - lo > 1) {
@@ -427,6 +457,65 @@ void main() {
 }
 )";
 
+// Weicher Schatten eines Bodenfahrzeugs: ein Viereck am Boden (Modellraum, z = 0).
+const char* VERT_SH = R"(#version 300 es
+precision highp float;
+uniform mat4 u_merc;
+uniform mat4 u_globe;
+uniform float u_t;
+uniform vec4 u_quad;
+out vec2 v_p;
+void main() {
+    int i = gl_VertexID;
+    vec2 p = vec2(i == 1 || i == 3 ? u_quad.z : u_quad.x, i >= 2 ? u_quad.w : u_quad.y);
+    vec4 pos = u_merc * vec4(p, 0.0, 1.0);
+    if (u_t > 0.0) {
+        vec4 g = u_globe * vec4(p, 0.0, 1.0);
+        pos = u_t > 0.999 ? g : mix(pos, g, u_t);
+    }
+    gl_Position = pos;
+    v_p = p;
+}
+)";
+
+// Abstand zum Rechteck (Ecken vorn/hinten verschieden rund), entlang u_sweep
+// gezogen — dicht abgetastet, ohne Stufen; weicher Rand über u_pen. Die zwei
+// Schnitte sind die Fugen zu den Nachbarwagen.
+const char* FRAG_SH = R"(#version 300 es
+precision highp float;
+in vec2 v_p;
+uniform vec4 u_box;
+uniform vec2 u_rad;
+uniform vec2 u_sweep;
+uniform vec3 u_cut0;
+uniform vec3 u_cut1;
+uniform float u_pen;
+uniform float u_shade;
+out vec4 fragColor;
+float box(vec2 p) {
+    p -= u_box.xy;
+    float r = p.y > 0.0 ? u_rad.x : u_rad.y;
+    vec2 q = abs(p) - u_box.zw + r;
+    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+}
+void main() {
+    float d = 1e9;
+    float best = 0.0;
+    for (int i = 0; i <= 8; i++) {
+        float t = float(i) * 0.125;
+        float s = box(v_p - t * u_sweep);
+        if (s < d) { d = s; best = t; }
+    }
+    // Zwischen zwei Abtastungen nachschärfen (keine Stufen am Rand).
+    d = min(d, min(box(v_p - max(0.0, best - 0.0625) * u_sweep), box(v_p - min(1.0, best + 0.0625) * u_sweep)));
+    float a = 1.0 - smoothstep(-u_pen, u_pen, d);
+    a *= smoothstep(-u_pen, u_pen, dot(u_cut0.xy, v_p) + u_cut0.z);
+    a *= smoothstep(-u_pen, u_pen, dot(u_cut1.xy, v_p) + u_cut1.z);
+    if (a <= 0.0) discard;
+    fragColor = vec4(0.0, 0.0, 0.0, u_shade * a);
+}
+)";
+
 GLuint compile(GLenum type, const char* src) {
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, nullptr);
@@ -451,10 +540,34 @@ struct Instance {
     std::array<float, 16> globe;
     float light[3];
     float viewer[3];
-    /** Schatten: Matrizen am Boden (Flugzeug: ohne Höhe) und Versatz je Meter Höhe. */
+    /** Flugzeug: Schatten-Matrizen am Boden (ohne Höhe). */
     std::array<float, 16> shadowMerc;
     std::array<float, 16> shadowGlobe;
-    float cast[2];
+    /** Bodenfahrzeug: weicher Schatten (siehe FRAG_SH), Maße im Modellraum. */
+    bool soft;
+    float box[4];
+    float rad[2];
+    float sweep[2];
+    float cut0[3];
+    float cut1[3];
+    float quad[4];
+    float pen;
+};
+
+/** Fuge zu einem Nachbarwagen: ihre Mitte und die Fahrtrichtung dort (zum Zugkopf). */
+struct Joint {
+    bool on = false;
+    LngLat at{0, 0};
+    double dirDeg = 0;
+};
+/** Was der weiche Schatten eines Wagens über seine Lage im Zug wissen muss. */
+struct CarShadow {
+    Joint ahead;
+    Joint behind;
+    /** +1: Modell-y zeigt zum Zugkopf; −1: der gewendete Endwagen. */
+    double fwd = 1;
+    /** Kopfform am +y-Ende (0 spitz, 1 rund, 2 flach) — −1 ohne Kopf. */
+    int nose = -1;
 };
 
 class LiveModelsHost final : public mln::style::CustomLayerHost {
@@ -484,9 +597,9 @@ public:
             const double bearing = p.bearing;
             const double pitch = p.pitch;  // Bogenmaß
             auto lerp = [u](double a, double b) { return a + (b - a) * u; };
-            // `straightDown`: Schatten senkrecht darunter am Boden (Flugzeug), sonst entlang des Lichts.
+            // `car`: weicher Schatten eines Bodenfahrzeugs; ohne (Flugzeug) fällt der Umriss senkrecht nach unten.
             auto add = [&](const std::string& meshName, const float* params, float head, double lng, double lat, double alt,
-                           double hdg, double k, bool straightDown) {
+                           double hdg, double k, const CarShadow* car) {
                 auto it = s.meshes.find(meshName);
                 if (it == s.meshes.end()) return;
                 const Mat merc = mul(arr(p.projectionMatrix), mercatorModel(lng, lat, alt, hdg, k, p.zoom));
@@ -509,13 +622,13 @@ public:
                     minW = std::min(minW, w);
                     maxW = std::max(maxW, w);
                 }
-                Instance in{meshName, {}, head, {}, {}, {}, {}, {}, {}, {}};
+                Instance in{meshName, {}, head, {}, {}, {}, {}, {}, {}, false, {}, {}, {}, {}, {}, {}, 0};
                 std::copy(params, params + 12, in.params.begin());
                 for (int i = 0; i < 16; i++) {
                     in.merc[i] = static_cast<float>(merc[i]);
                     in.globe[i] = static_cast<float>(globe[i]);
                 }
-                if (straightDown) {
+                if (!car) {
                     const Mat sm = mul(arr(p.projectionMatrix), mercatorModel(lng, lat, 0, hdg, k, p.zoom));
                     Mat sg{};
                     if (t > 0) sg = mul(arr(p.globeProjectionMatrix), globeModel(lng, lat, 0, hdg, k, nullptr));
@@ -523,9 +636,6 @@ public:
                         in.shadowMerc[i] = static_cast<float>(sm[i]);
                         in.shadowGlobe[i] = static_cast<float>(sg[i]);
                     }
-                } else {
-                    in.shadowMerc = in.merc;
-                    in.shadowGlobe = in.globe;
                 }
                 // Licht wie MapLibres Standardlicht (am Bildschirm verankert:
                 // 210° ab oben, 30° vom Zenit) und Blick zur Kamera — beides
@@ -541,9 +651,61 @@ public:
                 in.viewer[0] = static_cast<float>(V[0] * c - V[1] * sn);
                 in.viewer[1] = static_cast<float>(V[0] * sn + V[1] * c);
                 in.viewer[2] = static_cast<float>(V[2]);
-                // Vom Licht weg: je Meter Höhe so weit am Boden versetzt.
-                in.cast[0] = straightDown ? 0.f : -in.light[0] / in.light[2];
-                in.cast[1] = straightDown ? 0.f : -in.light[1] / in.light[2];
+                if (car) {
+                    // Rechteck aus dem Rahmen des Netzes; an einer Fuge reicht es über
+                    // sie hinaus, dort schneidet der weiche Schnitt.
+                    const double hx = std::max(std::abs(m.lo[0]), std::abs(m.hi[0]));
+                    const double H = m.hi[2];
+                    double y0 = m.lo[1];
+                    double y1 = m.hi[1];
+                    const double ext = v.coupling / 2 + 0.6 * hx;
+                    // Modell-+y zeigt beim gewendeten Endwagen nach hinten.
+                    const bool aheadAtY1 = car->fwd > 0;
+                    if (car->ahead.on) {
+                        if (aheadAtY1) y1 += ext; else y0 -= ext;
+                    }
+                    if (car->behind.on) {
+                        if (aheadAtY1) y0 -= ext; else y1 += ext;
+                    }
+                    const double rEnd = 0.3 * hx;
+                    const double rNose = car->nose == 0 ? 0.9 * hx : car->nose == 1 ? 0.55 * hx : rEnd;
+                    // Vom Licht weg: je Meter Höhe so weit am Boden versetzt.
+                    const double sx = -in.light[0] / in.light[2] * H;
+                    const double sy = -in.light[1] / in.light[2] * H;
+                    const double pen = std::max(metersPerDp(p.zoom, lat) / k, 0.07 * H);
+                    const double cl = std::cos(lat * DEG);
+                    auto cutAt = [&](const Joint& j, double sign) -> std::array<float, 3> {
+                        if (!j.on) return {0.f, 0.f, 1e4f};
+                        const double e = (j.at.lng - lng) * DEG * MERC_R * cl;
+                        const double nn = (j.at.lat - lat) * DEG * MERC_R;
+                        const double mx = (e * c - nn * sn) / k;
+                        const double my = (e * sn + nn * c) / k;
+                        const double te = std::sin(j.dirDeg * DEG);
+                        const double tn = std::cos(j.dirDeg * DEG);
+                        const double tx = (te * c - tn * sn) * sign;
+                        const double ty = (te * sn + tn * c) * sign;
+                        return {static_cast<float>(tx), static_cast<float>(ty), static_cast<float>(-(tx * mx + ty * my))};
+                    };
+                    in.soft = true;
+                    in.box[0] = 0;
+                    in.box[1] = static_cast<float>((y0 + y1) / 2);
+                    in.box[2] = static_cast<float>(hx);
+                    in.box[3] = static_cast<float>((y1 - y0) / 2);
+                    in.rad[0] = static_cast<float>(rNose);
+                    in.rad[1] = static_cast<float>(rEnd);
+                    in.sweep[0] = static_cast<float>(sx);
+                    in.sweep[1] = static_cast<float>(sy);
+                    // Der Wagen liegt HINTER der Fuge davor und VOR der dahinter.
+                    const auto c0 = cutAt(car->ahead, -1);
+                    const auto c1 = cutAt(car->behind, 1);
+                    std::copy(c0.begin(), c0.end(), in.cut0);
+                    std::copy(c1.begin(), c1.end(), in.cut1);
+                    in.quad[0] = static_cast<float>(-hx + std::min(0.0, sx) - 2 * pen);
+                    in.quad[1] = static_cast<float>(y0 + std::min(0.0, sy) - 2 * pen);
+                    in.quad[2] = static_cast<float>(hx + std::max(0.0, sx) + 2 * pen);
+                    in.quad[3] = static_cast<float>(y1 + std::max(0.0, sy) + 2 * pen);
+                    in.pen = static_cast<float>(pen);
+                }
                 list.push_back(std::move(in));
             };
             if (v.kind == 2) {
@@ -553,7 +715,7 @@ public:
                 const double dh = std::remainder(s.mot.b[3] - s.mot.a[3], 360.0);
                 const double hdg = s.mot.a[3] + dh * u;
                 const double k = std::max(1.0, v.minPlaneDp * metersPerDp(p.zoom, lat) / v.carLength);
-                add(v.headMesh, v.head, 1, lng, lat, alt, hdg, k, true);
+                add(v.headMesh, v.head, 1, lng, lat, alt, hdg, k, nullptr);
             } else if (!s.cum.empty()) {
                 const double d = lerp(s.mot.a[0], s.mot.b[0]);
                 const LngLat here = pointAt(s, d);
@@ -562,46 +724,99 @@ public:
                 const double L = v.carLength * k;
                 const double c = v.coupling * k;
                 const double total = v.units * L + (v.units - 1) * c;
-                const double headCenter = d + total / 2 - L / 2;
+                // Wendet die Strecke innerhalb des Zuges (Kopfbahnhof), steht er
+                // ganz auf EINEM Ast: einfahrend mit dem Kopf an der Spitze,
+                // ausfahrend mit dem Ende dort. Mit der Mitte an der Spitze lag
+                // sonst eine Hälfte auf dem Hin-, die andere auf dem Rückweg —
+                // der Zug war in der Mitte gefaltet.
+                double chainFront = d + total / 2;
+                for (const double tip : s.tips) {
+                    if (tip <= d - total / 2 || tip >= d + total / 2) continue;
+                    chainFront = d <= tip ? tip : tip + total;
+                    break;
+                }
+                const double headCenter = chainFront - L / 2;
+                // Starr von Ende zu Ende auf dem Gleis — wie eine echte Wagenkette.
+                struct Car {
+                    LngLat front;
+                    LngLat back;
+                    double fwdDeg;
+                };
+                std::vector<Car> cars(static_cast<size_t>(std::max(0, v.units)));
                 for (int i = 0; i < v.units; i++) {
                     const double di = headCenter - i * (L + c);
-                    // Starr von Ende zu Ende auf dem Gleis — wie eine echte Wagenkette.
                     const LngLat front = pointAt(s, di + L / 2);
                     const LngLat back = pointAt(s, di - L / 2);
+                    cars[i] = {front, back, bearingDeg(back, front)};
+                }
+                auto bisect = [](double a, double b) { return a + std::remainder(b - a, 360.0) / 2; };
+                for (int i = 0; i < v.units; i++) {
+                    const double di = headCenter - i * (L + c);
                     const bool tail = v.units > 1 && i == v.units - 1;
                     const bool isHead = i == 0 || tail || v.midMesh.empty();
-                    const double hdg = bearingDeg(back, front) + (tail ? 180.0 : 0.0);
-                    add(isHead ? v.headMesh : v.midMesh, isHead ? v.head : v.mid, isHead ? 1.f : 0.f,
-                        (front.lng + back.lng) / 2, (front.lat + back.lat) / 2, 0, hdg, k, false);
+                    const float* params = isHead ? v.head : v.mid;
+                    CarShadow sh;
+                    sh.fwd = tail ? -1 : 1;
+                    if (isHead && v.kind == 0) sh.nose = static_cast<int>(std::lround(params[6]));
+                    if (i > 0) sh.ahead = {true, pointAt(s, di + L / 2 + c / 2), bisect(cars[i - 1].fwdDeg, cars[i].fwdDeg)};
+                    if (i < v.units - 1) sh.behind = {true, pointAt(s, di - L / 2 - c / 2), bisect(cars[i].fwdDeg, cars[i + 1].fwdDeg)};
+                    const Car& car = cars[i];
+                    add(isHead ? v.headMesh : v.midMesh, params, isHead ? 1.f : 0.f, (car.front.lng + car.back.lng) / 2,
+                        (car.front.lat + car.back.lat) / 2, 0, car.fwdDeg + (tail ? 180.0 : 0.0), k, &sh);
                 }
             }
         }
         if (list.empty()) return;
         const double spanW = std::max(1e-6, maxW - minW);
 
-        glUseProgram(prog);
         // Die Karte stellt vor dem Aufruf den Tiefenbereich ihrer Ebene ein — wir brauchen den ganzen.
         glDepthRangef(0.0f, 1.0f);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_STENCIL_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        // Weiche Schatten der Bodenfahrzeuge: flach am Boden, ohne Tiefe — die
+        // Körper kommen danach und liegen darüber.
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        if (shProg) {
+            glUseProgram(shProg);
+            glUniform1f(sT, static_cast<float>(t));
+            glUniform1f(sShade, SHADE * alpha);
+            glBindVertexArray(emptyVao);
+        }
+        for (const auto& in : list) {
+            if (!in.soft || !shProg) continue;
+            glUniformMatrix4fv(sMerc, 1, GL_FALSE, in.merc.data());
+            glUniformMatrix4fv(sGlobe, 1, GL_FALSE, in.globe.data());
+            glUniform4fv(sQuad, 1, in.quad);
+            glUniform4fv(sBox, 1, in.box);
+            glUniform2fv(sRad, 1, in.rad);
+            glUniform2fv(sSweep, 1, in.sweep);
+            glUniform3fv(sCut0, 1, in.cut0);
+            glUniform3fv(sCut1, 1, in.cut1);
+            glUniform1f(sPen, in.pen);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        }
+
+        glUseProgram(prog);
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LESS);
         glDepthMask(GL_TRUE);
-        glDisable(GL_CULL_FACE);
-        glDisable(GL_STENCIL_TEST);
         glUniform1f(uT, static_cast<float>(t));
         glUniform3f(uDepth, static_cast<float>(minW), static_cast<float>(1.0 / spanW), static_cast<float>(DEPTH_BAND));
         glUniform1i(uKind, kind);
         glUniform3fv(uAccent, 1, accent);
         glUniform1f(uAlpha, alpha);
-        // Erst die Schatten (immer durchscheinend), dann die Körper darüber.
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        // Der Umriss des Flugzeugs am Boden (senkrecht darunter), dann die Körper darüber.
         glUniform1i(uPass, 1);
         glUniform1f(uShade, SHADE);
+        glUniform2f(uCast, 0.f, 0.f);
         for (const auto& in : list) {
+            if (in.soft) continue;
             const auto& gpu = gpuMeshes[in.meshName];
             glUniformMatrix4fv(uMerc, 1, GL_FALSE, in.shadowMerc.data());
             glUniformMatrix4fv(uGlobe, 1, GL_FALSE, in.shadowGlobe.data());
-            glUniform2f(uCast, in.cast[0], in.cast[1]);
             glBindVertexArray(gpu.vao);
             glDrawElements(GL_TRIANGLES, gpu.count, GL_UNSIGNED_SHORT, nullptr);
         }
@@ -627,6 +842,10 @@ public:
     void contextLost() override {
         // Die Objekte gehören zum verlorenen Kontext — nur vergessen, nicht löschen.
         prog = 0;
+        shProg = 0;
+        shadowFailed = false;
+        sMerc = -1;
+        emptyVao = 0;
         gpuMeshes.clear();
         uploaded = 0;
     }
@@ -639,7 +858,12 @@ public:
         }
         gpuMeshes.clear();
         if (prog) glDeleteProgram(prog);
+        if (shProg) glDeleteProgram(shProg);
+        if (emptyVao) glDeleteVertexArrays(1, &emptyVao);
         prog = 0;
+        shProg = 0;
+        sMerc = -1;
+        emptyVao = 0;
         uploaded = 0;
     }
 
@@ -651,10 +875,42 @@ private:
         GLsizei count = 0;
     };
     GLuint prog = 0;
+    GLuint shProg = 0;
+    bool shadowFailed = false;
+    /** Leeres Vertex-Array: Das Schatten-Viereck kommt aus gl_VertexID. */
+    GLuint emptyVao = 0;
     std::unordered_map<std::string, Gpu> gpuMeshes;
     uint64_t uploaded = 0;
     GLint uMerc = -1, uGlobe = -1, uT = -1, uDepth = -1, uKind = -1, uP0 = -1, uP1 = -1, uDoors = -1, uHead = -1, uAccent = -1,
           uLight = -1, uViewer = -1, uAlpha = -1, uPass = -1, uCast = -1, uShade = -1;
+    GLint sMerc = -1, sGlobe = -1, sT = -1, sQuad = -1, sBox = -1, sRad = -1, sSweep = -1, sCut0 = -1, sCut1 = -1, sPen = -1,
+          sShade = -1;
+
+    static GLuint link(const char* vsSrc, const char* fsSrc) {
+        GLuint vs = compile(GL_VERTEX_SHADER, vsSrc);
+        GLuint fs = compile(GL_FRAGMENT_SHADER, fsSrc);
+        if (!vs || !fs) {
+            if (vs) glDeleteShader(vs);
+            if (fs) glDeleteShader(fs);
+            return 0;
+        }
+        GLuint pr = glCreateProgram();
+        glAttachShader(pr, vs);
+        glAttachShader(pr, fs);
+        glLinkProgram(pr);
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        GLint ok = 0;
+        glGetProgramiv(pr, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            char log[1024];
+            glGetProgramInfoLog(pr, sizeof log, nullptr, log);
+            LM_LOG("Programm: %s", log);
+            glDeleteProgram(pr);
+            return 0;
+        }
+        return pr;
+    }
 
     static Mat arr(const std::array<double, 16>& a) {
         Mat m{};
@@ -665,25 +921,8 @@ private:
     /** Programm und Netze auf der Grafikkarte — beim ersten Bild und nach neuen Netzen. */
     bool ensureGpu(const Store& s) {
         if (!prog) {
-            GLuint vs = compile(GL_VERTEX_SHADER, VERT);
-            GLuint fs = compile(GL_FRAGMENT_SHADER, FRAG);
-            if (!vs || !fs) return false;
-            prog = glCreateProgram();
-            glAttachShader(prog, vs);
-            glAttachShader(prog, fs);
-            glLinkProgram(prog);
-            glDeleteShader(vs);
-            glDeleteShader(fs);
-            GLint ok = 0;
-            glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-            if (!ok) {
-                char log[1024];
-                glGetProgramInfoLog(prog, sizeof log, nullptr, log);
-                LM_LOG("Programm: %s", log);
-                glDeleteProgram(prog);
-                prog = 0;
-                return false;
-            }
+            prog = link(VERT, FRAG);
+            if (!prog) return false;
             uMerc = glGetUniformLocation(prog, "u_merc");
             uGlobe = glGetUniformLocation(prog, "u_globe");
             uT = glGetUniformLocation(prog, "u_t");
@@ -701,6 +940,25 @@ private:
             uCast = glGetUniformLocation(prog, "u_cast");
             uShade = glGetUniformLocation(prog, "u_shade");
         }
+        if (!shProg && !shadowFailed) {
+            shProg = link(VERT_SH, FRAG_SH);
+            // Ohne Schatten weiterzeichnen statt gar nicht (und nicht jedes Bild neu versuchen).
+            shadowFailed = shProg == 0;
+        }
+        if (shProg && sMerc < 0) {
+            sMerc = glGetUniformLocation(shProg, "u_merc");
+            sGlobe = glGetUniformLocation(shProg, "u_globe");
+            sT = glGetUniformLocation(shProg, "u_t");
+            sQuad = glGetUniformLocation(shProg, "u_quad");
+            sBox = glGetUniformLocation(shProg, "u_box");
+            sRad = glGetUniformLocation(shProg, "u_rad");
+            sSweep = glGetUniformLocation(shProg, "u_sweep");
+            sCut0 = glGetUniformLocation(shProg, "u_cut0");
+            sCut1 = glGetUniformLocation(shProg, "u_cut1");
+            sPen = glGetUniformLocation(shProg, "u_pen");
+            sShade = glGetUniformLocation(shProg, "u_shade");
+        }
+        if (!emptyVao) glGenVertexArrays(1, &emptyVao);
         if (uploaded != s.meshVersion) {
             for (const auto& [name, m] : s.meshes) {
                 if (gpuMeshes.count(name)) continue;
@@ -779,6 +1037,21 @@ void setRoute(const double* lngLat, const double* cum, size_t n) {
     for (size_t i = 0; i < n; i++) {
         s.lng[i] = lngLat[i * 2];
         s.lat[i] = lngLat[i * 2 + 1];
+    }
+    // Wendepunkte: Richtung über je 30 m davor und danach um mehr als 150°
+    // gedreht. Fehler der Linienführung (Haken, Zickzack) entfernt schon der
+    // Server (`cleanShape`) — was hier bleibt, sind echte Wenden.
+    s.tips.clear();
+    if (n < 3) return;
+    const double total = s.cum[n - 1];
+    for (size_t i = 1; i + 1 < n; i++) {
+        const double d = s.cum[i];
+        if (d < TIP_WIN_M || d > total - TIP_WIN_M) continue;
+        if (!s.tips.empty() && d - s.tips.back() < TIP_WIN_M) continue;
+        const LngLat here{s.lng[i], s.lat[i]};
+        const double turn = std::abs(std::remainder(
+            bearingDeg(here, pointAt(s, d + TIP_WIN_M)) - bearingDeg(pointAt(s, d - TIP_WIN_M), here), 360.0));
+        if (turn > 150) s.tips.push_back(d);
     }
 }
 

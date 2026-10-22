@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useState, useRef } from "react";
-import { PICKER_IN, PICKER_OUT } from "@/lib/nav/overlayCover";
+import { PICKER_IN, PICKER_KEYBOARD_WAIT, PICKER_OUT } from "@/lib/nav/overlayCover";
 import { useSheetSlide } from "@/lib/nav/sheetSlide";
 import { setSheetMoving } from "@/lib/nav/searchHandoff";
 import { prepareLayer, releaseLayer, holdLayer, rearmLayer } from "@/lib/nav/transitionLayer";
@@ -8,6 +8,7 @@ import {
   Dimensions,
   BackHandler,
   Keyboard,
+  type EmitterSubscription,
   Platform,
   View,
   Text,
@@ -20,6 +21,7 @@ import {
 import { usePalette } from "@/lib/theme/appBg";
 import { useQuery } from "@tanstack/react-query";
 import { X, Navigation, Plane, Train, Bus, Ship, Flag } from "lucide-react-native";
+import { SubwayIcon } from "@/components/ui/SubwayIcon";
 import Animated, { withTiming } from "react-native-reanimated";
 import { Location, TravelMode } from "@/types/search";
 import { fetchLocations } from "@/lib/api/client";
@@ -32,6 +34,7 @@ import { haptic } from "@/lib/haptics";
 import { SHEET_TITLE } from "@/components/ui/SheetModal";
 import { scaledStyles } from "@/lib/ui/compact";
 import { FadePress } from "@/components/ui/FadePress";
+import { standDetail } from "@/lib/surroundings/standLabel";
 
 type Field = "from" | "to";
 
@@ -107,6 +110,41 @@ const LIST_PAD = { paddingBottom: 32 } as const;
  * Auftrag, und die Zahlen für Sichtbarkeit und Sitzung wechseln inzwischen
  * ausschließlich außerhalb der Bewegung.
  */
+/**
+ * Die wechselnden Hinweise im Suchfeld — nur, was die Ortssuche hier wirklich
+ * findet: je nach Verkehrsmittel Bahnhöfe, Haltestellen, Flughäfen samt
+ * Kürzel, Häfen, Städte. Der erste Satz ist der bisherige Platzhalter; bei Von
+ * und Nach folgt die Frage nach Start bzw. Ziel. Wie und wie oft gewechselt
+ * wird: `HINT_TIMING` in components/SearchBar.tsx.
+ */
+function hintKeysFor(
+  placeholderKey: string,
+  mode: TravelMode | "ALL",
+  field: "from" | "to" | null,
+): readonly string[] {
+  const lead = field === "from" ? ["picker.hint.from"] : field === "to" ? ["picker.hint.to"] : [];
+  switch (mode) {
+    case "FLIGHT":
+      return [placeholderKey, ...lead, "picker.hint.airport", "picker.hint.code", "picker.hint.city", "picker.hint.type"];
+    case "TRAIN":
+      return [placeholderKey, ...lead, "picker.hint.station", "picker.hint.mainStation", "picker.hint.city", "picker.hint.type"];
+    case "BUS":
+      return [placeholderKey, ...lead, "picker.hint.busStation", "picker.hint.stop", "picker.hint.city", "picker.hint.type"];
+    case "CRUISE":
+      return [placeholderKey, ...lead, "picker.hint.port", "picker.hint.portCity", "picker.hint.type"];
+    default:
+      return [
+        placeholderKey,
+        ...lead,
+        "picker.hint.station",
+        "picker.hint.stop",
+        "picker.hint.airport",
+        "picker.hint.code",
+        "picker.hint.type",
+      ];
+  }
+}
+
 const LocationPickerInner = function LocationPicker({
   visible,
   mounted,
@@ -130,6 +168,15 @@ const LocationPickerInner = function LocationPicker({
   const t = useT();
   const accent = useAccent();
   const [query, setQuery] = useState("");
+  /**
+   * Die Hinweise des Suchfelds. Ohne eigenes Label (Umgebungs-Suche: leeres
+   * `leadingLabel`) gibt es keinen Start und kein Ziel, nach dem man fragen
+   * könnte.
+   */
+  const hintKeys = useMemo(
+    () => hintKeysFor(placeholderKey, mode, leadingLabel === "" ? null : field),
+    [placeholderKey, mode, leadingLabel, field],
+  );
   const debounced = useDebounce(query, 200);
   const savedStations = useSearchStore((s) => s.savedStations);
   // Im ALL-Mode zeigen wir alle gespeicherten Stationen, sonst nur die zum
@@ -351,6 +398,16 @@ const LocationPickerInner = function LocationPicker({
    * später nach und trägt nur noch, was React braucht (siehe Host).
    */
   const runSlide = useRef<(v: boolean) => void>(() => {});
+  /** Eine Ausfahrt, die auf das Einfahren der Tastatur wartet — siehe `slide`. */
+  const keyboardWaitRef = useRef<{ sub: EmitterSubscription; timer: ReturnType<typeof setTimeout> } | null>(null);
+  const clearKeyboardWait = () => {
+    const w = keyboardWaitRef.current;
+    if (!w) return;
+    keyboardWaitRef.current = null;
+    w.sub.remove();
+    clearTimeout(w.timer);
+  };
+  useEffect(() => clearKeyboardWait, []);
   useEffect(
     () =>
       useSearchStore.subscribe((st, prev) => {
@@ -410,6 +467,8 @@ const LocationPickerInner = function LocationPicker({
        * solchen Moment. Für sie wird die Arbeit hier erledigt und die Kurve ein
        * Bild später angestoßen, statt sie dagegen anlaufen zu lassen.
        */
+      // Eine Ausfahrt, die noch auf die Tastatur wartet, gilt nicht mehr.
+      clearKeyboardWait();
       const kbWasOpen = !show && Keyboard.isVisible();
       if (!show) Keyboard.dismiss();
       /**
@@ -424,9 +483,37 @@ const LocationPickerInner = function LocationPicker({
       if (show) holdLayer("pickerLocation");
       else rearmLayer("pickerLocation");
       const needsLayer = !layeredRef.current;
-      if (needsLayer) holdLayerFor(cfg.duration + (show ? 16 : 0));
-      armMovingGuard(cfg.duration);
-      if (kbWasOpen || needsLayer) {
+      const wait = kbWasOpen ? PICKER_KEYBOARD_WAIT : 0;
+      if (needsLayer) holdLayerFor(cfg.duration + wait + (show ? 16 : 0));
+      armMovingGuard(cfg.duration + wait);
+      if (kbWasOpen) {
+        /**
+         * ERST die Tastatur, DANN die Fahrt.
+         *
+         * Ihr Einfahren stößt die Neuvermessung des ganzen Wurzelbaums an
+         * (siehe oben, rund 250 ms). Ein Bild Vorlauf reichte dafür nicht: Die
+         * Arbeit lief weiter mitten in die Ausfahrt — und die Tastatur ist beim
+         * Schließen fast immer offen, der Fokus kommt ja von selbst. Gemeldet
+         * als „hin und zurück manchmal noch ruckelig". Jetzt wartet die Fahrt,
+         * bis die Tastatur unten ist (höchstens `PICKER_KEYBOARD_WAIT`), und
+         * läuft dann ungestört; die Auswahl ist bis dahin längst übernommen,
+         * und die Karte unter der Umgebungs-Suche ist in derselben Zeit wach.
+         */
+        const go = () => {
+          clearKeyboardWait();
+          requestAnimationFrame(() => runSheet(false));
+        };
+        // Schon jetzt als Fahrt melden: Aufgeschobene Arbeit, die auf „nichts
+        // fährt" wartet, liefe sonst in diese Lücke — und in die Fahrt hinein.
+        // Abgemeldet wird wie sonst am Ende (bzw. vom Wächter oben).
+        setSheetMoving(true, "pickerLocation");
+        keyboardWaitRef.current = {
+          sub: Keyboard.addListener("keyboardDidHide", go),
+          timer: setTimeout(go, PICKER_KEYBOARD_WAIT),
+        };
+        return;
+      }
+      if (needsLayer) {
         requestAnimationFrame(() => runSheet(show));
         return;
       }
@@ -834,6 +921,17 @@ const LocationPickerInner = function LocationPicker({
              */
             autoFocus={visible}
             autoFocusDelay={0}
+            /**
+             * Wechselnde Hinweise — erst, wenn der Wähler steht (`visible`
+             * kippt nach der Fahrt), und schon nicht mehr, sobald er schließt
+             * (`request` fällt sofort, `visible` erst nach der Ausfahrt — ein
+             * Wechsel samt Nachladen dazwischen fiele in die Fahrt). Je Öffnung
+             * neu, mit dem Platzhalter vorneweg (`session` zählt beim
+             * Berühren, vor der Fahrt).
+             */
+            hintKeys={hintKeys}
+            hintsActive={visible && request}
+            hintsSession={session}
           />
         </View>
 
@@ -984,21 +1082,44 @@ const LocationPickerInner = function LocationPicker({
 
 export const LocationPicker = memo(LocationPickerInner);
 
-// Icon pro Result aus seinem Typ ableiten — HAFAS liefert für „Train" auch
-// Bushaltestellen (type=BUS), Cities sind type=ALL → Flag.
+// Icon pro Result: die genaue Verkehrsart, wenn der Server sie kennt — die
+// U-Bahn mit „U" wie auf der Karte, eine Tram nicht als Bus. Sonst aus dem Typ
+// (HAFAS liefert für „Train" auch Bushaltestellen, type=BUS); Cities sind
+// type=ALL → Flag.
 function iconFor(loc: Location) {
   if (loc.type === "ALL") return Flag;
+  switch (loc.kind) {
+    case "subway":
+      return SubwayIcon;
+    case "train":
+    case "tram":
+      return Train;
+    case "bus":
+      return Bus;
+    case "ferry":
+      return Ship;
+  }
   return MODE_ICON[loc.type];
 }
 
+
 /** Toggle-Button für „Station speichern" — dieselbe SaveStarButton-Komponente
- *  wie im StopDetailSheet (Gold-Verlaufs-Stern + Pop + Funken), damit gespeicherte
- *  Stationen überall identisch aussehen. Der innere Pressable konsumiert den
- *  Tap, sodass der äußere Row-onPress (= Selection) NICHT mehr feuert. */
+ *  wie im StopDetailSheet, damit gespeicherte Stationen überall identisch
+ *  aussehen, samt derselben Meldung beim Merken. Der innere Pressable
+ *  konsumiert den Tap, sodass der äußere Row-onPress (= Selection) NICHT mehr
+ *  feuert. */
 function SaveStar({ loc }: { loc: Location }) {
+  const t = useT();
   const saved = useSearchStore((s) => s.savedStationCodes.has(loc.code));
   const toggle = useSearchStore((s) => s.toggleSavedStation);
-  return <SaveStarButton size={32} starSize={20} saved={saved} onChange={() => toggle(loc)} />;
+  const onChange = useCallback(
+    (willSave: boolean) => {
+      toggle(loc);
+      if (willSave) useSearchStore.getState().showStationToast(t("surroundings.stationsaved"), loc.label);
+    },
+    [toggle, loc, t],
+  );
+  return <SaveStarButton size={32} starSize={20} saved={saved} onChange={onChange} />;
 }
 
 /** Eine Zeile im Picker (Ergebnis / Gespeichert / Zuletzt / Vorschlag).
@@ -1018,11 +1139,13 @@ const PickerRow = memo(function PickerRow({
   /** Vorschlags-Variante: Länder (type ALL) zeigen „Country" als Subtitle. */
   suggested?: boolean;
 }) {
+  const t = useT();
   const Icon = iconFor(loc);
   const place = suggested && loc.type === "ALL" ? "Country" : loc.country || loc.city;
   // Steht ein gleichnamiger Halt daneben, kommt der Zusatz („Rochdale Road ·
-  // Stop RA") in die leise Zeile darunter — nie in den Namen.
-  const subtitle = [loc.detail, place].filter(Boolean).join(" · ");
+  // Stop RA", bei einem Bus-Steig „Steig 3") in die leise Zeile darunter — nie
+  // in den Namen.
+  const subtitle = [standDetail(t, loc.platform, loc.detail), place].filter(Boolean).join(" · ");
   return (
     /**
      * `Pressable` statt `RippleTouch` — der native Ripple lief IN die Fahrt.

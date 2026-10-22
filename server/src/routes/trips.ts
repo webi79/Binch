@@ -1058,10 +1058,13 @@ function liveResponse(
   meta: { product: string | null; line: string | null; direction: string | null; realtime: boolean },
 ): LiveTripResponse | null {
   if (stops.length < 2) return null;
-  const shape = buildLiveShape(geometry, stops.map((s) => [s.lon, s.lat] as LngLat));
+  const vehicle = liveVehicle(meta.product);
+  // Hin-und-zurück-Fehler der Linienführung nur bei Schienenfahrzeugen entfernen (siehe `cleanShape`).
+  const rail = vehicle === "train" || vehicle === "subway" || vehicle === "tram";
+  const shape = buildLiveShape(geometry, stops.map((s) => [s.lon, s.lat] as LngLat), { rail });
   return {
     tripId,
-    vehicle: liveVehicle(meta.product),
+    vehicle,
     product: meta.product,
     line: meta.line,
     direction: meta.direction,

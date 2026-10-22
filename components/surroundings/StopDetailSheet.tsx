@@ -1,5 +1,7 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useState, useRef } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useState, useRef, type ReactNode } from "react";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import { SegmentedToggle } from "@/components/ui/SegmentedToggle";
+import { SlidingPanels } from "@/components/ui/SlidingPanels";
 import { PUSH_SPRING, SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import { isSheetDragging, isTransitionBusy, setSheetDragging } from "@/lib/nav/transitionBusy";
 import {
@@ -17,12 +19,14 @@ import Animated, {
   useSharedValue,
   withTiming,
   Easing,
+  Extrapolation,
+  interpolate,
   runOnJS,
 } from "react-native-reanimated";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useQuery } from "@tanstack/react-query";
-import { Train, Bus, TramFront, Plane, Ship, type LucideIcon } from "lucide-react-native";
+import { useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
+import { Train, Bus, TramFront, Ship, Undo2, type LucideIcon } from "lucide-react-native";
 import Svg, { Circle, Path } from "react-native-svg";
 import {
   fetchStopArrivals,
@@ -45,21 +49,22 @@ import {
 import { isMapMoving, reportStopSheetTarget } from "@/lib/surroundings/mapViewport";
 import { CityTripBody } from "@/components/surroundings/CityTripBody";
 import { stopToLocation } from "@/lib/surroundings/savedStation";
+import { platformPrefixFor, standDetail } from "@/lib/surroundings/standLabel";
 import { haptic } from "@/lib/haptics";
 import { showConnectionNotFound } from "@/lib/connectionNotFoundAlert";
 import type { SearchResult, TravelMode } from "@/types/search";
 import { useAccent } from "@/lib/theme/accent";
 import { SaveStarButton } from "@/components/surroundings/SaveStarButton";
-import { ModePill } from "@/components/surroundings/ModePill";
 import { WalkIcon } from "@/components/ui/WalkIcon";
 import { iconForProduct } from "@/components/results/LinePill";
 import type { SharedValue } from "react-native-reanimated";
 import { LiveButton, useLiveClock } from "@/components/live/LiveButton";
 import { probeFrames, probeMark } from "@/lib/live/probe";
 import { airportByIata } from "@/lib/live/model";
+import { TRANSIT_COLOR, transitCategory } from "@/lib/theme/transitColors";
 import type { LiveSession } from "@/lib/live/types";
 import { router } from "expo-router";
-import { scaledStyles } from "@/lib/ui/compact";
+import { ms, scaledStyles } from "@/lib/ui/compact";
 import { daysFromToday, formatLocalizedDateInZone, formatTimeInZone, localTimeHint, shiftIsoByMinutes } from "@/lib/time-format";
 import { de, enGB, es, fr } from "date-fns/locale";
 import {
@@ -70,6 +75,7 @@ import {
   SWIPE_ACTIVATE,
   SWIPE_OUT,
   useSheetScrollGate,
+  type SheetScrollGate,
 } from "@/lib/ui/sheetSwipe";
 
 /**
@@ -103,31 +109,59 @@ const C = {
 // BORDER-Werte sind raus damit die Slide automatisch die User-Wahl
 // (Lime/Mint/Iris) erbt. Components die im StyleSheet noch statisch waren,
 // nutzen jetzt inline-style mit accent.* statt diesen Konstanten.
-const TRAIN_YELLOW = "#FFD60A";
-const TRAIN_YELLOW_BG = "rgba(255,214,10,0.18)";
-const BUS_PURPLE = "#9D5FE0";
-const BUS_PURPLE_BG = "rgba(157,95,224,0.22)";
-const SUBWAY_BLUE_BG = "rgba(31,58,138,0.30)";
-const TRAM_DARK_BG = "rgba(255,255,255,0.10)";
 
-const KIND_ICON: Record<MarkerKind, LucideIcon> = {
-  train: Train,
-  subway: Train,
-  bus: Bus,
-  tram: TramFront,
-  airport: Plane,
-  cruise: Ship,
-};
-const KIND_STYLE: Record<MarkerKind, { fg: string; bg: string; tKey: string }> = {
-  train: { fg: TRAIN_YELLOW, bg: TRAIN_YELLOW_BG, tKey: "stop.kind.train" },
-  subway: { fg: "#FFFFFF", bg: SUBWAY_BLUE_BG, tKey: "stop.kind.subway" },
-  bus: { fg: BUS_PURPLE, bg: BUS_PURPLE_BG, tKey: "stop.kind.bus" },
-  tram: { fg: "#FFFFFF", bg: TRAM_DARK_BG, tKey: "stop.kind.tram" },
-  airport: { fg: "#7FEA4D", bg: "rgba(127,234,77,0.18)", tKey: "stop.kind.airport" },
-  cruise: { fg: "#6B95B5", bg: "rgba(107,149,181,0.20)", tKey: "stop.kind.cruise" },
-};
 
 type BoardTab = "departures" | "arrivals";
+
+/**
+ * DIE VERKEHRSARTEN DER TAFEL als Filter-Kästen — wie DB Navigator und Google
+ * Maps: Das Blatt zeigt, was an diesem Halt fährt („RE/RB", „S-Bahn", „Bus"…),
+ * und ein Tipp auf einen Kasten blendet diese Art aus (die Farbe geht) bzw.
+ * wieder ein. Ein FILTER, kein Umschalter — mehrere Arten zugleich; sobald
+ * etwas ausgeblendet ist, holt der Pfeil rechts alles zurück. Vorher gab es nur
+ * bei Halten mit mehreren Arten Pillen, und die schalteten zwischen ihnen um.
+ *
+ * Feiner als die Arten der Karte (`MarkerKind`): Fern-, Regional- und S-Bahn-
+ * Züge sind dort alle „Zug", hier getrennt — aus dem Produkt jeder Fahrt.
+ * Transitous liefert deutsche S-Bahnen als `metro`.
+ */
+type BoardCategory = "longDistance" | "regional" | "suburban" | "subway" | "tram" | "bus" | "ferry" | "other";
+const CATEGORY_ORDER: readonly BoardCategory[] = [
+  "longDistance", "regional", "suburban", "subway", "tram", "bus", "ferry", "other",
+];
+/** Füllung in der Farbe der Verkehrsart — wie überall in der App (lib/theme/transitColors.ts). */
+const CATEGORY: Record<BoardCategory, { tKey: string; color: string; Icon?: LucideIcon; letter?: string }> = {
+  longDistance: { tKey: "stop.cat.longDistance", color: TRANSIT_COLOR.longDistance, Icon: Train },
+  regional: { tKey: "stop.cat.regional", color: TRANSIT_COLOR.regional, Icon: Train },
+  suburban: { tKey: "stop.cat.suburban", color: TRANSIT_COLOR.suburban, letter: "S" },
+  subway: { tKey: "stop.cat.subway", color: TRANSIT_COLOR.subway, letter: "U" },
+  tram: { tKey: "stop.cat.tram", color: TRANSIT_COLOR.tram, Icon: TramFront },
+  bus: { tKey: "stop.cat.bus", color: TRANSIT_COLOR.bus, Icon: Bus },
+  ferry: { tKey: "stop.cat.ferry", color: TRANSIT_COLOR.ferry, Icon: Ship },
+  other: { tKey: "stop.cat.other", color: TRANSIT_COLOR.other, Icon: Train },
+};
+const NO_CATS: ReadonlySet<BoardCategory> = new Set();
+/** Symbol und Schrift auf den Linien-Plaketten — weiß wie auf den Kästen der Karte. */
+const BADGE_INK = "#FFFFFF";
+
+/** Die Art einer Fahrt der Tafel — Ersatzbusse („Bus RB59") zählen als Bus. */
+function categoryOf(item: StopBoardItem): BoardCategory {
+  const c = transitCategory(item.product, item.line);
+  return c === "flight" ? "other" : c;
+}
+
+/** Welche Arten auf den Tafeln vorkommen — in fester Reihenfolge. */
+function categoriesOf(...boards: (StopBoardResponse | undefined)[]): BoardCategory[] {
+  const seen = new Set<BoardCategory>();
+  for (const b of boards) for (const it of b?.results ?? []) seen.add(categoryOf(it));
+  return CATEGORY_ORDER.filter((c) => seen.has(c));
+}
+
+/** Die Plakette einer Linie in der Farbe ihrer Verkehrsart (Flüge: Akzent). */
+function lineColor(item: StopBoardItem, flight: string): string {
+  const c = transitCategory(item.product, item.line);
+  return c === "flight" ? flight : TRANSIT_COLOR[c];
+}
 
 function formatDistance(m: number | undefined, t: (k: string) => string): string {
   if (m === undefined) return "";
@@ -489,7 +523,8 @@ function StopBoardRow({
 }) {
   const accent = useAccent();
   const delay = item.delayMinutes ?? 0;
-  const ModeIcon = iconForProduct(item.product);
+  const ModeIcon = iconForProduct(item.product, item.line);
+  const badge = lineColor(item, accent.dark);
   return (
     <RippleTouch
       onPress={onPress}
@@ -528,10 +563,10 @@ function StopBoardRow({
         )}
       </View>
 
-      {/* Accent-tinted Line-Badge mit Mode-Icon (Train/Bus/Tram etc.) */}
-      <View style={[styles.cardLineBadge, { backgroundColor: accent.subtle, borderColor: accent.border }]}>
-        <ModeIcon size={14} color={accent.solid} strokeWidth={2.2} />
-        <Text style={[styles.cardLineBadgeText, { color: accent.solid }]} numberOfLines={1}>
+      {/* Linien-Plakette mit Symbol — in der Farbe der Verkehrsart, wie überall. */}
+      <View style={[styles.cardLineBadge, { backgroundColor: badge, borderColor: badge }]}>
+        <ModeIcon size={14} color={BADGE_INK} strokeWidth={2.2} />
+        <Text style={[styles.cardLineBadgeText, { color: BADGE_INK }]} numberOfLines={1}>
           {item.line}
         </Text>
       </View>
@@ -600,7 +635,8 @@ function NextHero({
   const accent = useAccent();
   const palette = usePalette();
   const delay = item.delayMinutes ?? 0;
-  const ModeIcon = iconForProduct(item.product);
+  const ModeIcon = iconForProduct(item.product, item.line);
+  const badge = lineColor(item, accent.dark);
 
   // Live-Ticker: alle 1 s neu rendern damit Ring sekundengenau wandert.
   // Nur aktiv wenn das Sheet WIRKLICH offen ist (selectedStop != null) —
@@ -678,7 +714,10 @@ function NextHero({
       style={[styles.hero, { backgroundColor: palette.s2 }]}
     >
       <View style={styles.heroRing}>
-        <Svg width={84} height={84} viewBox="0 0 84 84">
+        {/* So groß wie seine Hülle: Die schrumpft auf kurzen Geräten mit
+            (`scaledStyles`), der Ring stand fest auf 84 — Zahl und „Min" saßen
+            dann in der kleineren Hülle zentriert, also neben der Ringmitte. */}
+        <Svg width={RING_BOX} height={RING_BOX} viewBox="0 0 84 84">
           <Circle cx={42} cy={42} r={RING_R} fill="none" stroke={C.border} strokeWidth={6} />
           <Circle
             cx={42}
@@ -702,7 +741,16 @@ function NextHero({
             </Text>
           ) : (
             <>
-              <Text style={styles.heroRingMin}>{mins}</Text>
+              {/* Drei, vier Ziffern kleiner — sonst stießen sie oben fast an
+                  den Ring („280"), während zwei Ziffern rundum Luft haben. */}
+              <Text
+                style={[
+                  styles.heroRingMin,
+                  mins >= 1000 ? styles.heroRingMinXs : mins >= 100 ? styles.heroRingMinSm : null,
+                ]}
+              >
+                {mins}
+              </Text>
               <Text style={styles.heroRingLabel}>Min</Text>
             </>
           )}
@@ -711,9 +759,9 @@ function NextHero({
 
       <View style={styles.heroBody}>
         <View style={styles.heroBadgeRow}>
-          <View style={[styles.cardLineBadge, { backgroundColor: accent.subtle, borderColor: accent.border }]}>
-            <ModeIcon size={14} color={accent.solid} strokeWidth={2.2} />
-            <Text style={[styles.cardLineBadgeText, { color: accent.solid }]} numberOfLines={1}>
+          <View style={[styles.cardLineBadge, { backgroundColor: badge, borderColor: badge }]}>
+            <ModeIcon size={14} color={BADGE_INK} strokeWidth={2.2} />
+            <Text style={[styles.cardLineBadgeText, { color: BADGE_INK }]} numberOfLines={1}>
               {item.line}
             </Text>
           </View>
@@ -893,25 +941,37 @@ function StopDetailSheetInner() {
   }
   const kinds: MarkerKind[] =
     stop?.kinds && stop.kinds.length > 0 ? (stop.kinds as MarkerKind[]) : ["bus"];
-  const [activeKind, setActiveKind] = useState<MarkerKind>(kinds[0] ?? "bus");
-  const [tab, setTab] = useState<BoardTab>("departures");
+  /** Flughafen: Die Tafel sind Flüge — eigene Live-Ansicht, keine Filter-Kästen. */
+  const isAirport = kinds[0] === "airport";
+  /**
+   * Ankünfte erst laden, wenn man sie einmal ansieht. Beide Tafeln stehen
+   * nebeneinander (`SlidingPanels`), aber eine zweite Anfrage für jeden
+   * geöffneten Halt wäre Last ohne Nutzen — bis dahin zeigt die Ankunftsseite
+   * den Ladekreis, und die Anfrage startet mit dem Tipp auf den Reiter.
+   *
+   * Angefragt wird mit dem Tipp (`requestArrivals`), GEZEIGT erst, wenn die
+   * Tafel drüben angekommen ist (`onBoardSettled`) — siehe `BoardSwitch`.
+   * Gemerkt mit dem Code des Halts: Ein neuer Halt beginnt im selben Durchgang
+   * ohne, nicht erst nach einem Effekt.
+   */
+  const [arrivalsFor, setArrivalsFor] = useState<string | null>(null);
+  const arrivalsWanted = !!stop && arrivalsFor === stop.code;
+  /**
+   * Ausgeblendete Verkehrsarten (Filter-Kästen) — für beide Tafeln, je Halt.
+   * Ebenfalls mit dem Code: Sonst stünde der Zurück-Pfeil des vorigen Halts
+   * ein Bild lang im Kopf des neuen.
+   */
+  const [hidden, setHidden] = useState<{ code: string | null; cats: ReadonlySet<BoardCategory> }>({
+    code: null,
+    cats: NO_CATS,
+  });
+  const hiddenCats = stop && hidden.code === stop.code ? hidden.cats : NO_CATS;
 
   // bodyReady: erst NACH der Slide-In-Animation auf true → vermeidet visuelles
   // Ruckeln wenn die Departures-Liste mitten in der Slide-Animation reinpoppt.
   // Header (Name + Distanz) bleibt immer sichtbar, weil dort kein Layout-Shift
   // passieren kann.
   const [bodyReady, setBodyReady] = useState(false);
-
-  useEffect(() => {
-    if (selectedStop) {
-      const ks =
-        selectedStop.kinds && selectedStop.kinds.length > 0
-          ? (selectedStop.kinds as MarkerKind[])
-          : (["bus"] as MarkerKind[]);
-      setActiveKind(ks[0]);
-      setTab("departures");
-    }
-  }, [selectedStop?.code]);
 
   // Tap auf einen Departure-Eintrag → DetailsOverlay slidet SOFORT von rechts
   // rein mit einem Stub-Result (Origin/Destination/Zeit/Linie aus dem Departure).
@@ -986,23 +1046,23 @@ function StopDetailSheetInner() {
     const at = Date.parse(it.plannedTime) + (it.delayMinutes ?? 0) * 60_000;
     const now = Date.now();
     if (!(at > now - LIVE_PAST_MS && at < now + LIVE_AHEAD_MS)) return false;
-    if (activeKind === "airport") {
+    if (isAirport) {
       const f = it.flight;
       return !!f && (f.depE ?? f.depP) != null && !!airportByIata(f.from) && !!airportByIata(f.to);
     }
     return !!it.id;
   };
-  const startLiveFor = (it: StopBoardItem) => {
+  const startLiveFor = (it: StopBoardItem, board: BoardTab) => {
     probeMark("start-tap");
     probeFrames("start", 4000);
     if (!stop) return;
     haptic("button");
     // Auf der Ankunftstafel ist `direction` die HERKUNFT — dann lieber das
     // Fahrtziel aus den Live-Daten (leer lassen, das Banner nimmt es von dort).
-    const direction = tab === "departures" ? it.direction : "";
+    const direction = board === "departures" ? it.direction : "";
     const iata = stop.code.replace(/^airport:/i, "").toUpperCase();
     const session: LiveSession =
-      activeKind === "airport" && it.flight
+      isAirport && it.flight
         ? {
             kind: "flight",
             flight: it.flight,
@@ -1030,7 +1090,8 @@ function StopDetailSheetInner() {
     router.navigate("/(tabs)/surroundings");
   };
 
-  const onSelectDeparture = (item: StopBoardItem) => {
+  /** `board`: die Tafel, von der die Zeile stammt — beide stehen nebeneinander. */
+  const onSelectDeparture = (item: StopBoardItem, board: BoardTab) => {
     if (!stop) return;
     const mode = productToSearchMode(item.product);
     if (!mode) return; // Ferry o.ä. → keine Ticket-Suche verfügbar
@@ -1068,8 +1129,6 @@ function StopDetailSheetInner() {
     //   - Nicht-DE Stops (unsere Booking-Suche kann die nicht handhaben)
     // Übrig bleibt: DE National/Regional Trains → Booking-Flow mit
     // DB-Navigator-Deeplink-Support.
-    // Die Tafel, von der die Zeile stammt — beim Tipp festgehalten.
-    const board = tab;
     const useDirectTripFlow =
       // ANKUNFT: Die Richtung der Zeile ist die HERKUNFT des Zugs. Der
       // Buchungs-Weg suchte damit eine Fahrt von hier ZUR Herkunft — die
@@ -1250,18 +1309,59 @@ function StopDetailSheetInner() {
     })();
   };
 
-  const queryFn = tab === "departures" ? fetchStopDepartures : fetchStopArrivals;
-  const { data, isLoading, isError, refetch } = useQuery<StopBoardResponse>({
-    queryKey: ["stopBoard", stop?.code ?? "_none_", tab],
-    queryFn: () => queryFn(stop!.code),
-    // Fetch erst sobald die Slide-Animation durch ist UND ein Stop aktiv ist.
-    // Vorher würde das Result die Layout-Shift mitten in der Animation
-    // verursachen.
-    enabled: !!selectedStop && !!stop && bodyReady,
+  // Fetch erst sobald die Slide-Animation durch ist UND ein Stop aktiv ist.
+  // Vorher würde das Result die Layout-Shift mitten in der Animation
+  // verursachen. Ankünfte zusätzlich erst auf Wunsch (`arrivalsWanted`).
+  const boardEnabled = !!selectedStop && !!stop && bodyReady;
+  const depQuery = useQuery<StopBoardResponse>({
+    queryKey: ["stopBoard", stop?.code ?? "_none_", "departures"],
+    queryFn: () => fetchStopDepartures(stop!.code),
+    enabled: boardEnabled,
     staleTime: 45 * 1000,
     refetchOnMount: "always",
     retry: 1,
   });
+  const arrQuery = useQuery<StopBoardResponse>({
+    queryKey: ["stopBoard", stop?.code ?? "_none_", "arrivals"],
+    queryFn: () => fetchStopArrivals(stop!.code),
+    enabled: boardEnabled && arrivalsWanted,
+    staleTime: 45 * 1000,
+    refetchOnMount: "always",
+    retry: 1,
+    // Bis sie gezeigt werden, weckt die Anfrage das Blatt nicht — siehe
+    // `requestArrivals`.
+    notifyOnChangeProps: arrivalsWanted ? undefined : [],
+  });
+  const queryClient = useQueryClient();
+  /**
+   * Der Tipp auf „Ankünfte": die Tafel schon anfragen, aber noch nicht zeigen.
+   *
+   * Vorher schaltete der Tipp die Abfrage direkt ein — ihr Start und eine
+   * schnelle Antwort legten je einen Durchgang durchs ganze Blatt mitten in
+   * die Fahrt, und die Liste baute sich darin auf. Das war das Ruckeln beim
+   * ERSTEN Wechsel. Jetzt läuft die Anfrage still (`notifyOnChangeProps`),
+   * und gezeigt wird ab der Ankunft (`onBoardSettled`) — mit Daten, wenn sie
+   * schon da sind, sonst mit dem Ladekreis bis dahin.
+   */
+  const requestArrivals = useCallback(() => {
+    if (!stop || !boardEnabled || arrivalsWanted) return;
+    const code = stop.code;
+    void queryClient.prefetchQuery({
+      queryKey: ["stopBoard", code, "arrivals"],
+      queryFn: () => fetchStopArrivals(code),
+      staleTime: 45 * 1000,
+      retry: 1,
+    });
+  }, [stop, boardEnabled, arrivalsWanted, queryClient]);
+  /** Die Tafel steht — erst jetzt die Ankünfte zeigen. */
+  const onBoardSettled = useCallback(
+    (index: number) => {
+      if (index === 1 && stop) setArrivalsFor(stop.code);
+    },
+    [stop],
+  );
+  /** Angaben zum HALT (Zone, Zusatz, HAFAS-Kennung) — gleich auf beiden Tafeln. */
+  const data = depQuery.data ?? arrQuery.data;
 
   /**
    * Ortszeit-Zone des Halts — kommt mit der Tafel (Server, aus der Lage). Alle
@@ -1271,8 +1371,8 @@ function StopDetailSheetInner() {
    */
   const boardTz = data?.stop?.tz;
   const zoneHint = useMemo(() => (boardTz ? localTimeHint([boardTz], t) : null), [boardTz, t]);
-  /** Unterscheidungs-Zusatz — vom Marker bzw. aus der Suche, sonst aus der Tafel. */
-  const stopDetail = stop?.detail ?? data?.stop?.detail;
+  /** Unterscheidungs-Zusatz — vom Marker bzw. aus der Suche, sonst aus der Tafel; ein Bus-Steig mit „Steig 3" davor. */
+  const stopDetail = standDetail(t, stop?.platform ?? data?.stop?.platform, stop?.detail ?? data?.stop?.detail);
 
   /**
    * Die laufende MINUTE — nur für das Aussortieren abgefahrener Züge.
@@ -1304,19 +1404,43 @@ function StopDetailSheetInner() {
     return () => clearTimeout(id);
   }, [selectedStop]);
 
-  const items: StopBoardItem[] = useMemo(() => {
-    /**
-     * Nur was noch kommt: Abfahrten (bzw. Ankünfte) ab der laufenden Minute,
-     * mit Verspätung gerechnet. Ein Zug um 14:26 steht bis 14:26:59 da — als
-     * „jetzt" —, danach ist er weg. Vergangene braucht niemand.
-     */
-    const fromMs = minuteNow * 60_000;
-    const upcoming = (data?.results ?? []).filter(
-      (it) => Date.parse(it.plannedTime) + (it.delayMinutes ?? 0) * 60_000 >= fromMs,
-    );
-    if (kinds.length < 2) return upcoming;
-    return upcoming.filter((it) => productMatchesKind(it.product, activeKind));
-  }, [data, kinds.length, activeKind, minuteNow]);
+  /**
+   * Nur was noch kommt: Abfahrten (bzw. Ankünfte) ab der laufenden Minute,
+   * mit Verspätung gerechnet. Ein Zug um 14:26 steht bis 14:26:59 da — als
+   * „jetzt" —, danach ist er weg. Vergangene braucht niemand.
+   */
+  const depAll = useMemo(() => upcomingOf(depQuery.data, minuteNow), [depQuery.data, minuteNow]);
+  const arrAll = useMemo(() => upcomingOf(arrQuery.data, minuteNow), [arrQuery.data, minuteNow]);
+  /** Die Filter-Kästen: was an diesem Halt fährt (beide Tafeln, sobald geladen). */
+  const categories = useMemo(
+    () => (isAirport ? [] : categoriesOf(depQuery.data, arrQuery.data)),
+    [isAirport, depQuery.data, arrQuery.data],
+  );
+  const depItems = useMemo(() => withoutHidden(depAll, hiddenCats), [depAll, hiddenCats]);
+  const arrItems = useMemo(() => withoutHidden(arrAll, hiddenCats), [arrAll, hiddenCats]);
+  /**
+   * Eine Art aus- bzw. wieder einblenden. Die letzte sichtbare bleibt: Ganz
+   * ohne Arten stünde nur eine leere Tafel da.
+   */
+  const stopCode = stop?.code ?? null;
+  const toggleCategory = useCallback(
+    (c: BoardCategory) => {
+      if (!stopCode) return;
+      setHidden((prev) => {
+        const next = new Set(prev.code === stopCode ? prev.cats : NO_CATS);
+        if (next.has(c)) next.delete(c);
+        else if (categories.filter((x) => !next.has(x)).length > 1) next.add(c);
+        else return prev;
+        return { code: stopCode, cats: next };
+      });
+      haptic("button");
+    },
+    [categories, stopCode],
+  );
+  const showAllCategories = useCallback(() => {
+    haptic("button");
+    setHidden({ code: null, cats: NO_CATS });
+  }, []);
 
   // Snap-Punkte (gleich wie SurroundingsSheet): full (oben), mid (halb),
   // sheetHeight = komplett off-screen unten.
@@ -1437,6 +1561,10 @@ function StopDetailSheetInner() {
       ? !sheetOwnsGesture.value && translateY.value <= snap.mid + 0.5
       : translateY.value <= snap.full + 0.5,
   }));
+  /** Dasselbe für die Ankunftsliste — je Liste eine eigene Bindung. */
+  const arrListProps = useAnimatedProps(() => ({
+    scrollEnabled: translateY.value <= snap.full + 0.5,
+  }));
 
   // Open/close animation getrieben durch selectedStop. 350ms matched die
   // Slide-Dauer der anderen Overlays in der App.
@@ -1554,6 +1682,12 @@ function StopDetailSheetInner() {
    */
   const gate = useSheetScrollGate();
   /**
+   * Die Ankunftsliste hat ihren eigenen — beide Listen stehen nebeneinander
+   * (`SlidingPanels`), und die Blatt-Geste fragt den der Liste, die der Finger
+   * berührt (nur die sichtbare kann es sein).
+   */
+  const arrGate = useSheetScrollGate();
+  /**
    * Scroll-Stand zurück auf null, sobald eine andere Liste im Blatt steht —
    * andere Haltestelle, andere Stadt, anderer Reiter, oder das Blatt geht zu.
    *
@@ -1565,7 +1699,8 @@ function StopDetailSheetInner() {
    */
   useEffect(() => {
     gate.scrollY.value = 0;
-  }, [target, tab, gate]);
+    arrGate.scrollY.value = 0;
+  }, [target, gate, arrGate]);
   const base = useSharedValue(0);
   /** Hat sich das BLATT in dieser Geste bewegt (nicht nur die Liste)? */
   const sheetMoved = useSharedValue(false);
@@ -1624,7 +1759,7 @@ function StopDetailSheetInner() {
       }
       manager.activate();
     })
-    .simultaneousWithExternalGesture(gate.native)
+    .simultaneousWithExternalGesture(gate.native, arrGate.native)
     /**
      * Anfang und Ende des Ziehens melden — GENAU ZWEIMAL, nicht pro Bild.
      *
@@ -1666,9 +1801,12 @@ function StopDetailSheetInner() {
         base.value = e.translationY;
         return;
       }
-      // `gate.onList`: nur eine Berührung, die AUF der Liste liegt (sonst
+      // `onList`: nur eine Berührung, die AUF der Liste liegt (sonst
       // sperrte eine gescrollte Abfahrtsliste auch das Ziehen am Kopf).
-      if (gate.onList.value && gate.scrollY.value > 0.5) {
+      if (
+        (gate.onList.value && gate.scrollY.value > 0.5) ||
+        (arrGate.onList.value && arrGate.scrollY.value > 0.5)
+      ) {
         // Die Liste scrollt noch — das Blatt bleibt stehen, der Nullpunkt geht mit.
         startY.value = translateY.value;
         base.value = e.translationY;
@@ -1686,23 +1824,24 @@ function StopDetailSheetInner() {
        * geht weiter hoch, bewegt es sich nicht — dann gehört die Bewegung der
        * Liste, und festhalten dürfte man sie nicht.
        */
-      if (
-        Math.abs(translateY.value - startY.value) > 0.5 &&
-        /**
-         * Nur korrigieren, wenn die Liste tatsächlich verrutscht IST.
-         *
-         * Hier stand der Aufruf unbedingt — also in jedem Bild eines Ziehens,
-         * auch wenn die Liste längst auf null stand. Das ist nicht nur
-         * überflüssig: Der native Scroller bekommt dieselbe Berührung ab, und
-         * ein „setze auf null" in jedem Bild arbeitet gegen ihn an, statt ihn
-         * einmal festzuhalten. Sichtbar wird daraus ein Zittern der Zeilen.
-         */
-        gate.scrollY.value > 0.5 &&
-        gate.ref()
-      ) {
-        // Der Test auf die Verknüpfung gehört dazu: Ohne Abfahrten zeigt dieses
-        // Blatt gar keine Liste, und Reanimated schriebe pro Bild eine Warnung.
-        scrollTo(gate.ref, 0, 0, false);
+      /**
+       * Nur korrigieren, wenn die Liste tatsächlich verrutscht IST.
+       *
+       * Hier stand der Aufruf unbedingt — also in jedem Bild eines Ziehens,
+       * auch wenn die Liste längst auf null stand. Das ist nicht nur
+       * überflüssig: Der native Scroller bekommt dieselbe Berührung ab, und
+       * ein „setze auf null" in jedem Bild arbeitet gegen ihn an, statt ihn
+       * einmal festzuhalten. Sichtbar wird daraus ein Zittern der Zeilen.
+       *
+       * Der Test auf die Verknüpfung gehört dazu: Ohne Abfahrten zeigt dieses
+       * Blatt gar keine Liste, und Reanimated schriebe pro Bild eine Warnung.
+       * Die Ankunftsliste nur, wenn der Finger auf ihr liegt.
+       */
+      if (Math.abs(translateY.value - startY.value) > 0.5) {
+        if (gate.scrollY.value > 0.5 && gate.ref()) scrollTo(gate.ref, 0, 0, false);
+        if (arrGate.onList.value && arrGate.scrollY.value > 0.5 && arrGate.ref()) {
+          scrollTo(arrGate.ref, 0, 0, false);
+        }
       }
     })
     .onEnd((e) => {
@@ -1781,7 +1920,136 @@ function StopDetailSheetInner() {
       stopDragHeal(stopSheetHeal);
       runOnJS(setSheetDragging)(false);
     }),
-  [snap, startY, translateY, base, gate, closeBySwipe, sheetMoved, cityMode, sheetOwnsGesture, listOwnsGesture, touchStartY, decided, closing, grabbed]);
+  [snap, startY, translateY, base, gate, arrGate, closeBySwipe, sheetMoved, cityMode, sheetOwnsGesture, listOwnsGesture, touchStartY, decided, closing, grabbed]);
+
+  /** Die Reiter — fest, die Umschaltung vergleicht ihre Einträge nicht neu. */
+  const boardTabs = useMemo(
+    () => [
+      { id: "departures", label: t("stop.tab.departures") },
+      { id: "arrivals", label: t("stop.tab.arrivals") },
+    ],
+    [t],
+  );
+
+  /**
+   * EINE TAFEL — Abfahrten oder Ankünfte. Beide stehen nebeneinander im Blatt
+   * (`SlidingPanels`) und fahren beim Wechsel gemeinsam; jede hat ihre eigene
+   * Liste mit eigenem Torhüter (`g`) für die Blatt-Geste.
+   */
+  const renderBoard = (
+    board: BoardTab,
+    q: UseQueryResult<StopBoardResponse>,
+    list: StopBoardItem[],
+    total: number,
+    g: SheetScrollGate,
+    lp: typeof listProps,
+    wanted: boolean,
+  ) => (
+    <View style={styles.boardPanel}>
+      {!wanted || q.isLoading ? (
+        <ActivityIndicator color={C.g1} style={{ marginTop: 24 }} />
+      ) : q.isError ? (
+        // FEHLER ist nicht LEER. Vorher lief beides in denselben Zweig —
+        // ein Netz-Aussetzer behauptete dann „Keine Abfahrten", also eine
+        // Falschaussage über den Fahrplan. Jetzt sagen wir, dass WIR
+        // nichts laden konnten, und bieten einen Retry an.
+        <View style={styles.empty}>
+          <Text style={styles.emptyTitle}>{t("stop.error.title")}</Text>
+          <Text style={styles.emptyBody}>{t("results.error.body")}</Text>
+          <RippleTouch onPress={() => void q.refetch()} style={[styles.retryBtn, { backgroundColor: palette.s3 }]} hitSlop={8}>
+            <Text style={styles.retryText}>{t("results.retry")}</Text>
+          </RippleTouch>
+        </View>
+      ) : list.length === 0 ? (
+        total > 0 ? (
+          // Es gäbe Fahrten — nur nicht für die gewählten Arten.
+          <View style={styles.empty}>
+            <Text style={styles.emptyBody}>{t("stop.empty.filtered")}</Text>
+          </View>
+        ) : (
+          <View style={styles.empty}>
+            <Text style={styles.emptyTitle}>
+              {t(
+                board === "departures"
+                  ? "stop.empty.departures.title"
+                  : "stop.empty.arrivals.title",
+              )}
+            </Text>
+            <Text style={styles.emptyBody}>
+              {t(
+                board === "departures"
+                  ? "stop.empty.departures.body"
+                  : "stop.empty.arrivals.body",
+              )}
+            </Text>
+          </View>
+        )
+      ) : (
+        <GestureDetector gesture={g.native}>
+        <Animated.ScrollView
+          // Neue Haltestelle oder anderer Reiter = neue Liste, oben
+          // beginnend — passend zum zurückgesetzten Scroll-Stand
+          // (siehe den Torhüter `g`).
+          key={`${stop!.code}|${board}`}
+          ref={g.ref}
+          contentContainerStyle={styles.list}
+          showsVerticalScrollIndicator
+          // Scrollt nur am oberen Rastpunkt — siehe `listProps`.
+          animatedProps={lp}
+          onScroll={g.onScroll}
+          scrollEventThrottle={16}
+          // Kein Überzieh-Schimmer oben: Dort übernimmt das Blatt.
+          overScrollMode="never"
+          bounces={false}
+        >
+          {/* Hero = nächste Abfahrt mit Countdown-Ring. „Danach"-Label
+              nur rendern wenn es noch weitere Items gibt, sonst wirkt
+              die Section-Headline einsam. */}
+          {/* Zeiten eines anderen, nahen Halts — ehrlich sagen, von welchem. */}
+          {q.data?.stop.servedBy ? (
+            <Text style={styles.servedByHint} numberOfLines={2}>
+              {t("stop.servedBy")
+                .replace("{name}", q.data.stop.servedBy.name)
+                .replace("{m}", String(q.data.stop.servedBy.distanceM))}
+            </Text>
+          ) : null}
+          <NextHero
+            item={list[0]!}
+            tz={boardTz}
+            dayLabel={boardDayLabel(list[0]!.plannedTime, boardTz, locale, t("stop.day.tomorrow"))}
+            ringDayLabel={boardDayLabel(list[0]!.plannedTime, boardTz, locale, t("stop.day.tomorrow"), true)}
+            fetchedAt={q.data?.fetchedAt}
+            platformPrefix={platformPrefixFor(t, list[0]!.product)}
+            nextLabel={t("stop.section.next")}
+            ontimeLabel={t("stop.section.ontime")}
+            loading={loadingDepartureId === list[0]!.id}
+            onPress={() => onSelectDeparture(list[0]!, board)}
+            onLive={canLive(list[0]!) ? () => startLiveFor(list[0]!, board) : undefined}
+            liveLabel={t("live.button")}
+            liveClock={liveClock}
+          />
+          {list.length > 1 && (
+            <Text style={styles.danachLabel}>{t("stop.section.later")}</Text>
+          )}
+          {list.slice(1, 6).map((it, i) => (
+            <StopBoardRow
+              key={`${it.id}-${i}`}
+              item={it}
+              tz={boardTz}
+              dayLabel={boardDayLabel(it.plannedTime, boardTz, locale, t("stop.day.tomorrow"))}
+              platformPrefix={platformPrefixFor(t, it.product)}
+              loading={loadingDepartureId === it.id}
+              onPress={() => onSelectDeparture(it, board)}
+              onLive={canLive(it) ? () => startLiveFor(it, board) : undefined}
+              liveLabel={t("live.button")}
+              liveClock={liveClock}
+            />
+          ))}
+        </Animated.ScrollView>
+        </GestureDetector>
+      )}
+    </View>
+  );
 
   // Sheet bleibt PERMANENT gemountet — auch wenn nichts ausgewählt ist
   // (translateY = sheetHeight = off-screen). Dadurch entfällt der React-
@@ -1892,184 +2160,61 @@ function StopDetailSheetInner() {
                 // Begründung an `STAR_INSET`.
                 return (
                   <View style={{ marginTop: -STAR_INSET, marginRight: -STAR_INSET }}>
-                    <SaveStarButton
-                      /**
-                       * Größen AUSDRÜCKLICH gesetzt, obwohl es die Vorgaben
-                       * sind — die Hülle rechnet mit ihnen.
-                       *
-                       * Der Knopf ist eine Trefferfläche von 46 mit einem
-                       * Symbol von 30 darin; die Differenz von 16 verteilt
-                       * sich als 8 Punkte Luft auf jede Seite. Genau diese 8
-                       * zieht `headerFav` wieder heraus. Stünden die Zahlen
-                       * nur als Vorgaben in der Komponente, ginge die
-                       * Rechnung beim nächsten Anfassen dort still kaputt.
-                       */
-                      size={STAR_BTN}
-                      starSize={STAR_ICON}
+                    <StarOrReset
+                      // Je Halt neu: Der Pfeil eines gefilterten Halts fährt
+                      // beim Wechsel nicht erst hinaus.
+                      key={stop.code}
+                      filtered={hiddenCats.size > 0}
                       saved={saved}
-                      onChange={(willSave) => {
+                      onSavedChange={(willSave) => {
                         if (!asLocation) return;
                         toggleSavedStation(asLocation);
                         if (willSave) {
-                          showStationToast(
-                            t("surroundings.stationsaved"),
-                            asLocation.label.toUpperCase(),
-                          );
+                          showStationToast(t("surroundings.stationsaved"), asLocation.label);
                         }
                       }}
+                      onReset={showAllCategories}
+                      resetLabel={t("stop.filter.reset")}
                     />
                   </View>
                 );
               })()}
             </View>
 
-            {/* Mode-Pillen (nur bei multi-modalen Stops sichtbar). Flat-Style:
-                Aktiv = Lime-Bg + schwarzer Text, Inaktiv = transparent + weißer
-                Text + grauer Border. Kein Color-Coding pro Mode mehr — das war
-                visuell zu viel im engen Sheet-Header. */}
-            {bodyReady && kinds.length >= 2 && (
-              <View style={styles.pillsRow}>
-                {kinds.map((k) => {
-                  const style = KIND_STYLE[k];
-                  const Icon = KIND_ICON[k];
-                  if (!Icon || !style) return null;
-                  const active = activeKind === k;
-                  return (
-                    <ModePill
-                      key={k}
-                      Icon={Icon}
-                      label={t(style.tKey)}
-                      active={active}
-                      onPress={() => setActiveKind(k)}
-                    />
-                  );
-                })}
-              </View>
-            )}
-
-            {/* Tabs Departures/Arrivals — aktiver Tab kriegt grünen Underline.
-                Auch hinter `bodyReady` gegated weil bei Single-Mode-Stops die
-                Pillen fehlen und sonst die Tabs alleine während der Slide-In
-                rein-poppen. */}
-            {bodyReady && (
-              <View style={styles.tabsRow}>
-                {(["departures", "arrivals"] as const).map((b) => {
-                  const active = tab === b;
-                  return (
-                    <RippleTouch key={b} onPress={() => setTab(b)} style={styles.tab}>
-                      <Text style={[styles.tabText, active ? styles.tabActive : styles.tabInactive]}>
-                        {t(b === "departures" ? "stop.tab.departures" : "stop.tab.arrivals")}
-                      </Text>
-                      {active && <View style={[styles.tabUnderline, { backgroundColor: accent.solid }]} />}
-                    </RippleTouch>
-                  );
-                })}
-                {/* „Ortszeit (UTC+1)" — rechts in der Reiter-Zeile, leise. */}
-                {zoneHint ? (
-                  <Text style={styles.zoneHint} numberOfLines={1}>
-                    {zoneHint}
-                  </Text>
-                ) : null}
-              </View>
-            )}
-
-            <View style={styles.body}>
-              {!bodyReady ? null : isLoading ? (
-                <ActivityIndicator color={C.g1} style={{ marginTop: 24 }} />
-              ) : isError ? (
-                // FEHLER ist nicht LEER. Vorher lief beides in denselben Zweig —
-                // ein Netz-Aussetzer behauptete dann „Keine Abfahrten", also eine
-                // Falschaussage über den Fahrplan. Jetzt sagen wir, dass WIR
-                // nichts laden konnten, und bieten einen Retry an.
-                <View style={styles.empty}>
-                  <Text style={styles.emptyTitle}>{t("stop.error.title")}</Text>
-                  <Text style={styles.emptyBody}>{t("results.error.body")}</Text>
-                  <RippleTouch onPress={() => void refetch()} style={[styles.retryBtn, { backgroundColor: palette.s3 }]} hitSlop={8}>
-                    <Text style={styles.retryText}>{t("results.retry")}</Text>
-                  </RippleTouch>
-                </View>
-              ) : items.length === 0 ? (
-                <View style={styles.empty}>
-                  <Text style={styles.emptyTitle}>
-                    {t(
-                      tab === "departures"
-                        ? "stop.empty.departures.title"
-                        : "stop.empty.arrivals.title",
-                    )}
-                  </Text>
-                  <Text style={styles.emptyBody}>
-                    {t(
-                      tab === "departures"
-                        ? "stop.empty.departures.body"
-                        : "stop.empty.arrivals.body",
-                    )}
-                  </Text>
-                </View>
-              ) : (
-                <GestureDetector gesture={gate.native}>
-                <Animated.ScrollView
-                  // Neue Haltestelle oder anderer Reiter = neue Liste, oben
-                  // beginnend — passend zum zurückgesetzten Scroll-Stand
-                  // (siehe `gate.scrollY` weiter oben).
-                  key={`${stop.code}|${tab}`}
-                  ref={gate.ref}
-                  contentContainerStyle={styles.list}
-                  showsVerticalScrollIndicator
-                  // Scrollt nur am oberen Rastpunkt — siehe `listProps`.
-                  animatedProps={listProps}
-                  onScroll={gate.onScroll}
-                  scrollEventThrottle={16}
-                  // Kein Überzieh-Schimmer oben: Dort übernimmt das Blatt.
-                  overScrollMode="never"
-                  bounces={false}
-                >
-                  {/* Hero = nächste Abfahrt mit Countdown-Ring. „Danach"-Label
-                      nur rendern wenn es noch weitere Items gibt, sonst wirkt
-                      die Section-Headline einsam. */}
-                  {/* Zeiten eines anderen, nahen Halts — ehrlich sagen, von welchem. */}
-                  {data?.stop.servedBy ? (
-                    <Text style={styles.servedByHint} numberOfLines={2}>
-                      {t("stop.servedBy")
-                        .replace("{name}", data.stop.servedBy.name)
-                        .replace("{m}", String(data.stop.servedBy.distanceM))}
-                    </Text>
-                  ) : null}
-                  <NextHero
-                    item={items[0]!}
-                    tz={boardTz}
-                    dayLabel={boardDayLabel(items[0]!.plannedTime, boardTz, locale, t("stop.day.tomorrow"))}
-                    ringDayLabel={boardDayLabel(items[0]!.plannedTime, boardTz, locale, t("stop.day.tomorrow"), true)}
-                    fetchedAt={data?.fetchedAt}
-                    platformPrefix={t("stop.platform.prefix")}
-                    nextLabel={t("stop.section.next")}
-                    ontimeLabel={t("stop.section.ontime")}
-                    loading={loadingDepartureId === items[0]!.id}
-                    onPress={() => onSelectDeparture(items[0]!)}
-                    onLive={canLive(items[0]!) ? () => startLiveFor(items[0]!) : undefined}
-                    liveLabel={t("live.button")}
-                    liveClock={liveClock}
+            {/* Was an diesem Halt fährt — Kästen als Filter (siehe `CATEGORY`).
+                Schon während die Tafel lädt, steht die Zeile in voller Höhe da:
+                Sonst sprängen Umschaltung und Liste nach unten, sobald sie kommt. */}
+            {bodyReady && !isAirport && (categories.length > 0 || depQuery.isLoading) && (
+              <View style={styles.catRow}>
+                {categories.map((c) => (
+                  <CategoryChip
+                    key={c}
+                    cat={c}
+                    label={t(CATEGORY[c].tKey)}
+                    active={!hiddenCats.has(c)}
+                    interactive={categories.length > 1}
+                    onToggle={toggleCategory}
                   />
-                  {items.length > 1 && (
-                    <Text style={styles.danachLabel}>{t("stop.section.later")}</Text>
-                  )}
-                  {items.slice(1, 6).map((it, i) => (
-                    <StopBoardRow
-                      key={`${it.id}-${i}`}
-                      item={it}
-                      tz={boardTz}
-                      dayLabel={boardDayLabel(it.plannedTime, boardTz, locale, t("stop.day.tomorrow"))}
-                      platformPrefix={t("stop.platform.prefix")}
-                      loading={loadingDepartureId === it.id}
-                      onPress={() => onSelectDeparture(it)}
-                      onLive={canLive(it) ? () => startLiveFor(it) : undefined}
-                      liveLabel={t("live.button")}
-                      liveClock={liveClock}
-                    />
-                  ))}
-                </Animated.ScrollView>
-                </GestureDetector>
-              )}
-            </View>
+                ))}
+              </View>
+            )}
+
+            {/* Abfahrten | Ankünfte — eine Blase, die wandert, wie im
+                Gespeichert-Tab; die Listen darunter fahren mit. */}
+            {bodyReady ? (
+              <BoardSwitch
+                // Je Halt neu — jeder beginnt mit den Abfahrten.
+                key={stop.code}
+                tabs={boardTabs}
+                zoneHint={zoneHint}
+                onArrivalsTap={requestArrivals}
+                onSettled={onBoardSettled}
+                departures={renderBoard("departures", depQuery, depItems, depAll.length, gate, listProps, true)}
+                arrivals={renderBoard("arrivals", arrQuery, arrItems, arrAll.length, arrGate, arrListProps, arrivalsWanted)}
+              />
+            ) : (
+              <View style={styles.body} />
+            )}
           </>
         )}
       </Animated.View>
@@ -2078,26 +2223,225 @@ function StopDetailSheetInner() {
   );
 }
 
-function productMatchesKind(product: string | null, kind: MarkerKind): boolean {
-  if (!product) return true;
-  const p = product.toLowerCase();
-  switch (kind) {
-    case "train":
-      return /national|regional|suburban|express|rail/.test(p);
-    case "subway":
-      return /subway|metro|u-bahn|ubahn/.test(p);
-    case "tram":
-      return /tram|stadtbahn/.test(p);
-    case "bus":
-      return /bus|coach/.test(p);
-    case "airport":
-      return /flight|air/.test(p);
-    case "cruise":
-      return /ferry|ship/.test(p);
-    default:
-      return true;
-  }
+/**
+ * Ein Kasten der Tafel: Symbol | Name. An = in der Farbe der Art, aus = nur
+ * der weiße Rahmen (die Farbe geht, die Fahrten dieser Art auch). Antippbar
+ * nur, wenn es mehrere Arten gibt — sonst zeigt er nur, was hier fährt.
+ */
+const CategoryChip = memo(function CategoryChip({
+  cat,
+  label,
+  active,
+  interactive,
+  onToggle,
+}: {
+  cat: BoardCategory;
+  label: string;
+  active: boolean;
+  interactive: boolean;
+  onToggle: (c: BoardCategory) => void;
+}) {
+  const def = CATEGORY[cat];
+  const Icon = def.Icon;
+  const onPress = useCallback(() => onToggle(cat), [onToggle, cat]);
+  return (
+    <RippleTouch
+      onPress={interactive ? onPress : undefined}
+      disabled={!interactive}
+      accessibilityRole={interactive ? "button" : "text"}
+      accessibilityLabel={label}
+      accessibilityState={interactive ? { selected: active } : undefined}
+      style={[styles.catChip, { backgroundColor: active ? def.color : "transparent" }]}
+    >
+      {def.letter ? (
+        <Text style={styles.catLetter}>{def.letter}</Text>
+      ) : Icon ? (
+        <Icon color="#FFFFFF" size={20} strokeWidth={2.2} />
+      ) : null}
+      <View style={styles.catSep} />
+      <Text style={styles.catLabel} numberOfLines={1}>
+        {label}
+      </Text>
+    </RippleTouch>
+  );
+});
+
+/**
+ * Abfahrten | Ankünfte — die Umschaltung und die beiden Tafeln darunter.
+ *
+ * Der gewählte Reiter lebt HIER, nicht im Blatt. Vorher lief bei jedem Wechsel
+ * das ganze Blatt durch, samt beider Listen mit Ringen und Live-Knöpfen — genau
+ * in dem Moment, in dem die Fahrt begann. Jetzt rendert ein Wechsel nur diese
+ * Hülle: Die Tafeln kommen als fertige Elemente herein, und React lässt sie
+ * unberührt. Dazu fährt die Schiene ohne Textur (`rasterize={false}`, siehe
+ * SlidingPanels).
+ */
+function BoardSwitch({
+  tabs,
+  zoneHint,
+  onArrivalsTap,
+  onSettled,
+  departures,
+  arrivals,
+}: {
+  tabs: { id: string; label: string }[];
+  zoneHint: string | null;
+  onArrivalsTap: () => void;
+  onSettled: (index: number) => void;
+  departures: ReactNode;
+  arrivals: ReactNode;
+}) {
+  const [tab, setTab] = useState<BoardTab>("departures");
+  const onChange = useCallback(
+    (id: string) => {
+      if (id === "arrivals") onArrivalsTap();
+      setTab(id as BoardTab);
+    },
+    [onArrivalsTap],
+  );
+  return (
+    <>
+      <View style={styles.toggleRow}>
+        <SegmentedToggle items={tabs} selectedId={tab} onChange={onChange} borderRadius={14} segmentHeight={34} />
+        {/* „Ortszeit (UTC+1)" — leise unter der Umschaltung. */}
+        {zoneHint ? (
+          <Text style={styles.zoneHint} numberOfLines={1}>
+            {zoneHint}
+          </Text>
+        ) : null}
+      </View>
+      <View style={styles.body}>
+        <SlidingPanels activeIndex={tab === "departures" ? 0 : 1} rasterize={false} onSettled={onSettled}>
+          {departures}
+          {arrivals}
+        </SlidingPanels>
+      </View>
+    </>
+  );
 }
+
+/** So weit rückt der Stern zur Seite, wenn der Pfeil kommt (Mitte zu Mitte). */
+const RESET_SHIFT = 40;
+/**
+ * Weich anfahren, weich ankommen. Die Kurve davor schoss in den ersten Bildern
+ * los — und genau die fielen dem Umbau der Tafeln zum Opfer: Der Stern sprang
+ * ein Stück und kroch dann („laggy"). Mit sanftem Anfang kostet ein spätes
+ * erstes Bild nichts Sichtbares.
+ */
+const RESET_SWAP = { duration: 360, easing: Easing.bezier(0.4, 0, 0.2, 1) };
+
+/**
+ * STERN UND ZURÜCK-PFEIL teilen sich den Platz oben rechts.
+ *
+ * Ist eine Verkehrsart ausgeblendet, rollt der Pfeil auf den Platz des Sterns
+ * und schiebt ihn zur Seite; ein Tipp darauf zeigt wieder alles, der Pfeil geht,
+ * und der Stern rückt zurück. Beide bleiben gemountet — was zu sehen ist,
+ * steuert ein Wert auf dem UI-Strang.
+ *
+ * Gefahren wird NACH dem Durchgang, der den Filter setzt — und ein Bild später
+ * als sein Effekt. Dieser Durchgang baut beide Tafeln um, und auf Fabric wird
+ * er danach auf dem UI-Strang eingehängt, demselben, auf dem die Fahrt läuft:
+ * Begann sie im selben Moment, fehlten ihr die ersten Bilder. Und ein Commit
+ * mitten in einer Reanimated-Fahrt schreibt deren Lage ein, zwei Bilder zu spät
+ * zurück — deshalb meldet sie sich als Bewegung an (`markSheetMoving`), dann
+ * setzt der Sekundentakt der Abfahrtszeiten so lange aus.
+ *
+ * Solange der Pfeil steht — und bis der Stern wieder zu Hause ist —, nimmt die
+ * Gruppe zwei Plätze ein: Ein langer Name endet dann vor dem Stern statt unter
+ * ihm. Umgestellt wird die Breite nur vor bzw. nach der Fahrt.
+ */
+const StarOrReset = memo(function StarOrReset({
+  filtered,
+  saved,
+  onSavedChange,
+  onReset,
+  resetLabel,
+}: {
+  filtered: boolean;
+  saved: boolean;
+  onSavedChange: (willSave: boolean) => void;
+  onReset: () => void;
+  resetLabel: string;
+}) {
+  const p = useSharedValue(filtered ? 1 : 0);
+  /** Den zweiten Platz halten, bis der Stern zurück ist. */
+  const [holdWide, setHoldWide] = useState(filtered);
+  /** Wohin zuletzt gefahren wurde — beim Einhängen gibt es nichts zu fahren. */
+  const targetRef = useRef(filtered ? 1 : 0);
+  useEffect(() => {
+    const target = filtered ? 1 : 0;
+    if (targetRef.current === target) return;
+    targetRef.current = target;
+    const id = requestAnimationFrame(() => {
+      markSheetMoving(RESET_SWAP.duration);
+      p.value = withTiming(target, RESET_SWAP, (finished) => {
+        if (finished) runOnJS(setHoldWide)(filtered);
+      });
+    });
+    return () => cancelAnimationFrame(id);
+  }, [filtered, p]);
+  const starStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: -RESET_SHIFT * p.value }],
+  }));
+  const arrowStyle = useAnimatedStyle(() => ({
+    opacity: interpolate(p.value, [0, 0.6], [0, 1], Extrapolation.CLAMP),
+    transform: [
+      { translateX: (1 - p.value) * 12 },
+      { rotate: `${(1 - p.value) * -50}deg` },
+      { scale: interpolate(p.value, [0, 0.75, 1], [0.5, 1.06, 1]) },
+    ],
+  }));
+  return (
+    <View style={[STAR_GROUP, { width: filtered || holdWide ? STAR_BTN + RESET_SHIFT : STAR_BTN }]}>
+      <Animated.View style={starStyle}>
+        <SaveStarButton
+          /**
+           * Größen AUSDRÜCKLICH gesetzt, obwohl es die Vorgaben sind — die
+           * Hülle rechnet mit ihnen.
+           *
+           * Der Knopf ist eine Trefferfläche von 46 mit einem Symbol von 30
+           * darin; die Differenz von 16 verteilt sich als 8 Punkte Luft auf jede
+           * Seite. Genau diese 8 zieht `headerFav` wieder heraus. Stünden die
+           * Zahlen nur als Vorgaben in der Komponente, ginge die Rechnung beim
+           * nächsten Anfassen dort still kaputt.
+           */
+          size={STAR_BTN}
+          starSize={STAR_ICON}
+          saved={saved}
+          onChange={onSavedChange}
+        />
+      </Animated.View>
+      <Animated.View
+        style={[RESET_SLOT, arrowStyle]}
+        pointerEvents={filtered ? "auto" : "none"}
+        accessibilityElementsHidden={!filtered}
+        importantForAccessibility={filtered ? "auto" : "no-hide-descendants"}
+      >
+        <RippleTouch
+          onPress={onReset}
+          borderless
+          accessibilityRole="button"
+          accessibilityLabel={resetLabel}
+          style={RESET_BTN}
+        >
+          <Undo2 color={C.white} size={26} strokeWidth={2.2} />
+        </RippleTouch>
+      </Animated.View>
+    </View>
+  );
+});
+
+function upcomingOf(board: StopBoardResponse | undefined, minuteNow: number): StopBoardItem[] {
+  const fromMs = minuteNow * 60_000;
+  return (board?.results ?? []).filter(
+    (it) => Date.parse(it.plannedTime) + (it.delayMinutes ?? 0) * 60_000 >= fromMs,
+  );
+}
+
+function withoutHidden(items: StopBoardItem[], hidden: ReadonlySet<BoardCategory>): StopBoardItem[] {
+  return hidden.size === 0 ? items : items.filter((it) => !hidden.has(categoryOf(it)));
+}
+
 
 /** Globales Overlay — wird in app/_layout.tsx einmal gerendert (damit's ÜBER
  *  FloatingTabBar liegt). Inner-Component bleibt permanent gemountet sobald
@@ -2118,9 +2462,15 @@ export const StopDetailSheet = memo(function StopDetailSheet() {
  * Falle, die beim Schalter den Kreis aus der Pille hat laufen lassen.
  */
 const STAR_BTN = 46;
+/** Der Countdown-Ring der nächsten Abfahrt — so groß wie seine Hülle (`heroRing`, skaliert). */
+const RING_BOX = ms(84);
 const STAR_ICON = 30;
 /** Die unsichtbare Luft je Seite — sie wird unten wieder herausgezogen. */
 const STAR_INSET = (STAR_BTN - STAR_ICON) / 2;
+/** Stern und Zurück-Pfeil (`StarOrReset`) — ebenso unskaliert wie der Knopf. */
+const STAR_GROUP = { flexDirection: "row", justifyContent: "flex-end" } as const;
+const RESET_SLOT = { position: "absolute", top: 0, right: 0, width: STAR_BTN, height: STAR_BTN } as const;
+const RESET_BTN = { flex: 1, alignItems: "center", justifyContent: "center" } as const;
 
 const styles = scaledStyles({
   sheet: {
@@ -2201,20 +2551,47 @@ const styles = scaledStyles({
   },
   headerDetailText: { color: C.g1, fontSize: 12, fontWeight: "600", letterSpacing: 0.1 },
 
-  pillsRow: {
+  // Die Verkehrsarten als Kästen (Filter) — wie DB Navigator: weißer Rahmen,
+  // an = in der Farbe der Art, aus = nur der Rahmen. Die Zeile hält ihre Höhe,
+  // auch solange die Tafel noch lädt (siehe dort).
+  catRow: {
     flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
     gap: 8,
     paddingHorizontal: 16,
     paddingBottom: 12,
+    minHeight: 48,
   },
-  // Die Pillen selbst stehen in `ModePill.tsx` — das Stadt-Blatt nimmt dieselben.
-
-  tabsRow: {
+  catChip: {
     flexDirection: "row",
-    paddingHorizontal: 16,
-    gap: 24,
+    alignItems: "center",
+    height: 36,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    borderWidth: 1.5,
+    borderColor: "#FFFFFF",
+    overflow: "hidden",
   },
-  tab: { paddingVertical: 8, position: "relative" },
+  catLetter: {
+    color: "#FFFFFF",
+    fontSize: 20,
+    fontWeight: "900",
+    minWidth: 20,
+    textAlign: "center",
+    includeFontPadding: false,
+  },
+  catSep: {
+    width: 1.5,
+    height: 20,
+    marginHorizontal: 9,
+    borderRadius: 1,
+    backgroundColor: "rgba(255,255,255,0.85)",
+  },
+  catLabel: { color: "#FFFFFF", fontSize: 15, fontWeight: "800", letterSpacing: 0.1 },
+
+  // Abfahrten | Ankünfte — über die volle Breite, Ortszeit darunter rechts.
+  toggleRow: { paddingHorizontal: 16, gap: 6 },
   // Ortszeit-Hinweis rechts in der Reiter-Zeile — klein und grau, damit
   // „15:33" in Oldham nicht für deutsche Zeit gehalten wird.
   servedByHint: {
@@ -2224,28 +2601,16 @@ const styles = scaledStyles({
     marginBottom: 8,
   },
   zoneHint: {
-    marginLeft: "auto",
-    alignSelf: "center",
-    flexShrink: 1,
+    alignSelf: "flex-end",
     color: C.g2,
     fontSize: 12,
     fontWeight: "500",
   },
-  tabText: { fontSize: 17, fontWeight: "700" },
-  tabActive: { color: C.white },
-  tabInactive: { color: C.g3 },
-  // Active-Tab-Underline: Brand-Grün (vorher rot).
-  // backgroundColor inline mit accent.solid gesetzt.
-  tabUnderline: {
-    position: "absolute",
-    left: 0,
-    right: 0,
-    bottom: 0,
-    height: 3,
-    borderRadius: 2,
-  },
 
-  body: { flex: 1, paddingHorizontal: 16, paddingTop: 12 },
+  // Der Körper über die volle Breite — die beiden Tafeln fahren als Ganzes
+  // (`SlidingPanels`); den Rand hält jede Tafel selbst.
+  body: { flex: 1, paddingTop: 12 },
+  boardPanel: { flex: 1, paddingHorizontal: 16 },
   empty: { alignItems: "center", paddingTop: 32, paddingHorizontal: 24 },
   emptyTitle: { color: C.white, fontSize: 18, fontWeight: "700", textAlign: "center" },
   emptyBody: { color: C.g1, fontSize: 15, marginTop: 6, textAlign: "center", lineHeight: 22 },
@@ -2294,6 +2659,9 @@ const styles = scaledStyles({
     letterSpacing: -0.6,
     lineHeight: 28,
   },
+  // Drei bzw. vier Ziffern: Der Abstand zum Ring bleibt etwa der von zweien.
+  heroRingMinSm: { fontSize: 20, lineHeight: 22, letterSpacing: -0.4 },
+  heroRingMinXs: { fontSize: 16, lineHeight: 18, letterSpacing: -0.3 },
   heroRingLabel: { color: C.g2, fontSize: 10, fontWeight: "600" },
   heroRingDay: {
     color: C.white,
@@ -2366,9 +2734,9 @@ const styles = scaledStyles({
     fontWeight: "700",
     marginTop: 2,
   },
-  // Lime-Tinted Badge mit Mode-Icon — gleicher Look in Hero und Cards
+  // Linien-Plakette mit Symbol — gleicher Look in Hero und Cards
   // (DRY: Badge-Style ist shared zwischen NextHero + StopBoardRow).
-  // backgroundColor/borderColor inline mit accent.subtle / accent.border.
+  // backgroundColor/borderColor inline: die Farbe der Verkehrsart (`lineColor`).
   cardLineBadge: {
     flexDirection: "row",
     alignItems: "center",
@@ -2379,7 +2747,7 @@ const styles = scaledStyles({
     paddingVertical: 5,
     flexShrink: 0,
   },
-  // color inline mit accent.solid.
+  // color inline: weiß wie auf den Kästen der Karte.
   cardLineBadgeText: {
     fontSize: 13,
     fontWeight: "700",

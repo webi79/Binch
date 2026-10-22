@@ -88,7 +88,7 @@ function foldStopName(v: string): string {
  * „Musterdorf Rathaus" und „Rathaus" sind deshalb NICHT derselbe Halt, nur weil
  * das eine auf das andere endet (siehe `sameStopName`).
  */
-const GENERIC_STOP_NAMES = new Set([
+export const GENERIC_STOP_NAMES = new Set([
   "rathaus", "kirche", "schule", "post", "markt", "marktplatz", "friedhof",
   "ortsmitte", "mitte", "zentrum", "dorfplatz", "dorf", "kirchplatz",
   "schulzentrum", "sportplatz", "siedlung", "abzweig", "kreuzung", "ort",

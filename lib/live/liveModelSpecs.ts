@@ -20,7 +20,7 @@ export const LIVE_MODEL_SPECS = {
         -9.625,
         5.875
       ],
-      "stripe": "#FFD60A",
+      "stripe": "#EC0016",
       "head": 1
     },
     "mid": {
@@ -36,7 +36,7 @@ export const LIVE_MODEL_SPECS = {
         -7.75,
         7.75
       ],
-      "stripe": "#FFD60A",
+      "stripe": "#EC0016",
       "head": 0
     }
   },
@@ -55,7 +55,7 @@ export const LIVE_MODEL_SPECS = {
         -7.670000000000001,
         6.37
       ],
-      "stripe": "#FFD60A",
+      "stripe": "#E8A800",
       "head": 1
     },
     "mid": {
@@ -71,7 +71,7 @@ export const LIVE_MODEL_SPECS = {
         -7.0200000000000005,
         7.0200000000000005
       ],
-      "stripe": "#FFD60A",
+      "stripe": "#E8A800",
       "head": 0
     }
   },
@@ -91,7 +91,7 @@ export const LIVE_MODEL_SPECS = {
         -0.25,
         5.33
       ],
-      "stripe": "#4C7BF0",
+      "stripe": "#1F3A8A",
       "head": 1
     },
     "mid": {
@@ -108,7 +108,7 @@ export const LIVE_MODEL_SPECS = {
         0,
         5.58
       ],
-      "stripe": "#4C7BF0",
+      "stripe": "#1F3A8A",
       "head": 0
     }
   },
@@ -126,7 +126,7 @@ export const LIVE_MODEL_SPECS = {
       "doors": [
         0.125
       ],
-      "stripe": "#3A3F47",
+      "stripe": "#2A2A2C",
       "head": 1
     },
     "mid": {
@@ -141,7 +141,7 @@ export const LIVE_MODEL_SPECS = {
       "doors": [
         0.5
       ],
-      "stripe": "#3A3F47",
+      "stripe": "#2A2A2C",
       "head": 0
     }
   },

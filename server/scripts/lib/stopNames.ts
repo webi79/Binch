@@ -33,6 +33,10 @@
  *     Steig, Mast, Bedarfshalt). Ortsvorsätze bleiben außerhalb
  *     Großbritanniens — „Praha, Florenc", „Utrecht, Centraal Station",
  *     „Zürich, Paradeplatz" heißen amtlich so.
+ *   • Überall: ein Ortsvorsatz, den der Name danach WIEDERHOLT, fällt weg
+ *     (`stripDoubledCity`: „Frankfurt am Main Frankfurt (Main) Börneplatz" →
+ *     „Frankfurt (Main) Börneplatz"). Den Vorsatz setzte ein früheres Skript
+ *     vor Namen, die ihren Ort schon trugen — 19 250 Halte, 15 800 in DE.
  *   • StaDa (Bahnhöfe) wird nie angefasst.
  *
  * Gemeinsam für `fix-stop-names.ts` (Bestand) und die Importe
@@ -183,9 +187,18 @@ export interface StopRow {
   lon: number | null;
   displayName: string | null;
   displayDetail: string | null;
+  /** Name im aktuellen Fahrplan (Abgleich) — Grundlage statt `label`, wo vorhanden. */
+  sourceName: string | null;
+  /** Station eines Steigs — der Steig trägt ihren Namen. */
+  parentCode: string | null;
 }
 
-export type NameRule = "gbtwin" | "gbclean" | "nltwin" | "clean";
+/**
+ * fahrplan = Name aus dem aktuellen Fahrplan statt aus `label` („Hbf Nord" →
+ * „Hauptbahnhof Nord"); steig = Name der Station (übernommene Masten wie MVG
+ * „Hbf Süd" unter „Hauptbahnhof Süd").
+ */
+export type NameRule = "gbtwin" | "gbclean" | "nltwin" | "clean" | "fahrplan" | "steig";
 
 export interface NameDecision {
   /** Der offizielle Name — gleich `label`, wenn nichts zu ändern ist. */
@@ -203,6 +216,162 @@ const RAIL_SUBTYPES = new Set(["LONG_DISTANCE", "REGIONAL", "SUBURBAN"]);
  * schon nach Verkehrsart vorgefiltert (siehe `loadTwins`).
  */
 export function decideName(row: StopRow, twins: TwinIndex | null): NameDecision {
+  const fromLabel = withoutCityPrefix(decideNameInner(row, twins), row);
+  const ws = (v: string) => v.replace(/\s+/g, " ").trim();
+  if (!row.sourceName || ws(row.sourceName) === ws(row.label)) return fromLabel;
+  const fromFeed = withoutCityPrefix(decideNameInner({ ...row, label: row.sourceName }, twins), row);
+  return feedNameAdds(fromLabel.name, fromFeed.name) ? { ...fromFeed, rule: "fahrplan" } : fromLabel;
+}
+
+function withoutCityPrefix(d: NameDecision, row: StopRow): NameDecision {
+  const noExonym = stripExonymCity(d.name, row.city, row.country);
+  const name = stripDoubledCity(noExonym ?? d.name, row.city) ?? noExonym;
+  return name ? { ...d, name, rule: d.rule ?? "clean" } : d;
+}
+
+/** Abkürzungen, die der Fahrplan ausschreibt („Hbf Nord" → „Hauptbahnhof Nord"). */
+const ABBREVIATIONS: Record<string, string> = { hbf: "hauptbahnhof", bf: "bahnhof", bhf: "bahnhof" };
+
+function nameTokens(v: string): string[] {
+  return v
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .toLowerCase()
+    .replace(/ß/g, "ss")
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean);
+}
+
+/**
+ * Taugt der Fahrplan-Name als Anzeigename? Nur, wenn er nichts verliert und
+ * etwas hinzufügt. Die alten Labels tragen oft den Ort vorn (Präfix-Skript:
+ * „Hof Joensuustr.", Wien „Meidling Lichtensterngasse"); der Fahrplan nennt
+ * dort nur die Straße — 110 000 Halte hätten ihren Ort verloren. Übernommen
+ * wird also nur, wenn jedes bisherige Wort im Fahrplan-Namen steht (auch
+ * ausgeschrieben: „Str." → „Straße", „Hbf" → „Hauptbahnhof") UND er ein neues
+ * Wort bringt. Reine Komma-, Akzent- oder Doppel-Unterschiede („Gąssy" →
+ * „Gassy", „Hausach Schulen,Hausach") ändern nichts.
+ */
+export function feedNameAdds(current: string, feed: string): boolean {
+  const cur = nameTokens(current);
+  const fed = nameTokens(feed);
+  const covered = (w: string) =>
+    fed.includes(w) ||
+    (ABBREVIATIONS[w] !== undefined && fed.includes(ABBREVIATIONS[w]!)) ||
+    fed.some((f) => f.length > w.length && f.startsWith(w));
+  return cur.every(covered) && fed.some((f) => !cur.includes(f));
+}
+
+/**
+ * Englische Namen großer Städte, die das alte Präfix-Skript (GeoNames-Name im
+ * Stadtfeld) vor die Halte setzte: „Munich München Hbf", „Munich Hbf Nord",
+ * „Nuremberg Nürnberg-Mögeldorf", „Vienna Plankengasse" — 5 300 Halte. In
+ * IHREM Land ist der englische Name nie Teil eines amtlichen Haltnamens; im
+ * Ausland bleibt er („Hanover Place", „Florence Ave" in England).
+ */
+const EXONYM_CITIES: Record<string, { country: string; local: string[] }> = {
+  munich: { country: "Germany", local: ["münchen"] },
+  nuremberg: { country: "Germany", local: ["nürnberg"] },
+  cologne: { country: "Germany", local: ["köln"] },
+  hanover: { country: "Germany", local: ["hannover"] },
+  brunswick: { country: "Germany", local: ["braunschweig"] },
+  vienna: { country: "Austria", local: ["wien"] },
+  prague: { country: "Czech Republic", local: ["praha"] },
+  warsaw: { country: "Poland", local: ["warszawa"] },
+  krakow: { country: "Poland", local: ["kraków"] },
+  brussels: { country: "Belgium", local: ["bruxelles", "brussel"] },
+  antwerp: { country: "Belgium", local: ["antwerpen"] },
+  ghent: { country: "Belgium", local: ["gent"] },
+  bruges: { country: "Belgium", local: ["brugge"] },
+  "the hague": { country: "Netherlands", local: ["den haag"] },
+  lisbon: { country: "Portugal", local: ["lisboa"] },
+  rome: { country: "Italy", local: ["roma"] },
+  milan: { country: "Italy", local: ["milano"] },
+  naples: { country: "Italy", local: ["napoli"] },
+  turin: { country: "Italy", local: ["torino"] },
+  florence: { country: "Italy", local: ["firenze"] },
+  venice: { country: "Italy", local: ["venezia"] },
+  genoa: { country: "Italy", local: ["genova"] },
+  geneva: { country: "Switzerland", local: ["genève"] },
+  zurich: { country: "Switzerland", local: ["zürich"] },
+  copenhagen: { country: "Denmark", local: ["københavn"] },
+  seville: { country: "Spain", local: ["sevilla"] },
+};
+
+/**
+ * „Munich München Hbf" → „München Hbf", „Munich Hbf Nord" → „Hbf Nord": der
+ * englische Stadtname vorn fällt weg, wenn der Halt in diesem Land liegt und
+ * seine Gemeinde diese Stadt ist (englisch oder in Landessprache im Stadtfeld).
+ */
+export function stripExonymCity(
+  name: string,
+  city: string | null | undefined,
+  country: string | null | undefined,
+): string | null {
+  if (!name || !city || !country) return null;
+  const lower = name.toLowerCase();
+  const cityLower = city.toLowerCase();
+  for (const [exo, info] of Object.entries(EXONYM_CITIES)) {
+    if (info.country !== country) continue;
+    if (cityLower !== exo && !info.local.includes(cityLower)) continue;
+    if (!lower.startsWith(`${exo} `) && !lower.startsWith(`${exo},`)) continue;
+    const rest = name.slice(exo.length).replace(/^[\s,]+/, "").trim();
+    if (rest.length >= 3 && /^[\p{L}\p{N}]/u.test(rest)) return rest;
+  }
+  return null;
+}
+
+/**
+ * Wörter, mit denen viele Ortsnamen beginnen — für sie zählt das ERSTE PAAR
+ * („Bad Soden", „Saint-Genis"): Sonst wäre „Church Common Church" ein
+ * doppelter Ort und bliebe als „Church" stehen.
+ */
+const GENERIC_FIRST_WORDS = new Set(
+  `bad les la le l saint sainte st ste san santa santo sankt sint market church new old upper lower great little
+   east west north south nieder ober unter alt neu gross klein hohen den de het el il lo los las das der die
+   mont port pont villa vila`.split(/\s+/),
+);
+
+const foldForPrefix = (v: string) =>
+  v.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase().replace(/ß/g, "ss");
+const prefixWords = (v: string) => foldForPrefix(v).split(/[\s\-/(),.]+/).filter(Boolean);
+
+/**
+ * „<Gemeinde> <Name>" → „<Name>", wenn der Name selbst mit derselben Gemeinde
+ * beginnt: „Frankfurt am Main Frankfurt (Main) Börneplatz", „Brandenburg an
+ * der Havel Brandenburg, Christinenstr.", „Skingen, Skingen". Ein früheres
+ * Skript (prefix-city-to-label) setzte die Gemeinde vor jeden Namen, auch vor
+ * die, die ihren Ort schon trugen.
+ *
+ * Nur, wenn der Vorsatz GENAU die Gemeinde des Halts ist (`city`) und der Rest
+ * mit deren erstem Wort beginnt (bei Allerweltswörtern wie „Bad", „Saint" mit
+ * den ersten beiden). Sonst nichts: „Via Galvani - Via Copernico" ist eine
+ * Kreuzung, „Tower Hill / Tower Gateway Station" auch.
+ */
+export function stripDoubledCity(name: string, city: string | null | undefined): string | null {
+  if (!name || !city) return null;
+  const fc = foldForPrefix(city);
+  if (!foldForPrefix(name).startsWith(fc)) return null;
+  // Schnittstelle im ORIGINAL — „ß" faltet zu zwei Zeichen, also schrittweise suchen.
+  let cut = -1;
+  for (let i = 1; i <= name.length; i++) {
+    if (foldForPrefix(name.slice(0, i)) === fc) {
+      cut = i;
+      break;
+    }
+  }
+  if (cut < 0 || !/^[\s,]/.test(name.slice(cut))) return null;
+  const rest = name.slice(cut).replace(/^[\s,]+/, "").trim();
+  if (rest.length < 3 || !/^[\p{L}\p{N}]/u.test(rest)) return null;
+  const cw = prefixWords(city);
+  if (cw.length === 0) return null;
+  const key = GENERIC_FIRST_WORDS.has(cw[0]!) && cw.length >= 2 ? cw.slice(0, 2) : cw.slice(0, 1);
+  if (key[0]!.length < 3) return null;
+  const rw = prefixWords(rest);
+  return key.every((w, i) => rw[i] === w) ? rest : null;
+}
+
+function decideNameInner(row: StopRow, twins: TwinIndex | null): NameDecision {
   const keep: NameDecision = { name: row.label, parts: [], rule: null };
   if (row.source === "stada" || (row.type !== "BUS" && row.type !== "TRAIN")) return keep;
 
@@ -308,7 +477,8 @@ export async function loadCountryRows(pool: pg.Pool | pg.PoolClient, country: st
   const r = await pool.query<StopRow>(
     `SELECT code, label, city, country, type, subtype, source,
             latitude::float8 AS lat, longitude::float8 AS lon,
-            display_name AS "displayName", display_detail AS "displayDetail"
+            display_name AS "displayName", display_detail AS "displayDetail",
+            source_name AS "sourceName", parent_code AS "parentCode"
      FROM locations WHERE country = $1 AND type IN ('BUS', 'TRAIN')`,
     [country],
   );
@@ -344,12 +514,38 @@ export interface CountryNames {
   details: Map<string, string>;
 }
 
-/** Anzeigenamen und Zusätze für alle Halte eines Landes. */
-export async function computeCountryNames(pool: pg.Pool | pg.PoolClient, country: string): Promise<CountryNames> {
+/**
+ * Anzeigenamen und Zusätze für alle Halte eines Landes. `sourceNames` ersetzt
+ * `source_name` im Speicher — für den Probelauf, bevor die Spalte gefüllt ist.
+ */
+export async function computeCountryNames(
+  pool: pg.Pool | pg.PoolClient,
+  country: string,
+  opts: { sourceNames?: Map<string, string> } = {},
+): Promise<CountryNames> {
   const rows = await loadCountryRows(pool, country);
+  if (opts.sourceNames) {
+    for (const row of rows) row.sourceName = opts.sourceNames.get(row.code) ?? row.sourceName;
+  }
   const twins = country === GB || country === NL ? await loadTwins(pool, country) : null;
   const decisions = new Map<string, NameDecision>();
   for (const row of rows) decisions.set(row.code, decideName(row, twins));
+  /**
+   * Ein Steig aus einem Fahrplan trägt den Namen seiner Station: Übernommene
+   * Zeilen behalten sonst ihren alten Quellnamen — „Hbf Süd" (MVG) neben
+   * „Hauptbahnhof Süd" waren die zwei Bahnsteige DERSELBEN Tram-Haltestelle.
+   * Seine eigenen Zusätze („Mast 2", „Richtung Eschborn") behält er — sie
+   * unterscheiden ihn von den anderen Steigen.
+   *
+   * OSM-Masten behalten ihren Namen: Er ist meist der örtlich richtige
+   * („Lakeside Bus Station", nicht „Chafford Hundred Bus Station").
+   */
+  for (const row of rows) {
+    if (!row.code.startsWith("gtfs:")) continue;
+    const station = row.parentCode ? decisions.get(row.parentCode) : undefined;
+    const own = decisions.get(row.code)!;
+    if (station && station.name !== own.name) decisions.set(row.code, { name: station.name, parts: own.parts, rule: "steig" });
+  }
   const named = rows.map((r) => {
     const d = decisions.get(r.code)!;
     return { code: r.code, type: r.type, subtype: r.subtype, lat: r.lat, lon: r.lon, name: d.name, parts: d.parts };

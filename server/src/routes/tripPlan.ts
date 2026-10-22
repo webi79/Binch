@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { and, eq, gte, inArray, isNotNull, lte, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, isNotNull, isNull, lte, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import { AIRPORTS, type AirportSeed } from "../data/airports.js";
@@ -256,6 +256,9 @@ async function nearby(
         lte(locations.latitude, String(lat + latDelta)),
         gte(locations.longitude, String(lng - lngDelta)),
         lte(locations.longitude, String(lng + lngDelta)),
+        // Stationen, nicht ihre einzelnen Steige (scripts/lib/gtfsStands.ts), und nur bediente.
+        isNull(locations.parentCode),
+        isNull(locations.unservedAt),
         where,
       ),
     )

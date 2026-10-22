@@ -34,18 +34,31 @@ import type { Locale } from "@/lib/i18n/dict";
  */
 const MARKER_ICONS = {
   "marker-train": require("@/assets/marker-icons/train.png"),
+  // Zug weiß — auf den Live-Punkten (Bernstein, Fernverkehr rot).
+  "marker-train-white": require("@/assets/marker-icons/train-white.png"),
   "marker-bus": require("@/assets/marker-icons/bus.png"),
+  // Bus weiß — auf dem lila Live-Punkt.
+  "marker-bus-white": require("@/assets/marker-icons/bus-white.png"),
   "marker-tram": require("@/assets/marker-icons/tram.png"),
   "marker-airport": require("@/assets/marker-icons/airport.png"),
   "marker-cruise": require("@/assets/marker-icons/cruise.png"),
-  // Pillen-Hintergründe für Multi-Mode-Marker (weißer abgerundeter Container,
-  // dunkle Outline). Die einzelnen farbigen Mode-Kreise sitzen INSIDE der Pille.
+  // U-Bahn: weißes „U" (Live-Ansicht, Punkt weit draußen).
+  "marker-subway": require("@/assets/marker-icons/subway.png"),
+  // Haltestellen-Kästen: abgerundetes Quadrat, dicker weißer Rand, Symbol
+  // eingebacken — je Verkehrsart ein Bild (siehe MarkerLayer).
+  "marker-box-train": require("@/assets/marker-icons/box-train.png"),
+  "marker-box-subway": require("@/assets/marker-icons/box-subway.png"),
+  "marker-box-bus": require("@/assets/marker-icons/box-bus.png"),
+  "marker-box-tram": require("@/assets/marker-icons/box-tram.png"),
+  "marker-box-cruise": require("@/assets/marker-icons/box-cruise.png"),
+  "marker-box-ferry": require("@/assets/marker-icons/box-ferry.png"),
+  "marker-box-airport-lime": require("@/assets/marker-icons/box-airport-lime.png"),
+  "marker-box-airport-mint": require("@/assets/marker-icons/box-airport-mint.png"),
+  // Halt mit mehreren Verkehrsarten: weißer Rahmen, darin je Art ein Kasten.
   "marker-pill-2": require("@/assets/marker-icons/pill-2.png"),
   "marker-pill-3": require("@/assets/marker-icons/pill-3.png"),
-  // Badge-Sprites: kleine farbige Kreise pro Mode. Werden als Hintergrund-
-  // Symbole für die einzelnen Slots in der Multi-Mode-Pille gerendert.
-  // Müssen Symbole sein, weil circle-translate in MapLibre nicht data-driven
-  // ist (für Multi-Slot-Positionierung brauchen wir icon-offset).
+  // Die Kästen im Rahmen — Symbole, weil sie per icon-offset nebeneinander
+  // sitzen (circle-translate ist in MapLibre nicht datengetrieben).
   "marker-badge-train": require("@/assets/marker-icons/badge-train.png"),
   "marker-badge-subway": require("@/assets/marker-icons/badge-subway.png"),
   "marker-badge-bus": require("@/assets/marker-icons/badge-bus.png"),

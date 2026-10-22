@@ -28,7 +28,7 @@ import Animated, {
 import { useT } from "@/lib/i18n/useT";
 import { useReduceMotion } from "@/lib/motion";
 import { fs } from "@/lib/ui/compact";
-import { useLandingPause } from "@/components/home/landingPause";
+import { useLandingPause, type LandingPause } from "@/components/home/landingPause";
 
 /**
  * Der Platzhalter der Landingscreen-Suchleiste — als wechselnde Sprüche.
@@ -99,12 +99,16 @@ const ROTATING_KEYS = [
   "home.search.rotating.ghost",
 ] as const;
 
-/** Wie lange ein Satz steht, bevor der nächste kommt. */
-const HOLD_MS = 3600;
-/** Der erste Satz nach dem Startbild steht etwas länger — er ist die Frage. */
-const FIRST_HOLD_MS = 4200;
-/** Nach jeder Pause (Tab, Bo, Hintergrund, Berührung): erst ankommen lassen. */
-const RESUME_HOLD_MS = 2500;
+/** Wie lange die Sätze stehen — die Werte des Landingscreens. */
+export interface RotationTiming {
+  /** … bevor der nächste kommt. */
+  hold: number;
+  /** Der erste Satz (nach dem Startbild) — er ist die Frage, er steht länger. */
+  firstHold: number;
+  /** Nach jeder Pause (Tab, Bo, Hintergrund, Berührung): erst ankommen lassen. */
+  resumeHold: number;
+}
+const LANDING_TIMING: RotationTiming = { hold: 3600, firstHold: 4200, resumeHold: 2500 };
 /** Nachladen des nächsten Satzes — nicht im Bild, in dem die Kurve endet. */
 const LOAD_DELAY_MS = 150;
 /** Bis Commit, Einhängen und Messung des nachgeladenen Satzes sicher durch sind. */
@@ -236,6 +240,39 @@ interface Props {
   firstKey: string;
   /** Schrift und senkrechtes Polster der Zeile, OHNE `flex` — das trägt der Ausschnitt. */
   textStyle: StyleProp<TextStyle>;
+  /** Siehe `RotatingText`. */
+  onLineShown?: (key: string) => void;
+}
+
+/**
+ * Der Landingscreen: seine Sprüche, sein Takt, seine Pausen (`landingPause`).
+ * Die Bewegung selbst ist `RotatingText` — auch im Suchfeld des Ortswählers.
+ */
+export const RotatingPlaceholder = forwardRef<RotatingPlaceholderHandle, Props>(
+  function RotatingPlaceholder({ firstKey, textStyle, onLineShown }, ref) {
+    const pause = useLandingPause();
+    const keys = useMemo(() => [firstKey, ...ROTATING_KEYS], [firstKey]);
+    return (
+      <RotatingText
+        ref={ref}
+        keys={keys}
+        pause={pause}
+        timing={LANDING_TIMING}
+        textStyle={textStyle}
+        onLineShown={onLineShown}
+      />
+    );
+  },
+);
+
+interface TextProps {
+  /** Alle Sätze (i18n-Schlüssel); der erste steht zuerst, danach gemischt. */
+  keys: readonly string[];
+  /** Wann nichts wechseln darf — siehe `LandingPause`. */
+  pause: LandingPause;
+  timing: RotationTiming;
+  /** Schrift und senkrechtes Polster der Zeile, OHNE `flex` — das trägt der Ausschnitt. */
+  textStyle: StyleProp<TextStyle>;
   /**
    * Ein neuer Satz steht, und der nächste ist eben nachgeladen (der Commit
    * dafür läuft in den nächsten ein, zwei Bildern). Danach bleibt die Leiste
@@ -257,13 +294,17 @@ interface Api {
   refit(): void;
 }
 
-export const RotatingPlaceholder = forwardRef<RotatingPlaceholderHandle, Props>(
-  function RotatingPlaceholder({ firstKey, textStyle, onLineShown }, ref) {
+/**
+ * Die wechselnden Sätze selbst — Bewegung, Mischen, Messen, Pausen. Mit einer
+ * festen Liste je Einhängung: Wer andere Sätze braucht, hängt neu ein (`key`).
+ */
+export const RotatingText = forwardRef<RotatingPlaceholderHandle, TextProps>(
+  function RotatingText({ keys, pause, timing, textStyle, onLineShown }, ref) {
     const t = useT();
     const reduceMotion = useReduceMotion();
-    /** Wann nichts wechseln darf — gemeinsam mit dem kleinen Bo, siehe dort. */
-    const pause = useLandingPause();
-    const keys = useMemo(() => [firstKey, ...ROTATING_KEYS], [firstKey]);
+    /** Der Takt über eine Ablage — ein neues Objekt des Aufrufers startet nichts neu. */
+    const timingRef = useRef(timing);
+    timingRef.current = timing;
     /** Für die Steuerung, die Kennungen statt Indizes melden will, ohne Neustart. */
     const keysRef = useRef(keys);
     keysRef.current = keys;
@@ -362,7 +403,8 @@ export const RotatingPlaceholder = forwardRef<RotatingPlaceholderHandle, Props>(
         }
         if (paused) {
           paused = false;
-          nextAt = Math.max(nextAt, Date.now() + (started ? RESUME_HOLD_MS : FIRST_HOLD_MS));
+          const { resumeHold, firstHold } = timingRef.current;
+          nextAt = Math.max(nextAt, Date.now() + (started ? resumeHold : firstHold));
           started = true;
         }
         if (!moving && timer === null) schedule(0);
@@ -402,7 +444,7 @@ export const RotatingPlaceholder = forwardRef<RotatingPlaceholderHandle, Props>(
         moving = false;
         swapped = true;
         const now = Date.now();
-        nextAt = now + HOLD_MS;
+        nextAt = now + timingRef.current.hold;
         loadAfter = now + LOAD_DELAY_MS;
         update();
       };

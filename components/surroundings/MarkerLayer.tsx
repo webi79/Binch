@@ -2,6 +2,8 @@ import { memo, useMemo } from "react";
 import { GeoJSONSource, Layer } from "@maplibre/maplibre-react-native";
 import { MapMarker } from "@/lib/surroundings/mockData";
 import { useAccent } from "@/lib/theme/accent";
+import { declutter, DECLUTTER_ZOOM } from "@/lib/surroundings/declutter";
+import { TRANSIT_COLOR } from "@/lib/theme/transitColors";
 
 /**
  * Rendert Marker als Vector-Layer (statt einzelne Overlay-Views) — pannt
@@ -14,20 +16,34 @@ import { useAccent } from "@/lib/theme/accent";
  * Layer (Render-Reihenfolge bottom → top):
  *   1. Cluster-Circle      → gefüllter Kreis bei Cluster-Punkten
  *   2. Cluster-Count       → Anzahl der Punkte im Cluster
- *   3. Marker-Background   → farbiger Kreis je Kategorie (Einzel-Marker)
- *   4. Marker-Icon         → Lucide-Icon (Train/Bus/Plane/Tram/Ship)
+ *   3. Marker-Kasten       → abgerundetes Quadrat je Verkehrsart mit dickem
+ *                            weißem Rand und eingebackenem Symbol (U-Bahn: „U")
+ *   4. Mehrfach-Halt       → weißer Rahmen + je Art ein farbiger Kasten
+ *
+ * Die Kästen sind fertige Bilder (`server/scripts/build-marker-icons.mjs`):
+ * Vorher waren es Kreise mit dunklem 2-dp-Strich und einem Symbol darüber —
+ * gewünscht waren Kästen wie Haltestellenschilder, mit dickerem Rahmen. Ein
+ * Bild statt Kreis + Symbol ist schärfer und spart je Quelle eine Ebene.
+ *
+ * Kästen, die sich überdecken würden, rücken auseinander — als `icon-offset`
+ * je Merkmal (`off`, bei mehreren Arten `off0`…`off2` je Kasten im Rahmen),
+ * gerechnet in lib/surroundings/declutter.ts.
  */
 
-// LIME entfernt auf Modul-Ebene — wird zur Laufzeit aus useAccent() berechnet
-// und innerhalb der MarkerLayer-Komponente als lokale Konstante geschadowed.
-const TRAIN_YELLOW = "#FFD60A";
-const BUS_PURPLE = "#9D5FE0";
-const WHITE = "#F4F4F5";
-const DARK = "#212123";
-const CRUISE_BLUE = "#6B95B5";
-// Dunkelblau für U-Bahn — klar vom dunkelgrauen Tram und blauen Cruise
-// unterscheidbar.
-const SUBWAY_BLUE = "#1F3A8A";
+/**
+ * Die Haufen (Cluster) in den Farben der Kästen — der Farben der ganzen App
+ * (lib/theme/transitColors.ts) —, mit weißem Rand und weißer Zahl wie Rahmen
+ * und Symbol der Kästen. Vorher hell gelb mit dunklem Rand: neben den Kästen
+ * sah ein Haufen aus wie aus einer anderen App. Flughafen: der dunkle Ton des
+ * Akzents (`accent.dark`), wie sein Kasten.
+ */
+const TRAIN_AMBER = TRANSIT_COLOR.regional;
+const BUS_PURPLE = TRANSIT_COLOR.bus;
+const TRAM_DARK = TRANSIT_COLOR.tram;
+const CRUISE_BLUE = TRANSIT_COLOR.ferry;
+const SUBWAY_BLUE = TRANSIT_COLOR.subway;
+const CLUSTER_RING = "#FFFFFF";
+const CLUSTER_TEXT = "#FFFFFF";
 
 interface Props {
   markers: MapMarker[];
@@ -56,49 +72,80 @@ const HIDDEN = { visibility: "none" } as const;
 const SRC_ID = "surroundings-markers-src";
 const SRC_ID_BUS = "surroundings-markers-src-bus";
 const SRC_ID_AIRCR = "surroundings-markers-src-aircr";
-const BG_SINGLE_BUS_LAYER_ID = "surroundings-markers-bg-single-bus";
-const ICON_BUS_LAYER_ID = "surroundings-markers-icon-bus";
-const BG_AIRCR_LAYER_ID = "surroundings-markers-bg-aircr";
-const ICON_AIRCR_LAYER_ID = "surroundings-markers-icon-aircr";
+// Neue IDs für die Kästen: Die alten Hintergründe waren Kreis-Ebenen, und
+// MapLibre Native verbietet einen Typwechsel unter derselben ID (silent fail).
+const BOX_BUS_LAYER_ID = "surroundings-markers-box-bus";
+const BOX_AIRCR_LAYER_ID = "surroundings-markers-box-aircr";
 const PILL_LAYER_ID = "surroundings-markers-pill";
-const BG_SINGLE_LAYER_ID = "surroundings-markers-bg-single";
+const BOX_SINGLE_LAYER_ID = "surroundings-markers-box-single";
 // Eigene neue Layer-IDs für die Badge-Symbol-Layer — die alten IDs waren
 // vorher Circle-Layer registriert, MapLibre Native verbietet Layer-Typ-
 // Änderungen unter derselben ID (silent fail).
 const BADGE_SLOT0_LAYER_ID = "surroundings-markers-badge-slot0";
 const BADGE_SLOT1_LAYER_ID = "surroundings-markers-badge-slot1";
 const BADGE_SLOT2_LAYER_ID = "surroundings-markers-badge-slot2";
-const ICON_SLOT0_LAYER_ID = "surroundings-markers-icon-slot0";
-const ICON_SLOT1_LAYER_ID = "surroundings-markers-icon-slot1";
-const ICON_SLOT2_LAYER_ID = "surroundings-markers-icon-slot2";
 const CLUSTER_CIRCLE_LAYER_ID = "surroundings-markers-cluster";
 const CLUSTER_COUNT_LAYER_ID = "surroundings-markers-cluster-count";
 
-// Multi-Mode-Slot-Offsets:
-//   2-Kind: zentriert links/rechts in der pill-2-Sprite
-//   3-Kind: links / mittig / rechts in der pill-3-Sprite
-// Badges UND Icons müssen identische pixel-Offsets haben, sonst sitzt das
-// Icon nicht zentriert auf seinem farbigen Badge. icon-offset wird mit
-// icon-size multipliziert → wenn Badge und Icon dasselbe icon-size haben,
-// reicht es, dieselben Offset-Werte einzusetzen. Wir vereinheitlichen daher
-// auf icon-size 0.5 für ALLES in Multi-Mode-Markern (Pille, Badge, Icon).
-const MM_OFFSET_2_LEFT: [number, number] = [-28, 0]; // = -14px visuell @ 0.5
-const MM_OFFSET_2_RIGHT: [number, number] = [28, 0];
-const MM_OFFSET_3_LEFT: [number, number] = [-56, 0];
+// Multi-Mode-Slot-Offsets — die Mitten der Kästen im weißen Rahmen:
+//   2-Kind: ±13,5 dp, 3-Kind: 0/±27 dp (bei Zoom 14). `icon-offset` wird mit
+//   `icon-size` multipliziert; Rahmen und Kästen sind vierfach aufgelöst und
+//   laufen mit derselben icon-size (`MULTI_SIZE`, 0.25 bei Zoom 14) — also ×4.
+//   Maße: `renderPill`/`renderBadge` in build-marker-icons.mjs. Dazu kommt der
+//   Versatz des ganzen Halts (`toFeature`).
+const MM_OFFSET_2_LEFT: [number, number] = [-54, 0];
+const MM_OFFSET_2_RIGHT: [number, number] = [54, 0];
+const MM_OFFSET_3_LEFT: [number, number] = [-108, 0];
 const MM_OFFSET_3_MID: [number, number] = [0, 0];
-const MM_OFFSET_3_RIGHT: [number, number] = [56, 0];
+const MM_OFFSET_3_RIGHT: [number, number] = [108, 0];
 
-// Die Icon-GLYPHEN laufen auf kleinerer icon-size (0.24/0.40/0.56) als die
-// BADGE-Kreise (0.30/0.50/0.70). MapLibre multipliziert icon-offset MIT
-// icon-size — mit demselben Offset landen Glyph und Badge daher NICHT
-// konzentrisch. Die Glyph-Offsets sind deshalb um den Faktor 1.25 (=0.50/0.40)
-// größer, sodass 28·0.50 = 35·0.40 = 14px → Icon exakt mittig im Kreis.
-const MM_ICON_OFFSET_2_LEFT: [number, number] = [-35, 0];
-const MM_ICON_OFFSET_2_RIGHT: [number, number] = [35, 0];
-const MM_ICON_OFFSET_3_LEFT: [number, number] = [-70, 0];
-const MM_ICON_OFFSET_3_MID: [number, number] = [0, 0];
-const MM_ICON_OFFSET_3_RIGHT: [number, number] = [70, 0];
-
+const SELECTED = ["==", ["get", "selected"], true] as const;
+/**
+ * Größe der Kästen: 17 / 30 / 42 dp bei Zoom 10 / 14 / 18 (ausgewählt etwas
+ * größer) — so viel Fläche wie vorher die Kreise samt Rand. Das Bild ist
+ * 120 px groß (vierfach für 30 dp).
+ */
+const BOX_SIZE = [
+  "interpolate", ["linear"], ["zoom"],
+  10, ["case", SELECTED, 0.175, 0.142],
+  14, ["case", SELECTED, 0.283, 0.25],
+  18, ["case", SELECTED, 0.383, 0.35],
+] as const;
+/**
+ * `icon-size` eines nicht gewählten Kastens auf `DECLUTTER_ZOOM` — `BOX_SIZE`
+ * und `MULTI_SIZE` stimmen dort überein (0,25 auf 14, 0,35 auf 18). Damit wird
+ * der Versatz aus Punkten in Bildpunkte umgerechnet.
+ */
+const SIZE_AT_DECLUTTER = 0.25 + ((0.35 - 0.25) * (DECLUTTER_ZOOM - 14)) / 4;
+/** Bildgröße in Pixeln (vierfach): Einzel-Kasten, Rahmen für zwei, für drei Arten. */
+const IMAGE_PX: Record<1 | 2 | 3, readonly [number, number]> = { 1: [120, 120], 2: [236, 128], 3: [344, 128] };
+const round1 = (v: number) => Math.round(v * 10) / 10;
+/** Rahmen und Kästen eines Halts mit mehreren Verkehrsarten — dieselbe Höhe wie ein Einzel-Kasten. */
+const MULTI_SIZE = [
+  "interpolate", ["linear"], ["zoom"],
+  10, ["case", SELECTED, 0.156, 0.142],
+  14, ["case", SELECTED, 0.275, 0.25],
+  18, ["case", SELECTED, 0.385, 0.35],
+] as const;
+/** Kasten je Verkehrsart (Flughafen: in der Akzentfarbe, siehe `boxImage`). */
+const BOX_BY_KIND = [
+  "train", "marker-box-train",
+  "subway", "marker-box-subway",
+  "bus", "marker-box-bus",
+  "tram", "marker-box-tram",
+  "cruise", "marker-box-cruise",
+  "ferry", "marker-box-ferry",
+] as const;
+const BADGE_BY_KIND = (prop: "kind" | "kind1" | "kind2") => [
+  "match",
+  ["get", prop],
+  "train", "marker-badge-train",
+  "subway", "marker-badge-subway",
+  "bus", "marker-badge-bus",
+  "tram", "marker-badge-tram",
+  "ferry", "marker-badge-ferry",
+  "marker-badge-bus",
+] as const;
 
 export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, hidden = false }: Props) {
   const vis = hidden ? HIDDEN : SHOWN;
@@ -106,7 +153,8 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
   // Literal-Hex eingebettet). Train/Bus/Cruise haben weiterhin Mode-spezifische
   // Farben (Gelb/Lila/Blau) damit Marker-Typen visuell unterscheidbar bleiben.
   const accent = useAccent();
-  const LIME = accent.solid;
+  const airportBox = accent.id === "mint" ? "marker-box-airport-mint" : "marker-box-airport-lime";
+  const boxImage = ["match", ["get", "kind"], ...BOX_BY_KIND, "airport", airportBox, "marker-box-bus"] as const;
   // Marker werden auf drei GeoJSON-Sources aufgeteilt, damit Clustering
   // pro Modus gesteuert werden kann (MapLibre kann Clustering nur global
   // pro Source schalten):
@@ -117,8 +165,34 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
     const main: ReturnType<typeof toFeature>[] = [];
     const bus: ReturnType<typeof toFeature>[] = [];
     const aircr: ReturnType<typeof toFeature>[] = [];
+    /**
+     * Auseinanderrücken, was sich überdecken würde — über ALLE Quellen
+     * gemeinsam: Ein Bushalt weicht auch dem Bahnhof aus, der in der anderen
+     * Quelle liegt. Wichtigere Halte bleiben eher stehen.
+     */
+    const shift = declutter(
+      markers.map((m) => {
+        const kinds = m.kinds && m.kinds.length > 0 ? m.kinds : [m.type];
+        const [w, h] = IMAGE_PX[Math.min(kinds.length, 3) as 1 | 2 | 3];
+        return {
+          id: m.id,
+          longitude: m.coord.longitude,
+          latitude: m.coord.latitude,
+          width: w * SIZE_AT_DECLUTTER,
+          height: h * SIZE_AT_DECLUTTER,
+          mobility: kinds.length === 1 && kinds[0] === "bus" ? 1 : 0.5,
+        };
+      }),
+    );
     function toFeature(m: MapMarker) {
       const kinds = m.kinds && m.kinds.length > 0 ? m.kinds : [m.type];
+      const count = Math.min(kinds.length, 3);
+      // In Bildpunkten: MapLibre nimmt `icon-offset` mit `icon-size` mal.
+      const d = shift.get(m.id);
+      const ox = d ? round1(d[0] / SIZE_AT_DECLUTTER) : 0;
+      const oy = d ? round1(d[1] / SIZE_AT_DECLUTTER) : 0;
+      const slots =
+        count === 3 ? [MM_OFFSET_3_LEFT, MM_OFFSET_3_MID, MM_OFFSET_3_RIGHT] : [MM_OFFSET_2_LEFT, MM_OFFSET_2_RIGHT];
       return {
         type: "Feature" as const,
         geometry: {
@@ -130,9 +204,18 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
           kind: kinds[0] ?? m.type,
           kind1: kinds[1] ?? "",
           kind2: kinds[2] ?? "",
-          kindsCount: Math.min(kinds.length, 3),
+          kindsCount: count,
           selected: Boolean(m.selected),
           big: Boolean(m.big),
+          off: [ox, oy],
+          // Die Kästen im Rahmen: ihr Platz darin plus der Versatz des Halts.
+          ...(count >= 2
+            ? {
+                off0: [slots[0]![0] + ox, oy],
+                off1: [slots[1]![0] + ox, oy],
+                off2: [(slots[2]?.[0] ?? 0) + ox, oy],
+              }
+            : {}),
         },
       };
     }
@@ -171,25 +254,20 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
   const clusterAircr = true;
 
   // Cluster-Farbe für den Haupt-Source — dominanter Mode entscheidet
-  // (Train gelb, Subway blau, Tram dunkel, gemischt → train default).
+  // (Zug bernstein, U-Bahn blau, Tram dunkel, gemischt → Zug).
   const clusterColorMain = useMemo(() => {
     const sample = geojsonMain.features[0]?.properties?.kind as string | undefined;
     if (sample === "subway") return SUBWAY_BLUE;
-    if (sample === "tram") return DARK;
+    if (sample === "tram") return TRAM_DARK;
     if (sample === "bus") return BUS_PURPLE;
-    return TRAIN_YELLOW;
+    return TRAIN_AMBER;
   }, [geojsonMain]);
-  const clusterTextColorMain =
-    clusterColorMain === DARK || clusterColorMain === SUBWAY_BLUE || clusterColorMain === BUS_PURPLE
-      ? "#F4F4F5"
-      : "#14181A";
 
   // Cluster-Farbe für Airport/Cruise-Source.
   const clusterColorAircr = useMemo(() => {
     const sample = geojsonAircr.features[0]?.properties?.kind;
-    return sample === "cruise" ? CRUISE_BLUE : LIME;
-  }, [geojsonAircr]);
-  const clusterTextColorAircr = clusterColorAircr === CRUISE_BLUE ? "#F4F4F5" : "#14181A";
+    return sample === "cruise" ? CRUISE_BLUE : accent.dark;
+  }, [geojsonAircr, accent.dark]);
 
   return (
     <>
@@ -215,8 +293,8 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
         layout={vis}
         paint={{
           "circle-color": clusterColorMain,
-          "circle-stroke-color": "#14181A",
-          "circle-stroke-width": 2,
+          "circle-stroke-color": CLUSTER_RING,
+          "circle-stroke-width": 2.5,
           "circle-radius": [
             "step",
             ["get", "point_count"],
@@ -236,15 +314,15 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
         layout={{
           ...vis,
           "text-field": ["get", "point_count_abbreviated"],
-          "text-font": ["Noto Sans Regular"],
-          "text-size": 12,
+          "text-font": ["Noto Sans Bold"],
+          "text-size": 13,
         }}
         paint={{
-          "text-color": clusterTextColorMain,
+          "text-color": CLUSTER_TEXT,
         }}
       />
 
-      {/* Pillen-Container für Multi-Mode-Marker. Zoom-skaliert via interpolate. */}
+      {/* Weißer Rahmen um einen Halt mit mehreren Verkehrsarten. */}
       <Layer
         id={PILL_LAYER_ID}
         type="symbol"
@@ -257,50 +335,30 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
             ["==", ["get", "kindsCount"], 3], "marker-pill-3",
             "marker-pill-2",
           ],
-          // Zoom-Skalierung: bei rausgezoomter Karte kleiner, bei reingezoomter
-          // größer. Multipliziert mit Selected-Faktor.
-          "icon-size": [
-            "interpolate", ["linear"], ["zoom"],
-            10, ["case", ["==", ["get", "selected"], true], 0.33, 0.30],
-            14, ["case", ["==", ["get", "selected"], true], 0.55, 0.50],
-            18, ["case", ["==", ["get", "selected"], true], 0.77, 0.70],
-          ],
+          "icon-size": MULTI_SIZE as never,
+          "icon-offset": ["get", "off"] as never,
           "icon-allow-overlap": true,
           "icon-ignore-placement": true,
         }}
       />
 
-      {/* Single-Mode BG: großer farbiger Kreis mit Stroke. */}
+      {/* Ein Halt, eine Verkehrsart: Kasten mit Rand und Symbol. */}
       <Layer
-        id={BG_SINGLE_LAYER_ID}
-        type="circle"
+        id={BOX_SINGLE_LAYER_ID}
+        type="symbol"
         source={SRC_ID}
         filter={["all", ["!", ["has", "point_count"]], ["<", ["get", "kindsCount"], 2]]}
-        layout={vis}
-        paint={{
-          "circle-radius": [
-            "interpolate", ["linear"], ["zoom"],
-            10, ["case", ["==", ["get", "selected"], true], 10, 8],
-            14, ["case", ["==", ["get", "selected"], true], 16, 14],
-            18, ["case", ["==", ["get", "selected"], true], 22, 20],
-          ],
-          "circle-color": [
-            "match",
-            ["get", "kind"],
-            "train", TRAIN_YELLOW,
-            "subway", SUBWAY_BLUE,
-            "airport", LIME,
-            "bus", BUS_PURPLE,
-            "tram", DARK,
-            "cruise", CRUISE_BLUE,
-            WHITE,
-          ],
-          "circle-stroke-color": "#14181A",
-          "circle-stroke-width": 2,
+        layout={{
+          ...vis,
+          "icon-image": boxImage as never,
+          "icon-size": BOX_SIZE as never,
+          "icon-offset": ["get", "off"] as never,
+          "icon-allow-overlap": true,
+          "icon-ignore-placement": true,
         }}
       />
 
-      {/* Multi-Mode Slot 0 Badge — farbiger Kreis hinter dem Slot-0-Icon. */}
+      {/* Mehrere Verkehrsarten: je Art ein farbiger Kasten im Rahmen. */}
       <Layer
         id={BADGE_SLOT0_LAYER_ID}
         type="symbol"
@@ -308,33 +366,13 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
         filter={["all", ["!", ["has", "point_count"]], [">=", ["get", "kindsCount"], 2]]}
         layout={{
           ...vis,
-          "icon-image": [
-            "match",
-            ["get", "kind"],
-            "train", "marker-badge-train",
-            "subway", "marker-badge-subway",
-            "bus", "marker-badge-bus",
-            "tram", "marker-badge-tram",
-            "ferry", "marker-badge-ferry",
-            "marker-badge-bus",
-          ],
-          "icon-offset": [
-            "case",
-            ["==", ["get", "kindsCount"], 3], ["literal", MM_OFFSET_3_LEFT],
-            ["literal", MM_OFFSET_2_LEFT],
-          ],
-          "icon-size": [
-            "interpolate", ["linear"], ["zoom"],
-            10, ["case", ["==", ["get", "selected"], true], 0.33, 0.30],
-            14, ["case", ["==", ["get", "selected"], true], 0.55, 0.50],
-            18, ["case", ["==", ["get", "selected"], true], 0.77, 0.70],
-          ],
+          "icon-image": BADGE_BY_KIND("kind") as never,
+          "icon-offset": ["get", "off0"] as never,
+          "icon-size": MULTI_SIZE as never,
           "icon-allow-overlap": true,
           "icon-ignore-placement": true,
         }}
       />
-
-      {/* Multi-Mode Slot 1 Badge. */}
       <Layer
         id={BADGE_SLOT1_LAYER_ID}
         type="symbol"
@@ -342,33 +380,13 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
         filter={["all", ["!", ["has", "point_count"]], [">=", ["get", "kindsCount"], 2]]}
         layout={{
           ...vis,
-          "icon-image": [
-            "match",
-            ["get", "kind1"],
-            "train", "marker-badge-train",
-            "subway", "marker-badge-subway",
-            "bus", "marker-badge-bus",
-            "tram", "marker-badge-tram",
-            "ferry", "marker-badge-ferry",
-            "marker-badge-bus",
-          ],
-          "icon-offset": [
-            "case",
-            ["==", ["get", "kindsCount"], 3], ["literal", MM_OFFSET_3_MID],
-            ["literal", MM_OFFSET_2_RIGHT],
-          ],
-          "icon-size": [
-            "interpolate", ["linear"], ["zoom"],
-            10, ["case", ["==", ["get", "selected"], true], 0.33, 0.30],
-            14, ["case", ["==", ["get", "selected"], true], 0.55, 0.50],
-            18, ["case", ["==", ["get", "selected"], true], 0.77, 0.70],
-          ],
+          "icon-image": BADGE_BY_KIND("kind1") as never,
+          "icon-offset": ["get", "off1"] as never,
+          "icon-size": MULTI_SIZE as never,
           "icon-allow-overlap": true,
           "icon-ignore-placement": true,
         }}
       />
-
-      {/* Multi-Mode Slot 2 Badge (3-Kind). */}
       <Layer
         id={BADGE_SLOT2_LAYER_ID}
         type="symbol"
@@ -376,144 +394,9 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
         filter={["all", ["!", ["has", "point_count"]], [">=", ["get", "kindsCount"], 3]]}
         layout={{
           ...vis,
-          "icon-image": [
-            "match",
-            ["get", "kind2"],
-            "train", "marker-badge-train",
-            "subway", "marker-badge-subway",
-            "bus", "marker-badge-bus",
-            "tram", "marker-badge-tram",
-            "ferry", "marker-badge-ferry",
-            "marker-badge-bus",
-          ],
-          "icon-offset": ["literal", MM_OFFSET_3_RIGHT],
-          "icon-size": [
-            "interpolate", ["linear"], ["zoom"],
-            10, ["case", ["==", ["get", "selected"], true], 0.33, 0.30],
-            14, ["case", ["==", ["get", "selected"], true], 0.55, 0.50],
-            18, ["case", ["==", ["get", "selected"], true], 0.77, 0.70],
-          ],
-          "icon-allow-overlap": true,
-          "icon-ignore-placement": true,
-        }}
-      />
-
-      {/* Icon-Layers — pro Slot ein symbol-Layer mit identischem icon-offset
-          wie das jeweilige Badge. Da Badge UND Icon dieselbe icon-size haben
-          (interpoliert auf gleichen Stops), landen Badge-Mittelpunkt und
-          Icon-Mittelpunkt exakt aufeinander. */}
-      <Layer
-        id={ICON_SLOT0_LAYER_ID}
-        type="symbol"
-        source={SRC_ID}
-        filter={["!", ["has", "point_count"]]}
-        layout={{
-          ...vis,
-          "icon-image": [
-            "match",
-            ["get", "kind"],
-            "train", "marker-train",
-            "subway", "marker-train",
-            "airport", "marker-airport",
-            "bus", "marker-bus",
-            "tram", "marker-tram",
-            "cruise", "marker-cruise",
-            "marker-bus",
-          ],
-          // Multi-Mode: identische Offsets wie Badge Slot 0.
-          // Single-Mode: zentriert.
-          "icon-offset": [
-            "case",
-            ["==", ["get", "kindsCount"], 3], ["literal", MM_ICON_OFFSET_3_LEFT],
-            ["==", ["get", "kindsCount"], 2], ["literal", MM_ICON_OFFSET_2_LEFT],
-            ["literal", [0, 0]],
-          ],
-          // Zoom-Skalierung. Single-Mode Icons sind etwas kleiner (passen
-          // in den 14px-Kreis besser), Multi-Mode-Icons gleichen sich an die
-          // 0.5-Badge-Größe an, damit alles proportional bleibt.
-          "icon-size": [
-            "interpolate", ["linear"], ["zoom"],
-            10, [
-              "case",
-              [">=", ["get", "kindsCount"], 2], 0.24,
-              ["==", ["get", "selected"], true], 0.30,
-              0.25,
-            ],
-            14, [
-              "case",
-              [">=", ["get", "kindsCount"], 2], 0.40,
-              ["==", ["get", "selected"], true], 0.50,
-              0.42,
-            ],
-            18, [
-              "case",
-              [">=", ["get", "kindsCount"], 2], 0.56,
-              ["==", ["get", "selected"], true], 0.70,
-              0.59,
-            ],
-          ],
-          "icon-allow-overlap": true,
-          "icon-ignore-placement": true,
-        }}
-      />
-
-      <Layer
-        id={ICON_SLOT1_LAYER_ID}
-        type="symbol"
-        source={SRC_ID}
-        filter={["all", ["!", ["has", "point_count"]], [">=", ["get", "kindsCount"], 2]]}
-        layout={{
-          ...vis,
-          "icon-image": [
-            "match",
-            ["get", "kind1"],
-            "train", "marker-train",
-            "subway", "marker-train",
-            "tram", "marker-tram",
-            "bus", "marker-bus",
-            "ferry", "marker-cruise",
-            "marker-bus",
-          ],
-          "icon-offset": [
-            "case",
-            ["==", ["get", "kindsCount"], 3], ["literal", MM_ICON_OFFSET_3_MID],
-            ["literal", MM_ICON_OFFSET_2_RIGHT],
-          ],
-          "icon-size": [
-            "interpolate", ["linear"], ["zoom"],
-            10, 0.24,
-            14, 0.40,
-            18, 0.56,
-          ],
-          "icon-allow-overlap": true,
-          "icon-ignore-placement": true,
-        }}
-      />
-
-      <Layer
-        id={ICON_SLOT2_LAYER_ID}
-        type="symbol"
-        source={SRC_ID}
-        filter={["all", ["!", ["has", "point_count"]], [">=", ["get", "kindsCount"], 3]]}
-        layout={{
-          ...vis,
-          "icon-image": [
-            "match",
-            ["get", "kind2"],
-            "train", "marker-train",
-            "subway", "marker-train",
-            "tram", "marker-tram",
-            "bus", "marker-bus",
-            "ferry", "marker-cruise",
-            "marker-bus",
-          ],
-          "icon-offset": ["literal", MM_ICON_OFFSET_3_RIGHT],
-          "icon-size": [
-            "interpolate", ["linear"], ["zoom"],
-            10, 0.24,
-            14, 0.40,
-            18, 0.56,
-          ],
+          "icon-image": BADGE_BY_KIND("kind2") as never,
+          "icon-offset": ["get", "off2"] as never,
+          "icon-size": MULTI_SIZE as never,
           "icon-allow-overlap": true,
           "icon-ignore-placement": true,
         }}
@@ -537,34 +420,13 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
         }}
       >
       <Layer
-        id={BG_SINGLE_BUS_LAYER_ID}
-        type="circle"
-        layout={vis}
-        paint={{
-          "circle-radius": [
-            "interpolate", ["linear"], ["zoom"],
-            10, ["case", ["==", ["get", "selected"], true], 10, 8],
-            14, ["case", ["==", ["get", "selected"], true], 16, 14],
-            18, ["case", ["==", ["get", "selected"], true], 22, 20],
-          ],
-          "circle-color": BUS_PURPLE,
-          "circle-stroke-color": "#14181A",
-          "circle-stroke-width": 2,
-        }}
-      />
-
-      <Layer
-        id={ICON_BUS_LAYER_ID}
+        id={BOX_BUS_LAYER_ID}
         type="symbol"
         layout={{
           ...vis,
-          "icon-image": "marker-bus",
-          "icon-size": [
-            "interpolate", ["linear"], ["zoom"],
-            10, ["case", ["==", ["get", "selected"], true], 0.30, 0.25],
-            14, ["case", ["==", ["get", "selected"], true], 0.50, 0.42],
-            18, ["case", ["==", ["get", "selected"], true], 0.70, 0.59],
-          ],
+          "icon-image": "marker-box-bus",
+          "icon-size": BOX_SIZE as never,
+          "icon-offset": ["get", "off"] as never,
           "icon-allow-overlap": true,
           "icon-ignore-placement": true,
         }}
@@ -597,8 +459,8 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
         layout={vis}
         paint={{
           "circle-color": clusterColorAircr,
-          "circle-stroke-color": "#14181A",
-          "circle-stroke-width": 2,
+          "circle-stroke-color": CLUSTER_RING,
+          "circle-stroke-width": 2.5,
           "circle-radius": [
             "step",
             ["get", "point_count"],
@@ -618,58 +480,25 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
         layout={{
           ...vis,
           "text-field": ["get", "point_count_abbreviated"],
-          "text-font": ["Noto Sans Regular"],
-          "text-size": 12,
+          "text-font": ["Noto Sans Bold"],
+          "text-size": 13,
         }}
         paint={{
-          "text-color": clusterTextColorAircr,
+          "text-color": CLUSTER_TEXT,
         }}
       />
 
       {/* Einzelne Airport/Cruise-Marker (nicht im Cluster) */}
       <Layer
-        id={BG_AIRCR_LAYER_ID}
-        type="circle"
-        source={SRC_ID_AIRCR}
-        filter={["!", ["has", "point_count"]]}
-        layout={vis}
-        paint={{
-          "circle-radius": [
-            "interpolate", ["linear"], ["zoom"],
-            10, ["case", ["==", ["get", "selected"], true], 10, 8],
-            14, ["case", ["==", ["get", "selected"], true], 16, 14],
-            18, ["case", ["==", ["get", "selected"], true], 22, 20],
-          ],
-          "circle-color": [
-            "match",
-            ["get", "kind"],
-            "airport", LIME,
-            "cruise", CRUISE_BLUE,
-            LIME,
-          ],
-          "circle-stroke-color": "#14181A",
-          "circle-stroke-width": 2,
-        }}
-      />
-      <Layer
-        id={ICON_AIRCR_LAYER_ID}
+        id={BOX_AIRCR_LAYER_ID}
         type="symbol"
+        source={SRC_ID_AIRCR}
         filter={["!", ["has", "point_count"]]}
         layout={{
           ...vis,
-          "icon-image": [
-            "match",
-            ["get", "kind"],
-            "airport", "marker-airport",
-            "cruise", "marker-cruise",
-            "marker-airport",
-          ],
-          "icon-size": [
-            "interpolate", ["linear"], ["zoom"],
-            10, ["case", ["==", ["get", "selected"], true], 0.30, 0.25],
-            14, ["case", ["==", ["get", "selected"], true], 0.50, 0.42],
-            18, ["case", ["==", ["get", "selected"], true], 0.70, 0.59],
-          ],
+          "icon-image": boxImage as never,
+          "icon-size": BOX_SIZE as never,
+          "icon-offset": ["get", "off"] as never,
           "icon-allow-overlap": true,
           "icon-ignore-placement": true,
         }}

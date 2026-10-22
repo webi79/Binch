@@ -185,6 +185,8 @@ export interface SelectedStop {
   label: string;
   /** Zusatz bei gleichnamigem Halt daneben — Plakette im Kopf des Blatts. */
   detail?: string;
+  /** Steig-Bezeichnung („3") eines einzelnen Bus-Steigs — „Steig 3" im Kopf. */
+  platform?: string;
   /** Distanz in Metern zum User-Standort, falls vorhanden. */
   distanceMeters?: number;
   /** Mode-Kategorien an dem Stop (z.B. ["subway","bus"]). Steuert die
@@ -1110,7 +1112,8 @@ export const useSearchStore = create<SearchStore>()(
       setMapStyleChoice: (c) => set({ mapStyleChoice: c }),
       mapBuildings3d: false,
       setMapBuildings3d: (on) => set({ mapBuildings3d: on }),
-      accent: "lime",
+      // Mint ist die Farbe der App; Lime bleibt wählbar.
+      accent: "mint",
       setAccent: (a) => set({ accent: a }),
       hapticsEnabled: true,
       setHapticsEnabled: (on) => set({ hapticsEnabled: on }),
@@ -1118,7 +1121,9 @@ export const useSearchStore = create<SearchStore>()(
       setNotificationsEnabled: (on) => set({ notificationsEnabled: on }),
       priceAlertsEnabled: false,
       setPriceAlertsEnabled: (on) => set({ priceAlertsEnabled: on }),
-      savedToastPosition: "bottom",
+      // Oben — wie die Meldungen es immer taten (die Einstellung war eine Zeit
+      // lang ohne Wirkung, siehe `migrate`).
+      savedToastPosition: "top",
       setSavedToastPosition: (p) => set({ savedToastPosition: p }),
       savedToast: null,
       showSavedToast: (result) =>
@@ -1613,7 +1618,10 @@ export const useSearchStore = create<SearchStore>()(
         for (const c of suggestionCodes) codes.add(c);
 
         if (codes.size === 0) return;
-        let lookup: Map<string, { exists: boolean; label?: string; detail?: string }>;
+        let lookup: Map<
+          string,
+          { exists: boolean; label?: string; detail?: string; platform?: string; replacedBy?: string }
+        >;
         try {
           const results = await fetchLocationsByCodes(Array.from(codes));
           lookup = new Map(
@@ -1622,7 +1630,11 @@ export const useSearchStore = create<SearchStore>()(
               // `label` ist der offizielle Name (Server: `display_name`) — so
               // bekommen gespeicherte Stationen und der Verlauf beim nächsten
               // Start den richtigen Namen, samt Zusatz bei gleichnamigem Nachbarn.
-              r.exists ? { exists: true, label: r.label, detail: r.detail } : { exists: false },
+              // `replacedBy`: Der Halt wurde als veraltet/doppelt entfernt — der
+              // Eintrag zieht auf den Ersatz am selben Ort um, statt zu verschwinden.
+              r.exists
+                ? { exists: true, label: r.label, detail: r.detail, platform: r.platform, replacedBy: r.replacedBy }
+                : { exists: false },
             ]),
           );
         } catch {
@@ -1658,8 +1670,14 @@ export const useSearchStore = create<SearchStore>()(
           if (d && !d.exists) continue;
           nextRecents.push({
             ...r,
-            origin: o?.exists && o.label ? { ...r.origin, label: o.label } : r.origin,
-            destination: d?.exists && d.label ? { ...r.destination, label: d.label } : r.destination,
+            origin:
+              o?.exists && o.label
+                ? { ...r.origin, label: o.label, code: o.replacedBy ?? r.origin.code }
+                : r.origin,
+            destination:
+              d?.exists && d.label
+                ? { ...r.destination, label: d.label, code: d.replacedBy ?? r.destination.code }
+                : r.destination,
           });
         }
           return nextRecents;
@@ -1670,9 +1688,18 @@ export const useSearchStore = create<SearchStore>()(
         for (const s of list) {
           const hit = lookup.get(s.code);
           if (hit && !hit.exists) continue;
+          const code = (hit?.exists && hit.label && hit.replacedBy) || s.code;
+          // Gespeichert waren womöglich beide — der alte Halt und sein Ersatz.
+          if (code !== s.code && nextStations.some((n) => n.code === code)) continue;
           nextStations.push(
             hit?.exists && hit.label
-              ? { ...s, label: hit.label, ...(hit.detail ? { detail: hit.detail } : { detail: undefined }) }
+              ? {
+                  ...s,
+                  code,
+                  label: hit.label,
+                  ...(hit.detail ? { detail: hit.detail } : { detail: undefined }),
+                  ...(hit.platform ? { platform: hit.platform } : { platform: undefined }),
+                }
               : s,
           );
         }
@@ -1713,12 +1740,18 @@ export const useSearchStore = create<SearchStore>()(
             nextRecents.some(
               (r, i) =>
                 r.origin.label !== cur.recentSearches[i]?.origin.label ||
-                r.destination.label !== cur.recentSearches[i]?.destination.label,
+                r.destination.label !== cur.recentSearches[i]?.destination.label ||
+                r.origin.code !== cur.recentSearches[i]?.origin.code ||
+                r.destination.code !== cur.recentSearches[i]?.destination.code,
             );
           const stationsChanged =
             nextStations.length !== cur.savedStations.length ||
             nextStations.some(
-              (s, i) => s.label !== cur.savedStations[i]?.label || s.detail !== cur.savedStations[i]?.detail,
+              (s, i) =>
+                s.label !== cur.savedStations[i]?.label ||
+                s.detail !== cur.savedStations[i]?.detail ||
+                s.platform !== cur.savedStations[i]?.platform ||
+                s.code !== cur.savedStations[i]?.code,
             );
           const invalidChanged =
             invalid.length !== cur.invalidSuggestionCodes.length ||
@@ -2168,15 +2201,24 @@ export const useSearchStore = create<SearchStore>()(
        * alle, die nie etwas eingestellt haben — die große Mehrheit —, tut die
        * Funktion endlich das, was sie verspricht.
        */
-      version: 1,
+      version: 2,
       migrate: (persisted, version) => {
         // `?? {}` statt eines Zweigs für „nichts gespeichert": Der leere Stand
         // fällt beim Zusammenführen ohnehin auf die Anfangswerte durch.
-        const st = (persisted ?? {}) as Partial<SearchStore> & { locale?: Locale };
+        let st = (persisted ?? {}) as Partial<SearchStore> & { locale?: Locale };
         if (version < 1 && st.localeExplicit !== true && st.locale === "de") {
           const { locale: _ererbt, ...rest } = st;
-          return rest as SearchStore;
+          st = rest;
         }
+        /**
+         * Die Speicher-Bestätigung einmal auf OBEN zurück.
+         *
+         * Die Einstellung stand von Juni bis Oktober 2026 ohne Wirkung da (die
+         * Meldung kam immer oben), ihre Vorgabe war aber „unten" — gespeichert
+         * ist bei fast allen also ein Wert, den nie jemand gewählt hat. Seit sie
+         * wieder wirkt, hätte er die Meldungen unbemerkt nach unten verlegt.
+         */
+        if (version < 2) st = { ...st, savedToastPosition: "top" };
         return st as SearchStore;
       },
       // Siehe createDeferredJSONStorage: serialisiert erst in der Ruhephase,

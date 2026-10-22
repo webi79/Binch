@@ -1,6 +1,8 @@
 import { Text, View } from "react-native";
 import { Bus, Plane, Ship, TramFront, Train, type LucideIcon } from "lucide-react-native";
 import { scaledStyles } from "@/lib/ui/compact";
+import { useAccent } from "@/lib/theme/accent";
+import { TRANSIT_COLOR, transitCategory } from "@/lib/theme/transitColors";
 
 /**
  * Die Linien-Plakette („ICE 643", „RB59", „S1", „Bus") — in der Farbe ihrer
@@ -9,13 +11,48 @@ import { scaledStyles } from "@/lib/ui/compact";
  * Stand bis eben nur in der Zeitleiste einer Fahrt (`LegTimelineOverlay`). Das
  * Stadt-Blatt zeigt dieselben Linien in seiner Verbindungsliste; beide nehmen
  * jetzt diese eine Plakette mit denselben Farben und Kürzeln, sonst läse ein
- * ICE hier rot und dort grau.
+ * ICE hier rot und dort grau. Die Farben sind die der ganzen App
+ * (lib/theme/transitColors.ts) — wie die Kästen auf der Karte.
  */
+
+/**
+ * MOTIS-Verkehrsarten (Zug-Suche über Transitous: „HIGHSPEED_RAIL"…) aufs
+ * HAFAS-Vokabular, mit dem die Kürzel arbeiten. Wie `modeToProduct` in
+ * server/src/services/motisStops.ts; METRO sind bei Transitous die S-Bahnen.
+ */
+function hafasProduct(product: string): string {
+  switch (product) {
+    case "HIGHSPEED_RAIL":
+      return "nationalExpress";
+    case "LONG_DISTANCE":
+    case "NIGHT_RAIL":
+      return "national";
+    case "REGIONAL_RAIL":
+    case "REGIONAL_FAST_RAIL":
+      return "regional";
+    case "SUBURBAN":
+    case "METRO":
+      return "suburban";
+    case "SUBWAY":
+      return "subway";
+    case "TRAM":
+      return "tram";
+    case "BUS":
+    case "COACH":
+      return "bus";
+    case "FERRY":
+      return "ferry";
+    case "AIRPLANE":
+      return "flight";
+    default:
+      return product;
+  }
+}
 
 /** Kürzel, wenn der Anbieter keinen Liniennamen mitschickt. */
 export function productLabel(product?: string): string | null {
   if (!product) return null;
-  switch (product) {
+  switch (hafasProduct(product)) {
     case "national":
     case "nationalExpress":
       return "ICE";
@@ -40,52 +77,34 @@ export function productLabel(product?: string): string | null {
 }
 
 /**
- * Das Symbol je Verkehrsart. Greift HAFAS-Produkte ab — alles, was nicht Bus,
- * Tram, Flug oder Fähre ist, landet auf dem Zug (regional, national, suburban,
- * subway …). Stand zuerst im Haltestellen-Blatt; das Stadt-Blatt setzt dasselbe
- * Symbol vor jede Linie, wie Google Maps.
+ * Das Symbol je Verkehrsart. Alles, was nicht Bus, Tram, Flug oder Fähre ist,
+ * landet auf dem Zug (regional, national, suburban, subway …). Stand zuerst im
+ * Haltestellen-Blatt; das Stadt-Blatt setzt dasselbe Symbol vor jede Linie, wie
+ * Google Maps. Mit dem Liniennamen erkennt es Ersatzverkehr („Bus RB59").
  */
-export function iconForProduct(product: string | null | undefined): LucideIcon {
-  if (!product) return Train;
-  const p = product.toLowerCase();
-  if (/bus|coach/.test(p)) return Bus;
-  if (/tram|stadtbahn/.test(p)) return TramFront;
-  if (/flight|air/.test(p)) return Plane;
-  if (/ferry|ship/.test(p)) return Ship;
-  return Train;
+export function iconForProduct(product: string | null | undefined, line?: string | null): LucideIcon {
+  switch (transitCategory(product, line)) {
+    case "bus":
+      return Bus;
+    case "tram":
+      return TramFront;
+    case "flight":
+      return Plane;
+    case "ferry":
+      return Ship;
+    default:
+      return Train;
+  }
 }
 
 /**
- * Farbe je Verkehrsart — Fernverkehr im DB-Rot, S-Bahn grün, Bus im Flix-Grün,
- * Regionalverkehr ORANGE.
- *
- * Regional stand hier nicht und fiel aufs Grau zurück: Im Stadt-Blatt waren
- * RE und RB damit graue Kästchen, bei Google Maps stehen sie farbig (RB59
- * orange). Orange trennt sie zugleich sichtbar vom roten Fernverkehr.
+ * Farbe je Verkehrsart — die der ganzen App (lib/theme/transitColors.ts),
+ * Flüge im Akzent. Ersatzverkehr („Bus RB59") ist ein Bus: Die Quellen führen
+ * ihn unter dem Zug, und er stand hier orange wie ein Regionalzug.
  */
-export function productColor(product?: string): string {
-  switch (product) {
-    case "regional":
-    case "regionalExpress":
-      return "#E8731A";
-    case "suburban":
-      return "#1F8A37";
-    case "subway":
-      return "#0066CC";
-    case "national":
-    case "nationalExpress":
-      return "#EC0016";
-    case "tram":
-      return "#C13635";
-    case "bus":
-      return "#73D700";
-    case "ferry":
-      return "#0EA5E9";
-    case "flight":
-      return "#1F2A57";
-    default:
-      return "#2D2D31";
-  }
+export function productColor(product: string | undefined, line: string | undefined, flight: string): string {
+  const category = transitCategory(product, line);
+  return category === "flight" ? flight : TRANSIT_COLOR[category];
 }
 
 /**
@@ -101,11 +120,12 @@ export function LinePill({
   product?: string;
   compact?: boolean;
 }) {
+  const accent = useAccent();
   return (
     <View
       style={[
         compact ? styles.pillCompact : styles.pill,
-        { backgroundColor: productColor(product) },
+        { backgroundColor: productColor(product, label, accent.dark) },
       ]}
     >
       <Text style={compact ? styles.textCompact : styles.text} numberOfLines={1}>

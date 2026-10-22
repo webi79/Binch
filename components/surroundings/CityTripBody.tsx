@@ -986,7 +986,7 @@ const ConnectionRow = memo(function ConnectionRow({
 
 /** Eine Fahrt: das Symbol ihrer Verkehrsart vor der farbigen Linien-Plakette. */
 function LegChip({ product, label }: { product?: string; label: string }) {
-  const Icon = iconForProduct(product);
+  const Icon = iconForProduct(product, label);
   return (
     <View style={styles.legChip}>
       <Icon size={16} color={C.g1} strokeWidth={2.2} />

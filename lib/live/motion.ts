@@ -16,6 +16,7 @@
  *     holt die Verspätung an den nächsten Halten wieder auf.
  */
 import type { LiveTrip, LiveVehicleKind } from "./types";
+import { isLongDistance } from "@/lib/theme/transitColors";
 
 interface Params {
   /** Anfahr- und Bremsbeschleunigung, m/s². */
@@ -33,10 +34,8 @@ interface Params {
 
 const kmh = (v: number) => v / 3.6;
 
-/** Fernverkehr? (ICE/IC/EC, MOTIS HIGHSPEED_RAIL/LONG_DISTANCE/NIGHT_RAIL, HAFAS national…) */
-export function isLongDistance(product: string | null | undefined): boolean {
-  return /highspeed|long_distance|night_rail|national|^ice|^ic\b|^ec\b/i.test(product ?? "");
-}
+// Fernverkehr erkennen — steht bei den Farben der Verkehrsmittel (eine Quelle).
+export { isLongDistance };
 
 export function paramsFor(kind: LiveVehicleKind, product: string | null): Params {
   switch (kind) {

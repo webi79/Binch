@@ -7,9 +7,13 @@ import { requireOptionalNativeModule } from "expo";
  * 2D-Punkt.
  */
 interface LiveModelsNativeModule {
-  /** Ebene in die Karte mit dieser Kennung hängen (unter `below`, wenn es die Ebene gibt). */
-  attach(mapTag: number, below: string | null): Promise<boolean>;
-  detach(): Promise<boolean>;
+  /**
+   * Ebene in die Karte mit dieser Kennung hängen (unter `below`, wenn es die
+   * Ebene gibt). `id` nennt diese Einhängung — `detach` mit derselben Nummer
+   * nimmt nur sie wieder ab, nie eine spätere.
+   */
+  attach(mapTag: number, below: string | null, id: number): Promise<boolean>;
+  detach(id: number): Promise<boolean>;
   /** Strecke: Länge, Breite abwechselnd; Meter ab Beginn je Punkt. */
   setRoute(lngLat: number[], cum: number[]): void;
   /** kind 0 Bahn, 1 Bus, 2 Flugzeug; Belegung von `params` siehe live_models_core.cpp. */
@@ -20,10 +24,17 @@ interface LiveModelsNativeModule {
 
 const native = Platform.OS === "android" ? requireOptionalNativeModule<LiveModelsNativeModule>("LiveModels") : null;
 
+let lastAttach = 0;
+
 export const LiveModels = {
   available: native != null,
-  attach: (mapTag: number, below: string | null) => native?.attach(mapTag, below) ?? Promise.resolve(false),
-  detach: () => native?.detach() ?? Promise.resolve(false),
+  /** Hängt ein und gibt die Nummer zurück, mit der `detach` genau diese Einhängung abnimmt. */
+  attach: (mapTag: number, below: string | null): number => {
+    const id = ++lastAttach;
+    void native?.attach(mapTag, below, id);
+    return id;
+  },
+  detach: (id: number) => native?.detach(id) ?? Promise.resolve(false),
   setRoute: (lngLat: number[], cum: number[]) => native?.setRoute(lngLat, cum),
   setVehicle: (kind: number, headMesh: string, midMesh: string, params: number[]) =>
     native?.setVehicle(kind, headMesh, midMesh, params),

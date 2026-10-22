@@ -13,6 +13,7 @@ import type {
   SearchProvider,
 } from "../providers/types.js";
 import { issueRedirectToken, issueRedirectTokens } from "./tokenService.js";
+import { resolveReplacements } from "./locationReplacements.js";
 import { enqueueRefresh as enqueueDbVendoRefresh } from "./dbVendoQueue.js";
 import { currentDbPriority, dbHasRoom, wasDbDenied, withDbPriority } from "./dbQuota.js";
 import {
@@ -1053,7 +1054,8 @@ async function searchNearbyFallback(rawInput: SearchInput): Promise<SearchOutput
   return null;
 }
 
-export async function runSearch(rawInput: SearchInput): Promise<SearchOutput> {
+export async function runSearch(input: SearchInput): Promise<SearchOutput> {
+  const rawInput = await withCurrentCodes(input);
   const out = await runSearchUncut(rawInput);
   const primary = guardTimelines(applyRequestedTime(out, rawInput), rawInput);
   if (rawInput.mode !== "FLIGHT" || primary.results.length > 0) return primary;
@@ -1066,6 +1068,25 @@ export async function runSearch(rawInput: SearchInput): Promise<SearchOutput> {
     `[flights] ${rawInput.origin} ohne Treffer — ausgewichen auf ${fallback.results[0]?.origin ?? "?"} (${fallback.results.length} Treffer)`,
   );
   return applyRequestedTime(fallback, rawInput);
+}
+
+/**
+ * Entfernte Halte (veraltet/doppelt, `location_replacements`) → ihr Ersatz am
+ * selben Ort. Ein alter Verlaufseintrag, ein Preisalarm oder eine App, die ihre
+ * gespeicherten Codes noch nicht abgeglichen hat, suchte sonst ins Leere — jeder
+ * Anbieter schlägt den Code in `locations` nach. IATA-Codes (ohne „:") gehen
+ * ohne Abfrage durch.
+ */
+async function withCurrentCodes(input: SearchInput): Promise<SearchInput> {
+  const codes = [input.origin, input.destination].filter((c) => c.includes(":"));
+  if (codes.length === 0) return input;
+  const replaced = await resolveReplacements(codes);
+  if (replaced.size === 0) return input;
+  return {
+    ...input,
+    origin: replaced.get(input.origin) ?? input.origin,
+    destination: replaced.get(input.destination) ?? input.destination,
+  };
 }
 
 /**

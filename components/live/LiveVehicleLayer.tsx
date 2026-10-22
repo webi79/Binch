@@ -6,6 +6,7 @@ import { useResolvedMapStyle } from "@/lib/theme/mapStyleChoice";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import { LINE_SOURCE_MAXZOOM } from "@/components/surroundings/lineSourceTuning";
 import { metersPerPixel } from "@/lib/live/geo";
+import { isLongDistance, TRANSIT_COLOR, tint } from "@/lib/theme/transitColors";
 import { cameraTarget, viewHeading } from "@/lib/live/camera";
 import { useSearchStore } from "@/stores/searchStore";
 import type { LiveModel } from "@/lib/live/model";
@@ -118,13 +119,17 @@ const DONE_WIDTH = 4.7;
  */
 const ARM_MS = 450;
 
-/** Farben der Verkehrsarten wie auf den Haltestellen-Markern (MarkerLayer). */
+/**
+ * Die Farben der Verkehrsmittel der ganzen App (lib/theme/transitColors.ts) —
+ * wie die Kästen der Karte, Symbol weiß.
+ */
 const DOT: Record<string, { fill: string; icon: string; halo: string }> = {
-  train: { fill: "#FFD60A", icon: "marker-train", halo: "rgba(255,214,10,0.24)" },
-  subway: { fill: "#4C7BF0", icon: "marker-train", halo: "rgba(76,123,240,0.26)" },
-  tram: { fill: "#2A2A2C", icon: "marker-tram", halo: "rgba(244,244,245,0.20)" },
-  bus: { fill: "#9D5FE0", icon: "marker-bus", halo: "rgba(157,95,224,0.26)" },
-  ferry: { fill: "#6B95B5", icon: "marker-cruise", halo: "rgba(107,149,181,0.26)" },
+  train: { fill: TRANSIT_COLOR.regional, icon: "marker-train-white", halo: tint(TRANSIT_COLOR.regional, 0.24) },
+  longDistance: { fill: TRANSIT_COLOR.longDistance, icon: "marker-train-white", halo: tint(TRANSIT_COLOR.longDistance, 0.24) },
+  subway: { fill: TRANSIT_COLOR.subway, icon: "marker-subway", halo: tint(TRANSIT_COLOR.subway, 0.32) },
+  tram: { fill: TRANSIT_COLOR.tram, icon: "marker-tram", halo: "rgba(244,244,245,0.20)" },
+  bus: { fill: TRANSIT_COLOR.bus, icon: "marker-bus-white", halo: tint(TRANSIT_COLOR.bus, 0.26) },
+  ferry: { fill: TRANSIT_COLOR.ferry, icon: "marker-cruise", halo: tint(TRANSIT_COLOR.ferry, 0.26) },
 };
 const DEST_COLOR = "#FF3B5C";
 
@@ -150,6 +155,36 @@ const IS_DONE: LineProps["filter"] = ["==", ["get", "k"], "done"];
 const IS_BODY: ExtrusionProps["filter"] = ["==", ["get", "k"], "body"];
 const IS_SHADOW: FillProps["filter"] = ["==", ["get", "k"], "shadow"];
 const IS_POINT: CircleProps["filter"] = ["==", ["get", "k"], "pt"];
+const IS_MID_STOP: CircleProps["filter"] = ["==", ["get", "role"], "mid"];
+const IS_END_STOP: CircleProps["filter"] = ["!=", ["get", "role"], "mid"];
+/**
+ * Start und Ziel GENAU wie die Wegpunkte einer Route (`RouteLayer`): heller
+ * Ring mit dunklem Rand, darin der Kern — Start im Akzent, Ziel im Rot der
+ * Route. Vorher waren es kleinere Punkte eigener Art (der Start sogar grau,
+ * sobald passiert), und die Übersicht sah anders aus als jede andere Route.
+ */
+const END_RING_PAINT: CircleProps["paint"] = {
+  "circle-radius": 12,
+  "circle-color": "#F4F4F5",
+  "circle-stroke-color": "#14181A",
+  "circle-stroke-width": 2,
+};
+
+/**
+ * Der 3D-Ebene sagen, wo das Fahrzeug jetzt ist und in `MOTION_AHEAD_MS` sein
+ * wird — dazwischen rechnet sie jedes Bild selbst (Boden: Meter entlang der
+ * Strecke; Flug: Lage, Höhe, Kurs).
+ */
+function sendMotion(model: LiveModel, now: number): void {
+  const t1 = now + MOTION_AHEAD_MS;
+  const f0 = model.frameAt(now);
+  const f1 = model.frameAt(t1);
+  LiveModels.setMotion(
+    model.kind === "plane"
+      ? [now, f0.position[0], f0.position[1], f0.drawAltitude, f0.heading, t1, f1.position[0], f1.position[1], f1.drawAltitude, f1.heading]
+      : [now, f0.d, t1, f1.d],
+  );
+}
 
 /** Der Rand auf der hellen Karte — wie `edgeOf` in RouteLayer. */
 function edgeOf(hex: string): string {
@@ -182,20 +217,35 @@ export const LiveVehicleLayer = memo(function LiveVehicleLayer({ model, zoom, ru
    * DIE 3D-EBENE IN DER KARTE (`modules/live-models`): Bahn, Bus und Flugzeug
    * als echte Netze, fest in der Welt nach Fahrtrichtung — einmal eingehängt,
    * dann bekommt sie Strecke, Fahrzeug und mit jedem Takt den Weg der nächsten
-   * halben Sekunde; Lage, Wagenkette und Größe rechnet sie jedes Bild selbst.
-   * Ohne das Modul (iOS) bleibt es beim 2D-Punkt.
+   * 800 ms (`sendMotion`); Lage, Wagenkette und Größe rechnet sie jedes Bild
+   * selbst. Ohne das Modul (iOS) bleibt es beim 2D-Punkt.
    */
   const native = LiveModels.available && liveModelConfig(model, accent.solid) != null;
   const nativeTagRef = useRef(nativeTag);
   nativeTagRef.current = nativeTag;
   useEffect(() => {
     if (!native) return;
-    const tag = nativeTagRef.current();
-    if (tag == null) return;
-    // Unter die Beschriftung der Halte — sie bleibt über dem Fahrzeug lesbar.
-    void LiveModels.attach(tag, "live-stop-label");
+    // Nach einem Kartentyp-Wechsel ist die Karte neu — ihre Kennung kann einen
+    // Augenblick fehlen. Kurz nachfragen statt aufzugeben (sonst fehlt das Fahrzeug).
+    let tries = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    // Die Nummer dieser Einhängung — `detach` nimmt nur sie ab, nie die des
+    // Nachfolgers (beim Neuaufbau der Karte kommen beide fast gleichzeitig an).
+    let id = 0;
+    const attach = () => {
+      timer = null;
+      const tag = nativeTagRef.current();
+      if (tag == null) {
+        if (++tries < 30) timer = setTimeout(attach, 100);
+        return;
+      }
+      // Unter die Beschriftung der Halte — sie bleibt über dem Fahrzeug lesbar.
+      id = LiveModels.attach(tag, "live-stop-label");
+    };
+    attach();
     return () => {
-      void LiveModels.detach();
+      if (timer) clearTimeout(timer);
+      if (id) void LiveModels.detach(id);
     };
   }, [native]);
   useEffect(() => {
@@ -204,6 +254,9 @@ export const LiveVehicleLayer = memo(function LiveVehicleLayer({ model, zoom, ru
     if (!cfg) return;
     if (model.kind !== "plane") LiveModels.setRoute(model.coords.flat(), model.cum);
     LiveModels.setVehicle(cfg.kind, cfg.head, cfg.mid, cfg.params);
+    // `setVehicle` erklärt den Weg für ungültig — gleich den neuen hinterher,
+    // sonst fehlte das Fahrzeug bis zum nächsten Takt (frische Daten jede Minute).
+    sendMotion(model, Date.now());
   }, [native, model, accent.solid]);
 
   /** Die Strecke — fest für die ganze Sitzung (bis neue Daten kommen). */
@@ -285,16 +338,7 @@ export const LiveVehicleLayer = memo(function LiveVehicleLayer({ model, zoom, ru
       const mpp = metersPerPixel(z, lat);
       const moving = frame.speed > 0.1;
       // Die 3D-Ebene: wo es jetzt ist und gleich — dazwischen rechnet sie selbst.
-      if (native) {
-        const t1 = now + MOTION_AHEAD_MS;
-        const f0 = model.frameAt(now);
-        const f1 = model.frameAt(t1);
-        LiveModels.setMotion(
-          plane
-            ? [now, f0.position[0], f0.position[1], f0.drawAltitude, f0.heading, t1, f1.position[0], f1.position[1], f1.drawAltitude, f1.heading]
-            : [now, f0.d, t1, f1.d],
-        );
-      }
+      if (native) sendMotion(model, now);
       /**
        * Was die Karte aus diesem Takt zeichnet, braucht jeden Takt: der Punkt
        * weit draußen, der Körper der Fähre, ohne 3D-Ebene der Schatten des
@@ -352,7 +396,9 @@ export const LiveVehicleLayer = memo(function LiveVehicleLayer({ model, zoom, ru
             : 1;
         next = 1000 / hz;
       } else {
-        next = moving ? Math.min(NATIVE_TICK_MS, tailAt - now) : 1000;
+        // Auch im Stand: Der Weg reicht nur `MOTION_AHEAD_MS` voraus — sonst
+        // blieb ein anfahrender Zug bis zum nächsten Takt stehen und sprang dann.
+        next = Math.min(NATIVE_TICK_MS, tailAt - now);
       }
       timer = setTimeout(step, Math.max(16, next));
     };
@@ -436,22 +482,20 @@ export const LiveVehicleLayer = memo(function LiveVehicleLayer({ model, zoom, ru
     [arcPaint, accent.solid],
   );
   /**
-   * Ringe wie die Wegpunkte einer Route (`RouteLayer`): hell mit dunklem Rand,
-   * Enden größer, Ziel im Rot der Route. Gefahrenes grau, der nächste Halt im
-   * Akzent. „Dein" Halt (der der Tafel) trägt einen Rand im Akzent — so findet
-   * man ihn auf der Strecke wieder.
+   * Die Zwischenhalte: hell mit dunklem Rand. Gefahrenes grau, der nächste
+   * Halt im Akzent. „Dein" Halt (der der Tafel) trägt einen Rand im Akzent —
+   * so findet man ihn auf der Strecke wieder. Start und Ziel: `END_RING_PAINT`.
    */
   const ringPaint = useMemo<CircleProps["paint"]>(
     () => ({
       "circle-radius": [
         "interpolate", ["linear"], ["zoom"],
-        8, ["case", ["==", ["get", "mine"], true], 5, ["match", ["get", "role"], "mid", 2.5, 4.5]],
-        13, ["case", ["==", ["get", "mine"], true], 8, ["match", ["get", "role"], "mid", 4.5, 7]],
-        17, ["case", ["==", ["get", "mine"], true], 10, ["match", ["get", "role"], "mid", 6, 9]],
+        8, ["case", ["==", ["get", "mine"], true], 5, 2.5],
+        13, ["case", ["==", ["get", "mine"], true], 8, 4.5],
+        17, ["case", ["==", ["get", "mine"], true], 10, 6],
       ],
       "circle-color": [
         "case",
-        ["==", ["get", "role"], "end"], DEST_COLOR,
         // Dein Halt bleibt hell (mit Akzent-Rand), auch als nächster Halt —
         // ganz im Akzent wurde er zum Klecks (Probe-Darstellung).
         ["==", ["get", "mine"], true], "#F4F4F5",
@@ -461,6 +505,13 @@ export const LiveVehicleLayer = memo(function LiveVehicleLayer({ model, zoom, ru
       ],
       "circle-stroke-color": ["case", ["==", ["get", "mine"], true], accent.solid, "#14181A"],
       "circle-stroke-width": ["case", ["==", ["get", "mine"], true], 3, 2],
+    }),
+    [accent.solid],
+  );
+  const endDotPaint = useMemo<CircleProps["paint"]>(
+    () => ({
+      "circle-radius": 8,
+      "circle-color": ["match", ["get", "role"], "end", DEST_COLOR, accent.solid],
     }),
     [accent.solid],
   );
@@ -514,7 +565,8 @@ export const LiveVehicleLayer = memo(function LiveVehicleLayer({ model, zoom, ru
     }),
     [z3d],
   );
-  const dot = DOT[model.kind] ?? DOT.train!;
+  const dot =
+    model.kind === "train" && isLongDistance(model.product) ? DOT.longDistance! : DOT[model.kind] ?? DOT.train!;
   const haloPaint = useMemo<CircleProps["paint"]>(
     () => ({
       "circle-radius": 24,
@@ -634,11 +686,13 @@ export const LiveVehicleLayer = memo(function LiveVehicleLayer({ model, zoom, ru
         {/* Die Ringe UNTER das Fahrzeug (es steht am Halt genau darauf), aber
             über das Gefahrene — `beforeId` statt Einhäng-Reihenfolge, die ist
             keine verlässliche Zusage (siehe Buildings3DLayer). */}
-        <Layer id="live-stop-ring" type="circle" beforeId="live-veh-shadow" paint={ringPaint} />
+        <Layer id="live-stop-ring" type="circle" beforeId="live-veh-shadow" filter={IS_MID_STOP} paint={ringPaint} />
+        <Layer id="live-stop-end-ring" type="circle" beforeId="live-veh-shadow" filter={IS_END_STOP} paint={END_RING_PAINT} />
+        <Layer id="live-stop-end-dot" type="circle" beforeId="live-veh-shadow" filter={IS_END_STOP} paint={endDotPaint} />
         <Layer id="live-stop-label" type="symbol" layout={labelLayout} paint={labelPaint} />
       </GeoJSONSource>
     ),
-    [stopsJson, ringPaint, labelLayout, labelPaint],
+    [stopsJson, ringPaint, endDotPaint, labelLayout, labelPaint],
   );
 
   return (

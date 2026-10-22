@@ -35,10 +35,10 @@ const MAT = {
 const STYLE_W = 1.7;
 const STYLE_H = 1.3;
 const RAIL = {
-  "rail-ice": { L: 25, W: 2.95, H: 3.9, nose: "sleek", noseLen: 7.5, doors: [-0.31, 0.31], stripe: "#FFD60A", window: 2.35 },
-  "rail-regional": { L: 26, W: 2.9, H: 4.1, nose: "round", noseLen: 2.6, doors: [-0.27, 0.27], stripe: "#FFD60A", window: 2.2 },
-  "rail-subway": { L: 18, W: 2.65, H: 3.55, nose: "flat", noseLen: 1.0, doors: [-0.31, 0, 0.31], stripe: "#4C7BF0", window: 2.0 },
-  "rail-tram": { L: 10, W: 2.4, H: 3.4, nose: "round", noseLen: 1.5, doors: [0.05], stripe: "#3A3F47", window: 1.8, lowFloor: true },
+  "rail-ice": { L: 25, W: 2.95, H: 3.9, nose: "sleek", noseLen: 7.5, doors: [-0.31, 0.31], stripe: "#EC0016", window: 2.35 },
+  "rail-regional": { L: 26, W: 2.9, H: 4.1, nose: "round", noseLen: 2.6, doors: [-0.27, 0.27], stripe: "#E8A800", window: 2.2 },
+  "rail-subway": { L: 18, W: 2.65, H: 3.55, nose: "flat", noseLen: 1.0, doors: [-0.31, 0, 0.31], stripe: "#1F3A8A", window: 2.0 },
+  "rail-tram": { L: 10, W: 2.4, H: 3.4, nose: "round", noseLen: 1.5, doors: [0.05], stripe: "#2A2A2C", window: 1.8, lowFloor: true },
 };
 const NOSE = { sleek: 0, round: 1, flat: 2 };
 

@@ -41,6 +41,7 @@ import {
   SlidersHorizontal,
   type LucideIcon,
 } from "lucide-react-native";
+import { SubwayIcon } from "@/components/ui/SubwayIcon";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useT } from "@/lib/i18n/useT";
 import { MarkerKind, SheetMode, StopListItem } from "@/lib/surroundings/mockData";
@@ -62,19 +63,22 @@ import {
   stopSheetY,
 } from "@/components/surroundings/stopSheetAnimation";
 import { reportSurroundingsTarget } from "@/lib/surroundings/mapViewport";
+import { TRANSIT_COLOR, tint } from "@/lib/theme/transitColors";
 
 const LIME = "#7FEA4D";
 const LIME_SUB = "rgba(127,234,77,0.18)";
-const TRAIN_YELLOW = "#FFD60A";
-const TRAIN_YELLOW_SUB = "rgba(255,214,10,0.18)";
-const BUS_PURPLE = "#9D5FE0";
-const BUS_PURPLE_SUB = "rgba(157,95,224,0.22)";
-
-/** Chip-Styling pro Marker-Typ — matched die Map-Marker für visuelle Konsistenz. */
+/**
+ * Chip-Styling pro Marker-Typ — in den Farben der Verkehrsmittel der ganzen App
+ * (lib/theme/transitColors.ts), getönt. U-Bahn und Tram sind zu dunkel für ein
+ * farbiges Symbol auf dunklem Grund: dort Symbol weiß auf ihrer Tönung.
+ */
 const KIND_CHIP_STYLE: Record<string, { bg: string; fg: string }> = {
-  train: { bg: TRAIN_YELLOW_SUB, fg: TRAIN_YELLOW },
+  train: { bg: tint(TRANSIT_COLOR.regional, 0.18), fg: TRANSIT_COLOR.regional },
+  subway: { bg: tint(TRANSIT_COLOR.subway, 0.5), fg: "#FFFFFF" },
+  tram: { bg: "rgba(255,255,255,0.10)", fg: "#FFFFFF" },
   // airport entfernt — wird zur Laufzeit aus accent berechnet (siehe useAccent).
-  bus: { bg: BUS_PURPLE_SUB, fg: BUS_PURPLE },
+  bus: { bg: tint(TRANSIT_COLOR.bus, 0.22), fg: TRANSIT_COLOR.bus },
+  cruise: { bg: tint(TRANSIT_COLOR.ferry, 0.2), fg: TRANSIT_COLOR.ferry },
 };
 const C = {
   bg: "#171719",
@@ -90,7 +94,7 @@ const C = {
 
 const KIND_ICON: Record<MarkerKind, LucideIcon> = {
   train: Train,
-  subway: Train, // U-Bahn nutzt Train-Icon, in der Liste durch eigenen Chip-Farbton unterschieden
+  subway: SubwayIcon, // „U" wie auf der Karte
   bus: Bus,
   tram: TramFront,
   airport: Plane,
@@ -597,9 +601,8 @@ const StopRow = memo(function StopRow({ item }: { item: StopListItem }) {
             // aus partiellen Daten) → Chip einfach skippen statt Render-
             // Crash mit „Cannot read property displayName of undefined".
             if (!Icon) return null;
-            // Airport-Chip nutzt den User-Akzent, train/bus haben feste
-            // informative Farben (Gelb/Lila) damit die Mode-Erkennung im
-            // Marker erhalten bleibt.
+            // Airport-Chip nutzt den User-Akzent, die übrigen die Farben der
+            // Verkehrsmittel — wie ihre Kästen auf der Karte.
             const styled = k === "airport"
               ? { bg: accent.subtle, fg: accent.solid }
               : KIND_CHIP_STYLE[k];

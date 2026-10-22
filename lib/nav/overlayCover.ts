@@ -597,6 +597,12 @@ export const SHEET_OUT = { duration: 260, easing: SHEET_EASE } as const;
  */
 export const PICKER_IN = SHEET_IN;
 export const PICKER_OUT = SHEET_OUT;
+/**
+ * So lange (ms) wartet die Ausfahrt eines Wählers höchstens auf die Tastatur.
+ * Ihr Einfahren stößt die Neuvermessung des ganzen Wurzelbaums an (rund 250 ms)
+ * — die Fahrt startet deshalb erst, wenn sie unten ist (`LocationPicker`).
+ */
+export const PICKER_KEYBOARD_WAIT = 300;
 
 /**
  * Bo fährt VON UNTEN herein, nicht von rechts — wie das Such-Blatt und der

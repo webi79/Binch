@@ -61,7 +61,11 @@ fetch() {
 
 ok=0
 fail=0
-while IFS='|' read -r feed_id url country prefix active rest; do
+# Präfixe aller Feeds — ein Feed muss die längeren unter seinem eigenen kennen
+# („gtfs:de:vbb:" unter „gtfs:de:"), deren Zeilen gehören nicht ihm.
+ALL_PREFIXES="$(grep -v '^[[:space:]]*#' "$CONF" | cut -d'|' -f4 | grep -v '^$')"
+
+while IFS='|' read -r feed_id url country prefix active ids rest; do
   [[ -z "$feed_id" || "$feed_id" =~ ^[[:space:]]*# ]] && continue
   [[ "$(echo "${active:-1}" | xargs)" != "1" ]] && { echo "[$feed_id] inaktiv — übersprungen"; continue; }
   dir="$WORK/$feed_id"
@@ -106,7 +110,16 @@ while IFS='|' read -r feed_id url country prefix active rest; do
     found=$(find "$gtfs_dir" -maxdepth 3 -name "stops.txt" -print -quit)
     [[ -n "$found" ]] && gtfs_dir=$(dirname "$found")
   fi
+  # 6. Spalte „unstable": Der Feed nummeriert jede Veröffentlichung neu (gtfs.de)
+  # — der Abgleich ordnet dann über Name + Lage zu (import-gtfs.ts, GTFS_IDS).
+  other="$(echo "$ALL_PREFIXES" | awk -v p="$prefix" 'index($0, p) == 1 && $0 != p' | paste -sd, -)"
+  # Liegt der Feed unter einem breiteren (Verbund unter gtfs.de), stellt der die
+  # Steige — sonst kämen sie doppelt (GTFS_STANDS in import-gtfs.ts).
+  covered="$(echo "$ALL_PREFIXES" | awk -v p="$prefix" 'index(p, $0) == 1 && $0 != p' | head -1)"
+  stands=1
+  [[ -n "$covered" ]] && stands=0
   if GTFS_MODE=refresh GTFS_DIR="$gtfs_dir" GTFS_COUNTRY="$country" GTFS_CODE_PREFIX="$prefix" \
+    GTFS_IDS="$(echo "${ids:-stable}" | xargs)" GTFS_OTHER_PREFIXES="$other" GTFS_STANDS="$stands" \
     npx tsx scripts/import-gtfs.ts </dev/null; then
     touch "$dir/imported"
     ok=$((ok + 1))

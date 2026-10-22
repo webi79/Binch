@@ -1,7 +1,8 @@
 /**
  * Akzent-Farb-System.
  *
- * Drei Paletten: Lime (Default, war vorher hardcoded #7FEA4D), Mint, Iris.
+ * Paletten: Mint (Vorgabe — die Farbe der App) und Lime (früher die Vorgabe,
+ * davor hardcoded #7FEA4D).
  * User wählt eine im Settings-Screen, die Auswahl liegt in `searchStore.accent`
  * und propagiert über den useAccent-Hook in jeden Component der den Akzent
  * verwendet (Tab-Bar, Buttons, Line-Badges, Tabs, Ring im StopDetailSheet, …).
@@ -67,14 +68,15 @@ export const ACCENT_PALETTES: Record<AccentId, AccentPalette> = {
   },
 };
 
+/** Mint zuerst — die Farbe der App; Lime als Wahl. */
 export const ACCENT_LIST: AccentPalette[] = [
-  ACCENT_PALETTES.lime,
   ACCENT_PALETTES.mint,
+  ACCENT_PALETTES.lime,
 ];
 
 /** Liefert die aktive Palette aus dem Store. Re-rendert den Caller wenn der
  *  User den Akzent wechselt — Zustand-Selektor sorgt für minimale Re-Renders. */
 export function useAccent(): AccentPalette {
   const id = useSearchStore((s) => s.accent);
-  return ACCENT_PALETTES[id] ?? ACCENT_PALETTES.lime;
+  return ACCENT_PALETTES[id] ?? ACCENT_PALETTES.mint;
 }

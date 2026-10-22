@@ -33,6 +33,7 @@ import { preloadDetails } from "@/lib/nav/detailsPreload";
 import { startDetailsPush } from "@/lib/nav/overlayCover";
 import { buildRoutePlan } from "@/lib/routing/buildRoute";
 import { scaledStyles } from "@/lib/ui/compact";
+import { isLongDistance, TRANSIT_COLOR } from "@/lib/theme/transitColors";
 
 interface Props {
   result: SearchResult;
@@ -73,14 +74,18 @@ const C = {
 
 const MODE_ICON = { FLIGHT: Plane, TRAIN: Train, BUS: Bus, CRUISE: Ship };
 
-// Mode-Farben übernommen aus dem Surroundings-Map (MarkerLayer): einheitliche
-// visuelle Sprache zwischen Karten-Markern und Result-Card-Badges.
-const MODE_COLOR: Record<TravelMode, { bg: string; fg: string }> = {
-  FLIGHT: { bg: "#7FEA4D", fg: "#000000" },
-  TRAIN: { bg: "#FFD60A", fg: "#000000" },
-  BUS: { bg: "#9D5FE0", fg: "#FFFFFF" },
-  CRUISE: { bg: "#6B95B5", fg: "#FFFFFF" },
+// Die Farben der Verkehrsmittel der ganzen App (lib/theme/transitColors.ts) —
+// wie die Kästen der Karte, Symbol weiß. Flug: der Akzent (siehe unten).
+const MODE_COLOR: Record<Exclude<TravelMode, "FLIGHT">, { bg: string; fg: string }> = {
+  TRAIN: { bg: TRANSIT_COLOR.regional, fg: "#FFFFFF" },
+  BUS: { bg: TRANSIT_COLOR.bus, fg: "#FFFFFF" },
+  CRUISE: { bg: TRANSIT_COLOR.ferry, fg: "#FFFFFF" },
 };
+/**
+ * Fernverkehr in DB-Rot wie überall in der App — ein ICE-/IC-Abschnitt genügt,
+ * so trennt auch die DB Fern- von Nahverkehrs-Verbindungen.
+ */
+const LONG_DISTANCE_COLOR = { bg: TRANSIT_COLOR.longDistance, fg: "#FFFFFF" };
 
 function formatDuration(minutes: number): string {
   const h = Math.floor(minutes / 60);
@@ -381,7 +386,12 @@ function ResultCardInner({
   }
 
   const ModeIcon = MODE_ICON[result.mode] ?? Plane;
-  const modeColor = MODE_COLOR[result.mode] ?? MODE_COLOR.FLIGHT;
+  const modeColor =
+    result.mode === "FLIGHT"
+      ? { bg: accent.dark, fg: "#FFFFFF" }
+      : result.mode === "TRAIN" && result.legs?.some((l) => isLongDistance(l.product))
+        ? LONG_DISTANCE_COLOR
+        : MODE_COLOR[result.mode] ?? MODE_COLOR.TRAIN;
   const carrierName = displayProvider(result);
   const urls = logoUrls(result, carrierName);
   const [logoIdx, setLogoIdx] = useState(0);

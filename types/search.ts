@@ -138,9 +138,21 @@ export interface Location {
    * zeigen, nie im Namen.
    */
   detail?: string;
+  /**
+   * Steig-Bezeichnung („3") eines einzelnen Bus-Steigs einer Station — die App
+   * zeigt sie als „Steig 3" vor dem Zusatz (lib/surroundings/standLabel.ts).
+   */
+  platform?: string;
   city: string;
   country: string;
   type: TravelMode | "ALL";
+  /**
+   * Genaue Verkehrsart eines Halts (Server: aus `subtype`) — fürs Symbol: Eine
+   * U-Bahn-Station steht sonst als „Bus" da, wenn dort auch Busse fahren, und
+   * gleichnamige Treffer verschiedener Art (S-Bahnhof und Bushaltestelle)
+   * müssen sich unterscheiden lassen.
+   */
+  kind?: "train" | "subway" | "tram" | "bus" | "ferry";
   /** Wenn vom Server vorhanden: GPS-Position. Live-Quellen (db-rest Stations,
    *  FlixBus Autocomplete) liefern das mit, lokale DB-Einträge haben es
    *  (noch) nicht — dort macht der Client einen Fallback via AIRPORT_PINS

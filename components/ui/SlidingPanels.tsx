@@ -10,7 +10,7 @@
  * pro Frame neu compositet — sie sind einfach Children einer einzigen
  * sich bewegenden View. Wirkt wie ein durchgehender Pager (Shazam-Style).
  */
-import { Children, useEffect, useMemo, useRef, useState } from "react";
+import { Children, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import { Platform, StyleSheet, useWindowDimensions, View } from "react-native";
 import Animated, {
@@ -27,9 +27,16 @@ interface Props {
   activeIndex: number;
   /** Panels — jedes Kind wird in einen full-width Slot gepackt. */
   children: ReactNode;
+  /**
+   * Während der Fahrt als Textur rastern (Vorgabe: ja). Aus bei Flächen mit
+   * Listen und laufenden Animationen darin — siehe unten.
+   */
+  rasterize?: boolean;
+  /** Die Fahrt ist angekommen — mit dem Panel, auf dem sie steht. */
+  onSettled?: (index: number) => void;
 }
 
-export function SlidingPanels({ activeIndex, children }: Props) {
+export function SlidingPanels({ activeIndex, children, rasterize: rasterizeWanted = true, onSettled }: Props) {
   const { width: screenW } = useWindowDimensions();
   const panels = Children.toArray(children);
   const tx = useSharedValue(-activeIndex * screenW);
@@ -45,6 +52,13 @@ export function SlidingPanels({ activeIndex, children }: Props) {
   const [rasterize, setRasterize] = useState(false);
   /** Erster Durchgang? Dann ist nichts zu bewegen — siehe Effekt. */
   const startedRef = useRef(false);
+  /** Neuester Rückruf — die Fahrt meldet sich erst am Ende, mit ihm. */
+  const onSettledRef = useRef(onSettled);
+  onSettledRef.current = onSettled;
+  const arrived = useCallback((index: number, rastered: boolean) => {
+    if (rastered) setRasterize(false);
+    onSettledRef.current?.(index);
+  }, []);
 
   useEffect(() => {
     /**
@@ -79,25 +93,41 @@ export function SlidingPanels({ activeIndex, children }: Props) {
      * Saved-Reiter, Ergebnis-Richtung und Datums-Modus.
      */
     markSheetMoving(SHEET_OUT.duration);
+    const index = activeIndex;
+    const slide = () => {
+      tx.value = withTiming(
+        -index * screenW,
+        // Gehörte vorher keiner Familie an: 280ms mit der Kurve der
+        // Seitwärts-Slides. Das hier ist ein Blatt-artiger Wechsel innerhalb einer
+        // Fläche, also die Blatt-Vorgabe.
+        SHEET_OUT,
+        (finished) => {
+          // `finished` prüfen ist hier RICHTIG, ich hatte es fälschlich entfernt:
+          // Bei einem Wechsel während einer laufenden Slide bricht die neue die alte
+          // ab, deren Rückruf feuert mit false — und hätte die Ebene damit direkt
+          // nach dem Einschalten wieder abgeräumt. Die neue Slide liefe dann ohne.
+          if (finished) runOnJS(arrived)(index, rasterizeWanted);
+        },
+      );
+    };
+    /**
+     * Ohne Textur sofort los — der Vorlauf von einem Bild gilt nur ihr. Und
+     * ohne die zwei Durchgänge, die sie an- und abschalten.
+     *
+     * Die Textur kostet hier mehr, als sie spart: Eine bloße Verschiebung
+     * zeichnet nichts neu (die Bildlisten der Kinder bleiben gültig), ihr
+     * Aufbau aber schon — über die doppelte Bildschirmbreite. Und läuft darin
+     * etwas (die pulsierenden Live-Knöpfe der Abfahrtstafel), zeichnet sie
+     * die ganze Ebene in jedem Bild neu.
+     */
+    if (!rasterizeWanted) {
+      slide();
+      return;
+    }
     setRasterize(true);
-    const id = requestAnimationFrame(() => {
-    tx.value = withTiming(
-      -activeIndex * screenW,
-      // Gehörte vorher keiner Familie an: 280ms mit der Kurve der
-      // Seitwärts-Slides. Das hier ist ein Blatt-artiger Wechsel innerhalb einer
-      // Fläche, also die Blatt-Vorgabe.
-      SHEET_OUT,
-      (finished) => {
-        // `finished` prüfen ist hier RICHTIG, ich hatte es fälschlich entfernt:
-        // Bei einem Wechsel während einer laufenden Slide bricht die neue die alte
-        // ab, deren Rückruf feuert mit false — und hätte die Ebene damit direkt
-        // nach dem Einschalten wieder abgeräumt. Die neue Slide liefe dann ohne.
-        if (finished) runOnJS(setRasterize)(false);
-      },
-    );
-    });
+    const id = requestAnimationFrame(slide);
     return () => cancelAnimationFrame(id);
-  }, [activeIndex, screenW, tx]);
+  }, [activeIndex, screenW, tx, rasterizeWanted, arrived]);
 
   const style = useAnimatedStyle(() => ({
     transform: [{ translateX: tx.value }],

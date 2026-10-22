@@ -9,8 +9,11 @@ import { useSearchStore } from "@/stores/searchStore";
 import { GradientFill } from "@/components/ui/GradientFill";
 import {
   RotatingPlaceholder,
+  RotatingText,
   type RotatingPlaceholderHandle,
+  type RotationTiming,
 } from "@/components/home/RotatingPlaceholder";
+import { useHintPause } from "@/lib/ui/hintPause";
 import { MiniBo, type MiniBoHandle } from "@/components/home/MiniBo";
 import { scaledStyles } from "@/lib/ui/compact";
 
@@ -95,6 +98,16 @@ interface InputProps extends CommonProps {
    *  Mal spürbares Lag macht. Mit Delay startet das Keyboard erst NACH dem
    *  Slide. */
   autoFocusDelay?: number;
+  /**
+   * Wechselnde Hinweise im LEEREN Feld (Ortswähler) — dieselbe Bewegung wie
+   * die Sprüche des Landingscreens, nur mit viel mehr Ruhe dazwischen
+   * (`HINT_TIMING`). Der erste Satz steht zuerst (der bisherige Platzhalter).
+   */
+  hintKeys?: readonly string[];
+  /** Darf gerade gewechselt werden? Der Aufrufer weiß, wann das Feld steht und zu sehen ist. */
+  hintsActive?: boolean;
+  /** Neu beginnen — erster Satz zuerst —, sobald sich das ändert (neue Öffnung). */
+  hintsSession?: string | number;
   onPress?: undefined;
   rotatePlaceholder?: undefined;
   mascot?: undefined;
@@ -146,6 +159,16 @@ export function SearchBar(props: Props) {
   // Außerdem reagiert das Effect auch wenn autoFocus von false→true togglet
   // (z.B. weil ein parent-Overlay sichtbar wird) → wir können dann ein
   // immer-gemountetes Picker-Overlay realisieren.
+  /**
+   * Wechselnde Hinweise im Eingabefeld — nur, solange es leer ist und der
+   * Aufrufer das Wechseln erlaubt. Immer aufgerufen (Hook-Regel); ohne Hinweise
+   * hält er nichts.
+   */
+  const hintKeys = "hintKeys" in props ? props.hintKeys : undefined;
+  const hints = props.value !== undefined && hintKeys !== undefined && hintKeys.length > 1;
+  const hintPause = useHintPause(
+    hints && "hintsActive" in props && props.hintsActive === true && props.value === "",
+  );
   const inputAutoFocusDelay =
     "autoFocusDelay" in props ? props.autoFocusDelay : undefined;
   const inputAutoFocus = "autoFocus" in props ? props.autoFocus : undefined;
@@ -199,22 +222,44 @@ export function SearchBar(props: Props) {
   ) : null;
 
   if (isInput) {
+    const input = (
+      <TextInput
+        ref={inputRef}
+        value={props.value}
+        onChangeText={props.onChangeText}
+        // Mit Hinweisen trägt die Ebene darunter den Platzhalter — für
+        // Vorleser bleibt er als Label am Feld (die Ebene ist für sie stumm).
+        placeholder={hints ? undefined : placeholder}
+        accessibilityLabel={hints ? placeholder : undefined}
+        placeholderTextColor={COLORS.gray3}
+        style={hints ? styles.inputFlush : styles.input}
+        autoCorrect={false}
+        // Nativer autoFocus nur wenn KEIN Delay konfiguriert ist.
+        // Sonst übernimmt der useEffect oben das Fokussieren.
+        autoFocus={inputAutoFocus === true && inputAutoFocusDelay === undefined}
+      />
+    );
     return (
       <View style={[styles.bar, { backgroundColor: palette.s2 }, style]}>
         <SearchIcon size={18} color={COLORS.gray2} />
         {leadingLabel && <Text style={styles.leadingLabel}>{leadingLabel}</Text>}
-        <TextInput
-          ref={inputRef}
-          value={props.value}
-          onChangeText={props.onChangeText}
-          placeholder={placeholder}
-          placeholderTextColor={COLORS.gray3}
-          style={styles.input}
-          autoCorrect={false}
-          // Nativer autoFocus nur wenn KEIN Delay konfiguriert ist.
-          // Sonst übernimmt der useEffect oben das Fokussieren.
-          autoFocus={inputAutoFocus === true && inputAutoFocusDelay === undefined}
-        />
+        {hints ? (
+          <View style={styles.inputBox}>
+            {/* Hinter dem Feld, ohne Berührungen — und weg, sobald getippt wird. */}
+            <View pointerEvents="none" style={[styles.hintLayer, props.value !== "" && styles.hintHidden]}>
+              <RotatingText
+                key={("hintsSession" in props ? props.hintsSession : undefined) ?? 0}
+                keys={hintKeys}
+                pause={hintPause}
+                timing={HINT_TIMING}
+                textStyle={styles.hintText}
+              />
+            </View>
+            {input}
+          </View>
+        ) : (
+          input
+        )}
         {mic}
       </View>
     );
@@ -325,6 +370,13 @@ export function SearchBar(props: Props) {
 }
 
 /**
+ * Der Takt der Hinweise im Ortswähler — mit viel mehr Ruhe als die Sprüche des
+ * Landingscreens (3,6 s): Dort lädt eine Leiste zum Tippen ein, hier sucht man
+ * gerade einen Ort, und nichts soll dabei stören.
+ */
+const HINT_TIMING: RotationTiming = { hold: 7500, firstHold: 6000, resumeHold: 4500 };
+
+/**
  * Schrift des Platzhalters — EINMAL, für die feste Zeile und die wechselnden
  * Sprüche. Die wechselnden bekommen sie ohne `flex`: Den trägt dort der
  * Ausschnitt, und an absolut gesetzten Ebenen hätte er nichts verloren.
@@ -361,6 +413,22 @@ const styles = scaledStyles({
   placeholder: { flex: 1, ...PLACEHOLDER_TEXT },
   placeholderText: PLACEHOLDER_TEXT,
   input: { flex: 1, fontSize: 14, color: COLORS.white, fontWeight: "400", paddingVertical: 10 },
+  /**
+   * Feld und Hinweise übereinander: dieselbe Schrift, dasselbe senkrechte
+   * Polster, links bündig auf 0 — die Hinweise stehen so genau dort, wo der
+   * Platzhalter stand und wo getippt wird.
+   */
+  inputBox: { flex: 1, justifyContent: "center" },
+  inputFlush: {
+    fontSize: 14,
+    color: COLORS.white,
+    fontWeight: "400",
+    paddingVertical: 10,
+    paddingHorizontal: 0,
+  },
+  hintLayer: { ...StyleSheet.absoluteFillObject, flexDirection: "row" },
+  hintHidden: { opacity: 0 },
+  hintText: { ...PLACEHOLDER_TEXT, color: COLORS.gray3 },
   micButton: {
     width: 38,
     height: 38,

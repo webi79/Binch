@@ -13,6 +13,11 @@
  * `--codes` zeigt für einzelne Halte, was herauskäme (Quelle, Zwilling, Name,
  * Zusatz) — für Stichproben, schreibt nie.
  *
+ * `--source-names=<csv>` (Spalten `code,name`): Fahrplan-Namen aus den Berichten
+ * eines Abgleichs (`GTFS_REPORT`) — im Probelauf nur im Speicher, mit `--apply`
+ * landen sie in `source_name` (Abschnitt `source`). Sonst füllt die Spalte der
+ * Monatsabgleich selbst.
+ *
  * Mit `--apply` je Abschnitt EINE Transaktion; vorher landen die betroffenen
  * Zeilen vollständig als JSON in FIX_OUT (Vorgabe: ./). `label` wird nie
  * angefasst — zurück geht es mit `display_name`/`display_detail` aus der
@@ -22,6 +27,9 @@
  *   gbtwin  — GB: Name des Fahrplan-Zwillings (BODS = NaPTAN, wie die Zeitleiste)
  *   gbclean — GB: Quellname ohne Ort-Vorsatz, Straßenseite, Richtung, Halt-Buchstabe
  *   nltwin  — NL: Name des Fahrplan-Zwillings (OVapi, „Ort, Halt")
+ *   source  — `source_name` aus `--source-names` übernehmen
+ *   fahrplan — Name aus dem aktuellen Fahrplan statt aus `label` („Hbf Nord" → „Hauptbahnhof Nord")
+ *   steig   — Steige tragen den Namen ihrer Station
  *   clean   — übrige Länder: ohne Fahrtrichtung, Steig, Mastnummer, Bedarfshalt
  *   detail  — Zusatz bei gleichnamigen Nachbarn (≤ 400 m, gleiche Art)
  *   reset   — Anzeigenamen, die nach den Regeln nicht mehr gelten (→ NULL)
@@ -29,7 +37,7 @@
  * Läuft auch im monatlichen Abgleich (refresh-stops.sh) — dann fallen nur die
  * neuen bzw. geänderten Halte an.
  */
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { pool } from "../src/db/client.js";
 import { computeCountryNames, displayNameValue, type NameDecision } from "./lib/stopNames.js";
 
@@ -45,13 +53,30 @@ const CODES = (arg("codes") ?? "")
   .map((s) => s.trim())
   .filter(Boolean);
 const OUT = process.env.FIX_OUT ?? ".";
+const SOURCE_NAMES_FILE = arg("source-names");
+/** code → Name im Fahrplan (zweispaltige CSV mit Kopfzeile `code,name`). */
+function readSourceNames(file: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const lines = readFileSync(file, "utf-8").split("\n").slice(1);
+  for (const line of lines) {
+    if (!line) continue;
+    const comma = line.indexOf(",");
+    let name = line.slice(comma + 1);
+    if (name.startsWith('"')) name = name.slice(1, -1).replace(/""/g, '"');
+    out.set(line.slice(0, comma), name);
+  }
+  return out;
+}
 const STAMP = new Date().toISOString().replace(/[:.]/g, "-");
 
-type SectionId = "gbtwin" | "gbclean" | "nltwin" | "clean" | "detail" | "reset";
-const SECTIONS: Array<{ id: SectionId; title: string; column: "display_name" | "display_detail" }> = [
+type SectionId = "source" | "gbtwin" | "gbclean" | "nltwin" | "fahrplan" | "steig" | "clean" | "detail" | "reset";
+const SECTIONS: Array<{ id: SectionId; title: string; column: "display_name" | "display_detail" | "source_name" }> = [
+  { id: "source", title: "Fahrplan-Namen in source_name übernehmen", column: "source_name" },
   { id: "gbtwin", title: "GB: Name des Fahrplan-Zwillings (NaPTAN)", column: "display_name" },
   { id: "gbclean", title: "GB: Quellname ohne Ort-Vorsatz, Seite, Richtung, Halt-Buchstabe", column: "display_name" },
   { id: "nltwin", title: "NL: Name des Fahrplan-Zwillings („Ort, Halt“)", column: "display_name" },
+  { id: "fahrplan", title: "Name aus dem aktuellen Fahrplan statt aus label", column: "display_name" },
+  { id: "steig", title: "Steige tragen den Namen ihrer Station", column: "display_name" },
   { id: "clean", title: "Übrige Länder: ohne Fahrtrichtung, Steig, Mastnummer, Bedarfshalt", column: "display_name" },
   { id: "reset", title: "Anzeigenamen, die nicht mehr gelten (→ NULL)", column: "display_name" },
   { id: "detail", title: "Zusatz bei gleichnamigen Nachbarn (≤ 400 m, gleiche Art)", column: "display_detail" },
@@ -72,17 +97,19 @@ function csvCell(v: unknown): string {
 }
 
 /** Stichprobe: Was käme für diese Halte heraus? */
-async function showCodes(codes: string[]): Promise<void> {
+async function showCodes(codes: string[], sourceNames?: Map<string, string>): Promise<void> {
   const rows = (
     await pool.query<{ code: string; country: string | null }>(`SELECT code, country FROM locations WHERE code = ANY($1)`, [codes])
   ).rows;
   const countries = [...new Set(rows.map((r) => r.country).filter((c): c is string => !!c))];
   for (const country of countries) {
-    const { rows: all, decisions, details } = await computeCountryNames(pool, country);
+    const { rows: all, decisions, details } = await computeCountryNames(pool, country, { sourceNames });
     for (const r of all.filter((x) => codes.includes(x.code))) {
       const d = decisions.get(r.code)!;
       console.log(`${r.code} [${country}, ${r.type}/${r.subtype ?? "-"}, ${r.source ?? "-"}]`);
       console.log(`   Quelle (label):  «${r.label}»`);
+      if (r.sourceName) console.log(`   Fahrplan:        «${r.sourceName}»`);
+      if (r.parentCode) console.log(`   Station:         ${r.parentCode}`);
       if (d.twin) console.log(`   Fahrplan-Zwilling: «${d.twin.name}» (${d.twin.stopId}, ${d.twin.d} m, ${d.twin.same ? "gleicher Name" : "gleicher Punkt"})`);
       console.log(`   Anzeigename:     «${d.name}»${d.rule ? ` [${d.rule}]` : " [unverändert]"}`);
       console.log(`   Zusatz:          ${details.get(r.code) ? `«${details.get(r.code)}»` : "— (kein gleichnamiger Nachbar bzw. nichts abgetrennt)"}`);
@@ -92,8 +119,10 @@ async function showCodes(codes: string[]): Promise<void> {
 }
 
 async function main() {
+  const sourceNames = SOURCE_NAMES_FILE ? readSourceNames(SOURCE_NAMES_FILE) : undefined;
+  if (sourceNames) console.log(`[fix-stop-names] ${sourceNames.size} Fahrplan-Namen aus ${SOURCE_NAMES_FILE}`);
   if (CODES.length > 0) {
-    await showCodes(CODES);
+    await showCodes(CODES, sourceNames);
     await pool.end();
     return;
   }
@@ -111,9 +140,23 @@ async function main() {
   const twinStats = { same: 0, point: 0 };
   for (const country of countries) {
     const t0 = Date.now();
-    const { rows, decisions, details } = await computeCountryNames(pool, country);
+    const original = sourceNames
+      ? new Map(
+          (
+            await pool.query<{ code: string; source_name: string | null }>(
+              `SELECT code, source_name FROM locations WHERE country = $1 AND type IN ('BUS', 'TRAIN')`,
+              [country],
+            )
+          ).rows.map((r) => [r.code, r.source_name]),
+        )
+      : undefined;
+    const { rows, decisions, details } = await computeCountryNames(pool, country, { sourceNames });
     let n = 0;
     for (const row of rows) {
+      if (original && row.sourceName !== original.get(row.code)) {
+        bySection.get("source")!.push({ code: row.code, country, label: row.label, old: original.get(row.code) ?? null, value: row.sourceName });
+        n++;
+      }
       const d: NameDecision = decisions.get(row.code)!;
       const name = displayNameValue(row, d);
       if (name !== row.displayName) {

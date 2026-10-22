@@ -45,6 +45,12 @@ interface Props {
   /** Borderless-Ripple — kreisförmig über Bounds hinaus (für Icon-Buttons ohne sichtbaren Container). */
   borderless?: boolean;
   /**
+   * Radius der Welle in dp (Android). Ohne Angabe reicht eine randlose Welle
+   * bis in die Ecken ihrer Fläche — bei einem großen Knopf größer als bei den
+   * übrigen runden Symbol-Knöpfen der App.
+   */
+  rippleRadius?: number;
+  /**
    * Kein `overflow: "hidden"` setzen.
    *
    * Nötig für Elemente, die von einer Animation per TRANSFORM bewegt werden: Der
@@ -88,6 +94,7 @@ export function RippleTouch({
   disabled,
   rippleColor,
   borderless = false,
+  rippleRadius,
   noClip = false,
   className,
   style,
@@ -116,7 +123,7 @@ export function RippleTouch({
         accessibilityRole={accessibilityRole}
         accessibilityState={accessibilityState}
         disabled={disabled}
-        background={TouchableNativeFeedback.Ripple(color, borderless)}
+        background={TouchableNativeFeedback.Ripple(color, borderless, rippleRadius)}
         useForeground={true}
         // Verzögerung wieder drin — ihr Entfernen hat das Scrollen im
         // Landingscreen spürbar ruckeln lassen. Ohne sie startet bei JEDER

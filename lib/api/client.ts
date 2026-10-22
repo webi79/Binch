@@ -221,12 +221,14 @@ export function fetchLocations(query: string, mode: TravelMode | "ALL" = "ALL"):
 }
 
 export type LocationByCode =
-  | { code: string; label: string; detail?: string; exists: true }
+  | { code: string; label: string; detail?: string; platform?: string; replacedBy?: string; exists: true }
   | { code: string; exists: false };
 
 /** Batch-Lookup: holt für eine Liste von Codes den aktuellen Label-Stand aus
- *  der DB. Wenn ein Code nicht mehr existiert → `exists: false`. Wird beim
- *  App-Start für die Validierung persistierter Recent-Searches benutzt. */
+ *  der DB. Wenn ein Code nicht mehr existiert → `exists: false`; wurde der Halt
+ *  als veraltet/doppelt entfernt, kommt sein Ersatz am selben Ort (`replacedBy`,
+ *  Name und Zusatz von dort). Wird beim App-Start für die Validierung
+ *  persistierter Recent-Searches benutzt. */
 export function fetchLocationsByCodes(codes: string[]): Promise<LocationByCode[]> {
   if (codes.length === 0) return Promise.resolve([]);
   return getJson<{ results: LocationByCode[] }>(
@@ -254,12 +256,16 @@ export interface SurroundingsMarker {
   label?: string;
   /** Zusatz, nur bei gleichnamigem Halt daneben (zwei Straßenseiten, Steige). */
   detail?: string;
+  /** Steig-Bezeichnung („3") — nur bei einem einzelnen Bus-Steig einer Station. */
+  platform?: string;
 }
 
 export interface SurroundingsListItem {
   id: string;
   name: string;
   detail?: string;
+  /** Wie beim Marker: Steig-Bezeichnung eines einzelnen Bus-Steigs. */
+  platform?: string;
   kinds: SurroundingsKind[];
   distance: string;
   lines?: { id: string; color: string }[];
@@ -459,6 +465,8 @@ export interface StopBoardResponse {
     /** Die Zeiten stammen von einem ANDEREN Halt in der Nähe (> 30 m, anderer
      *  Name) — die Tafel sagt das über der Liste. */
     servedBy?: { name: string; distanceM: number };
+    /** Steig-Bezeichnung („3") — nur bei einem einzelnen Bus-Steig einer Station. */
+    platform?: string;
   };
 }
 

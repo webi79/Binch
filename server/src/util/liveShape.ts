@@ -165,6 +165,149 @@ export function simplify(coords: LngLat[], toleranceM: number): LngLat[] {
   return coords.filter((_, i) => keep[i] === 1);
 }
 
+/**
+ * HIN UND ZURÜCK, WO KEIN ZUG WENDET.
+ *
+ * Die Linienführung aus den offenen Fahrplänen (GTFS-`shapes`, über MOTIS)
+ * läuft an Bahnhöfen oft ein Stück hinaus und wieder zurück: kleine Haken zum
+ * Haltepunkt (Berliner S-Bahn an fast jedem Halt), ganze Doppelschleifen (die
+ * Münchner Stammstrecke fährt zwischen Donnersbergerbrücke und Hackerbrücke
+ * zweimal hin und einmal zurück — „Zickzack"), einzelne Spitzen fern jedes
+ * Halts, Stücke hinter dem Zielbahnhof. Kein Zug fährt so: Er wendet nur an
+ * einem Halt, an dem er steht (Kopfbahnhof — Leipzig, Frankfurt, Stuttgart,
+ * Köln beim Kopfmachen, Hamburg-Blankenese).
+ *
+ * Deshalb ist jede scharfe Umkehr ein Fehler, außer sie liegt an einem
+ * Zwischenhalt (`GENUINE_AT_STOP_M`) UND die Linie fährt danach nicht in der
+ * alten Richtung weiter: Bei einem Haken oder Z (hin, zurück, wieder hin)
+ * geht es hinter dem Ausflug weiter wie davor (Berlin Warschauer Str.: 54 m
+ * zurück, dann wieder nach Westen). Bei einer echten Wende verlässt der Zug
+ * den Bahnhof dorthin, woher er kam, oder biegt ab (Leutzsch: nach Süden).
+ * Ein Fehler wird herausgeschnitten:
+ * Von der Spitze aus laufen beide Äste nebeneinander zurück, bis sie
+ * auseinandergehen — dieses Stück fällt weg, die Linie springt höchstens um
+ * `RETRACE_W_M` auf das Nachbargleis. Im Z zuerst die Spitze, die NICHT am
+ * Halt liegt, sonst die kürzere: In Leipzig-Leutzsch wendet die S1 wirklich,
+ * die Daten hängen aber noch 838 m hin und zurück an — entfernt wird nur das.
+ *
+ * Nur für Schienenfahrzeuge — ein Bus fährt wirklich einmal in eine
+ * Stichstraße zu seinem Halt und zurück. Durchgespielt an 67 Fahrten aus 14
+ * Bahnhöfen (Fernverkehr, S-Bahn, Regionalverkehr, U-Bahn, Tram).
+ */
+const REV_TURN_DEG = 150;
+/** Richtung vor und nach einem Punkt über so viele Meter — robust gegen Kleinst-Zacken. */
+const REV_WIN_M = 30;
+/** So weit (m) dürfen die zwei Äste einer Umkehr auseinanderliegen und gelten als „zurück". */
+const RETRACE_W_M = 40;
+const RETRACE_STEP_M = 5;
+const GENUINE_AT_STOP_M = 80;
+/** So weit (m) hinter dem Ausflug wird geschaut, wohin die Linie weiterfährt. */
+const AFTER_M = 150;
+/** Weiter „in der alten Richtung": höchstens so weit (cos) davon abgewichen (≈ 37°). */
+const FORWARD_COS = 0.8;
+
+function headingDeg(a: LngLat, b: LngLat): number {
+  const cos = Math.cos(((a[1] + b[1]) / 2) * RAD);
+  return Math.atan2((b[0] - a[0]) * cos, b[1] - a[1]) / RAD;
+}
+
+interface Reversal {
+  /** Stelle der Spitze auf der Linie (m). */
+  d: number;
+  /** So weit (m) laufen die Äste von der Spitze aus nebeneinander zurück. */
+  back: number;
+  /** Der Ast zum Anfang bzw. zum Ende lief dabei bis ans Ende der Linie. */
+  hitsStart: boolean;
+  hitsEnd: boolean;
+  /** Hinter dem Ausflug geht es in der alten Richtung weiter — ein Haken, keine Wende. */
+  forward: boolean;
+}
+
+/** Läuft die Linie von `s` nach `f` in Richtung `u` (Einheitsvektor Ost/Nord) weiter? */
+function goesOn(s: LngLat, f: LngLat, u: [number, number]): boolean {
+  const cos = Math.cos(s[1] * RAD);
+  const dx = (f[0] - s[0]) * RAD * cos * R;
+  const dy = (f[1] - s[1]) * RAD * R;
+  const len = Math.hypot(dx, dy);
+  return len > 20 && (dx * u[0] + dy * u[1]) / len > FORWARD_COS;
+}
+
+export function reversalsOf(coords: LngLat[], cum: number[]): Reversal[] {
+  const total = cum[cum.length - 1]!;
+  const out: Reversal[] = [];
+  for (let i = 1; i < coords.length - 1; i++) {
+    const d = cum[i]!;
+    // Zwei Punkte derselben Spitze nur einmal.
+    if (out.length > 0 && d - out[out.length - 1]!.d < REV_WIN_M) continue;
+    const a = pointAt(coords, cum, d - REV_WIN_M);
+    const b = pointAt(coords, cum, d + REV_WIN_M);
+    if (stepMeters(a, coords[i]!) < 1 || stepMeters(coords[i]!, b) < 1) continue;
+    const turn = Math.abs(((headingDeg(coords[i]!, b) - headingDeg(a, coords[i]!) + 540) % 360) - 180);
+    if (turn < REV_TURN_DEG) continue;
+    let s = 0;
+    while (
+      d - s - RETRACE_STEP_M >= 0 &&
+      d + s + RETRACE_STEP_M <= total &&
+      stepMeters(pointAt(coords, cum, d - s - RETRACE_STEP_M), pointAt(coords, cum, d + s + RETRACE_STEP_M)) <= RETRACE_W_M
+    ) {
+      s += RETRACE_STEP_M;
+    }
+    // Richtung, in der die Linie in den Ausflug hineinlief, und wohin es danach geht.
+    const from = pointAt(coords, cum, d - s);
+    const h = headingDeg(pointAt(coords, cum, d - s - REV_WIN_M), from) * RAD;
+    const forward = goesOn(from, pointAt(coords, cum, Math.min(total, d + s + AFTER_M)), [Math.sin(h), Math.cos(h)]);
+    out.push({ d, back: s, hitsStart: d - s - RETRACE_STEP_M < 0, hitsEnd: d + s + RETRACE_STEP_M > total, forward });
+  }
+  return out;
+}
+
+/** Das Stück einer Umkehr herausschneiden (siehe oben). */
+export function cutReversal(coords: LngLat[], cum: number[], r: Reversal): LngLat[] {
+  const from = r.d - r.back;
+  const to = r.d + r.back;
+  const before = coords.filter((_, i) => cum[i]! < from);
+  const after = coords.filter((_, i) => cum[i]! > to);
+  // Läuft ein Ast bis ans Ende der Linie, war es ein Haken am Anfang bzw. Ende.
+  if (r.hitsStart) return [pointAt(coords, cum, to), ...after];
+  if (r.hitsEnd) return [...before, pointAt(coords, cum, from)];
+  return [...before, pointAt(coords, cum, from), pointAt(coords, cum, to), ...after];
+}
+
+/** Ein Stück der Linie zwischen zwei Stellen (m). */
+function sliceLine(coords: LngLat[], cum: number[], from: number, to: number): LngLat[] {
+  const inner = coords.filter((_, i) => cum[i]! > from && cum[i]! < to);
+  return [pointAt(coords, cum, from), ...inner, pointAt(coords, cum, to)];
+}
+
+/** Siehe oben: Umkehrungen ohne Wende entfernen, Stücke vor dem ersten und hinter dem letzten Halt kappen. */
+export function cleanShape(coords: LngLat[], stops: LngLat[]): LngLat[] {
+  let line = coords;
+  for (let guard = 0; guard < 80; guard++) {
+    const cum = measure(line);
+    const revs = reversalsOf(line, cum);
+    if (revs.length === 0) break;
+    const mids = snapStops(line, cum, stops).slice(1, -1);
+    const faults = revs
+      .map((r) => ({ r, atStop: mids.some((sd) => Math.abs(sd - r.d) <= GENUINE_AT_STOP_M) }))
+      .filter(({ r, atStop }) => {
+        const zig = revs.some((o) => o !== r && Math.abs(o.d - r.d) <= Math.max(r.back, o.back) + REV_WIN_M);
+        return !atStop || zig || r.forward || r.hitsStart || r.hitsEnd;
+      })
+      .sort((a, b) => Number(a.atStop) - Number(b.atStop) || a.r.back - b.r.back);
+    const pick = faults[0]?.r;
+    if (!pick) break;
+    const next = cutReversal(line, cum, pick);
+    if (next.length < 2) break;
+    line = next;
+  }
+  if (stops.length < 2) return line;
+  const cum = measure(line);
+  const stopD = snapStops(line, cum, stops);
+  const from = stopD[0]!;
+  const to = stopD[stopD.length - 1]!;
+  return to - from > 1 ? sliceLine(line, cum, from, to) : line;
+}
+
 const round6 = (v: number) => Math.round(v * 1e6) / 1e6;
 
 /**
@@ -176,12 +319,13 @@ const round6 = (v: number) => Math.round(v * 1e6) / 1e6;
 export function buildLiveShape(
   geometry: LngLat[] | null,
   stops: LngLat[],
-  opts: { toleranceM?: number; maxOffM?: number } = {},
+  opts: { toleranceM?: number; maxOffM?: number; rail?: boolean } = {},
 ): { coords: LngLat[]; cum: number[]; stopD: number[]; source: "geometry" | "straight" } {
   const tolerance = opts.toleranceM ?? 3;
   const maxOff = opts.maxOffM ?? 600;
   if (geometry && geometry.length >= 2 && stops.length >= 2) {
-    const coords = simplify(geometry, tolerance).map(([x, y]) => [round6(x), round6(y)] as LngLat);
+    const simple = simplify(geometry, tolerance);
+    const coords = (opts.rail ? cleanShape(simple, stops) : simple).map(([x, y]) => [round6(x), round6(y)] as LngLat);
     const cum = measure(coords);
     const stopD = snapStops(coords, cum, stops);
     // Gegenprobe: Liegt jeder Halt wirklich an der Linie?

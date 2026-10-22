@@ -37,7 +37,7 @@ import { exonymQueryVariants } from "../util/cityExonyms.js";
 import { motisGeocode } from "./motisClient.js";
 import { loadStopBoard } from "../routes/stops.js";
 import type { TravelMode } from "../db/schema.js";
-import { and, eq, gte, isNotNull, lte, sql } from "drizzle-orm";
+import { and, eq, gte, isNotNull, isNull, lte, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import { planMultimodal, resolvePlanEndpoint, type PlanEndpoint, type PlanLeg } from "./multimodalPlanner.js";
@@ -1090,6 +1090,10 @@ async function resolvePoiToStop(
         // als Ersatz für einen Platz in der Innenstadt wäre unbrauchbar.
         // `search_journey` übergibt immer einen konkreten Modus, nie „ALL".
         eq(locations.type, mode),
+        // Stationen, nicht ihre einzelnen Steige — sonst stünde „Dortmund
+        // Hörde Bf" fünfmal in der Liste. Und nur Halte, an denen etwas fährt.
+        isNull(locations.parentCode),
+        isNull(locations.unservedAt),
       ),
     )
     .orderBy(
@@ -1150,7 +1154,7 @@ async function knownStopsInCity(
       country: locations.country,
     })
     .from(locations)
-    .where(and(eq(locations.city, city), eq(locations.type, mode)))
+    .where(and(eq(locations.city, city), eq(locations.type, mode), isNull(locations.parentCode), isNull(locations.unservedAt)))
     /**
      * Nach NÄHE zum anderen Ende, nicht nach Namenslänge.
      *

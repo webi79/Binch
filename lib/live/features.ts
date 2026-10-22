@@ -2,6 +2,7 @@
  * Die Daten der Live-Ebene auf der Karte (`components/live/LiveVehicleLayer`)
  * — als reine Rechnung herausgelöst, damit sie sich ohne Gerät prüfen lässt.
  */
+import { TRANSIT_COLOR } from "@/lib/theme/transitColors";
 import { metersPerPixel, sliceLine } from "./geo";
 import { isLongDistance } from "./motion";
 import { LIVE_MODEL_SPECS, type LiveModelSet } from "./liveModelSpecs";
@@ -114,7 +115,7 @@ export function liveModelConfig(model: LiveModel, finColor: string): {
   }
   const spec = LIVE_MODEL_SPECS[set];
   const look = lookFor(model.kind as Exclude<typeof model.kind, "plane">, model.product);
-  const accent = set === "bus" ? "#9D5FE0" : (spec.head as { stripe?: string }).stripe ?? "#FFD60A";
+  const accent = set === "bus" ? TRANSIT_COLOR.bus : (spec.head as { stripe?: string }).stripe ?? TRANSIT_COLOR.regional;
   const mid = "mid" in spec ? (spec.mid as Part) : undefined;
   return {
     kind: set === "bus" ? 1 : 0,

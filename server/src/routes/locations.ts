@@ -5,6 +5,7 @@ import { searchLocations } from "../services/locationService.js";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
 import { ipLimiter } from "../util/rateLimit.js";
+import { resolveReplacements } from "../services/locationReplacements.js";
 
 const querySchema = z.object({
   q: z.string().min(1),
@@ -69,20 +70,47 @@ export async function locationsRoutes(app: FastifyInstance) {
     ).slice(0, BY_CODES_MAX);
     if (codes.length === 0) return { results: [] };
 
-    const rows = await db
-      .select({
-        code: locations.code,
-        label: sql<string>`coalesce(${locations.displayName}, ${locations.label})`,
-        detail: locations.displayDetail,
-      })
-      .from(locations)
-      .where(inArray(locations.code, codes));
-
+    const load = (list: string[]) =>
+      db
+        .select({
+          code: locations.code,
+          label: sql<string>`coalesce(${locations.displayName}, ${locations.label})`,
+          detail: locations.displayDetail,
+          // Steig-Bezeichnung nur bei einem Bus- oder Tram-Steig (wie Karte und
+          // Tafel) — eine gespeicherte Station behält so ihr „Steig 3".
+          platform: sql<string | null>`CASE WHEN ${locations.parentCode} IS NOT NULL
+            AND coalesce(${locations.subtype}, CASE WHEN ${locations.type} = 'BUS' THEN 'BUS' END) IN ('BUS', 'COACH', 'TRAM')
+            THEN ${locations.platform} END`,
+        })
+        .from(locations)
+        .where(inArray(locations.code, list));
+    const rows = await load(codes);
     const byCode = new Map(rows.map((r) => [r.code, r]));
+
+    /**
+     * Entfernte Halte (veraltet oder doppelt, `location_replacements`): Die
+     * App bekommt den Ersatz am selben Ort mitgeteilt (`replacedBy`) und
+     * tauscht die Kennung in gespeicherten Stationen und im Verlauf aus —
+     * statt sie als „gibt es nicht" zu verwerfen.
+     */
+    const missing = codes.filter((c) => !byCode.has(c));
+    const replaced = missing.length > 0 ? await resolveReplacements(missing) : new Map<string, string>();
+    if (replaced.size > 0) {
+      for (const r of await load([...new Set(replaced.values())])) byCode.set(r.code, r);
+    }
+
     const results = codes.map((code) => {
-      const row = byCode.get(code);
+      const target = replaced.get(code);
+      const row = byCode.get(target ?? code);
       return row != null
-        ? { code, label: row.label, ...(row.detail ? { detail: row.detail } : {}), exists: true as const }
+        ? {
+            code,
+            label: row.label,
+            ...(row.detail ? { detail: row.detail } : {}),
+            ...(row.platform ? { platform: row.platform } : {}),
+            ...(target ? { replacedBy: target } : {}),
+            exists: true as const,
+          }
         : { code, exists: false as const };
     });
     return { results };

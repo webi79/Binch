@@ -29,6 +29,7 @@ export function stopToLocation(stop: {
   code: string;
   label: string;
   detail?: string;
+  platform?: string;
   kinds?: MarkerKind[];
   latitude?: number;
   longitude?: number;
@@ -46,6 +47,7 @@ export function stopToLocation(stop: {
     code: normalizedCode,
     label: stop.label,
     ...(stop.detail ? { detail: stop.detail } : {}),
+    ...(stop.platform ? { platform: stop.platform } : {}),
     city: "",
     country: "",
     type,

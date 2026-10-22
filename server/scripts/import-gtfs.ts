@@ -21,9 +21,17 @@ import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import { and, inArray, isNotNull, like, sql } from "drizzle-orm";
 import { db, pool } from "../src/db/client.js";
-import { locations } from "../src/db/schema.js";
+import { locationReplacements, locations } from "../src/db/schema.js";
+import { resolveReplacements } from "../src/services/locationReplacements.js";
 import { applyCountryNames } from "./lib/stopNames.js";
-import { countryFromCoord } from "../src/lib/country-from-coord.js";
+import {
+  dominantSubtype,
+  kindsForStop,
+  subtypeToType,
+  type Kind,
+  type Subtype,
+} from "./lib/gtfsModes.js";
+import { countryFromCoord, countryFromZone } from "../src/lib/country-from-coord.js";
 import {
   NearbyIndex,
   dedupFamily,
@@ -31,15 +39,38 @@ import {
   haversineMeters,
   sameStopName,
 } from "./lib/locationDedup.js";
+import {
+  STAND_MERGE_M,
+  familyOfSubtype,
+  physicalStands,
+  planStands,
+  sharesDistinctWord,
+  stationKinds,
+  type FeedChild,
+  type FeedStand,
+  type KnownStop,
+  type PlannedStand,
+} from "./lib/gtfsStands.js";
 
 /** So weit darf sich ein Halt zwischen zwei Veröffentlichungen „bewegen" — mehr ist ein anderer Halt. */
 const SAME_STOP_MAX_MOVE_M = 2_000;
+/**
+ * `GTFS_IDS=unstable`: So weit darf eine Station von ihrer Zeile entfernt liegen,
+ * um über Name + Lage zugeordnet zu werden — Bahnhöfe sind groß, Haltestellen
+ * gleichen Namens stehen im Ort oft nur ein paar Hundert Meter auseinander.
+ */
+const PLACE_MATCH_M = { RAIL: 500, LOCAL: 300, FERRY: 300 } as const;
+/** So nah ist eine gleichnamige Zeile anderer Familie dieselbe Station (Bahnhof samt Bussteigen). */
+const SAME_SPOT_ANY_FAMILY_M = 25;
+/** So nah ist eine Zeile derselben Familie unter anderem Namen derselbe Halt (umbenannt). */
+const SAME_SPOT_RENAMED_M = 15;
 
 /**
  * `GTFS_MODE=refresh` — der monatliche Abgleich (scripts/refresh-stops.sh):
  *   • NEUE Haltestellen werden eingefügt, ohne Stadt (die setzt danach
  *     `enrich-stops-city.ts`);
- *   • bei VORHANDENEN nur, was die Quelle wirklich weiß: Lage, Verkehrsarten;
+ *   • bei VORHANDENEN nur, was die Quelle wirklich weiß: Lage, Verkehrsarten
+ *     und ihren heutigen Namen (`source_name`, daraus der Anzeigename);
  *     NIE Label, Stadt, Bahn-ID, Land oder Art — die sind teils von Hand bzw.
  *     per Skript korrigiert (fix-stop-cities.ts, HAFAS-Zuordnungen);
  *   • nichts wird gelöscht, und die Prüfungen danach (fragen bei der Bahn
@@ -47,6 +78,32 @@ const SAME_STOP_MAX_MOVE_M = 2_000;
  * Ohne diesen Schalter: der volle Import wie bisher (überschreibt alles).
  */
 const REFRESH = process.env.GTFS_MODE === "refresh";
+/**
+ * `GTFS_IDS=unstable` — der Feed vergibt seine Kennungen bei jeder
+ * Veröffentlichung neu (gtfs.de). Der Abgleich ordnet dann über Name + Lage +
+ * Art zu statt über die Kennung: Regel 1 unten ließ sonst jeden neuen Halt,
+ * dessen Nummer schon eine ALTE Zeile trug, nie herein (Okt. 2026: 12 000
+ * fehlende Steige in Deutschland), und die vorhandenen Zeilen blieben auf dem
+ * Stand ihrer ersten Veröffentlichung.
+ */
+const UNSTABLE_IDS = process.env.GTFS_IDS === "unstable";
+/**
+ * Präfixe ANDERER Feeds, die mit dem eigenen beginnen („gtfs:de:vbb:" unter
+ * „gtfs:de:") — deren Zeilen gehören nicht zu diesem Feed. Kommagetrennt, von
+ * refresh-stops.sh aus stops-feeds.conf gesetzt.
+ */
+const OTHER_PREFIXES = (process.env.GTFS_OTHER_PREFIXES ?? "")
+  .split(",")
+  .map((p: string) => p.trim())
+  .filter(Boolean);
+/**
+ * `GTFS_STANDS=0` — keine Steige anlegen, nur Stationen auffrischen. Für die
+ * Verbund-Feeds (VBB, MVG, VRS): gtfs.de beschreibt dieselben Masten schon,
+ * die Verbünde nur mit 5–25 m anderer Lage — jeder Steig käme doppelt.
+ */
+const WITH_STANDS = process.env.GTFS_STANDS !== "0";
+/** `GTFS_REPORT=<verzeichnis>` — die geplanten Änderungen als CSV (stations.csv, stands.csv). */
+const REPORT_DIR = process.env.GTFS_REPORT;
 const GTFS_DIR = process.env.GTFS_DIR ?? "/tmp/gtfs";
 const COUNTRY = process.env.GTFS_COUNTRY ?? "Germany";
 const CODE_PREFIX = process.env.GTFS_CODE_PREFIX ?? "gtfs:";
@@ -88,37 +145,6 @@ const UIC_PREFIX_BY_COUNTRY: Record<string, string> = {
  *  alle Einträge ablehnen). */
 function uicPrefixForCountry(country: string): string | null {
   return UIC_PREFIX_BY_COUNTRY[country] ?? null;
-}
-
-type Subtype =
-  | "LONG_DISTANCE"
-  | "REGIONAL"
-  | "SUBURBAN"
-  | "SUBWAY"
-  | "TRAM"
-  | "BUS"
-  | "COACH"
-  | "FERRY";
-
-/** Frontend-Kategorie zu der ein Subtype gehört — wird im `kinds` Array
- *  gespeichert und steuert welche Icons im Multi-Mode-Marker erscheinen.
- *  Mehrere Subtypes können zur selben Kategorie gehören (RAIL bündelt
- *  Long-Distance + Regional + Suburban). */
-type Kind = "train" | "subway" | "tram" | "bus" | "ferry";
-
-function subtypeToKind(s: Subtype): Kind {
-  switch (s) {
-    case "LONG_DISTANCE":
-    case "REGIONAL":
-    case "SUBURBAN":
-      return "train";
-    case "SUBWAY": return "subway";
-    case "TRAM": return "tram";
-    case "BUS":
-    case "COACH":
-      return "bus";
-    case "FERRY": return "ferry";
-  }
 }
 
 interface GtfsRow {
@@ -246,102 +272,6 @@ function routeTypeToSubtype(rt: number): Subtype {
   return "BUS"; // Default-Fallback
 }
 
-/** Liefert alle Kinds die am Stop signifikant verkehren. Sortiert nach
- *  Häufigkeit absteigend. Frontend rendert die als nebeneinander-Icons in
- *  einer Pille.
- *
- *  Beispiel „Dortmund Barop Parkhaus": SUBWAY 80%, BUS 20% → ["subway","bus"].
- *  Beispiel reine Bushaltestelle: BUS 100% → ["bus"].
- *
- *  Schwelle: Sekundäre Kinds müssen ≥30% Anteil UND ≥100 Trip-Erwähnungen
- *  haben. Vermeidet dass Schienenersatzverkehr / Aggregations-Artefakte aus
- *  Quell-Feeds (z.B. gtfs.de „free") fälschlich „train" an Bushaltestellen
- *  setzen. User-Bug-Report: Hamm Münsterische Schiff.-AG hatte 20-29% rail-
- *  getaggte Trips trotz reiner Buskategorie. */
-function kindsForStop(types: Map<Subtype, number>): Kind[] {
-  const total = Array.from(types.values()).reduce((s, n) => s + n, 0);
-  if (total === 0) return ["bus"];
-
-  // Pro Frontend-Kind die Frequenz aufsummieren (RAIL bündelt mehrere Subtypes).
-  const kindCounts = new Map<Kind, number>();
-  for (const [t, c] of types) {
-    const k = subtypeToKind(t);
-    kindCounts.set(k, (kindCounts.get(k) ?? 0) + c);
-  }
-
-  // Sortieren absteigend nach Frequenz. Mindestens den Top-Kind nehmen.
-  const sorted = Array.from(kindCounts.entries()).sort((a, b) => b[1] - a[1]);
-  const out: Kind[] = [sorted[0]![0]];
-  for (let i = 1; i < sorted.length; i++) {
-    const [k, c] = sorted[i]!;
-    if (c / total >= 0.3 && c >= 100) out.push(k);
-  }
-  return out;
-}
-
-/** Wenn an einem Stop mehrere Subtypes auftreten, wählen wir den
- *  „prominentesten" (Fern > Regional > S-Bahn > U-Bahn > Tram > Bus > …).
- *  So zeigt z.B. „Berlin Hbf" mit U-Bahn-Eingang trotzdem als TRAIN. */
-const SUBTYPE_PRIORITY: Record<Subtype, number> = {
-  LONG_DISTANCE: 100,
-  REGIONAL: 90,
-  SUBURBAN: 80,
-  SUBWAY: 70,
-  TRAM: 60,
-  COACH: 50,
-  FERRY: 40,
-  BUS: 30,
-};
-
-/** Wählt aus den Subtypes eines Stops den dominanten — gewichtet nach
- *  Frequenz, nicht reiner Priorität. Subtypes mit <20% Anteil werden
- *  ignoriert. So gewinnt an einem Bus-Hub mit 100 Bus-Routen + 1 S-Bahn-Route
- *  nicht mehr S-Bahn → BUS bleibt korrekt klassifiziert. */
-function dominantSubtype(types: Map<Subtype, number>): Subtype {
-  const total = Array.from(types.values()).reduce((sum, n) => sum + n, 0);
-  if (total === 0) return "BUS";
-
-  // Subtypes mit signifikantem Anteil sammeln (≥30%). Falls keiner so hoch
-  // kommt → den absolut häufigsten nehmen. Hohe Schwelle weil sonst
-  // Schienenersatzverkehr (~20% rail-Anteil) Buspendel-Stops als TRAIN
-  // klassifiziert (User-Bug: Hamm Münsterische Schiff.-AG).
-  const significant = new Set<Subtype>();
-  for (const [t, c] of types) {
-    if (c / total >= 0.3) significant.add(t);
-  }
-
-  if (significant.size === 0) {
-    let best: Subtype = "BUS";
-    let bestCount = -1;
-    for (const [t, c] of types) {
-      if (c > bestCount) {
-        best = t;
-        bestCount = c;
-      }
-    }
-    return best;
-  }
-
-  // Aus den signifikanten Subtypes: höchste Priorität gewinnt.
-  let best: Subtype = "BUS";
-  let bestPrio = -1;
-  for (const t of significant) {
-    const p = SUBTYPE_PRIORITY[t];
-    if (p > bestPrio) {
-      best = t;
-      bestPrio = p;
-    }
-  }
-  return best;
-}
-
-/** Hauptkategorie für die DB — TRAIN umfasst alles auf Schienen ohne U-Bahn/Tram. */
-function subtypeToType(s: Subtype): "TRAIN" | "BUS" {
-  if (s === "LONG_DISTANCE" || s === "REGIONAL" || s === "SUBURBAN") return "TRAIN";
-  return "BUS"; // SUBWAY/TRAM/BUS/COACH/FERRY fallen optisch in BUS-Kategorie,
-  // werden aber im Marker über `subtype` weiter unterschieden (im surroundings-Endpoint).
-}
-
 interface CsvRow {
   [k: string]: string;
 }
@@ -433,6 +363,8 @@ async function main() {
   const childToParent = new Map<string, string>();
   /** Summe der gültigen Kind-Lagen je Elternstation (für `placeOfParent`). */
   const childPlaces = new Map<string, { lat: number; lng: number; n: number }>();
+  /** Die Kinder (Steige) je Elternstation — für ihre eigenen Zeilen (gtfsStands.ts). */
+  const childrenOf = new Map<string, FeedChild[]>();
   for (const r of stopRows) {
     const id = r["stop_id"]?.trim();
     const parent = r["parent_station"]?.trim();
@@ -446,6 +378,18 @@ async function main() {
         acc.lng += lng;
         acc.n++;
         childPlaces.set(parent, acc);
+        const locType = (r["location_type"] ?? "0").trim() || "0";
+        if (locType === "0") {
+          const kids = childrenOf.get(parent) ?? [];
+          kids.push({
+            id,
+            name: r["stop_name"]?.trim() ?? "",
+            lat,
+            lng,
+            platformCode: r["platform_code"]?.trim() ?? "",
+          });
+          childrenOf.set(parent, kids);
+        }
       }
     }
   }
@@ -563,9 +507,15 @@ async function main() {
    * NEU ein; der volle Import nimmt sie wie bisher mit.
    */
   const unplaced = new Set<string>();
+  /** Feed-Code einer Station (vor der Zuordnung) → ihre physischen Steige, ab zwei. */
+  const standsOfStation = new Map<string, FeedStand[]>();
+  /** Alleinstehende Masten (location_type 0 ohne Station) — Prag, Wien, Warschau, Großbritannien. */
+  const standalonePoles = new Set<string>();
 
   for (const r of stopRows) {
-    const locType = r["location_type"] ?? "0";
+    // Leer heißt laut GTFS „0" (Haltestelle) — `??` greift bei "" nicht, und so
+    // fehlten 1 544 deutsche Einzelhalte (gtfs.de lässt die Spalte leer).
+    const locType = (r["location_type"] ?? "").trim() || "0";
     const parent = r["parent_station"] ?? "";
     if (locType !== "0" && locType !== "1") continue;
     if (locType === "0" && parent !== "") continue;
@@ -588,7 +538,9 @@ async function main() {
     // anderen unserer 8 Länder → skip (es kommt dann durch den anderen
     // Country-Import rein). Liegt er in keinem modellierten Land → trotzdem
     // mit dem Feed-COUNTRY taggen (z.B. SK/HU-Stops im AT-Feed).
-    const detectedCountry = countryFromCoord(lat, lng);
+    // Sagt die Zeitzone „dieses Land", gilt das — die groben Polygone schnitten
+    // ganze Grenzregionen ab (Bayerischer Wald, Niederrhein, Eifel, Saarland).
+    const detectedCountry = countryFromZone(lat, lng) === COUNTRY ? COUNTRY : countryFromCoord(lat, lng);
     if (detectedCountry !== null && detectedCountry !== COUNTRY) continue;
     const rowCountry = detectedCountry ?? COUNTRY;
 
@@ -604,7 +556,20 @@ async function main() {
     if (!hasData) noTripData.add(code);
     if (detectedCountry === null) unplaced.add(code);
     const subtype = hasData ? dominantSubtype(subtypeCounts) : "BUS";
-    const kinds = hasData ? kindsForStop(subtypeCounts) : ["bus" as Kind];
+    /**
+     * Station mit Steigen: ihre Arten sind die ihrer Steige, jeder für sich
+     * bewertet — über die Station gezählt fiel in Hörde Bf die U-Bahn neben
+     * den Bussen unter die Schwelle. Ab zwei physischen Steigen bekommt jeder
+     * eine eigene Zeile (unten, `standsOfStation`).
+     */
+    const stands = locType === "1" && hasData ? physicalStands(childrenOf.get(stopId) ?? [], stopSubtypeCounts) : [];
+    if (stands.length >= 2) standsOfStation.set(code, stands);
+    if (locType === "0") standalonePoles.add(code);
+    const kinds = hasData
+      ? stands.length > 0
+        ? stationKinds(stands, subtypeCounts)
+        : kindsForStop(subtypeCounts)
+      : ["bus" as Kind];
     const type = subtypeToType(subtype);
     // hafas_id nur setzen wenn (a) der Stop im HEIMATLAND des Feeds liegt und
     // (b) die 7-stellige ID das UIC-Prefix dieses Landes trägt. Beides nötig:
@@ -635,14 +600,21 @@ async function main() {
         ? stopId
         : null;
 
+    /**
+     * Station mit genau EINEM physischen Steig: Die Zeile steht auf dem Mast. Der
+     * Mittelpunkt, den der Fahrplan der Station gibt, lag oft 30–1 000 m daneben
+     * („Lehe, Neuleher/Moorkante" 989 m) — der Marker stand im Nirgendwo, die Tafel
+     * suchte dort. Ab zwei Steigen zeigt die Karte ohnehin die Steige.
+     */
+    const at = stands.length === 1 ? { lat: stands[0]!.lat, lng: stands[0]!.lng } : { lat, lng };
     out.push({
       code,
       label: name,
       city: name,
       country: rowCountry,
       type,
-      latitude: lat.toFixed(6),
-      longitude: lng.toFixed(6),
+      latitude: at.lat.toFixed(6),
+      longitude: at.lng.toFixed(6),
       hafasId,
       subtype,
       kinds,
@@ -706,28 +678,93 @@ async function main() {
   let skippedNoTrips = 0;
   let acceptedNew = 0;
   let skippedUnplaced = 0;
+  let matchedByPlace = 0;
+  let skippedReplaced = 0;
+  /** Feed-Code einer Station → ihr Code in der Tabelle (zugeordnet oder neu). */
+  const stationCodeOf = new Map<string, string>();
+  /** Name und Stadt der Station in der Tabelle — ihre Steige übernehmen beides. */
+  const stationInfo = new Map<string, { label: string; city: string | null }>();
+  /** Die Zeilen der Gegend, für die Steige (gtfsStands.ts). */
+  let knownStops: KnownStop[] = [];
+  /** Steht an dieser Stelle schon ein Steig derselben Familie (≤ `STAND_MERGE_M`)? */
+  let standCovered: (s: FeedStand) => boolean = () => false;
+  /** Alle vergebenen Codes dieses Präfixes — ein neuer darf keinen davon treffen. */
+  const usedCodes = new Set<string>();
+  /**
+   * Ein freier Code für eine Feed-Kennung. Bei `GTFS_IDS=unstable` trägt die
+   * Kennung oft schon eine ALTE Zeile (anderer Halt) — dann „n" davor.
+   */
+  const freeCode = (id: string): string => {
+    const candidates = [`${CODE_PREFIX}${id}`, `${CODE_PREFIX}n${id}`];
+    for (let n = 2; candidates.length < 12; n++) candidates.push(`${CODE_PREFIX}n${id}-${n}`);
+    const code = candidates.find((c) => c.length <= 64 && !usedCodes.has(c)) ?? `${CODE_PREFIX}n${id}-${Date.now()}`;
+    usedCodes.add(code);
+    return code;
+  };
+  /** Report-Zeilen für `GTFS_REPORT` (Stationen). */
+  const stationReport: string[][] = [];
   if (REFRESH) {
     const knownRows = await db
       .select({
         code: locations.code,
         label: locations.label,
+        city: locations.city,
         type: locations.type,
         subtype: locations.subtype,
         kinds: locations.kinds,
         lat: locations.latitude,
         lng: locations.longitude,
+        parentCode: locations.parentCode,
       })
       .from(locations)
       .where(like(locations.code, `${CODE_PREFIX}%`));
-    const known = new Map(knownRows.map((r) => [r.code, r]));
+    for (const r of knownRows) usedCodes.add(r.code);
+    /**
+     * Entfernte Zeilen dieses Präfixes (`location_replacements`, veraltet oder
+     * doppelt — scripts/apply-stop-replacements.ts). Ihre Codes bleiben
+     * vergeben: Ein neuer Halt darunter bekäme sonst die gespeicherten
+     * Stationen, die zum Ersatz gehören.
+     */
+    const replacedCodes = (
+      await db
+        .select({ oldCode: locationReplacements.oldCode })
+        .from(locationReplacements)
+        .where(like(locationReplacements.oldCode, `${CODE_PREFIX}%`))
+    ).map((r) => r.oldCode);
+    for (const c of replacedCodes) usedCodes.add(c);
+    /** Entfernte Kennung → Lage ihres heutigen Ersatzes (Ketten aufgelöst). */
+    const replacedAt = new Map<string, { lat: number; lng: number }>();
+    if (replacedCodes.length > 0) {
+      const target = await resolveReplacements(replacedCodes);
+      const at = new Map(
+        (
+          await db
+            .select({ code: locations.code, lat: locations.latitude, lng: locations.longitude })
+            .from(locations)
+            .where(and(inArray(locations.code, [...new Set(target.values())]), isNotNull(locations.latitude)))
+        ).map((t) => [t.code, { lat: Number(t.lat), lng: Number(t.lng) }]),
+      );
+      for (const [from, to] of target) {
+        const p = at.get(to);
+        if (p) replacedAt.set(from, p);
+      }
+    }
+    /** Gehört die Zeile zu DIESEM Feed (nicht zu einem mit längerem Präfix, „gtfs:de:vbb:")? */
+    const ownFeed = (code: string) => !OTHER_PREFIXES.some((p: string) => code.startsWith(p));
+    const known = new Map(knownRows.filter((r) => ownFeed(r.code)).map((r) => [r.code, r]));
     const countries = [...new Set(out.map((r) => r.country).filter((c): c is string => !!c))];
     const nearby = await db
       .select({
+        code: locations.code,
         label: locations.label,
         type: locations.type,
         subtype: locations.subtype,
         lat: locations.latitude,
         lng: locations.longitude,
+        source: locations.source,
+        parentCode: locations.parentCode,
+        hafasId: locations.hafasId,
+        displayName: locations.displayName,
       })
       .from(locations)
       .where(
@@ -738,9 +775,120 @@ async function main() {
         ),
       );
     const index = new NearbyIndex();
+    /**
+     * `GTFS_IDS=unstable`: Dubletten-Prüfung nur gegen FREMDE Zeilen (OSM,
+     * StaDa, andere Feeds). Die eigenen ordnet schon die Zuordnung über Name +
+     * Lage zu — bleibt eine eigene gleichnamige Zeile übrig, gehört sie einer
+     * anderen Feed-Station (die Gegenrichtung als eigene Station), und die
+     * hier ist ein eigener Halt.
+     */
+    const foreignIndex = new NearbyIndex();
     for (const e of nearby) {
       index.add(e.label, e.subtype, e.type, Number(e.lat), Number(e.lng));
+      const own = e.code.startsWith(CODE_PREFIX) && ownFeed(e.code);
+      if (!own && !e.parentCode) foreignIndex.add(e.label, e.subtype, e.type, Number(e.lat), Number(e.lng));
     }
+    knownStops = nearby.map((e) => ({
+      code: e.code,
+      label: e.label,
+      type: e.type,
+      subtype: e.subtype,
+      lat: Number(e.lat),
+      lng: Number(e.lng),
+      source: e.source,
+      parentCode: e.parentCode,
+      hafasId: e.hafasId,
+      displayName: e.displayName,
+    }));
+    /** Steige, die schon in der Tabelle stehen (jede Station, jeder Feed) — für den Feed-Zwilling unten. */
+    const standGrid = new Map<string, KnownStop[]>();
+    for (const k of knownStops) {
+      if (!k.parentCode) continue;
+      const key = `${Math.floor(k.lat * 1000)},${Math.floor(k.lng * 1000)}`;
+      const cell = standGrid.get(key);
+      if (cell) cell.push(k);
+      else standGrid.set(key, [k]);
+    }
+    standCovered = (s: FeedStand): boolean => {
+      const subtype = dominantSubtype(s.counts);
+      const family = familyOfSubtype(subtype, subtypeToType(subtype));
+      const cy = Math.floor(s.lat * 1000);
+      const cx = Math.floor(s.lng * 1000);
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          for (const k of standGrid.get(`${cy + dy},${cx + dx}`) ?? []) {
+            if (familyOfSubtype(k.subtype, k.type) === family && haversineMeters(s.lat, s.lng, k.lat, k.lng) <= STAND_MERGE_M) {
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    };
+    /**
+     * Steht DERSELBE Mast schon in der Tabelle? Für alleinstehende Masten
+     * eines Feeds mit festen Kennungen (Prag, Wien, Warschau): Jeder Mast hat
+     * dort seine eigene Kennung — die Gegenrichtung 20–40 m weiter ist ein
+     * anderer Halt mit eigener Tafel. Die Prüfung „gleicher Name im Umkreis
+     * von 500 m" (`hasDuplicate`) hielt sie für eine Dublette: In Prag fehlten
+     * so 4 400 Masten (Vollprüfung 22.10.2026, „Břetislavka" A/B 36 m).
+     * Derselbe Mast ist es nur, wenn er wirklich dasteht (immer dieselbe Familie):
+     *  - irgendein Halt ≤ 6 m, wie auch immer er heißt;
+     *  - gleicher Name aus DIESEM Feed ≤ 5 m (Prag führt jeden Mast für Stadt-
+     *    und Regionalverkehr doppelt, U3Z1P/U3Z1, 0 m) — ein anderer Mast
+     *    desselben Feeds weiter weg ist die Gegenrichtung;
+     *  - aus einer anderen Quelle (OSM) ≤ 15 m mit gleichem Namen oder einem
+     *    gemeinsamen markanten Wort — jede Quelle schreibt anders: „Pośrednia
+     *    01" (OSM) / „Pośrednia", „Doksy, železniční stanice" / „Doksy,žel.st.".
+     */
+    const poleGrid = new Map<string, KnownStop[]>();
+    for (const k of knownStops) {
+      const key = `${Math.floor(k.lat * 1000)},${Math.floor(k.lng * 1000)}`;
+      const cell = poleGrid.get(key);
+      if (cell) cell.push(k);
+      else poleGrid.set(key, [k]);
+    }
+    const samePoleExists = (r: GtfsRow, lat: number, lng: number): boolean => {
+      const family = dedupFamily(r.subtype, r.type);
+      const cy = Math.floor(lat * 1000);
+      const cx = Math.floor(lng * 1000);
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          for (const k of poleGrid.get(`${cy + dy},${cx + dx}`) ?? []) {
+            if (dedupFamily(k.subtype, k.type) !== family) continue;
+            const d = haversineMeters(lat, lng, k.lat, k.lng);
+            if (d <= 6) return true;
+            const own = k.code.startsWith(CODE_PREFIX) && ownFeed(k.code);
+            const names = k.displayName ? [k.label, k.displayName] : [k.label];
+            if (own) {
+              if (d <= 5 && names.some((n) => sameStopName(n, r.label, { veryClose: true }))) return true;
+              continue;
+            }
+            if (d <= 15 && names.some((n) => sameStopName(n, r.label, { veryClose: true }) || sharesDistinctWord(n, r.label))) {
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    };
+    const addPole = (r: GtfsRow, lat: number, lng: number) => {
+      const key = `${Math.floor(lat * 1000)},${Math.floor(lng * 1000)}`;
+      const k: KnownStop = {
+        code: r.code,
+        label: r.label,
+        type: r.type,
+        subtype: r.subtype,
+        lat,
+        lng,
+        source: "gtfs",
+        parentCode: null,
+        hafasId: r.hafasId,
+      };
+      const cell = poleGrid.get(key);
+      if (cell) cell.push(k);
+      else poleGrid.set(key, [k]);
+    };
     // Bahn-Nummern, die schon vergeben sind — ein neuer Halt mit derselben
     // Nummer ist derselbe Bahnhof unter anderem Namen („Brugg AG" ↔ „Brugg",
     // „Vilvorde" ↔ „Vilvoorde").
@@ -766,40 +914,133 @@ async function main() {
       return m ? m[1]! : null;
     };
 
+    /**
+     * `GTFS_IDS=unstable`: Feed-Station ↔ Zeile über Name + Lage + Familie,
+     * höchstens `PLACE_MATCH_M` auseinander — die nächsten Paare zuerst, jede
+     * Zeile und jede Feed-Station höchstens einmal. Steige (`parent_code`)
+     * und Zeilen anderer Feeds sind keine Kandidaten.
+     */
+    const placeMatch = new Map<number, string>();
+    if (UNSTABLE_IDS) {
+      const grid = new Map<string, typeof knownRows>();
+      for (const k of knownRows) {
+        if (k.parentCode || !ownFeed(k.code) || k.lat == null || k.lng == null) continue;
+        const key = `${Math.floor(Number(k.lat) * 100)},${Math.floor(Number(k.lng) * 100)}`;
+        const cell = grid.get(key);
+        if (cell) cell.push(k);
+        else grid.set(key, [k]);
+      }
+      /**
+       * Paare mit Rang: gleicher Name und gleiche Familie zuerst (Rang =
+       * Abstand), dann — nur fast auf demselben Punkt — der gleiche Name bei
+       * anderer Familie (die Bushaltestelle „Laudenbach, Bahnhof", die der Feed
+       * jetzt mit den Gleisen zu EINER Station zusammenführt) und die gleiche
+       * Familie unter neuem Namen („Niedererbach Brückenstr." heißt jetzt
+       * „…Brückenstraße", 0 m daneben). Ohne die beiden kämen solche Halte
+       * als neue Zeile neben die alte — doppelt auf der Karte.
+       */
+      /**
+       * Zeilen, an denen schon Steige hängen. Stehen zwei Zeilen gleich gut da
+       * (Zwillinge auf demselben Punkt, etwa „Hbf Nord" und „Hauptbahnhof
+       * Nord"), entschied bisher die zufällige Reihenfolge aus der Datenbank:
+       * Heute die eine, nächsten Monat die andere — und jedes Mal bekam die
+       * gerade gewählte eigene Steige. So entstanden am 22.10.2026 in 25
+       * Stationen doppelte Steige. Jetzt gewinnt die Zeile mit Steigen, dann
+       * der kleinere Code.
+       */
+      const holdsStands = new Set(knownRows.map((k) => k.parentCode).filter((c): c is string => !!c));
+      const pairs: Array<{ i: number; code: string; rank: number; holds: boolean }> = [];
+      out.forEach((r, i) => {
+        const lat = Number(r.latitude);
+        const lng = Number(r.longitude);
+        const hasTrips = !noTripData.has(r.code);
+        const family = dedupFamily(r.subtype, r.type);
+        const cy = Math.floor(lat * 100);
+        const cx = Math.floor(lng * 100);
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            for (const k of grid.get(`${cy + dy},${cx + dx}`) ?? []) {
+              const d = haversineMeters(lat, lng, Number(k.lat), Number(k.lng));
+              if (d > PLACE_MATCH_M[family]) continue;
+              const sameFamily = !hasTrips || dedupFamily(k.subtype, k.type) === family;
+              const named = sameStopName(k.label, r.label, { veryClose: d <= 150 });
+              const holds = holdsStands.has(k.code);
+              if (sameFamily && named) pairs.push({ i, code: k.code, rank: d, holds });
+              else if (named && d <= SAME_SPOT_ANY_FAMILY_M) pairs.push({ i, code: k.code, rank: d + 1_000, holds });
+              else if (sameFamily && d <= SAME_SPOT_RENAMED_M) pairs.push({ i, code: k.code, rank: d + 2_000, holds });
+            }
+          }
+        }
+      });
+      // Auf den Meter genau gleich weit → Zeile mit Steigen zuerst, dann fest nach Code.
+      pairs.sort(
+        (a, b) =>
+          Math.floor(a.rank) - Math.floor(b.rank) ||
+          Number(b.holds) - Number(a.holds) ||
+          a.rank - b.rank ||
+          (a.code < b.code ? -1 : a.code > b.code ? 1 : 0),
+      );
+      const claimed = new Set<string>();
+      for (const p of pairs) {
+        if (placeMatch.has(p.i) || claimed.has(p.code)) continue;
+        placeMatch.set(p.i, p.code);
+        claimed.add(p.code);
+      }
+    }
+
     rowsToWrite = [];
-    for (const r of out) {
+    for (let i = 0; i < out.length; i++) {
+      const r = out[i]!;
       const lat = Number(r.latitude);
       const lng = Number(r.longitude);
       const hasTrips = !noTripData.has(r.code);
-      const k = known.get(r.code);
+      const matchedCode = UNSTABLE_IDS ? placeMatch.get(i) : r.code;
+      const k = matchedCode ? known.get(matchedCode) : undefined;
       if (k) {
-        /**
-         * Regel 1 — dieselbe Kennung ist nur dann derselbe Halt, wenn …
-         *  - der Name passt, und
-         *  - die Lage höchstens `SAME_STOP_MAX_MOVE_M` wandert — hat die Zeile
-         *    KEINE Lage mehr (Reparatur vom 30.09.2026), muss der Name
-         *    wörtlich gleich sein;
-         *  - und die Familie gleich bleibt, sofern der Feed überhaupt Fahrten
-         *    kennt: Unter einer neu vergebenen Kennung stand sonst die
-         *    Bushaltestelle „München Ostbahnhof" für den Bahnhof daneben.
-         */
-        const place =
-          k.lat == null || k.lng == null
-            ? exactStopName(k.label, r.label)
-            : sameStopName(k.label, r.label) &&
-              haversineMeters(lat, lng, Number(k.lat), Number(k.lng)) <= SAME_STOP_MAX_MOVE_M;
-        const family =
-          !hasTrips || dedupFamily(k.subtype, k.type) === dedupFamily(r.subtype, r.type);
-        if (!place || !family) {
-          skippedForeign++;
-          continue;
+        if (!UNSTABLE_IDS) {
+          /**
+           * Regel 1 — dieselbe Kennung ist nur dann derselbe Halt, wenn …
+           *  - der Name passt, und
+           *  - die Lage höchstens `SAME_STOP_MAX_MOVE_M` wandert — hat die Zeile
+           *    KEINE Lage mehr (Reparatur vom 30.09.2026), muss der Name
+           *    wörtlich gleich sein;
+           *  - und die Familie gleich bleibt, sofern der Feed überhaupt Fahrten
+           *    kennt: Unter einer neu vergebenen Kennung stand sonst die
+           *    Bushaltestelle „München Ostbahnhof" für den Bahnhof daneben.
+           * (Bei `GTFS_IDS=unstable` ist das schon die Zuordnung oben.)
+           */
+          const place =
+            k.lat == null || k.lng == null
+              ? exactStopName(k.label, r.label)
+              : sameStopName(k.label, r.label) &&
+                haversineMeters(lat, lng, Number(k.lat), Number(k.lng)) <= SAME_STOP_MAX_MOVE_M;
+          const family =
+            !hasTrips || dedupFamily(k.subtype, k.type) === dedupFamily(r.subtype, r.type);
+          if (!place || !family) {
+            skippedForeign++;
+            stationReport.push([r.code, "", "fremd", r.label, r.latitude, r.longitude, r.kinds.join(" ")]);
+            continue;
+          }
+        } else {
+          matchedByPlace++;
         }
         // Ohne Fahrten ist die Verkehrsart nur geraten — die bekannte bleibt.
         rowsToWrite.push(
           hasTrips
-            ? r
-            : { ...r, subtype: (k.subtype ?? r.subtype) as Subtype, kinds: (k.kinds ?? r.kinds) as Kind[] },
+            ? { ...r, code: k.code }
+            : { ...r, code: k.code, subtype: (k.subtype ?? r.subtype) as Subtype, kinds: (k.kinds ?? r.kinds) as Kind[] },
         );
+        stationCodeOf.set(r.code, k.code);
+        stationInfo.set(r.code, { label: k.label, city: k.city });
+        stationReport.push([
+          r.code,
+          k.code,
+          (k.kinds ?? []).join(" ") === r.kinds.join(" ") ? "zugeordnet" : "zugeordnet, Arten neu",
+          r.label,
+          r.latitude,
+          r.longitude,
+          `${(k.kinds ?? []).join(" ")} → ${r.kinds.join(" ")}`,
+        ]);
         continue;
       }
       /**
@@ -825,84 +1066,252 @@ async function main() {
         skippedUnplaced++;
         continue;
       }
+      /**
+       * Bewusst entfernt (veraltet bzw. Kopie eines gtfs.de-Halts) — sein
+       * Ersatz steht noch daneben, also nicht wieder anlegen. Nur bei festen
+       * Kennungen: Unter `GTFS_IDS=unstable` steht die Kennung nächsten Monat
+       * für einen anderen Halt.
+       */
+      const replacement = UNSTABLE_IDS ? undefined : replacedAt.get(r.code);
+      if (
+        replacement &&
+        haversineMeters(lat, lng, replacement.lat, replacement.lng) <= PLACE_MATCH_M[dedupFamily(r.subtype, r.type)]
+      ) {
+        skippedReplaced++;
+        continue;
+      }
       const uic = uicOf(r);
-      if ((uic && knownHafas.has(uic)) || index.hasDuplicate(r.label, r.subtype, r.type, lat, lng)) {
+      /**
+       * Gibt es den Halt unter einer anderen Quelle schon, bleibt es bei der —
+       * außer die Feed-Station hat mehrere Steige: Dann kommt sie als Station
+       * dazu, und ihre Steige stellen die Karte (die fremde Zeile wird, wo sie
+       * genau auf einem Steig steht, dessen Zeile — gtfsStands.ts). Sonst
+       * fehlten in Berlin, Köln und München die Steige ganz, weil dort die
+       * Verbund-Feeds die Halte zuerst geliefert haben.
+       */
+      const multiStand = (standsOfStation.get(r.code)?.length ?? 0) >= 2;
+      /**
+       * Die Mast-Regel (`samePoleExists`) nur für Feeds, die ihr Gebiet selbst
+       * stellen. Ein Verbund-Feed unter gtfs.de (`GTFS_STANDS=0`) bringt keine
+       * neuen Masten: gtfs.de hat sie schon, nur 15–60 m anders verortet — der
+       * Nachlauf vom 22.10.2026 legte so 1 435 Doppelungen in Berlin und Köln an.
+       */
+      /**
+       * Feed-Zwilling: gtfs.de führt manche Masten unter zwei Stationen
+       * („Striesaer Weg" / „Oschatz Striesaer Weg", dieselben Koordinaten).
+       * Stehen ALLE Steige dieser neuen Station schon als Steige einer anderen
+       * da, ist sie nur deren Kopie — sonst käme sie jeden Monat als Marker
+       * ohne Steige zurück (neue Steige dort sperrt gtfsStands.ts).
+       */
+      const feedTwin = WITH_STANDS && multiStand && standsOfStation.get(r.code)!.every(standCovered);
+      const dup =
+        feedTwin ||
+        (UNSTABLE_IDS
+          ? !multiStand && foreignIndex.hasDuplicate(r.label, r.subtype, r.type, lat, lng)
+          : WITH_STANDS && standalonePoles.has(r.code) && dedupFamily(r.subtype, r.type) !== "RAIL"
+            ? samePoleExists(r, lat, lng)
+            : index.hasDuplicate(r.label, r.subtype, r.type, lat, lng));
+      if ((uic && knownHafas.has(uic)) || dup) {
         skippedDup++;
         continue;
       }
-      index.add(r.label, r.subtype, r.type, lat, lng);
+      if (!UNSTABLE_IDS) index.add(r.label, r.subtype, r.type, lat, lng);
+      addPole(r, lat, lng);
       if (uic) knownHafas.add(uic);
       acceptedNew++;
-      rowsToWrite.push(r);
+      // Die Feed-Kennung trägt bei neu nummerierenden Feeds oft schon eine alte Zeile.
+      const code = UNSTABLE_IDS || usedCodes.has(r.code) ? freeCode(r.code.slice(CODE_PREFIX.length)) : r.code;
+      usedCodes.add(code);
+      rowsToWrite.push({ ...r, code });
+      stationCodeOf.set(r.code, code);
+      stationInfo.set(r.code, { label: r.label, city: null });
+      stationReport.push([r.code, code, "neu", r.label, r.latitude, r.longitude, r.kinds.join(" ")]);
     }
     console.log(
-      `[gtfs:${COUNTRY}]   ${skippedForeign} Kennungen gehören im Feed einem anderen Halt (unberührt), ` +
+      `[gtfs:${COUNTRY}]   ${UNSTABLE_IDS ? `${matchedByPlace} über Name + Lage zugeordnet, ` : `${skippedForeign} Kennungen gehören im Feed einem anderen Halt (unberührt), `}` +
         `${skippedDup} neue Halte übersprungen (gibt es schon), ${skippedNoTrips} neue ohne Fahrten übersprungen, ` +
+        `${skippedReplaced} entfernte nicht wieder angelegt, ` +
         `${skippedUnplaced} neue außerhalb bekannter Länder oder Bahnsteige übersprungen, ` +
         `${acceptedNew} wirklich neu`,
     );
   }
 
+  /**
+   * Die STEIGE der Stationen mit mindestens zwei (lib/gtfsStands.ts) — nur im
+   * Abgleich; der volle Import schreibt weiter nur Stationen.
+   */
+  let plannedStands: PlannedStand[] = [];
+  let staleStands = 0;
+  if (REFRESH && WITH_STANDS) {
+    const stations = [];
+    const outByCode = new Map(out.map((r) => [r.code, r]));
+    for (const [feedCode, stands] of standsOfStation) {
+      const code = stationCodeOf.get(feedCode);
+      const info = stationInfo.get(feedCode);
+      const row = outByCode.get(feedCode);
+      if (!code || !info || !row) continue;
+      stations.push({ code, label: info.label, country: row.country, city: info.city, stands });
+    }
+    const planned = planStands({
+      stations,
+      known: knownStops,
+      stationCodes: new Set(stationCodeOf.values()),
+      // „gtfs:de:" — der Präfix des Landes, samt der Verbund-Feeds darunter.
+      linkPrefix: CODE_PREFIX.split(":").slice(0, 2).join(":") + ":",
+      newCode: freeCode,
+    });
+    plannedStands = planned.stands;
+    staleStands = planned.stale;
+    const by = (a: PlannedStand["action"]) => plannedStands.filter((s) => s.action === a).length;
+    console.log(
+      `[gtfs:${COUNTRY}]   Steige: ${stations.length} Stationen mit ≥ 2 Steigen → ${by("new")} neu, ` +
+        `${by("update")} aufgefrischt, ${by("link")} vorhandene Zeilen als Steig übernommen, ` +
+        `${planned.covered} schon durch einen Steig an derselben Stelle vertreten; ` +
+        `${staleStands} Steige kennt der Feed nicht mehr (bleiben stehen)`,
+    );
+  }
+
+  if (REPORT_DIR) {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(REPORT_DIR, { recursive: true });
+    const csv = (rows: string[][]) =>
+      rows.map((r) => r.map((v) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v)).join(",")).join("\n") + "\n";
+    writeFileSync(
+      `${REPORT_DIR}/stations.csv`,
+      csv([["feed_code", "code", "aktion", "name", "lat", "lng", "arten"], ...stationReport]),
+    );
+    writeFileSync(
+      `${REPORT_DIR}/stands.csv`,
+      csv([
+        ["station", "code", "aktion", "name", "steig", "unterart", "arten", "lat", "lng", "feed_ids"],
+        ...plannedStands.map((s) => [
+          s.parentCode,
+          s.code,
+          s.action,
+          s.label,
+          s.platform ?? "",
+          s.subtype,
+          s.kinds.join(" "),
+          s.latitude,
+          s.longitude,
+          s.feedIds.join(" "),
+        ]),
+      ]),
+    );
+    console.log(`[gtfs:${COUNTRY}] Bericht: ${REPORT_DIR}/stations.csv, stands.csv`);
+  }
+
   // `GTFS_DRY_RUN=1`: nur zählen, nichts schreiben — zum Prüfen eines Abgleichs.
   // Mit `GTFS_DRY_RUN=list` zusätzlich die wirklich neuen Halte (für Stichproben).
   if (process.env.GTFS_DRY_RUN === "list" && REFRESH) {
-    const knownCodes = new Set(
-      (await db.select({ code: locations.code }).from(locations).where(like(locations.code, `${CODE_PREFIX}%`))).map((r) => r.code),
-    );
-    for (const r of rowsToWrite) {
-      if (!knownCodes.has(r.code)) console.log(`[gtfs:${COUNTRY}]   neu: ${r.code} «${r.label}» ${r.subtype} ${r.latitude},${r.longitude}`);
+    for (const [, code, action, name, lat, lng, kinds] of stationReport) {
+      if (action === "neu") console.log(`[gtfs:${COUNTRY}]   neu: ${code} «${name}» ${kinds} ${lat},${lng}`);
     }
   }
   if (process.env.GTFS_DRY_RUN) {
-    console.log(`[gtfs:${COUNTRY}] Trockenlauf: ${rowsToWrite.length} würden geschrieben — nichts geändert.`);
+    console.log(
+      `[gtfs:${COUNTRY}] Trockenlauf: ${rowsToWrite.length} Stationen und ${plannedStands.length} Steige würden geschrieben — nichts geändert.`,
+    );
     process.exit(0);
   }
   console.log(`[gtfs:${COUNTRY}] inserting ${rowsToWrite.length} stops…${REFRESH ? " (Auffrischen)" : ""}`);
   let inserted = 0;
-  for (let i = 0; i < rowsToWrite.length; i += CHUNK) {
-    const batch = REFRESH
-      ? rowsToWrite.slice(i, i + CHUNK).map((r) => ({ ...r, city: null }))
-      : rowsToWrite.slice(i, i + CHUNK);
-    const rows = await db
-      .insert(locations)
-      .values(batch)
-      .onConflictDoUpdate({
-        target: locations.code,
-        set: REFRESH
-          ? {
-              latitude: sql`excluded.latitude`,
-              longitude: sql`excluded.longitude`,
-              /**
-               * Die Art (`type`) schreibt der Abgleich nie — also auch keine
-               * Verkehrsart, die nicht zu ihr passt. Sonst entstanden
-               * Bahnhöfe mit Verkehrsart „Bus" (101 Zeilen, 30.09.2026).
-               */
-              subtype: sql`CASE WHEN excluded.type = ${locations.type} THEN excluded.subtype ELSE ${locations.subtype} END`,
-              kinds: sql`CASE WHEN excluded.type = ${locations.type} THEN excluded.kinds ELSE ${locations.kinds} END`,
-            }
-          : {
-              label: sql`excluded.label`,
-              city: sql`excluded.city`,
-              country: sql`excluded.country`,
-              type: sql`excluded.type`,
-              latitude: sql`excluded.latitude`,
-              longitude: sql`excluded.longitude`,
-              hafasId: sql`excluded.hafas_id`,
-              subtype: sql`excluded.subtype`,
-              kinds: sql`excluded.kinds`,
-              source: sql`excluded.source`,
-            },
-      })
-      // `xmax = 0` heißt: die Zeile ist neu (eingefügt, nicht aktualisiert).
-      .returning({ isNew: sql<boolean>`(xmax = 0)` });
-    inserted += rows.filter((r) => r.isNew).length;
-    if ((i / CHUNK) % 20 === 0) {
-      console.log(`[gtfs:${COUNTRY}]   ${Math.min(i + CHUNK, rowsToWrite.length)} / ${rowsToWrite.length}`);
+  let standsInserted = 0;
+  /**
+   * Stationen und Steige in EINER Transaktion: Bricht der Lauf ab, bleibt der
+   * alte Stand — nie Steige ohne Station oder eine Station, die die Karte
+   * schon über Steige zeigt, die es noch nicht gibt.
+   */
+  await db.transaction(async (tx) => {
+    for (let i = 0; i < rowsToWrite.length; i += CHUNK) {
+      // `sourceName`: der Name im Fahrplan — auch dort, wo `label` bleibt (siehe schema.ts).
+      const batch = rowsToWrite
+        .slice(i, i + CHUNK)
+        .map((r) => (REFRESH ? { ...r, city: null, sourceName: r.label } : { ...r, sourceName: r.label }));
+      const rows = await tx
+        .insert(locations)
+        .values(batch)
+        .onConflictDoUpdate({
+          target: locations.code,
+          set: REFRESH
+            ? {
+                latitude: sql`excluded.latitude`,
+                longitude: sql`excluded.longitude`,
+                /**
+                 * Die Art (`type`) schreibt der Abgleich nie — also auch keine
+                 * Verkehrsart, die nicht zu ihr passt. Sonst entstanden
+                 * Bahnhöfe mit Verkehrsart „Bus" (101 Zeilen, 30.09.2026).
+                 */
+                subtype: sql`CASE WHEN excluded.type = ${locations.type} THEN excluded.subtype ELSE ${locations.subtype} END`,
+                kinds: sql`CASE WHEN excluded.type = ${locations.type} THEN excluded.kinds ELSE ${locations.kinds} END`,
+                sourceName: sql`excluded.source_name`,
+              }
+            : {
+                label: sql`excluded.label`,
+                sourceName: sql`excluded.source_name`,
+                city: sql`excluded.city`,
+                country: sql`excluded.country`,
+                type: sql`excluded.type`,
+                latitude: sql`excluded.latitude`,
+                longitude: sql`excluded.longitude`,
+                hafasId: sql`excluded.hafas_id`,
+                subtype: sql`excluded.subtype`,
+                kinds: sql`excluded.kinds`,
+                source: sql`excluded.source`,
+              },
+        })
+        // `xmax = 0` heißt: die Zeile ist neu (eingefügt, nicht aktualisiert).
+        .returning({ isNew: sql<boolean>`(xmax = 0)` });
+      inserted += rows.filter((r) => r.isNew).length;
+      if ((i / CHUNK) % 20 === 0) {
+        console.log(`[gtfs:${COUNTRY}]   ${Math.min(i + CHUNK, rowsToWrite.length)} / ${rowsToWrite.length}`);
+      }
     }
-  }
+    for (let i = 0; i < plannedStands.length; i += CHUNK) {
+      const batch = plannedStands.slice(i, i + CHUNK).map((s) => ({
+        code: s.code,
+        label: s.label,
+        city: s.city,
+        country: s.country,
+        type: s.type,
+        latitude: s.latitude,
+        longitude: s.longitude,
+        hafasId: null,
+        subtype: s.subtype,
+        kinds: s.kinds,
+        source: "gtfs",
+        parentCode: s.parentCode,
+        platform: s.platform,
+      }));
+      const rows = await tx
+        .insert(locations)
+        .values(batch)
+        .onConflictDoUpdate({
+          target: locations.code,
+          /**
+           * Vorhandener Steig oder übernommene Zeile (OSM-Mast): Station,
+           * Steig und Lage aus dem Fahrplan — an dieser Lage findet die Tafel
+           * den Steig bei MOTIS. Name und Art bleiben, wie oben.
+           */
+          set: {
+            latitude: sql`excluded.latitude`,
+            longitude: sql`excluded.longitude`,
+            subtype: sql`CASE WHEN excluded.type = ${locations.type} THEN excluded.subtype ELSE ${locations.subtype} END`,
+            kinds: sql`CASE WHEN excluded.type = ${locations.type} THEN excluded.kinds ELSE ${locations.kinds} END`,
+            parentCode: sql`excluded.parent_code`,
+            platform: sql`excluded.platform`,
+          },
+        })
+        .returning({ isNew: sql<boolean>`(xmax = 0)` });
+      standsInserted += rows.filter((r) => r.isNew).length;
+      if ((i / CHUNK) % 40 === 0) {
+        console.log(`[gtfs:${COUNTRY}]   Steige ${Math.min(i + CHUNK, plannedStands.length)} / ${plannedStands.length}`);
+      }
+    }
+  });
 
   console.log(
-    `[gtfs:${COUNTRY}] done in ${((Date.now() - t0) / 1000).toFixed(1)}s — ${inserted} neu, ${rowsToWrite.length - inserted} aufgefrischt${REFRESH ? `, ${skippedForeign} fremd, ${skippedDup} Dubletten übersprungen` : ""}.`,
+    `[gtfs:${COUNTRY}] done in ${((Date.now() - t0) / 1000).toFixed(1)}s — ${inserted} neu, ${rowsToWrite.length - inserted} aufgefrischt${REFRESH ? `, ${skippedForeign} fremd, ${skippedDup} Dubletten übersprungen; Steige ${standsInserted} neu, ${plannedStands.length - standsInserted} aufgefrischt/übernommen` : ""}.`,
   );
   /**
    * Offizielle Anzeigenamen gleich mitsetzen (`display_name`/`display_detail`,

@@ -21,6 +21,7 @@ import { iconForProduct } from "@/components/results/LinePill";
 import { TAB_BAR_H } from "@/components/ui/BinchTabBar";
 import type { CameraPadding, MapSurfaceHandle } from "@/components/surroundings/MapSurface";
 import { useAccent } from "@/lib/theme/accent";
+import { TRANSIT_COLOR, transitCategory } from "@/lib/theme/transitColors";
 import { SPACE } from "@/lib/theme/spacing";
 import { ms, scaledStyles } from "@/lib/ui/compact";
 import { useT } from "@/lib/i18n/useT";
@@ -212,12 +213,21 @@ export function LiveOverlay({
     const pad = padding(ms(SPACE.xxl));
     const cam = overviewCamera(m.coords, width, height, pad);
     if (!cam) return;
-    // Den Zoom NICHT vorab aufs Ziel setzen: Gebaut für die Übersicht wäre ein
-    // Zug auf der Folge-Stufe ein kilometerbreiter Block, und die Kamera stünde
-    // zu Beginn der Fahrt mitten darin. Die Fahrt meldet ihn Bild für Bild
-    // (sie neigt sich dabei auf), sonst gleitet die Schätzung mit.
-    const dur = mapRef.current?.followTo({ ...cam, padding: pad }) ?? 0;
-    zoom.glide(cam.zoom, dur);
+    // Weit weg (fast immer: von der Folge-Stufe auf die ganze Strecke) ein
+    // SCHNITT wie beim Start und Ende der Ansicht — der Bogenflug lud mit
+    // Neigung auf jeder Zwischenstufe Kacheln nach („Übersicht öffnen laggt").
+    // Nah dran gleitend; den Zoom dann NICHT vorab aufs Ziel setzen: Gebaut für
+    // die Übersicht wäre ein Zug auf der Folge-Stufe ein kilometerbreiter Block,
+    // und die Kamera stünde zu Beginn der Fahrt mitten darin.
+    const map = mapRef.current;
+    const cut = map?.isFar(cam.latitude, cam.longitude, cam.zoom) ?? false;
+    const dur = map?.followTo({ ...cam, padding: pad, cut }) ?? 0;
+    if (dur > 0) {
+      zoom.glide(cam.zoom, dur);
+    } else {
+      zoom.setView(cam.bearing, cam.pitch);
+      zoom.jump(cam.zoom);
+    }
   }, [setLiveFollow, padding, width, height, mapRef, zoom]);
 
   const panelBottom = ms(TAB_BAR_H) + bottomInset + ms(SPACE.md);
@@ -311,16 +321,19 @@ const LiveBanner = memo(function LiveBanner({
 }) {
   const accent = useAccent();
   const t = useT();
-  const ModeIcon = session.kind === "flight" ? Plane : iconForProduct(session.product);
+  const ModeIcon = session.kind === "flight" ? Plane : iconForProduct(session.product, session.line);
+  // Die Linie in der Farbe ihrer Verkehrsart, wie auf der Tafel, von der sie kam.
+  const category = session.kind === "flight" ? "flight" : transitCategory(session.product, session.line);
+  const badge = category === "flight" ? accent.dark : TRANSIT_COLOR[category];
   return (
     <View style={[styles.bannerWrap, { top: topInset + 8 }]} pointerEvents="box-none" onLayout={onLayout}>
       <RippleTouch onPress={onClose} hitSlop={8} style={styles.backBtn}>
         <ArrowLeft color={C.white} size={20} strokeWidth={2.2} />
       </RippleTouch>
       <View style={styles.titleBox}>
-        <View style={[styles.lineBadge, { backgroundColor: accent.subtle, borderColor: accent.border }]}>
-          <ModeIcon size={13} color={accent.solid} strokeWidth={2.2} />
-          <Text style={[styles.lineText, { color: accent.solid }]} numberOfLines={1}>
+        <View style={[styles.lineBadge, { backgroundColor: badge, borderColor: badge }]}>
+          <ModeIcon size={13} color="#FFFFFF" strokeWidth={2.2} />
+          <Text style={[styles.lineText, { color: "#FFFFFF" }]} numberOfLines={1}>
             {session.line}
           </Text>
         </View>

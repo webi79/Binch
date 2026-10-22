@@ -246,6 +246,34 @@
       "when": 1792000463697,
       "tag": "0034_locations_display_name",
       "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1792634056939,
+      "tag": "0035_locations_stands",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1792668168372,
+      "tag": "0036_location_replacements",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1792670996643,
+      "tag": "0037_locations_source_name",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1792676424586,
+      "tag": "0038_locations_unserved_at",
+      "breakpoints": true
     }
   ]
 }

@@ -28,6 +28,8 @@ export interface MapMarker {
   label?: string;
   /** Zusatz bei gleichnamigem Halt daneben (siehe SurroundingsMarker). */
   detail?: string;
+  /** Steig-Bezeichnung eines einzelnen Bus-Steigs (siehe SurroundingsMarker). */
+  platform?: string;
   selected?: boolean;
   big?: boolean;
 }
