@@ -12,7 +12,7 @@ import {
 import { usePalette } from "@/lib/theme/appBg";
 import { ClearSearchHistoryAlert } from "@/components/ui/ClearSearchHistoryAlert";
 import { RippleTouch } from "@/components/ui/RippleTouch";
-import { SHEET_SUBTITLE, SHEET_TITLE } from "@/components/ui/SheetModal";
+import { SheetHandle, SHEET_SUBTITLE, SHEET_TITLE } from "@/components/ui/SheetModal";
 import Animated, {
   FadeIn,
   FadeOut,
@@ -27,13 +27,21 @@ import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
 import { RecentCard } from "@/components/home/RecentCard";
 import { scaledStyles } from "@/lib/ui/compact";
+import { GROUP_GAP, GUTTER, ITEM_GAP, SECTION_GAP, SPACE } from "@/lib/theme/spacing";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { dragHealOffset, snapToPixel, SWIPE_OUT, useSheetScrollGate, useSheetSwipe } from "@/lib/ui/sheetSwipe";
+import { slideTiming } from "@/lib/nav/slideMotion";
 
 /**
  * Bottom-sheet overlay showing the full recent-search history.
- * Visual styling mirrors AddTicketModal: dimmed backdrop, dark sheet
- * (#171719) with 28px top radius, drag-handle indicator, tap backdrop
- * to dismiss. Sheet height locked to width:height = 1:1.168 aspect ratio.
+ * Visual styling mirrors AddTicketModal: dimmed backdrop, sheet in `s1`
+ * with 28px top radius, drag-handle indicator, tap backdrop to dismiss.
+ * Sheet height locked to width:height = 1:1.168 aspect ratio.
+ *
+ * Der KOPF ist seit 05.11.2026 Maß für Maß der jedes anderen Blattes
+ * (`SheetModal`): Griff-Zone 12/4/16, Titel, 8, Untertitel, 16, Inhalt. Hier
+ * stand eine Titelzeile mit 8 Polster oben und unten plus 8 Abstand — der
+ * Titel saß 8 tiefer als in jedem anderen Blatt, der Untertitel 8 weiter weg.
  */
 export function RecentHistoryOverlay() {
   const open = useSearchStore((s) => s.recentHistoryOverlayOpen);
@@ -47,6 +55,7 @@ function RecentHistorySheet() {
   const recentSearches = useSearchStore((s) => s.recentSearches);
   const clearRecentSearches = useSearchStore((s) => s.clearRecentSearches);
   const t = useT();
+  const insets = useSafeAreaInsets();
   const { width, height } = useWindowDimensions();
 
   useEffect(() => {
@@ -117,7 +126,7 @@ function RecentHistorySheet() {
   useEffect(() => {
     const id = requestAnimationFrame(() => {
       markSheetMoving();
-      translateY.value = withTiming(0, SHEET_IN);
+      translateY.value = withTiming(0, slideTiming(SHEET_IN));
     });
     return () => cancelAnimationFrame(id);
   }, [translateY]);
@@ -127,7 +136,7 @@ function RecentHistorySheet() {
     closingRef.current = true;
     markSheetMoving();
     closingSv.value = true;
-    translateY.value = withTiming(sheetHeight, SHEET_OUT);
+    translateY.value = withTiming(sheetHeight, slideTiming(SHEET_OUT));
     closeTimer.current = setTimeout(close, SHEET_OUT.duration);
   }, [close, sheetHeight, translateY]);
 
@@ -193,12 +202,18 @@ function RecentHistorySheet() {
       </Animated.View>
       <GestureDetector gesture={panGesture}>
         <Animated.View
-          style={[styles.sheet, { backgroundColor: palette.s1 }, sheetAnim, { top: sheetTop }]}
+          style={[
+            styles.sheet,
+            // Unten die Navigationsleiste freihalten — das Blatt reicht bis an
+            // den Bildschirmrand (randlos), die Liste soll vor ihr enden.
+            { backgroundColor: palette.s1, paddingBottom: insets.bottom },
+            sheetAnim,
+            { top: sheetTop },
+          ]}
         >
-          {/* Nur noch Zeichen, nicht mehr Griff — gezogen wird überall. */}
-          <View style={styles.handleWrap}>
-            <View style={styles.handle} />
-          </View>
+          {/* Nur noch Zeichen, nicht mehr Griff — gezogen wird überall. Griff
+              und Abstand zum Titel wie in jedem Blatt (`SheetHandle`). */}
+          <SheetHandle />
           <View style={styles.titleRow}>
             <Text style={styles.title}>{t("home.recent.title")}</Text>
             {/* Keine sichtbare Fläche, nur die Welle — dieselbe Begründung wie
@@ -231,7 +246,7 @@ function RecentHistorySheet() {
               bounces={false}
             >
               {recentSearches.map((s) => (
-                <RecentCard key={s.id} search={s} bordered />
+                <RecentCard key={s.id} search={s} />
               ))}
             </Animated.ScrollView>
           </GestureDetector>
@@ -264,29 +279,31 @@ const styles = scaledStyles({
     // Farbe kommt zur Laufzeit aus der Palette (siehe Render).
     borderTopLeftRadius: 28,
     borderTopRightRadius: 28,
-    paddingBottom: 40,
   },
-  handleWrap: { alignItems: "center", paddingTop: 12, paddingBottom: 16 },
-  handle: { width: 40, height: 4, borderRadius: 9999, backgroundColor: "#FFFFFF" },
+  /** Titel und Papierkorb auf einer Mittellinie; 8 bis zum Untertitel wie in
+   *  jedem Blatt (`title.marginBottom` dort). */
   titleRow: {
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 20,
-    // 8 statt 6 — auf dem Raster, und der größere Titel braucht etwas mehr Luft.
-    marginBottom: 8,
+    gap: SPACE.md,
+    paddingHorizontal: GUTTER,
+    marginBottom: SPACE.sm,
   },
   /** Aufschrift des Blattes — dieselbe wie in jedem anderen (SHEET_TITLE). */
   title: { ...SHEET_TITLE, flex: 1 },
+  /**
+   * Wie der Papierkorb des Mitteilungs-Blatts: keine Fläche, nur die randlose
+   * Welle; so hoch wie das Symbol, bündig am rechten Rand. Die Trefferfläche
+   * kommt aus `hitSlop`.
+   */
   trashBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+    width: 26,
+    height: 26,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#171719",
   },
-  subtitle: { ...SHEET_SUBTITLE, marginBottom: 16, paddingHorizontal: 20 },
+  subtitle: { ...SHEET_SUBTITLE, marginBottom: GROUP_GAP, paddingHorizontal: GUTTER },
   scroll: { flex: 1 },
-  scrollContent: { paddingBottom: 24 },
+  /** Ende der Liste: SECTION_GAP sichtbar — die letzte Karte bringt ITEM_GAP mit. */
+  scrollContent: { paddingBottom: SECTION_GAP - ITEM_GAP },
 });

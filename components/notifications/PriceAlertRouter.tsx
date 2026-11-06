@@ -9,12 +9,21 @@ import * as Notifications from "expo-notifications";
  * Modul importiert. Das ist keine Zusicherung: Wer dort den Import umbaut,
  * nimmt lautlos die Vordergrund-Anzeige mit. Hier steht er ausdrücklich.
  */
+import { requestScheduledTask } from "@/lib/assistant/scheduledLink";
 import { openAlertRoute } from "@/lib/nav/openAlertRoute";
 import { deleteAlertOnServer } from "@/lib/notifications/alertToggle";
-import { ackNotification, ensurePushToken, restorePushToken, syncDeviceLocale } from "@/lib/notifications/push";
+import {
+  ackNotification,
+  announceTestArrived,
+  ensurePushToken,
+  restorePushToken,
+  syncDeviceSettings,
+} from "@/lib/notifications/push";
 import { catchUpFiredAlerts, syncPriceAlerts } from "@/lib/notifications/syncAlerts";
 import { priceAlertKey, useSearchStore } from "@/stores/searchStore";
 import type { AlertHit } from "@/types/saved";
+import { router } from "expo-router";
+import { useTripReminderSync } from "@/lib/notifications/tripReminders";
 
 /**
  * Ein Tipp auf eine Preis-Alarm-Meldung öffnet die zugehörige Suche.
@@ -178,6 +187,20 @@ function recordHit(p: AlertPayload): void {
  * quittieren, öffnen. Ein dritter Eingang kann jetzt keinen davon mehr
  * vergessen.
  */
+/**
+ * Tipp auf eine Erinnerung oder eine Test-Mitteilung: quittieren und — bei der
+ * Erinnerung — dorthin, wo die Reise liegt. Der Test öffnet bewusst nichts.
+ */
+function ackOtherTap(type: "tripReminder" | "test" | "boTask", taskId?: unknown): void {
+  void restorePushToken().then(() => ackNotification("tapped"));
+  if (type === "tripReminder") router.navigate("/saved");
+  if (type === "boTask") {
+    // Bo öffnen, Seitenleiste auf „Geplant" mit dieser Aufgabe.
+    useSearchStore.getState().openAssistant();
+    if (typeof taskId === "string") requestScheduledTask(taskId);
+  }
+}
+
 function handleAlertTap(data: AlertPayload): void {
   recordHit(data);
   /**
@@ -224,26 +247,34 @@ export function PriceAlertRouter() {
    * ungefragt wieder.
    */
   const coldHandled = useRef(false);
+  /** Abfahrts-Erinnerungen der gespeicherten Reisen aktuell halten (lokal geplant). */
+  useTripReminderSync();
 
   /**
-   * Sprachwechsel im Betrieb dem Server melden.
+   * Sprachwechsel und die Meldungs-Schalter im Betrieb dem Server melden.
    *
    * Den Titel der Meldung schreibt der Server, und er kennt die Sprache nur aus
    * der Anmeldung des Geräts. Die läuft beim Start — wer danach umstellt, bekäme
-   * seine Meldungen sonst bis zum nächsten Start in der alten Sprache.
+   * seine Meldungen sonst bis zum nächsten Start in der alten Sprache. Ebenso
+   * die Schalter „Benachrichtigungen" und „Preisalarme": Ob geschickt wird,
+   * entscheidet der Server. Und die Anmeldung selbst: Erst sie verknüpft das
+   * Gerät mit dem Konto, und ohne das erreicht es keine geplante Aufgabe.
    *
    * Als Abonnement am Store statt als Abhängigkeit eines Effekts: So läuft
    * nichts beim ersten Aufbau, wo die Anmeldung ohnehin gerade stattfindet.
    */
   useEffect(() => {
     // Der Store trägt kein `subscribeWithSelector` — der Vergleich steht
-    // deshalb hier. Das ist ein Zeichenketten-Vergleich pro Store-Änderung,
-    // also nichts, was ins Gewicht fällt.
-    let last = useSearchStore.getState().locale;
+    // deshalb hier. Drei Vergleiche pro Store-Änderung, also nichts, was ins
+    // Gewicht fällt.
+    const pick = (st: ReturnType<typeof useSearchStore.getState>) =>
+      `${st.locale}|${st.notificationsEnabled}|${st.priceAlertsEnabled}|${st.boUpdatesEnabled}|${!!st.authToken}`;
+    let last = pick(useSearchStore.getState());
     return useSearchStore.subscribe((st) => {
-      if (st.locale === last) return;
-      last = st.locale;
-      syncDeviceLocale();
+      const next = pick(st);
+      if (next === last) return;
+      last = next;
+      syncDeviceSettings();
     });
   }, []);
 
@@ -315,10 +346,14 @@ export function PriceAlertRouter() {
       coldHandled.current = true;
       void Notifications.getLastNotificationResponseAsync().then((res) => {
         if (!alive || !res) return;
-        const data = res.notification.request.content.data as AlertPayload | undefined;
+        const data = res.notification.request.content.data as AlertPayload | { type?: string } | undefined;
+        if (data?.type === "tripReminder" || data?.type === "test" || data?.type === "boTask") {
+          ackOtherTap(data.type, (data as { taskId?: unknown }).taskId);
+          return;
+        }
         if (data?.type !== "priceAlert") return;
         // Derselbe Vorgang wie beim Zuhörer unten — siehe `handleAlertTap`.
-        handleAlertTap(data);
+        handleAlertTap(data as AlertPayload);
       });
     }, 900);
 
@@ -332,7 +367,14 @@ export function PriceAlertRouter() {
      * der Tipp der Nachweis.
      */
     const arrived = Notifications.addNotificationReceivedListener((n) => {
-      const data = n.request.content.data as AlertPayload | undefined;
+      const data = n.request.content.data as AlertPayload | { type?: string } | undefined;
+      // Erinnerungen und Tests ebenso quittieren — sonst bliebe gerade ihre
+      // letzte Meile unbeobachtbar (es gab nie einen Beleg, dass eine ankam).
+      if (data?.type === "tripReminder" || data?.type === "test" || data?.type === "boTask") {
+        if (data.type === "test") announceTestArrived();
+        void restorePushToken().then(() => ackNotification("received"));
+        return;
+      }
       if (data?.type !== "priceAlert") return;
       /**
        * Zweiter Riegel für den Zwischenspeicher.
@@ -343,7 +385,7 @@ export function PriceAlertRouter() {
        * dabei nicht entstehen: Wer eine Meldung empfängt, hat die Erlaubnis
        * zwangsläufig erteilt.
        */
-      recordHit(data);
+      recordHit(data as AlertPayload);
       void restorePushToken().then(() => ackNotification("received"));
     });
 
@@ -351,9 +393,13 @@ export function PriceAlertRouter() {
       // Ab hier läuft die App — der Kaltstart-Weg darf nicht mehr greifen,
       // sonst öffnete derselbe Tipp die Suche zweimal.
       coldHandled.current = true;
-      const data = res.notification.request.content.data as AlertPayload | undefined;
+      const data = res.notification.request.content.data as AlertPayload | { type?: string } | undefined;
+      if (data?.type === "tripReminder" || data?.type === "test" || data?.type === "boTask") {
+        ackOtherTap(data.type, (data as { taskId?: unknown }).taskId);
+        return;
+      }
       if (data?.type !== "priceAlert") return;
-      handleAlertTap(data);
+      handleAlertTap(data as AlertPayload);
     });
 
     return () => {

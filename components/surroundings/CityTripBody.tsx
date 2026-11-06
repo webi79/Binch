@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
+import { ITEM_GAP, SECTION_GAP } from "@/lib/theme/spacing";
+import { StyleSheet, Text, View, type StyleProp, type ViewStyle } from "react-native";
 import Animated, { useAnimatedStyle, type useAnimatedProps } from "react-native-reanimated";
 import { LinearGradient } from "expo-linear-gradient";
 import { GestureDetector } from "react-native-gesture-handler";
@@ -25,9 +26,17 @@ import type { useSheetScrollGate } from "@/lib/ui/sheetSwipe";
 import type { SearchResult } from "@/types/search";
 import { LinePill, iconForProduct, productLabel } from "@/components/results/LinePill";
 import { WalkIcon } from "@/components/ui/WalkIcon";
-import { ModePill } from "@/components/surroundings/ModePill";
+import { SheetTabs } from "@/components/surroundings/SheetTabs";
 import { whenMapQuiet } from "@/lib/surroundings/mapViewport";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import { useFareProfile } from "@/lib/travel/fareProfile";
+import { StatePanel } from "@/components/ui/StatePanel";
+import { LoadGate } from "@/components/ui/LoadGate";
+import { SheetLoader } from "@/components/surroundings/SheetLoader";
+import type { StateArtKind } from "@/components/ui/StateArt";
+
+/** Markiert in der Zustands-Kette des Blattes die Lade-Zweige (siehe `LoadGate`). */
+const LOADING = Symbol("loading");
 
 /**
  * Der Inhalt des Stadt-Blatts: vom eigenen Standort in die angetippte Stadt.
@@ -39,7 +48,7 @@ import { RippleTouch } from "@/components/ui/RippleTouch";
  *   • Kopf: die Stadt, darunter Entfernung und Startstation. Geschlossen wird
  *     wie das Haltestellen-Blatt — herunterwischen oder Zurück-Taste.
  *   • Zug · Bus · Flug als dieselben Pillen wie an der Haltestelle
- *     (`ModePill`, mit Welle). Zug ist vorgewählt. Was für diese Strecke keinen
+ *     (`SheetTabs`, gleitende Pille). Zug ist vorgewählt. Was für diese Strecke keinen
  *     Sinn hat, ist gedimmt; antippen erklärt, warum. Die Prüfung macht der
  *     Server (`/api/trip-plan/city`).
  *   • Darunter die Verbindungen als ZEILEN, nicht als Ticket-Karten: links groß
@@ -199,6 +208,8 @@ export function CityTripBody({
   gate,
   listProps,
   listBottomInset,
+  onHeadLayout,
+  bodyStyle,
 }: {
   city: SelectedCity;
   bodyReady: boolean;
@@ -206,6 +217,10 @@ export function CityTripBody({
   listProps: ListProps;
   /** Wie viel vom Blatt in der Mitte unter dem Bildrand liegt — Luft am Listenende. */
   listBottomInset: number;
+  /** Unterkante der Bedienung (Trennlinie) im Blatt — für die eingeklappte Stufe. */
+  onHeadLayout?: (bottom: number) => void;
+  /** Deckkraft der Verbindungen (eingeklappt unsichtbar), vom Blatt auf dem UI-Strang. */
+  bodyStyle?: StyleProp<ViewStyle>;
 }) {
   const t = useT();
   const palette = usePalette();
@@ -424,11 +439,13 @@ export function CityTripBody({
     if (flightArm === "next" && flightKey) setFlightArm(flightKey);
   }, [flightArm, flightKey]);
 
+  const fareProfile = useFareProfile(mode);
   const searchQ = useQuery({
     // Die Währung gehört dazu: Sie geht an den Server, und ein Treffer aus dem
     // Zwischenspeicher in EUR landete sonst nach dem Wechsel auf CHF als
-    // Grundpreis eines CHF-Alarms.
-    queryKey: ["citySearch", searchKey, today, currency],
+    // Grundpreis eines CHF-Alarms. Ebenso das Tarifprofil (BahnCard,
+    // Deutschlandticket): `searchByMode` setzt es bei Zügen selbst ein.
+    queryKey: ["citySearch", searchKey, today, currency, fareProfile],
     queryFn: () =>
       searchByMode({
         mode,
@@ -751,34 +768,48 @@ export function CityTripBody({
         </Text>
       </View>
 
-      <View style={styles.pillsRow}>
-        {MODE_ORDER.map((m) => (
-          <ModePill
-            key={m}
-            Icon={MODE_TAB[m].Icon}
-            label={t(MODE_TAB[m].tKey)}
-            active={mode === m}
-            disabled={plan ? !plan.modes[m].available : false}
-            onPress={() => pickMode(m)}
-          />
-        ))}
-      </View>
+      {/* Dieselbe Reihe wie die Umgebung (Transit · Airport · Cruise) — mit
+          gleitender Pille; gewählt wird, wenn sie angekommen ist. */}
+      <SheetTabs
+        tabs={MODE_ORDER.map((m) => ({
+          key: m,
+          label: t(MODE_TAB[m].tKey),
+          Icon: MODE_TAB[m].Icon,
+          disabled: plan ? !plan.modes[m].available : false,
+        }))}
+        active={mode}
+        onChange={pickMode}
+        chipColor={palette.s2}
+        style={styles.pillsRow}
+      />
       {/* Trennt die Auswahl von den Verbindungen — dieselbe Kante wie unter den
           Reitern des Auswahlfensters. */}
-      <View style={styles.controlsDivider} />
+      <View
+        style={styles.controlsDivider}
+        onLayout={
+          onHeadLayout
+            ? (e) => onHeadLayout(e.nativeEvent.layout.y + e.nativeEvent.layout.height)
+            : undefined
+        }
+      />
 
-      <View style={styles.body}>
-        {!bodyReady ? null : !from && !editFrom ? (
+      <Animated.View style={[styles.body, bodyStyle]}>
+        {(() => {
+          // Ladezustände nach der einen Regel (`LoadGate`): erst nach 2 s ein
+          // Lader, dann mindestens zwei volle Durchläufe, weich hinaus — mittig
+          // im SICHTBAREN Teil des Blattes (`SheetLoader`). `LOADING` markiert
+          // die beiden Lade-Zweige der Kette.
+          const view = !bodyReady ? null : !from && !editFrom ? (
           <Empty title={t("city.noLocation.title")} body={t("city.noLocation.body")} />
         ) : planQ.isLoading ? (
-          <ActivityIndicator color={C.g1} style={styles.spinner} />
+          LOADING
         ) : (planQ.isError || !plan) && !route ? (
           // Ohne Plan geht es nur weiter, wenn Start UND Ziel selbst gewählt
           // sind (dann steht die Strecke auch so) — sonst ehrlich „nochmal".
           <Retry
             title={t("city.error.title")}
             body={t("results.error.body")}
-            label={t("results.retry")}
+            label={t("state.retry")}
             bg={palette.s3}
             onPress={() => void planQ.refetch()}
           />
@@ -797,6 +828,7 @@ export function CityTripBody({
           />
         ) : mode === "FLIGHT" && !flightArmed && !searchQ.data ? (
           <Retry
+            art={null}
             title={t("city.flightPrompt.title").replace("{city}", headerTitle)}
             body={t("city.flightPrompt.body").replace("{city}", headerTitle)}
             label={t("city.flightPrompt.button")}
@@ -804,12 +836,12 @@ export function CityTripBody({
             onPress={() => setFlightArm(flightKey ?? "next")}
           />
         ) : searchQ.isPending ? (
-          <ActivityIndicator color={C.g1} style={styles.spinner} />
+          LOADING
         ) : searchQ.isError ? (
           <Retry
             title={t("city.error.title")}
             body={t("results.error.body")}
-            label={t("results.retry")}
+            label={t("state.retry")}
             bg={palette.s3}
             onPress={() => void searchQ.refetch()}
           />
@@ -851,13 +883,19 @@ export function CityTripBody({
               ))}
             </Animated.ScrollView>
           </GestureDetector>
-        )}
+        );
+          return (
+            <LoadGate loading={view === LOADING} fill loader={<SheetLoader />} contentStyle={styles.body}>
+              {() => (view === LOADING ? null : view)}
+            </LoadGate>
+          );
+        })()}
         {/* Schatten an der Kante — siehe `edgeShadowStyle`. Über der Liste,
             nimmt keine Berührung. */}
         <Animated.View pointerEvents="none" style={[styles.edgeShadow, edgeShadowStyle]}>
           <LinearGradient colors={EDGE_SHADOW} style={StyleSheet.absoluteFill} />
         </Animated.View>
-      </View>
+      </Animated.View>
     </>
   );
 }
@@ -1010,22 +1048,19 @@ function Retry({
   label,
   bg,
   onPress,
+  art = "offline",
 }: {
   title: string;
   body: string;
   label: string;
   bg: string;
   onPress: () => void;
+  /** Fehler: Stecker und Dose. Die Rückfrage vor der Flugsuche ist kein Fehler — ohne Bild. */
+  art?: StateArtKind | null;
 }) {
-  return (
-    <View style={styles.empty}>
-      <Text style={styles.emptyTitle}>{title}</Text>
-      <Text style={styles.emptyBody}>{body}</Text>
-      <RippleTouch onPress={onPress} style={[styles.retryBtn, { backgroundColor: bg }]} hitSlop={8}>
-        <Text style={styles.retryText}>{label}</Text>
-      </RippleTouch>
-    </View>
-  );
+  // `bg` bleibt in der Unterschrift für die Aufrufer; die Fläche gibt jetzt der gemeinsame Zustand vor.
+  void bg;
+  return <StatePanel compact art={art ?? undefined} title={title} body={body} action={label} onAction={onPress} />;
 }
 
 /**
@@ -1047,24 +1082,22 @@ function Retry({
  * Stadt rutschen).
  */
 const styles = scaledStyles({
+  /** Kein Polster oben: Die Griffzone des Blattes (`SheetHandle`) endet genau am Titel. */
   header: {
     paddingHorizontal: GUTTER,
-    paddingTop: 4,
     paddingBottom: 16,
   },
   title: { color: C.white, fontSize: 22, lineHeight: 28, fontWeight: "700", letterSpacing: -0.3 },
-  subtitle: { color: C.g1, fontSize: 14, lineHeight: 20, fontWeight: "500", marginTop: 2 },
+  subtitle: { color: C.g1, fontSize: 14, lineHeight: 20, fontWeight: "500", marginTop: 4 },
   pillsRow: {
-    flexDirection: "row",
-    gap: 8,
     paddingHorizontal: GUTTER,
+    paddingTop: 0,
     paddingBottom: 16,
   },
   controlsDivider: { height: 1, backgroundColor: C.border },
   body: { flex: 1 },
   /** Schatten unter der Trennlinie: 10 hoch, oben kräftig, nach unten auslaufend. */
   edgeShadow: { position: "absolute", top: 0, left: 0, right: 0, height: 10 },
-  spinner: { marginTop: 32 },
   /**
    * Kein Abstand oben: Die erste Zeile beginnt direkt unter der Kante. Hier
    * standen 4 Punkte — war die erste Zeile gewählt, lag zwischen Kante und
@@ -1090,26 +1123,17 @@ const styles = scaledStyles({
   plusDay: { color: C.g2, fontSize: 12, fontWeight: "700" },
   price: { fontSize: 15, lineHeight: 22, fontWeight: "800", letterSpacing: -0.2 },
   priceFrom: { color: C.g2, fontSize: 11, fontWeight: "700", letterSpacing: 0.4 },
-  chips: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", rowGap: 6 },
-  chipCell: { flexDirection: "row", alignItems: "center", gap: 6, marginRight: 6 },
+  chips: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", rowGap: ITEM_GAP },
+  chipCell: { flexDirection: "row", alignItems: "center", gap: 8, marginRight: 8 },
   walk: { flexDirection: "row", alignItems: "flex-end" },
   // Tiefgestellt: an der Grundlinie der Figur, nicht in ihrer Mitte.
-  walkText: { color: C.g1, fontSize: 11, lineHeight: 12, fontWeight: "700", marginLeft: 1 },
+  walkText: { color: C.g1, fontSize: 11, lineHeight: 12, fontWeight: "700" },
   legChip: { flexDirection: "row", alignItems: "center", gap: 4 },
-  metaGroup: { gap: 2 },
+  metaGroup: { gap: 4 },
   meta: { color: C.g2, fontSize: 13, lineHeight: 18, fontWeight: "500" },
   metaDim: { color: C.g3, fontSize: 13, lineHeight: 18, fontWeight: "500" },
 
-  empty: { alignItems: "center", paddingTop: 32, paddingHorizontal: 24 },
+  empty: { alignItems: "center", paddingTop: SECTION_GAP, paddingHorizontal: 24 },
   emptyTitle: { color: C.white, fontSize: 18, fontWeight: "700", textAlign: "center" },
-  emptyBody: { color: C.g1, fontSize: 15, marginTop: 6, textAlign: "center", lineHeight: 22 },
-  retryBtn: {
-    marginTop: 16,
-    paddingVertical: 10,
-    paddingHorizontal: 22,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: C.border,
-  },
-  retryText: { color: C.white, fontSize: 15, fontWeight: "700" },
+  emptyBody: { color: C.g1, fontSize: 15, marginTop: 8, textAlign: "center", lineHeight: 22 },
 });

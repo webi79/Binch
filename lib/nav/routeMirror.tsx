@@ -1,4 +1,4 @@
-import { createContext, useContext, useRef, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useRef, type ReactNode } from "react";
 import { usePathname, useGlobalSearchParams } from "expo-router";
 
 /**
@@ -31,6 +31,24 @@ export interface RouteSnapshot {
 const FALLBACK: { current: RouteSnapshot } = { current: { pathname: "/" } };
 const RouteMirrorContext = createContext(FALLBACK);
 
+const pathListeners = new Set<(pathname: string) => void>();
+
+/**
+ * Bei jedem Pfadwechsel benachrichtigt werden — ohne selbst neu zu rendern.
+ *
+ * Für Ebenen am Wurzel-Layout, die über dem Navigations-Stapel liegen und
+ * Platz machen müssen, sobald darin ein Bildschirm aufgeht: Das Kalender-Blatt
+ * läge sonst über der Routen-Karte. Dasselbe leisten Detail- und
+ * Zeitleisten-Blatt mit `usePathname()` — dort rendert das aber bei JEDEM
+ * Tab-Wechsel mit; hier nicht.
+ */
+export function onPathnameChange(listener: (pathname: string) => void): () => void {
+  pathListeners.add(listener);
+  return () => {
+    pathListeners.delete(listener);
+  };
+}
+
 export function RouteMirror({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   // GLOBAL, nicht local: Am Root liefert `useLocalSearchParams()` die Params
@@ -48,6 +66,10 @@ export function RouteMirror({ children }: { children: ReactNode }) {
     pathname,
     params: Object.keys(flat).length > 0 ? flat : undefined,
   };
+
+  useEffect(() => {
+    for (const l of pathListeners) l(pathname);
+  }, [pathname]);
 
   return <RouteMirrorContext.Provider value={ref}>{children}</RouteMirrorContext.Provider>;
 }

@@ -11,7 +11,7 @@ import { formatLocalizedDateInZone, formatTimeInZone } from "@/lib/time-format";
 import { de, enGB, es, fr } from "date-fns/locale";
 import { Ticket } from "@/types/saved";
 import { useT } from "@/lib/i18n/useT";
-import { GUTTER, SPACE } from "@/lib/theme/spacing";
+import { GUTTER, SPACE, ITEM_GAP } from "@/lib/theme/spacing";
 import { useSearchStore } from "@/stores/searchStore";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
@@ -240,10 +240,10 @@ function TicketCardInner({ ticket }: { ticket: Ticket }) {
 }
 
 const styles = scaledStyles({
-  wrap: { marginHorizontal: GUTTER, marginBottom: 8 },
+  wrap: { marginHorizontal: GUTTER, marginBottom: ITEM_GAP },
   headerRow: {
     paddingHorizontal: 8,
-    paddingTop: 6,
+    paddingTop: 8,
     paddingBottom: 8,
   },
   date: { fontSize: 13, color: C.gray300, fontWeight: "500" },
@@ -252,7 +252,7 @@ const styles = scaledStyles({
     fontWeight: "800",
     color: C.white,
     letterSpacing: -0.5,
-    marginTop: 2,
+    marginTop: 4,
   },
 
   // Mehrschichtiger Schatten (Fabric-boxShadow, dasselbe Modell wie CSS:
@@ -283,7 +283,7 @@ const styles = scaledStyles({
     overflow: "hidden",
   },
 
-  countdown: { paddingHorizontal: SPACE.lg, paddingTop: 20, paddingBottom: 18 },
+  countdown: { paddingHorizontal: SPACE.lg, paddingTop: 20, paddingBottom: 16 },
   countdownTop: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -295,7 +295,7 @@ const styles = scaledStyles({
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "flex-end",
-    marginTop: 5,
+    marginTop: 4,
   },
   checkIn: {
     fontSize: 22,

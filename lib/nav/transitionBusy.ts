@@ -21,12 +21,26 @@
  * Zeitstempel verfällt von selbst; im schlimmsten Fall wartet ein
  * Schreibvorgang eine halbe Sekunde zu lang.
  */
+import { probeTransition } from "@/lib/perf/transitionProbe";
+
 let busyUntil = 0;
 
-/** Meldet eine laufende Bewegung an, für die angegebene Dauer plus Reserve. */
-export function markTransitionBusy(durationMs: number): void {
+/**
+ * Meldet eine laufende Bewegung an, für die angegebene Dauer plus Reserve.
+ * Gibt das Ende DIESER Meldung zurück (`Date.now()`-Zeit) — für
+ * `whenMapQuiet(fn, ownBusyUntil)`.
+ */
+export function markTransitionBusy(durationMs: number): number {
   const until = Date.now() + durationMs + 80;
   if (until > busyUntil) busyUntil = until;
+  // Messsonde (vorübergehend, nur gegen einen Server im eigenen Netz).
+  probeTransition(durationMs);
+  return until;
+}
+
+/** Bis wann (`Date.now()`-Zeit) gerade etwas fährt; in der Vergangenheit: nichts. */
+export function transitionBusyUntil(): number {
+  return busyUntil;
 }
 
 export function isTransitionBusy(): boolean {

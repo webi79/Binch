@@ -11,7 +11,45 @@
  * darauf.
  */
 import { API_BASE_URL, type StopBoardResponse } from "./client";
+import type { TaskProposal } from "@/lib/api/chats";
 import type { SearchResult } from "@/types/search";
+import { useSearchStore } from "@/stores/searchStore";
+import { fareProfileFor } from "@/lib/travel/fareProfile";
+
+/**
+ * Reise-Vorlieben für Bo (Profil → Einstellungen → Reisen): Seine Zugsuchen
+ * rechnen mit derselben Karte und Klasse wie die App, und „Zuhause" ist sein
+ * Start, wenn der Nutzer keinen nennt. Beim Senden gelesen, nicht gemerkt —
+ * eine Änderung gilt ab der nächsten Nachricht.
+ */
+/**
+ * Bos Treffer mit dem versehen, womit er gesucht hat — wie `searchByMode` es für
+ * die eigenen Suchen tut. Bo sucht Züge mit Klasse und Tarif aus den
+ * Einstellungen (`travelPrefs`), alles andere in der Vorgabe-Klasse.
+ */
+function withBoSearchContext(event: Extract<ChatStreamEvent, { type: "search_result" }>): ChatStreamEvent {
+  const st = useSearchStore.getState();
+  const train = event.result.mode === "TRAIN";
+  return {
+    ...event,
+    result: {
+      ...event.result,
+      ...(train ? { travelClass: st.defaultTrainClass, fareProfile: fareProfileFor("TRAIN", st) || undefined } : {}),
+      roundTrip: false,
+    },
+  };
+}
+
+function travelPrefs() {
+  const st = useSearchStore.getState();
+  const fareProfile = fareProfileFor("TRAIN", st);
+  return {
+    ...(fareProfile ? { fareProfile } : {}),
+    trainClass: st.defaultTrainClass,
+    ...(st.homeStation ? { home: { code: st.homeStation.code, label: st.homeStation.label.slice(0, 160) } } : {}),
+    ...(st.workStation ? { work: { code: st.workStation.code, label: st.workStation.label.slice(0, 160) } } : {}),
+  };
+}
 
 export type ChatMood = "idle" | "waving" | "thinking" | "talking" | "happy" | "error";
 
@@ -31,6 +69,12 @@ export interface LastSearchParams {
   currency: string;
 }
 
+/** Eine Quelle der Websuche — Seite und Titel, so wie Bo sie zitiert hat. */
+export interface ChatSource {
+  url: string;
+  title: string;
+}
+
 export interface StopBoardHint {
   stop: { code: string; label: string };
   board: "departures" | "arrivals";
@@ -39,7 +83,8 @@ export interface StopBoardHint {
 export type ChatStreamEvent =
   | { type: "mood"; mood: ChatMood }
   | { type: "text"; delta: string }
-  | { type: "tool_use"; name: string }
+  /** Ein Werkzeug läuft — `detail` ist eine kurze Angabe dazu („Köln → Berlin"). */
+  | { type: "tool_use"; name: string; detail?: string }
   | {
       type: "search_result";
       result: SearchResult;
@@ -68,8 +113,14 @@ export type ChatStreamEvent =
    * Ereignis bekäme jeder Turn eines frischen Chats eine eigene Unterhaltung.
    */
   | { type: "conversation"; id: string }
+  /** Die Quellen einer Websuche — gehören unter Bos Antwort (Pflicht bei Websuche). */
+  | { type: "sources"; sources: ChatSource[] }
+  /** Bo schlägt eine geplante Aufgabe vor — Karte im Chat, angelegt erst mit „Anlegen". */
+  | { type: "task_proposal"; proposal: TaskProposal }
+  /** Bo hat sich etwas gemerkt, es ersetzt oder vergessen — als leiser Vermerk. */
+  | { type: "memory"; action: "saved" | "updated" | "forgotten"; text: string }
   | { type: "usage"; input: number; output: number; cacheRead: number; cacheWrite: number }
-  | { type: "error"; message: string }
+  | { type: "error"; message: string; code?: "maintenance" }
   | { type: "done" };
 
 export interface ChatStreamRequest {
@@ -148,7 +199,7 @@ export async function streamChat(req: ChatStreamRequest): Promise<void> {
         if (dataLines.length === 0) continue; // Heartbeat-Comment-Lines
         try {
           const event = JSON.parse(dataLines.join("\n")) as ChatStreamEvent;
-          req.onEvent(event);
+          req.onEvent(event.type === "search_result" ? withBoSearchContext(event) : event);
         } catch {
           // Malformed-Frame — skip, nicht abort'en.
         }
@@ -278,6 +329,7 @@ export async function streamChat(req: ChatStreamRequest): Promise<void> {
         today: req.today,
         ...(req.lastSearch ? { lastSearch: req.lastSearch } : {}),
         ...(req.conversationId ? { conversationId: req.conversationId } : {}),
+        ...travelPrefs(),
       }),
     );
   });

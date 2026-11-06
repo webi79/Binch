@@ -385,18 +385,22 @@ const PLACEHOLDER_TEXT = {
   fontSize: 14,
   color: COLORS.gray2,
   fontWeight: "400",
-  paddingVertical: 10,
+  /**
+   * 12 im Feld + 8 an der Leiste = die 20 von vorher (je 10): Die Leiste behält
+   * ihre Höhe, beide Werte liegen auf dem Raster.
+   */
+  paddingVertical: 12,
 } as const;
 
 const styles = scaledStyles({
   bar: {
     borderRadius: 9999,
-    paddingLeft: 18,
+    paddingLeft: 16,
     paddingRight: 8,
     paddingVertical: 8,
     flexDirection: "row",
     alignItems: "center",
-    gap: 10,
+    gap: 8,
     /**
      * Die Umrandung steht HIER, nicht an der Aufrufstelle.
      *
@@ -412,7 +416,7 @@ const styles = scaledStyles({
   leadingLabel: { fontSize: 14, color: COLORS.white, fontWeight: "500" },
   placeholder: { flex: 1, ...PLACEHOLDER_TEXT },
   placeholderText: PLACEHOLDER_TEXT,
-  input: { flex: 1, fontSize: 14, color: COLORS.white, fontWeight: "400", paddingVertical: 10 },
+  input: { flex: 1, fontSize: 14, color: COLORS.white, fontWeight: "400", paddingVertical: 12 },
   /**
    * Feld und Hinweise übereinander: dieselbe Schrift, dasselbe senkrechte
    * Polster, links bündig auf 0 — die Hinweise stehen so genau dort, wo der
@@ -423,7 +427,7 @@ const styles = scaledStyles({
     fontSize: 14,
     color: COLORS.white,
     fontWeight: "400",
-    paddingVertical: 10,
+    paddingVertical: 12,
     paddingHorizontal: 0,
   },
   hintLayer: { ...StyleSheet.absoluteFillObject, flexDirection: "row" },
@@ -446,5 +450,5 @@ const styles = scaledStyles({
  */
 const BAR_GAP = (() => {
   const gap = StyleSheet.flatten(styles.bar).gap;
-  return typeof gap === "number" ? gap : 10;
+  return typeof gap === "number" ? gap : 8;
 })();

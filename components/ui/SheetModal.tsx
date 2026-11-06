@@ -21,6 +21,8 @@ import { usePalette } from "@/lib/theme/appBg";
 import { SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import { scaledStyles } from "@/lib/ui/compact";
 import { dragHealOffset, snapToPixel, useSheetSwipe } from "@/lib/ui/sheetSwipe";
+import { slideTiming } from "@/lib/nav/slideMotion";
+import { SheetStatusHost } from "@/components/ui/StatusToast";
 
 /**
  * Blatt von unten — die Hülle, die sich das Ticket-Blatt und die Optionen des
@@ -136,7 +138,7 @@ function Sheet({
       sheetH.value = fallback;
       translateY.value = fallback;
       markSheetMoving();
-      translateY.value = withTiming(0, SHEET_IN);
+      translateY.value = withTiming(0, slideTiming(SHEET_IN));
     }, 32);
     return () => clearTimeout(id);
   }, [translateY, sheetH]);
@@ -152,7 +154,7 @@ function Sheet({
       translateY.value = h;
       requestAnimationFrame(() => {
         markSheetMoving();
-        translateY.value = withTiming(0, SHEET_IN);
+        translateY.value = withTiming(0, slideTiming(SHEET_IN));
       });
     },
     [translateY, sheetH],
@@ -209,7 +211,7 @@ function Sheet({
     if (closingRef.current) return;
     markSheetMoving(SHEET_OUT.duration);
     closingSv.value = true;
-    translateY.value = withTiming(sheetH.value || 900, SHEET_OUT);
+    translateY.value = withTiming(sheetH.value || 900, slideTiming(SHEET_OUT));
     scheduleClose(SHEET_OUT.duration);
   }, [scheduleClose, translateY, sheetH]);
   useEffect(() => registerClose(requestClose), [registerClose, requestClose]);
@@ -253,14 +255,15 @@ function Sheet({
           >
             {/* Der Strich ist nur noch Zeichen, nicht mehr Griff: Gezogen wird
                 überall. Er bleibt, weil er ansagt, DASS gezogen werden kann. */}
-            <View style={styles.handleWrap}>
-              <View style={styles.handle} />
-            </View>
+            <SheetHandle />
 
             {children(requestClose)}
           </Animated.View>
         </GestureDetector>
       </View>
+      {/* Hinweise aus dem Blatt heraus (`showSheetStatus`) — hier im Fenster,
+          sonst lägen sie unter ihm. Oben, wie jede Meldung der App. */}
+      <SheetStatusHost />
     </GestureHandlerRootView>
   );
 }
@@ -299,6 +302,38 @@ function Sheet({
  */
 export const SHEET_PAD_H = 20;
 
+/**
+ * Oberkante des Blattes → Zeilenkasten des Titels — EIN Wert für JEDES Blatt,
+ * mit Griff oder ohne.
+ *
+ * Nutzer 05.11.2026: „zwischen Oberkante und Titel soll das gleiche Spacing
+ * sein … bei jeder Slide". Es waren vier Werte: 32 (diese Hülle, Verlauf,
+ * Ticket, Etappen), 24 (Haltestelle, Stadt), 20 (Mitteilungen, Kalender,
+ * Geplant, Aufnahme), 17 (Umgebung). Am Gerät stand der Titel des Preisalarms
+ * damit 8 Punkte tiefer als der Name einer Haltestelle — und genau der war zu
+ * tief. 24 ist der Wert des Haltestellen-Blattes, das niemand bemängelt hat.
+ *
+ * Blätter ohne Griff setzen ihn als `paddingTop`; Blätter mit Griff bekommen
+ * ihn von `SheetHandle` (die Griffzone IST so hoch).
+ */
+export const SHEET_HEAD_TOP = 24;
+
+/**
+ * Der Griff — EINE Fassung für alle Blätter: 8 unter der Kante, 40 × 4, weiß,
+ * dann 12 bis zum Titel (zusammen `SHEET_HEAD_TOP`).
+ *
+ * Vorher hatte jedes Blatt seinen eigenen Strich (40 × 4 deckend, 40 × 4 zu
+ * 90 %, 44 × 5 zu 85 %, einer in Textfarbe) — nebeneinander gesehen vier
+ * Entwürfe statt eines Bauteils.
+ */
+export function SheetHandle() {
+  return (
+    <View style={styles.handleZone}>
+      <View style={styles.handle} />
+    </View>
+  );
+}
+
 export const SHEET_TITLE: TextStyle = {
   fontSize: 24,
   fontWeight: "600",
@@ -331,6 +366,7 @@ const styles = scaledStyles({
      */
     maxHeight: "92%",
   },
-  handleWrap: { alignItems: "center", paddingTop: 12, paddingBottom: 16 },
-  handle: { width: 40, height: 4, borderRadius: 9999, backgroundColor: "#FFFFFF" },
+  /** Feste Höhe statt Polster unten: Die Zone endet genau dort, wo der Titel beginnt. */
+  handleZone: { height: SHEET_HEAD_TOP, paddingTop: 8, alignItems: "center" },
+  handle: { width: 40, height: 4, borderRadius: 2, backgroundColor: "#FFFFFF" },
 });

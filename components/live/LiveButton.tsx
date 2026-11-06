@@ -3,6 +3,7 @@ import { StyleSheet, View } from "react-native";
 import Animated, {
   cancelAnimation,
   Easing,
+  useAnimatedReaction,
   useAnimatedStyle,
   useSharedValue,
   withRepeat,
@@ -38,18 +39,42 @@ const PERIOD_MS = 1800;
 const BOX = 28;
 const ICON = 22;
 
-/** Gemeinsame Uhr für alle Knöpfe einer Tafel; läuft nur, solange `active`. */
-export function useLiveClock(active: boolean): SharedValue<number> {
+/** Die Uhr anwerfen — VOR ihren Aufrufern, ein Worklet wird beim Laden gebaut. */
+function startClock(clock: SharedValue<number>): void {
+  "worklet";
+  clock.value = 0;
+  clock.value = withRepeat(withTiming(1, { duration: PERIOD_MS, easing: Easing.linear }), -1, false);
+}
+
+/**
+ * Gemeinsame Uhr für alle Knöpfe einer Tafel; läuft nur, solange `active`.
+ *
+ * `paused` (06.11.2026): hält sie an, solange die Tafel unsichtbar eingehängt
+ * ist (eingeklapptes Haltestellen-Blatt, `stopSheetCollapsed`) — auf dem
+ * UI-Strang, ohne React-Durchgang. Eine Endlos-Animation, die niemand sieht,
+ * kostet trotzdem jedes Bild.
+ */
+export function useLiveClock(active: boolean, paused?: SharedValue<boolean>): SharedValue<number> {
   const clock = useSharedValue(0);
+  const on = useSharedValue(false);
   useEffect(() => {
+    on.value = active;
     if (!active) {
       cancelAnimation(clock);
       return;
     }
-    clock.value = 0;
-    clock.value = withRepeat(withTiming(1, { duration: PERIOD_MS, easing: Easing.linear }), -1, false);
+    if (!paused?.value) startClock(clock);
     return () => cancelAnimation(clock);
-  }, [active, clock]);
+  }, [active, clock, on, paused]);
+  useAnimatedReaction(
+    () => (paused ? paused.value : false),
+    (now, prev) => {
+      if (prev === null || now === prev || !on.value) return;
+      if (now) cancelAnimation(clock);
+      else startClock(clock);
+    },
+    [paused],
+  );
   return clock;
 }
 

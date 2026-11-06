@@ -77,7 +77,6 @@ const styles = scaledStyles({
     borderRadius: 9999,
     paddingHorizontal: 16,
     paddingVertical: 8,
-    rowGap: 1,
     shadowColor: "#000",
     shadowOffset: { width: 0, height: 8 },
     shadowOpacity: 0.5,

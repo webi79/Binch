@@ -14,6 +14,7 @@
  * Zeitfenster: jetzt → in 12 Stunden. AeroDataBox erlaubt max 12h pro Call.
  */
 import { config } from "../config.js";
+import { BoundedTtlCache } from "../util/boundedCache.js";
 import type { StopBoard, StopBoardItem, StopBoardResponse } from "./stopInfoService.js";
 
 const CACHE_TTL_MS = 60 * 60 * 1000; // 60 min — Flugpläne sind stabil
@@ -23,12 +24,12 @@ const MAX_RESULTS = 6;
 // Flüge weiterhin anzeigen. RAW_CACHE_MAX begrenzt nur den Speicher.
 const RAW_CACHE_MAX = 60;
 
-interface CacheEntry {
-  data: StopBoardResponse;
-  expiresAt: number;
-}
-
-const cache = new Map<string, CacheEntry>();
+/**
+ * Gedeckelt — vorher eine Map ohne Löschen: Jeder je abgefragte Flughafen
+ * (bis 4000, je Abflug UND Ankunft) blieb samt Tafel für die ganze Laufzeit im
+ * Speicher, abgelaufen oder nicht.
+ */
+const cache = new BoundedTtlCache<StopBoardResponse>(400, CACHE_TTL_MS);
 const inflight = new Map<string, Promise<StopBoardResponse>>();
 
 function cacheKey(iata: string, board: StopBoard): string {
@@ -226,14 +227,14 @@ export async function getFlightBoard(iata: string, board: StopBoard): Promise<St
   const key = cacheKey(iata, board);
 
   const cached = cache.get(key);
-  if (cached && cached.expiresAt > Date.now()) return pruneStale(cached.data);
+  if (cached) return pruneStale(cached);
 
   const existing = inflight.get(key);
   if (existing) return existing.then(pruneStale);
 
   const promise = fetchFromAeroDataBox(iata, board)
     .then((data) => {
-      cache.set(key, { data, expiresAt: Date.now() + CACHE_TTL_MS });
+      cache.set(key, data);
       return data;
     })
     .finally(() => {

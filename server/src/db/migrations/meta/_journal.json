@@ -274,6 +274,48 @@
       "when": 1792676424586,
       "tag": "0038_locations_unserved_at",
       "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1793138514028,
+      "tag": "0039_locations_position_fixed_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1793150432689,
+      "tag": "0040_bo_memory",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1793197193454,
+      "tag": "0041_push_token_prefs",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1793198063570,
+      "tag": "0042_fare_profile",
+      "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "7",
+      "when": 1793214061906,
+      "tag": "0043_trip_reminders",
+      "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1793324576485,
+      "tag": "0044_bo_tasks",
+      "breakpoints": true
     }
   ]
 }

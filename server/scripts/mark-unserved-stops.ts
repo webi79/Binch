@@ -8,6 +8,11 @@
  * auch kein gleichnamiger in 300 m. Nur OSM-Zeilen und Fahrplan-Zeilen, die kein aktueller
  * Fahrplan mehr führt — nie DB-Kennungen (StaDa), Steige oder Stationen mit Steigen.
  *
+ * Seit 27.10. zweite Art im selben Plan (`plan_1027.py`, `kind: "überzählig"`): OSM-Marker, deren
+ * Mast schon einen eigenen Marker hat (eindeutige Zuordnung Mast ↔ Marker ≤ 30 m) und in 60 m
+ * kein freier Mast ihrer Art steht — die zweite „Millway Close" 15 m neben der ersten, „Inbound"
+ * neben „Brooklands PH". Ihre Tafel zeigte ohnehin nur die des Nachbarn.
+ *
  * Abgleich: Plan-Zeilen werden markiert (sofern noch nicht); markierte Zeilen, die NICHT mehr im
  * Plan stehen, werden wieder sichtbar — dort fährt inzwischen etwas.
  *

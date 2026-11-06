@@ -465,7 +465,7 @@ index 593328c..e068849 100644
          }
  }
 diff --git a/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapView.kt b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapView.kt
-index 7c5fe02..7e3bc52 100644
+index 7c5fe02..d11db15 100644
 --- a/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapView.kt
 +++ b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapView.kt
 @@ -1,15 +1,25 @@
@@ -525,7 +525,7 @@ index 7c5fe02..7e3bc52 100644
  import kotlin.math.roundToInt
  
  sealed class MapChild {
-@@ -201,12 +219,21 @@ open class MLRNMapView(
+@@ -201,6 +219,14 @@ open class MLRNMapView(
      }
  
      override fun onDestroy() {
@@ -540,14 +540,7 @@ index 7c5fe02..7e3bc52 100644
          super.onDestroy()
          destroyed = true
      }
- 
-     override fun onAttachedToWindow() {
-         super.onAttachedToWindow()
-+        applyPendingStyleCover()
-         ViewCompat.setOnApplyWindowInsetsListener(this) { _, insets ->
-             windowInsets = insets
-             updateUISettings()
-@@ -475,14 +502,53 @@ open class MLRNMapView(
+@@ -475,14 +501,53 @@ open class MLRNMapView(
          updateScaleBar()
  
          mapLibreMap.addOnCameraMoveStartedListener { reason ->
@@ -602,7 +595,7 @@ index 7c5fe02..7e3bc52 100644
          mapLibreMap.addOnMoveListener(
              object : MapLibreMap.OnMoveListener {
                  override fun onMoveBegin(detector: MoveGestureDetector) {
-@@ -499,7 +565,26 @@ open class MLRNMapView(
+@@ -499,7 +564,26 @@ open class MLRNMapView(
              },
          )
  
@@ -630,7 +623,7 @@ index 7c5fe02..7e3bc52 100644
      }
  
      fun reflow() {
-@@ -566,7 +651,14 @@ open class MLRNMapView(
+@@ -566,7 +650,14 @@ open class MLRNMapView(
  
      @SuppressLint("ClickableViewAccessibility")
      override fun onTouchEvent(ev: MotionEvent?): Boolean {
@@ -645,7 +638,7 @@ index 7c5fe02..7e3bc52 100644
  
          if (result && scrollEnabled == true) {
              requestDisallowInterceptTouchEvent(true)
-@@ -575,6 +667,181 @@ open class MLRNMapView(
+@@ -575,6 +666,181 @@ open class MLRNMapView(
          return result
      }
  
@@ -827,7 +820,7 @@ index 7c5fe02..7e3bc52 100644
      override fun onLayout(
          changed: Boolean,
          left: Int,
-@@ -710,9 +977,18 @@ open class MLRNMapView(
+@@ -710,9 +976,18 @@ open class MLRNMapView(
          handleMapChangedEvent("onDidFailLoadingMap")
      }
  
@@ -847,7 +840,7 @@ index 7c5fe02..7e3bc52 100644
      }
  
      override fun onDidFinishRenderingFrame(
-@@ -720,11 +996,9 @@ open class MLRNMapView(
+@@ -720,11 +995,9 @@ open class MLRNMapView(
          frameEncodingTime: Double,
          frameRenderingTime: Double,
      ) {
@@ -862,18 +855,7 @@ index 7c5fe02..7e3bc52 100644
      }
  
      override fun onWillStartRenderingMap() {
-@@ -733,6 +1007,10 @@ open class MLRNMapView(
- 
-     override fun onDidFinishRenderingMap(fully: Boolean) {
-         if (fully) {
-+            // Binch: die neue Karte ist fertig — das eingefrorene Bild der alten darf gehen.
-+            // Ein Schnitt (`coverCut`) wartet auf sein eigenes Zeichen: Diese Meldung
-+            // kann noch von der alten Stelle stammen.
-+            if (cutHoldUntil == 0L) fadeOutStyleCover(STYLE_COVER_FADE_MS)
-             handleMapChangedEvent("onDidFinishRenderingMapFully")
-         } else {
-             handleMapChangedEvent("onDidFinishRenderingMap")
-@@ -1191,6 +1469,21 @@ open class MLRNMapView(
+@@ -1191,6 +1464,21 @@ open class MLRNMapView(
  
          val uiSettings = mapLibreMap!!.uiSettings
  
@@ -895,7 +877,7 @@ index 7c5fe02..7e3bc52 100644
          if (scrollEnabled != null && uiSettings.isScrollGesturesEnabled != scrollEnabled) {
              uiSettings.isScrollGesturesEnabled = scrollEnabled!!
  
-@@ -1494,6 +1787,127 @@ open class MLRNMapView(
+@@ -1494,6 +1782,127 @@ open class MLRNMapView(
          return null
      }
  
@@ -1023,55 +1005,22 @@ index 7c5fe02..7e3bc52 100644
      fun sendRegionDidChangeEvent() {
          handleMapChangedEvent("onRegionDidChange", true)
          cameraChangeTracker.setReason(CameraChangeTracker.EMPTY)
-@@ -1550,7 +1964,158 @@ open class MLRNMapView(
+@@ -1550,7 +1959,120 @@ open class MLRNMapView(
          return markerViewManager!!
      }
  
 +    /*
-+     * Binch: KARTENTYP WECHSELN OHNE AUFBLITZEN.
++     * Binch: DAS STANDBILD DER LIVE-ANSICHT (`coverCut`, „Schnitt statt Flug") — als
++     * Vordergrund dieser Karte, bis die neue Stelle gezeichnet ist; dann blendet es weich aus.
++     * Spätestens nach der Frist aus JS, und sofort bei einer Berührung.
 +     *
-+     * Die App baut beim Wechsel des Kartentyps die ganze Karte neu auf (`key` an der
-+     * Kartenfläche — ein Stilwechsel unter laufender Karte stürzt ab). Die neue Fläche ist
-+     * aber bis zu ihrem ersten vollständigen Bild leer, und das blitzte. Deshalb friert die
-+     * ALTE Karte vorher ihr letztes Bild ein (`captureStyleCover`, aus JS über
-+     * `createStaticMapImage({ output: "cover" })`), und die NEUE legt es sich als
-+     * Vordergrund über, bis sie fertig gezeichnet hat — dann blendet es weich aus. Spätestens
-+     * nach `STYLE_COVER_MAX_MS`, und sofort bei einer Berührung.
++     * Das Standbild beim Wechsel des KARTENTYPS lag bis 06.11.2026 ebenfalls hier und wurde
++     * dann ersetzt: Die Karte wird dabei neu aufgebaut, ein Vordergrund IN ihr blitzte beim
++     * Austausch. Es liegt jetzt als eigene Ansicht über der Karte (modules/map-cover).
 +     */
 +    private var styleCover: BitmapDrawable? = null
 +    private var styleCoverFade: ValueAnimator? = null
 +    private val styleCoverTimeout = Runnable { fadeOutStyleCover(STYLE_COVER_FADE_MS) }
-+
-+    /** Das aktuelle Kartenbild für die nächste Karte einfrieren (auf dem UI-Thread). */
-+    fun captureStyleCover() {
-+        val texture = findTextureView(this) ?: return
-+        val bitmap =
-+            try {
-+                texture.bitmap
-+            } catch (_: Exception) {
-+                null
-+            } ?: return
-+        synchronized(STYLE_COVER_LOCK) {
-+            pendingStyleCover?.recycle()
-+            pendingStyleCover = bitmap
-+            pendingStyleCoverAt = SystemClock.uptimeMillis()
-+        }
-+    }
-+
-+    private fun applyPendingStyleCover() {
-+        val bitmap =
-+            synchronized(STYLE_COVER_LOCK) {
-+                val pending = pendingStyleCover
-+                val fresh = pending != null && SystemClock.uptimeMillis() - pendingStyleCoverAt < STYLE_COVER_MAX_MS
-+                pendingStyleCover = null
-+                if (fresh) pending else pending?.recycle().let { null }
-+            } ?: return
-+        clearStyleCover()
-+        val drawable = BitmapDrawable(resources, bitmap)
-+        styleCover = drawable
-+        foreground = drawable
-+        postDelayed(styleCoverTimeout, STYLE_COVER_MAX_MS)
-+    }
 +
 +    private fun fadeOutStyleCover(durationMs: Long) {
 +        val drawable = styleCover ?: return
@@ -1166,11 +1115,6 @@ index 7c5fe02..7e3bc52 100644
      companion object {
          const val LOG_TAG: String = "MLRNMapView"
 +
-+        /** Binch: das eingefrorene Bild der alten Karte, bis die neue es abholt. */
-+        private val STYLE_COVER_LOCK = Any()
-+        private var pendingStyleCover: Bitmap? = null
-+        private var pendingStyleCoverAt = 0L
-+        private const val STYLE_COVER_MAX_MS = 2500L
 +        private const val STYLE_COVER_FADE_MS = 260L
 +        private const val STYLE_COVER_TOUCH_FADE_MS = 120L
 +        private const val CUT_MIN_HOLD_MS = 90L
@@ -1183,20 +1127,13 @@ index 7c5fe02..7e3bc52 100644
 +private const val FLING_MIN_DP_PER_S = 250f
 +private const val FLING_STOP_DP_PER_S = 12.0
 diff --git a/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapViewModule.kt b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapViewModule.kt
-index 961d649..45e6f20 100644
+index 961d649..7dc0cd4 100644
 --- a/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapViewModule.kt
 +++ b/node_modules/@maplibre/maplibre-react-native/android/src/main/java/org/maplibre/reactnative/components/mapview/MLRNMapViewModule.kt
-@@ -184,6 +184,20 @@ class MLRNMapViewModule(
+@@ -184,6 +184,13 @@ class MLRNMapViewModule(
          promise: Promise,
      ) {
          withViewportOnUIThread(reactTag, promise) {
-+            // Binch: „cover" friert nur das aktuelle Bild für die nächste Karte ein
-+            // (Kartentyp-Wechsel ohne Aufblitzen, siehe `MLRNMapView.captureStyleCover`).
-+            if (output == "cover") {
-+                it.captureStyleCover()
-+                promise.resolve("")
-+                return@withViewportOnUIThread
-+            }
 +            // Binch: „cut:<ms>" friert das Bild für DIESE Karte ein — Schnitt statt
 +            // Flug in der Live-Ansicht (siehe `MLRNMapView.coverCut`).
 +            if (output.startsWith("cut")) {

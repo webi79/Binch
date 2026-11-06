@@ -7,6 +7,11 @@
  * `~/binch-backups/stops-audit-2026-10-22/mode_plan.py` (Beweis aus dem Fahrplan). Geschrieben
  * wird nur, wo die Zeile JETZT noch genau den alten Stand hat.
  *
+ * Zweiter Plan derselben Form: `kinds_plan.py` — Arten an geteilten Masten (Bus an einem Tramhalt,
+ * dessen Busse die Tafel bisher wegfilterte). Nur ERGÄNZEN (Art und Unterart gleich, nichts fällt
+ * weg) darf auch ein Steig; seine Station bekommt dieselbe Art dazu — sie führt die Arten aller
+ * Steige, und ihre Tafel filtert genauso.
+ *
  * PROBELAUF IST DIE VORGABE.
  *   FIX_OUT=… npx tsx --env-file=.env scripts/fix-stop-modes.ts --plan=mode-plan.json
  *   FIX_OUT=… npx tsx --env-file=.env scripts/fix-stop-modes.ts --plan=mode-plan.json --apply
@@ -43,6 +48,11 @@ const TYPES = new Set(["TRAIN", "BUS"]);
 const SUBTYPES = new Set(["LONG_DISTANCE", "REGIONAL", "SUBURBAN", "SUBWAY", "TRAM", "BUS", "COACH", "FERRY"]);
 const KINDS = new Set(["train", "subway", "tram", "bus", "ferry"]);
 const same = (a: string[] | null, b: string[]) => (a ?? []).join(" ") === b.join(" ");
+/** Kommt nur eine Art dazu (Art und Unterart gleich, nichts fällt weg)? Das darf auch ein Steig. */
+const addsKindsOnly = (e: PlanEntry) =>
+  e.new.type === e.old.type &&
+  (e.new.subtype ?? null) === (e.old.subtype ?? null) &&
+  e.old.kinds.every((k) => e.new.kinds.includes(k));
 
 async function write(changes: Array<{ code: string; to: Mode }>, label: string): Promise<void> {
   const client = await pool.connect();
@@ -93,8 +103,8 @@ async function main() {
       throw new Error(`Planeintrag kaputt: ${JSON.stringify(e)}`);
     }
   }
-  const { rows } = await pool.query<{ code: string; type: string; subtype: string | null; kinds: string[] | null; parent: boolean; stands: boolean }>(
-    `SELECT l.code, l.type, l.subtype, l.kinds, l.parent_code IS NOT NULL AS parent,
+  const { rows } = await pool.query<{ code: string; type: string; subtype: string | null; kinds: string[] | null; parent: boolean; parent_code: string | null; stands: boolean }>(
+    `SELECT l.code, l.type, l.subtype, l.kinds, l.parent_code IS NOT NULL AS parent, l.parent_code,
             EXISTS (SELECT 1 FROM locations s WHERE s.parent_code = l.code) AS stands
        FROM locations l WHERE l.code = ANY($1::text[])`,
     [plan.map((e) => e.code)],
@@ -107,15 +117,41 @@ async function main() {
   for (const e of plan) {
     const r = now.get(e.code);
     if (!r) count("fehlt");
-    else if (r.parent || r.stands) count("Steig bzw. Station mit Steigen");
+    else if (r.stands || (r.parent && !addsKindsOnly(e))) count("Steig bzw. Station mit Steigen");
     else if (r.type !== e.old.type || (r.subtype ?? null) !== (e.old.subtype ?? null) || !same(r.kinds, e.old.kinds)) count("inzwischen geändert");
     else {
       changes.push({ code: e.code, to: e.new });
       count(`${e.old.kinds.join("+") || e.old.subtype} → ${e.new.kinds.join("+")}`);
+      if (r.parent) count("  davon Steige");
       report.push(
         [e.code, `"${e.name.replace(/"/g, '""')}"`, `${e.old.type}/${e.old.subtype}/${e.old.kinds.join("+")}`,
          `${e.new.type}/${e.new.subtype}/${e.new.kinds.join("+")}`, e.pole, e.d].join(","),
       );
+    }
+  }
+  // Die Station eines ergänzten Steigs: dieselbe Art dazu (sie führt die Arten aller Steige).
+  const parentAdds = new Map<string, Set<string>>();
+  for (const c of changes) {
+    const p = now.get(c.code)?.parent_code;
+    if (!p) continue;
+    const set = parentAdds.get(p) ?? new Set<string>();
+    for (const k of c.to.kinds) set.add(k);
+    parentAdds.set(p, set);
+  }
+  if (parentAdds.size > 0) {
+    const { rows: parents } = await pool.query<{ code: string; type: string; subtype: string | null; kinds: string[] | null }>(
+      `SELECT code, type, subtype, kinds FROM locations WHERE code = ANY($1::text[])`,
+      [[...parentAdds.keys()]],
+    );
+    for (const p of parents) {
+      const have = p.kinds ?? [];
+      // Ohne eigene Arten (Altbestand) nichts erfinden — das macht der nächste Abgleich.
+      if (have.length === 0 || changes.some((c) => c.code === p.code)) continue;
+      const add = [...parentAdds.get(p.code)!].filter((k) => !have.includes(k));
+      if (add.length === 0) continue;
+      changes.push({ code: p.code, to: { type: p.type, subtype: p.subtype, kinds: [...have, ...add] } });
+      count("Station: Art ihrer Steige dazu");
+      report.push([p.code, "Station", `${p.type}/${p.subtype}/${have.join("+")}`, `${p.type}/${p.subtype}/${[...have, ...add].join("+")}`, "", ""].join(","));
     }
   }
   for (const [k, n] of [...why].sort((a, b) => b[1] - a[1])) console.log(`  ${k.padEnd(34)} ${n}`);

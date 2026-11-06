@@ -46,6 +46,8 @@ export const searchRequests = pgTable(
      * als leer gespeichert, siehe `normalizeTravelClass` in searchService.ts.
      */
     travelClass: varchar("travel_class", { length: 64 }),
+    /** Tarifprofil der Zugsuche (BahnCard, Deutschlandticket; util/fareProfile.ts) — Teil der Cache-Identität, leer = ohne. */
+    fareProfile: varchar("fare_profile", { length: 40 }),
     // `ip_hash` gibt es nicht mehr (Migration 0031): ein ungesalzener SHA-256
     // der IP, bei IPv4 in Minuten umkehrbar — geschrieben, nie gelesen, nie
     // gelöscht. Die Rate-Limits zählen im Speicher (util/rateLimit.ts).
@@ -187,11 +189,48 @@ export const users = pgTable(
     lastName: varchar("last_name", { length: 80 }).notNull(),
     /** data: URL (image/jpeg base64) — capped at ~256x256 client-side. */
     avatarDataUrl: text("avatar_data_url"),
+    /**
+     * Darf Bo sich Dinge über dieses Konto merken (`bo_memories`)? Aus heißt:
+     * Er liest sein Gedächtnis nicht und schreibt nichts hinein — was schon
+     * drinsteht, bleibt, bis der Nutzer es löscht (Profil → Einstellungen → Bo).
+     */
+    boMemoryEnabled: boolean("bo_memory_enabled").notNull().default(true),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     emailIdx: index("idx_users_email").on(t.email),
+  }),
+);
+
+/**
+ * BOS GEDÄCHTNIS — je Konto, was er sich über den Nutzer merkt.
+ *
+ * Kurze Sätze, die Bo selbst schreibt („Wohnt in Werl, Heimatbahnhof Werl",
+ * „BahnCard 50, 2. Klasse"), über sein Werkzeug `remember`. Jeder Turn bekommt
+ * sie in den ungecachten Teil seiner Anweisungen — gelesen wird also nie über
+ * ein Werkzeug, das kostete einen Aufruf mehr pro Nachricht.
+ *
+ * Zeilen statt eines Textblocks: Der Nutzer sieht und löscht sie einzeln
+ * (Profil → Einstellungen → Bo), und Bo ersetzt eine veraltete gezielt (`replace_id`),
+ * statt ein ganzes Dokument neu zu schreiben, in dem dabei etwas verloren geht.
+ * Die laufende Nummer ist Bos Verweis — kurz, anders als eine UUID, die das
+ * Modell beim Abschreiben verstümmeln könnte. Gedeckelt im Code
+ * (`MAX_MEMORIES_PER_USER`), Länge hier.
+ */
+export const boMemories = pgTable(
+  "bo_memories",
+  {
+    id: integer("id").primaryKey().generatedAlwaysAsIdentity(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    content: varchar("content", { length: 300 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    userRecent: index("idx_bo_memories_user").on(t.userId, t.updatedAt),
   }),
 );
 
@@ -318,8 +357,10 @@ export const chatConversations = pgTable(
 
 export type ChatMessageRole = "user" | "assistant";
 /** Was die Zeile im Chat wird: eine Sprechblase (`text`), eine Ergebniskarte
- *  (`result`), eine Abfahrtstafel (`board`) oder ein Aktions-Knopf (`action`). */
-export type ChatMessageKind = "text" | "result" | "board" | "action";
+ *  (`result`), eine Abfahrtstafel (`board`), ein Aktions-Knopf (`action`), die
+ *  Quellen einer Websuche (`sources`) oder ein Vermerk aus Bos Gedächtnis
+ *  („Gemerkt: …", `note`). */
+export type ChatMessageKind = "text" | "result" | "board" | "action" | "sources" | "note" | "task";
 
 /**
  * Einzelne Chat-Zeilen, aufsteigend nach `seq` innerhalb einer Unterhaltung.
@@ -408,6 +449,12 @@ export const locations = pgTable(
      * Bedienung wieder geleert) von `scripts/mark-unserved-stops.ts`.
      */
     unservedAt: timestamp("unserved_at", { withTimezone: true }),
+    /**
+     * Seit wann die Lage von Hand bzw. per Prüfung korrigiert ist (`scripts/fix-stop-positions.ts`).
+     * Der Monatsabgleich (`import-gtfs.ts`, `import-stada.ts`) schreibt dann keine Lage mehr —
+     * sonst holte er die alte zurück (trainline führt Graz Hbf 530 m neben dem Bahnhof).
+     */
+    positionFixedAt: timestamp("position_fixed_at", { withTimezone: true }),
     city: text("city"),
     country: text("country"),
     /**
@@ -755,11 +802,140 @@ export const pushTokens = pgTable(
      */
     lastDeliveredAt: timestamp("last_delivered_at", { withTimezone: true }),
     lastTappedAt: timestamp("last_tapped_at", { withTimezone: true }),
+    /**
+     * Die beiden Schalter aus der App (Profil → Einstellungen → Mitteilungen):
+     * Meldungen überhaupt, und Preisalarme im Besonderen.
+     *
+     * Am GERÄT, nicht am Konto — die Kennung ist gerätegebunden, und ein Alarm
+     * funktioniert ohne Anmeldung. Die App meldet beide bei jeder Registrierung
+     * und sofort beim Umschalten. Vorgabe AN: So hat sich der Server verhalten,
+     * bevor es die Spalten gab, und so bleibt es für jedes Gerät, das sie noch
+     * nicht kennt (ältere App-Fassung).
+     */
+    notificationsEnabled: boolean("notifications_enabled").notNull().default(true),
+    priceAlertsEnabled: boolean("price_alerts_enabled").notNull().default(true),
+    /** Mitteilungen aus Bos geplanten Aufgaben (Einstellungen → Mitteilungen → Bo-Updates). */
+    boUpdatesEnabled: boolean("bo_updates_enabled").notNull().default(true),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     byUser: index("idx_push_tokens_user").on(t.userId),
+  }),
+);
+
+/**
+ * Abfahrts- und Ausstiegs-Erinnerungen gespeicherter Reisen — bis zum Versand.
+ *
+ * Die App ersetzt die Liste eines Geräts bei jedem Abgleich (`PUT
+ * /api/reminders`); ein Lauf alle 30 Sekunden schickt, was fällig ist, und
+ * LÖSCHT die Zeile danach. Lokal geplante Wecker kamen auf manchen Handys nie
+ * an (Android verschiebt ungenaue Wecker, Xiaomi hält sie bei geschlossener
+ * App zurück); ein Push von hier kommt auf demselben Weg wie die Preisalarme.
+ *
+ * Titel und Text schreibt die App — in ihrer Sprache, mit der Ortszeit des
+ * Halts. Hier liegt nur, was bis zum Versand nötig ist; am Gerät hängend,
+ * nicht am Konto (wie die Alarme), und mit ihm gelöscht.
+ */
+export const tripReminders = pgTable(
+  "trip_reminders",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    pushTokenId: uuid("push_token_id")
+      .notNull()
+      .references(() => pushTokens.id, { onDelete: "cascade" }),
+    /** Von der App vergeben: „departure:trip:<id>" usw. — je Gerät eindeutig. */
+    key: varchar("key", { length: 160 }).notNull(),
+    kind: varchar("kind", { length: 16 }).notNull(),
+    fireAt: timestamp("fire_at", { withTimezone: true }).notNull(),
+    /** Danach ist sie wertlos (Abfahrt/Ankunft vorbei) — dann nicht mehr schicken. */
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    title: varchar("title", { length: 120 }).notNull(),
+    body: varchar("body", { length: 300 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    uniquePerDevice: uniqueIndex("uq_trip_reminders_device_key").on(t.pushTokenId, t.key),
+    byFire: index("idx_trip_reminders_fire").on(t.fireAt),
+  }),
+);
+
+/**
+ * GEPLANTE AUFGABEN, die Bo selbst ausführt — „Geplant" in Bos Seitenleiste
+ * (services/boTasks.ts).
+ *
+ * Bisher eine Art: `route_status` — die Lage auf einer Strecke (Ausfälle,
+ * Verspätungen, Gleiswechsel), zu einer Uhrzeit an gewählten Tagen, auf Wunsch
+ * mit einer Wache bis `watch_until`, die dann nur NEUE Störungen meldet.
+ *
+ * Am Konto, nicht am Gerät: Die Meldung geht an alle Geräte des Kontos, und
+ * mit dem Konto verschwindet alles (`ON DELETE CASCADE`). Angelegt wird nur
+ * nach Bestätigung in der App — Bo schlägt bloß vor.
+ */
+export type BoTaskKind = "route_status";
+export type BoTaskNotify = "always" | "issues";
+export type BoTaskStatus = "ok" | "issue" | "unknown";
+
+export const boTasks = pgTable(
+  "bo_tasks",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** Der Chat, in dem sie entstand — dorthin führt „Im Chat öffnen". */
+    conversationId: uuid("conversation_id").references(() => chatConversations.id, { onDelete: "set null" }),
+    kind: varchar("kind", { length: 24 }).notNull().$type<BoTaskKind>(),
+    title: varchar("title", { length: 60 }).notNull(),
+    origin: varchar("origin", { length: 64 }).notNull(),
+    destination: varchar("destination", { length: 64 }).notNull(),
+    originLabel: varchar("origin_label", { length: 160 }).notNull(),
+    destLabel: varchar("dest_label", { length: 160 }).notNull(),
+    /** Wochentage als Bitmaske: Mo = 1, Di = 2 … So = 64. */
+    days: integer("days").notNull(),
+    /** Ortszeit „HH:MM" in `timezone`. */
+    time: varchar("time", { length: 5 }).notNull(),
+    /** Optional: bis dahin weiter beobachten und nur bei neuen Störungen melden. */
+    watchUntil: varchar("watch_until", { length: 5 }),
+    timezone: varchar("timezone", { length: 64 }).notNull(),
+    notify: varchar("notify", { length: 8 }).notNull().$type<BoTaskNotify>(),
+    locale: varchar("locale", { length: 5 }).notNull().default("de"),
+    active: boolean("active").notNull().default(true),
+    nextRunAt: timestamp("next_run_at", { withTimezone: true }),
+    lastRunAt: timestamp("last_run_at", { withTimezone: true }),
+    lastStatus: varchar("last_status", { length: 8 }).$type<BoTaskStatus>(),
+    lastSummary: varchar("last_summary", { length: 300 }),
+    /** Was die Wache zuletzt gemeldet hat — dieselbe Störung kommt nicht zweimal. */
+    lastIssueKey: varchar("last_issue_key", { length: 400 }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    byUser: index("idx_bo_tasks_user").on(t.userId),
+    due: index("idx_bo_tasks_due").on(t.nextRunAt),
+  }),
+);
+
+/** Ein Lauf einer Aufgabe — der Verlauf in der App. Nur die letzten behalten (siehe `RUNS_KEPT`). */
+export const boTaskRuns = pgTable(
+  "bo_task_runs",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    taskId: uuid("task_id")
+      .notNull()
+      .references(() => boTasks.id, { onDelete: "cascade" }),
+    ranAt: timestamp("ran_at", { withTimezone: true }).notNull().defaultNow(),
+    /** `schedule` = zur Uhrzeit, `watch` = Wache, `manual` = „Jetzt prüfen". */
+    trigger: varchar("trigger", { length: 8 }).notNull(),
+    status: varchar("status", { length: 8 }).notNull().$type<BoTaskStatus>(),
+    title: varchar("title", { length: 120 }).notNull(),
+    body: varchar("body", { length: 600 }).notNull(),
+    /** Die Fakten hinter dem Text — Fahrten, Quelle, Stand. */
+    facts: jsonb("facts").$type<Record<string, unknown>>(),
+    pushed: boolean("pushed").notNull().default(false),
+  },
+  (t) => ({
+    byTask: index("idx_bo_task_runs_task").on(t.taskId, t.ranAt),
   }),
 );
 
@@ -835,6 +1011,13 @@ export const priceAlerts = pgTable(
     passengers: integer("passengers").notNull().default(1),
     /** i18n-Schlüssel der Klasse, oder leer. Wird nur verglichen, nie gedeutet. */
     travelClass: varchar("travel_class", { length: 60 }).notNull().default(""),
+    /**
+     * Tarifprofil, unter dem der Alarm angelegt wurde (BahnCard,
+     * Deutschlandticket; util/fareProfile.ts). Gehört zum Preis wie die Klasse:
+     * Ein BahnCard-50-Preis darf nur mit BahnCard-50-Preisen verglichen werden,
+     * sonst „stiege" er bei jeder Suche ohne Karte. Leer = ohne.
+     */
+    fareProfile: varchar("fare_profile", { length: 40 }).notNull().default(""),
 
     currency: varchar("currency", { length: 8 }).notNull(),
     /**
@@ -904,6 +1087,7 @@ export const priceAlerts = pgTable(
       t.passengers,
       t.travelClass,
       t.currency,
+      t.fareProfile,
     ),
   }),
 );

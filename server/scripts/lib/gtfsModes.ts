@@ -52,7 +52,12 @@ export function subtypeToKind(s: Subtype): Kind {
  *     ≥ 50 Fahrten, oder ≥ 300 Fahrten. Mit der Bahn-Schwelle fielen sie weg —
  *     Zürich, Museum Rietberg (Tram 7: 3 931, Bus 161/165: 674 Fahrten = 15 %)
  *     stand nur als Tram da, und die Tafel blendete die Busse aus, weil sie
- *     nur Arten zeigt, die der Halt führt (routes/stops.ts, filterToStopKinds). */
+ *     nur Arten zeigt, die der Halt führt (routes/stops.ts, filterToStopKinds).
+ *   - Bus an einem Tramhalt bzw. Tram an einem Bushalt (geteilter Mast) schon
+ *     ab 10 Fahrten. Mit der Schwelle davor fehlten die Busse an über tausend
+ *     geteilten Masten auf der Tafel (Krefeld Buddestraße: Tram, 32 Busfahrten;
+ *     Magdeburg AMO/Steubenallee: 18). Nicht an Bahnhöfen — deren Tafel bekäme
+ *     sonst die Busse des Vorplatzes (Köln Hbf ↔ Breslauer Platz). */
 export function kindsForStop(types: Map<Subtype, number>): Kind[] {
   const total = Array.from(types.values()).reduce((s, n) => s + n, 0);
   if (total === 0) return ["bus"];
@@ -67,10 +72,17 @@ export function kindsForStop(types: Map<Subtype, number>): Kind[] {
   // Sortieren absteigend nach Frequenz. Mindestens den Top-Kind nehmen.
   const sorted = Array.from(kindCounts.entries()).sort((a, b) => b[1] - a[1]);
   const out: Kind[] = [sorted[0]![0]];
+  /** Bus- oder Tramhalt, kein Bahnhof — siehe die dritte Schwelle oben. */
+  const surface = out[0] === "bus" || out[0] === "tram";
   for (let i = 1; i < sorted.length; i++) {
     const [k, c] = sorted[i]!;
     const share = c / total;
-    const significant = k === "train" ? share >= 0.3 && c >= 100 : (share >= 0.1 && c >= 50) || c >= 300;
+    const significant =
+      k === "train"
+        ? share >= 0.3 && c >= 100
+        : surface && (k === "bus" || k === "tram")
+          ? c >= 10
+          : (share >= 0.1 && c >= 50) || c >= 300;
     if (significant) out.push(k);
   }
   return out;

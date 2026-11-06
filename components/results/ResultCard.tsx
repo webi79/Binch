@@ -1,7 +1,6 @@
 import { memo, useCallback, useMemo, useState } from "react";
 import { View, Text, Share, Image, StyleSheet } from "react-native";
 import { usePalette } from "@/lib/theme/appBg";
-import { useRouter } from "expo-router";
 import { useRouteMirror } from "@/lib/nav/routeMirror";
 import { Heart, Share2, Plane, Train, Bus, Ship, ChevronRight, Route as RouteIcon } from "lucide-react-native";
 import Animated, {
@@ -18,7 +17,7 @@ import { formatTimeInZone, formatDateInZone, shiftIsoByMinutes } from "@/lib/tim
 import { changesShort } from "@/lib/format/routeMeta";
 import { DelayedTime } from "@/components/results/DelayedTime";
 import { JourneyWarningBadge } from "@/components/results/JourneyWarningBadge";
-import { redirectUrl, fetchTripPolylines, fetchFlightBookingOptions } from "@/lib/api/client";
+import { redirectUrl, fetchFlightBookingOptions } from "@/lib/api/client";
 import { useAccent } from "@/lib/theme/accent";
 import { useQueryClient } from "@tanstack/react-query";
 import { haptic } from "@/lib/haptics";
@@ -31,9 +30,10 @@ import { usePressBounce } from "@/lib/motion";
 import { prepareLayer, type LayerKey } from "@/lib/nav/transitionLayer";
 import { preloadDetails } from "@/lib/nav/detailsPreload";
 import { startDetailsPush } from "@/lib/nav/overlayCover";
-import { buildRoutePlan } from "@/lib/routing/buildRoute";
+import { openRouteMap } from "@/lib/nav/openRouteMap";
 import { scaledStyles } from "@/lib/ui/compact";
 import { isLongDistance, TRANSIT_COLOR } from "@/lib/theme/transitColors";
+import { coveredByDTicket } from "@/lib/travel/fareProfile";
 
 interface Props {
   result: SearchResult;
@@ -109,7 +109,6 @@ function ResultCardInner({
   const palette = usePalette();
   const accent = useAccent();
   const t = useT();
-  const router = useRouter();
   // Route NICHT per Hook abonnieren: `usePathname()`/`useLocalSearchParams()`
   // hängen an expo-routers routeInfo-Store, der sich bei JEDEM Tab-Wechsel
   // ändert — das rendete jede gemountete Karte neu, an der memo-Schranke unten
@@ -150,8 +149,6 @@ function ResultCardInner({
   // Cards × 4 Subscriptions wird das spürbar.
   const toggleSavedTrip = useSearchStore.getState().toggleSavedTrip;
   const selectResult = useSearchStore.getState().selectResult;
-  const setRoute = useSearchStore.getState().setRoute;
-  const setRoutePolylines = useSearchStore.getState().setRoutePolylines;
   const queryClient = useQueryClient();
 
   const bookUrl = result.redirectToken
@@ -200,7 +197,8 @@ function ResultCardInner({
     // Detail-Blatt im Berührungsfenster bauen statt im Loslass-Bild.
     preloadDetails(result);
     selectBounce.onPressIn();
-  }, [underlay, selectBounce]);
+    // `result` mit: Ändert sich der Treffer (Preis, Verspätung), baute der Vorbau sonst den alten.
+  }, [underlay, selectBounce, result]);
 
   function onSelect() {
     // Overlay-Pattern: nur den Store füllen — DetailsOverlay im _layout
@@ -366,23 +364,11 @@ function ResultCardInner({
 
   function onShowRoute() {
     haptic("button");
-    const plan = buildRoutePlan(result);
-    if (!plan) return;
-    // PUSH /search/route-map IM selben Stack — KEIN Tab-Wechsel mehr,
-    // KEIN router.replace mit previousHref. Results-Screen bleibt drunter
-    // gemountet, Back im RouteMapScreen ruft router.back() → pop. Vorher
-    // ging das via Surroundings-Tab + router.replace, was beim Zurück-
+    // PUSH /search/route-map IM selben Stack — Begründung in lib/nav/openRouteMap.ts.
+    // Vorher ging das via Surroundings-Tab + router.replace, was beim Zurück-
     // Navigieren den Results-Screen frisch mountete → Loader-Animation
     // spielte unnötig wieder ab.
-    setRoute({ ...plan });
-    router.push("/search/route-map");
-
-    const tripIds = plan.legs.map((l) => l.tripId).filter((id): id is string => Boolean(id));
-    if (tripIds.length > 0) {
-      fetchTripPolylines(tripIds)
-        .then((r) => setRoutePolylines(r.polylines))
-        .catch(() => {});
-    }
+    openRouteMap(result);
   }
 
   const ModeIcon = MODE_ICON[result.mode] ?? Plane;
@@ -596,7 +582,11 @@ function ResultCardInner({
               <Text style={styles.priceCurrency}>  {currencyCode(result.currency)}</Text>
             </Text>
           ) : (
-            <Text style={styles.priceUnknownText}>{t("results.price.provider")}</Text>
+            // Mit Deutschlandticket nennt die Bahn für abgedeckte Fahrten keinen
+            // Preis — dann sagen wir das, statt „beim Anbieter" (lib/travel/fareProfile.ts).
+            <Text style={styles.priceUnknownText}>
+              {t(coveredByDTicket(result) ? "results.price.dticket" : "results.price.provider")}
+            </Text>
           )}
         </View>
         {/* Druck-Effekt am Aufsetzen, NICHT an `onPressIn`: RippleTouch hält
@@ -669,10 +659,18 @@ const styles = scaledStyles({
     // (0.55 statt 0.42) und dafür enger gezogen.
     boxShadow: "0px 8px 20px -6px rgba(0, 0, 0, 0.55)",
   },
+  /**
+   * Dicht, aber auf dem Raster (05.11.2026). Beim Umstellen aufs 4er-Raster
+   * wurden die 14er Abstände zu 16 und die Karte damit 14 Punkte höher als
+   * vorher — in einer Liste heißt das: weniger Treffer auf einem Blick. Innen
+   * jetzt 12 (Kopf → Zeiten, um die Trennlinie) und 4 (Zeiten → Kürzel); außen
+   * bleibt der übliche 16er Rand. Zusammen 2 Punkte KÜRZER als vor der
+   * Umstellung.
+   */
   card: {
     backgroundColor: C.card,
     borderRadius: 20,
-    paddingVertical: 14,
+    paddingVertical: 16,
     paddingHorizontal: 16,
   },
   /**
@@ -686,14 +684,14 @@ const styles = scaledStyles({
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    marginBottom: 14,
-    gap: 10,
+    marginBottom: 12,
+    gap: 8,
   },
   providerWrap: {
     flex: 1,
     flexDirection: "row",
     alignItems: "center",
-    gap: 6,
+    gap: 8,
     minWidth: 0,
   },
   providerLogo: {
@@ -708,9 +706,9 @@ const styles = scaledStyles({
   providerLogoImg: { width: 24, height: 24 },
   providerCode: { color: C.sub, fontSize: 12, fontWeight: "600" },
   headerActions: { flexDirection: "row", alignItems: "center", gap: 12 },
-  iconBtn: { padding: 2 },
+  iconBtn: { padding: 4 },
 
-  timeRow: { flexDirection: "row", alignItems: "center", gap: 10 },
+  timeRow: { flexDirection: "row", alignItems: "center", gap: 8 },
   timeCol: { minWidth: 70, flexShrink: 0 },
   timeBig: { color: C.text, fontSize: 24, fontWeight: "800", letterSpacing: -0.6 },
   // Ausgefallen: wie die durchgestrichene Fahrplanzeit in DelayedTime.
@@ -740,34 +738,35 @@ const styles = scaledStyles({
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "flex-start",
-    marginTop: 6,
-    gap: 10,
+    marginTop: 4,
+    gap: 8,
   },
   metaCol: { flex: 1, minWidth: 0, alignItems: "flex-start" },
   metaCode: { color: C.sub, fontSize: 12, fontWeight: "700", letterSpacing: 0.4 },
-  metaDate: { color: C.subDim, fontSize: 11, fontWeight: "500", marginTop: 2 },
+  metaDate: { color: C.subDim, fontSize: 11, fontWeight: "500", marginTop: 4 },
 
-  divider: { height: 1, backgroundColor: C.border, marginVertical: 14 },
-  warningRow: { marginTop: 10 },
+  divider: { height: 1, backgroundColor: C.border, marginVertical: 12 },
+  warningRow: { marginTop: 8 },
 
   footerRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 10,
+    gap: 8,
   },
   priceCol: { flex: 1 },
   priceLabelInline: { color: C.sub, fontSize: 11, fontWeight: "700", letterSpacing: 0.4 },
   // color inline mit accent.solid gesetzt.
   priceText: { fontSize: 22, fontWeight: "800", letterSpacing: -0.5 },
   priceCurrency: { color: C.text, fontSize: 12, fontWeight: "700", letterSpacing: 0 },
-  priceUnknownText: { color: C.sub, fontSize: 13, fontWeight: "600", marginTop: 1 },
+  priceUnknownText: { color: C.sub, fontSize: 13, fontWeight: "600" },
   cta: {
     flexDirection: "row",
     alignItems: "center",
     gap: 4,
     borderRadius: 9999,
     paddingHorizontal: 16,
-    paddingVertical: 10,
+    // 12, nicht 8: Der Knopf soll nicht kleiner werden als vorher (Treffer-Fläche).
+    paddingVertical: 12,
     overflow: "hidden",
   },
   ctaText: { color: C.black, fontSize: 13, fontWeight: "700", letterSpacing: -0.1 },

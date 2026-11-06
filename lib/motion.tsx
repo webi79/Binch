@@ -182,6 +182,8 @@ function subscribeReduceMotion(notify: () => void): () => void {
 
 export function useReduceMotion(): boolean {
   watchReduceMotion();
+  // Nur die Einstellung des Handys. Der Schalter in der App betrifft allein die
+  // Slides (lib/nav/slideMotion.ts) — so gewünscht.
   return useSyncExternalStore(subscribeReduceMotion, () => reduceMotionValue);
 }
 

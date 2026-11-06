@@ -418,8 +418,10 @@ async function main() {
         target: locations.code,
         set: refresh
           ? {
-              latitude: sql`excluded.latitude`,
-              longitude: sql`excluded.longitude`,
+              // Korrigierte Lage (`position_fixed_at`) bleibt: trainline führt
+              // manche Bahnhöfe Hunderte Meter daneben (Graz Hbf 530 m).
+              latitude: sql`CASE WHEN ${locations.positionFixedAt} IS NULL THEN excluded.latitude ELSE ${locations.latitude} END`,
+              longitude: sql`CASE WHEN ${locations.positionFixedAt} IS NULL THEN excluded.longitude ELSE ${locations.longitude} END`,
             }
           : {
               label: sql`excluded.label`,

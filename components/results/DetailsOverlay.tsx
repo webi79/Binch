@@ -1,4 +1,5 @@
 import { subscribeDetailsPreload } from "@/lib/nav/detailsPreload";
+import { SECTION_GAP, GROUP_GAP } from "@/lib/theme/spacing";
 import { memo, useCallback, useEffect, useRef, useState, useMemo } from "react";
 import {
   View,
@@ -79,6 +80,9 @@ import { tripSignature } from "@/lib/results/signature";
 import { TravelMode, type SearchResult } from "@/types/search";
 import { useAccent } from "@/lib/theme/accent";
 import { scaledStyles } from "@/lib/ui/compact";
+import { classOptionsFor } from "@/lib/search/recentSearch";
+import { coveredByDTicket, fareProfileLabel } from "@/lib/travel/fareProfile";
+import { slideTiming } from "@/lib/nav/slideMotion";
 
 /**
  * Details-Slide als globales Overlay (Pattern wie SearchHeroOverlay).
@@ -511,7 +515,7 @@ const DetailsContent = memo(function DetailsContent({
      * Der Merker ist ein JS-Wert (kein Zugriff auf den geteilten Wert).
      */
     if (isDetailsPushStarted()) return;
-    detailsPush.value = withTiming(0, POP_SPRING, (finished?: boolean) => {
+    detailsPush.value = withTiming(0, slideTiming(POP_SPRING), (finished?: boolean) => {
       "worklet";
       // Die Textur der Unterlage lebt jetzt genau so lange wie die Bewegung.
       //
@@ -536,7 +540,7 @@ const DetailsContent = memo(function DetailsContent({
     // Versatz wäre an der Kante zu sehen.
     if (ownsCoverRef.current || wasMoving) {
       ownsCoverRef.current = false;
-      overlayCover.value = withTiming(0, COVER_OUT_SPRING);
+      overlayCover.value = withTiming(0, slideTiming(COVER_OUT_SPRING));
     }
     });
     return () => cancelAnimationFrame(raf);
@@ -564,7 +568,7 @@ const DetailsContent = memo(function DetailsContent({
      */
     overlayCover.value = withTiming(
       hiddenForRoute ? 0 : 1,
-      hiddenForRoute ? COVER_OUT_SPRING : COVER_IN_SPRING,
+      slideTiming(hiddenForRoute ? COVER_OUT_SPRING : COVER_IN_SPRING),
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hiddenForRoute]);
@@ -717,7 +721,15 @@ const DetailsContent = memo(function DetailsContent({
 
   const paxKey = passengers === 1 ? "details.passenger.one" : "details.passenger.many";
   const paxLabel = t(paxKey).replace("{count}", String(passengers));
-  const classLabel = result.mode === "FLIGHT" ? t("search.class.economy") : t("search.class.second");
+  // Was GESUCHT wurde (vom Client am Treffer vermerkt, siehe `searchByMode`) —
+  // hier standen fest „Economy"/„2. Klasse" und „Einfach", egal wie gesucht war.
+  const classLabel = t(result.travelClass || classOptionsFor(result.mode)[0]!);
+  const tripLabel = !result.roundTrip
+    ? t("details.oneway")
+    : result.mode === "FLIGHT"
+      ? t("details.roundtrip")
+      : t(result.direction === "RETURN" ? "results.direction.return" : "results.direction.outbound");
+  const fareLabel = fareProfileLabel(result.fareProfile);
 
   const isFlight = result.mode === "FLIGHT";
   const bookingToken = result.bookingToken;
@@ -958,7 +970,7 @@ const DetailsContent = memo(function DetailsContent({
         <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
           {/* Route-Card */}
           <View style={[styles.routeCard, { backgroundColor: palette.s2 }]}>
-            <View style={{ gap: 10 }}>
+            <View style={{ gap: 8 }}>
               <CityRow head={origin.head} tail={origin.tail} />
               <View style={styles.dividerSoft} />
               <CityRow head={destination.head} tail={destination.tail} />
@@ -969,9 +981,15 @@ const DetailsContent = memo(function DetailsContent({
               <MetaDot />
               <Text style={styles.metaText}>{paxLabel}</Text>
               <MetaDot />
-              <Text style={styles.metaText}>{t("details.oneway")}</Text>
+              <Text style={styles.metaText}>{tripLabel}</Text>
               <MetaDot />
               <Text style={styles.metaText}>{classLabel}</Text>
+              {fareLabel ? (
+                <>
+                  <MetaDot />
+                  <Text style={styles.metaText}>{fareLabel}</Text>
+                </>
+              ) : null}
             </View>
 
             <View style={styles.dividerSoft} />
@@ -1141,7 +1159,7 @@ const DetailsContent = memo(function DetailsContent({
                     ) : (
                       <>
                         {providerList.map((p, i) => (
-                          <ProviderCard key={`${p.name}-${i}`} provider={p} t={t} />
+                          <ProviderCard key={`${p.name}-${i}`} provider={p} t={t} dTicket={coveredByDTicket(result)} />
                         ))}
                       </>
                     )}
@@ -1270,9 +1288,12 @@ function MetaDot() {
 function ProviderCard({
   provider,
   t,
+  dTicket = false,
 }: {
   provider: ProviderRow;
   t: (key: string) => string;
+  /** Vom Deutschlandticket abgedeckt — dann steht das statt „—" (lib/travel/fareProfile.ts). */
+  dTicket?: boolean;
 }) {
   const accent = useAccent();
   const palette = usePalette();
@@ -1355,7 +1376,9 @@ function ProviderCard({
           <Text style={[styles.priceValue, { color: accent.solid }]}>
             {provider.price !== undefined && provider.price > 0
               ? `${provider.price.toFixed(0)} ${(provider.currency ?? "EUR").toUpperCase()}`
-              : "—"}
+              : dTicket
+                ? t("results.price.dticket")
+                : "—"}
           </Text>
         </View>
       </View>
@@ -1451,12 +1474,12 @@ function ProviderCardSkeleton() {
       <View style={styles.providerHeader}>
         <View style={styles.providerLeft}>
           <Animated.View style={[styles.skeletonLogo, { backgroundColor: palette.s3 }, pulseStyle]} />
-          <View style={{ flex: 1, gap: 6 }}>
+          <View style={{ flex: 1, gap: 8 }}>
             <Animated.View style={[styles.skeletonLineLg, { backgroundColor: palette.s3 }, pulseStyle]} />
             <Animated.View style={[styles.skeletonLineSm, { backgroundColor: palette.s3 }, pulseStyle]} />
           </View>
         </View>
-        <View style={{ alignItems: "flex-end", gap: 6 }}>
+        <View style={{ alignItems: "flex-end", gap: 8 }}>
           <Animated.View style={[styles.skeletonLabel, { backgroundColor: palette.s3 }, pulseStyle]} />
           <Animated.View style={[styles.skeletonPrice, pulseStyle]} />
         </View>
@@ -1484,8 +1507,8 @@ const styles = scaledStyles({
     alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: 20,
-    paddingTop: 6,
-    paddingBottom: 12,
+    paddingTop: 8,
+    paddingBottom: GROUP_GAP,
   },
   headerLeft: { flexDirection: "row", alignItems: "center", gap: 12, flex: 1, minWidth: 0 },
   headerRight: { flexDirection: "row", gap: 8 },
@@ -1499,14 +1522,14 @@ const styles = scaledStyles({
   },
   title: { fontSize: 19, fontWeight: "700", color: C.text, letterSpacing: -0.4 },
 
-  scrollContent: { paddingHorizontal: 20, paddingBottom: 32 },
+  scrollContent: { paddingHorizontal: 20, paddingBottom: SECTION_GAP },
 
   /* Route card */
   routeCard: {
     backgroundColor: C.card,
     borderRadius: 24,
     padding: 20,
-    gap: 14,
+    gap: 16,
   },
   dividerSoft: { height: 1, backgroundColor: C.borderSoft },
   cityText: {
@@ -1524,7 +1547,7 @@ const styles = scaledStyles({
   metaDot: { width: 3, height: 3, borderRadius: 1.5, backgroundColor: C.subDim },
 
   /* Train row */
-  trainRow: { flexDirection: "row", alignItems: "center", gap: 14 },
+  trainRow: { flexDirection: "row", alignItems: "center", gap: 16 },
   trainBadge: {
     width: 56,
     height: 56,
@@ -1550,12 +1573,12 @@ const styles = scaledStyles({
   // Ausgefallen: wie die durchgestrichene Fahrplanzeit in DelayedTime.
   trainTimeCancelled: { color: C.sub, textDecorationLine: "line-through" },
   trainTimeDash: { color: C.sub, fontSize: 22, fontWeight: "700" },
-  trainVia: { fontSize: 13, color: C.sub, marginTop: 3, fontWeight: "500" },
+  trainVia: { fontSize: 13, color: C.sub, marginTop: 4, fontWeight: "500" },
   // Ortszeit-Hinweis unter „via …" — eine Stufe leiser.
-  zoneHint: { fontSize: 11, color: C.sub, marginTop: 2, fontWeight: "500", opacity: 0.85 },
+  zoneHint: { fontSize: 11, color: C.sub, marginTop: 4, fontWeight: "500", opacity: 0.85 },
   stopsText: { fontSize: 13, fontWeight: "700", color: C.alert },
   stopsTextDirect: { fontSize: 13, fontWeight: "700" },
-  durationText: { fontSize: 13, color: C.sub, marginTop: 3, fontWeight: "500" },
+  durationText: { fontSize: 13, color: C.sub, marginTop: 4, fontWeight: "500" },
 
   /* Details ghost button */
   detailsBtn: {
@@ -1568,12 +1591,12 @@ const styles = scaledStyles({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    gap: 6,
+    gap: 8,
   },
   detailsBtnLabel: { fontSize: 14, fontWeight: "700", letterSpacing: -0.15 },
 
   /* Section */
-  sectionHeader: { paddingTop: 24, paddingBottom: 12 },
+  sectionHeader: { paddingTop: SECTION_GAP, paddingBottom: 12 },
   sectionTitle: { fontSize: 22, fontWeight: "700", color: C.text, letterSpacing: -0.5 },
   sectionCaption: { fontSize: 12, color: C.sub, fontWeight: "500", marginTop: 4 },
   sectionContent: { gap: 8 },
@@ -1583,7 +1606,7 @@ const styles = scaledStyles({
     backgroundColor: C.card,
     borderRadius: 20,
     paddingHorizontal: 16,
-    paddingVertical: 14,
+    paddingVertical: 16,
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
@@ -1599,14 +1622,14 @@ const styles = scaledStyles({
   infoTitle: { fontSize: 15, fontWeight: "700", color: C.text, letterSpacing: -0.15 },
   // Abstand zur Fahrtzeile darüber; Farbe der Fläche kommt aus der Palette.
   warningInfoRow: { marginTop: 12 },
-  infoSubtitle: { fontSize: 12, color: C.sub, marginTop: 2, fontWeight: "500" },
+  infoSubtitle: { fontSize: 12, color: C.sub, marginTop: 4, fontWeight: "500" },
 
   /* Provider card */
   providerCard: {
     backgroundColor: C.card,
     borderRadius: 24,
     padding: 16,
-    gap: 14,
+    gap: 16,
   },
   providerCardRecommended: {
     borderWidth: 1.5,
@@ -1621,9 +1644,9 @@ const styles = scaledStyles({
     alignItems: "center",
 
     borderRadius: 9999,
-    paddingVertical: 5,
-    paddingHorizontal: 10,
-    gap: 6,
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+    gap: 8,
   },
   recommendedText: {
     color: C.black,
@@ -1659,9 +1682,9 @@ const styles = scaledStyles({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    gap: 10,
+    gap: 8,
   },
-  baggageRow: { flexDirection: "row", alignItems: "center", gap: 14 },
+  baggageRow: { flexDirection: "row", alignItems: "center", gap: 16 },
   footerActions: { flexDirection: "row", alignItems: "center", gap: 12 },
   fareDetails: {
     color: C.text,
@@ -1721,7 +1744,7 @@ const styles = scaledStyles({
   skeletonPrice: { height: 18, borderRadius: 5, backgroundColor: C.surface3, width: 70 },
   skeletonCta: { height: 46, borderRadius: 9999, backgroundColor: C.surface3 },
   providerName: { fontSize: 15, fontWeight: "700", color: C.text, letterSpacing: -0.15 },
-  providerNote: { fontSize: 12, color: C.sub, marginTop: 2, fontWeight: "500" },
+  providerNote: { fontSize: 12, color: C.sub, marginTop: 4, fontWeight: "500" },
   priceLabel: {
     fontSize: 10,
     color: C.sub,
@@ -1729,18 +1752,19 @@ const styles = scaledStyles({
     letterSpacing: 0.8,
     textTransform: "uppercase",
   },
-  priceValue: { fontSize: 22, fontWeight: "800", letterSpacing: -0.5, marginTop: 2 },
+  priceValue: { fontSize: 22, fontWeight: "800", letterSpacing: -0.5, marginTop: 4 },
   providerCta: {
     // Kein backgroundColor — der GradientFill rendert als Absolute-Fill-Child
     // den Hintergrund. `overflow: hidden` clipped den Gradient an der
     // borderRadius-Pille.
-    paddingVertical: 10,
+    // 12 wie der Knopf der Ergebnis-Karte — nicht kleiner als vorher.
+    paddingVertical: 12,
     paddingHorizontal: 16,
     borderRadius: 9999,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    gap: 6,
+    gap: 8,
     overflow: "hidden",
   },
   providerCtaText: { color: C.black, fontSize: 13, fontWeight: "800", letterSpacing: -0.1 },

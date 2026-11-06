@@ -315,7 +315,7 @@ const styles = scaledStyles({
     flexDirection: "row",
     alignItems: "center",
     gap: SPACE.md,
-    paddingHorizontal: 14,
+    paddingHorizontal: 16,
   },
   rowThumb: { width: 32, height: 32, borderRadius: 10 },
   rowBars: { flex: 1, gap: SPACE.sm },

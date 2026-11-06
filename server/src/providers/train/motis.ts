@@ -17,6 +17,7 @@ import type {
   SearchProvider,
   StopoverInfo,
 } from "../types.js";
+import { motisFareParams, parseFareProfile } from "../../util/fareProfile.js";
 
 /**
  * MOTIS-Zug-Provider (Übergang: öffentliche Transitous-Instanz, später eigene
@@ -558,6 +559,7 @@ function toNormalized(
     departDelayMinutes: startsWithWalk
       ? 0
       : delayMinutes(first.from.scheduledDeparture, first.from.departure, first.realTime),
+    departRealtime: first.realTime === true ? true : undefined,
     // Ankunft am Ziel verschiebt sich sehr wohl mit dem letzten Fahrzeug —
     // auch wenn danach noch ein Fußweg kommt.
     arriveDelayMinutes: delayMinutes(last.to.scheduledArrival, last.to.arrival, last.realTime),
@@ -635,6 +637,10 @@ function makeMotisProvider(mode: TravelMode, transitModes: string, name: string)
         return empty(start, { skipped: "motis resolve no match", origin: input.origin, destination: input.destination });
       }
 
+      // Vorgaben aus den Reise-Einstellungen (nur Deutschlandticket, Umstiegszeit,
+      // Fahrrad) — dieselben wie bei der DB, sonst mischte MOTIS Verstöße dazu.
+      const fare = motisFareParams(parseFareProfile(input.fareProfile));
+      const modes = fare.transitModes ?? transitModes;
       // Ein MOTIS-Plan (mit Cache). Wird für Hin- UND Rückfahrt benutzt.
       const plan = async (
         a: MotisPlace,
@@ -648,8 +654,8 @@ function makeMotisProvider(mode: TravelMode, transitModes: string, name: string)
         // transitModes im Key: Bus- und Zug-Suche derselben Strecke dürfen sich
         // den Plan-Cache NICHT teilen.
         const key = cursor
-          ? `${transitModes}|${a.id}|${b.id}|cursor:${cursor}`
-          : `${transitModes}|${a.id}|${b.id}|${bucket}`;
+          ? `${modes}${fare.extra}|${a.id}|${b.id}|cursor:${cursor}`
+          : `${modes}${fare.extra}|${a.id}|${b.id}|${bucket}`;
         const hit = planCache.get(key);
         if (hit) return hit;
 
@@ -669,7 +675,8 @@ function makeMotisProvider(mode: TravelMode, transitModes: string, name: string)
           // Mal FLX10 09:57 und ICE 599 10:37 mit anderem Anschluss). Unser Dedup
           // fasst die korrekt zusammen, der User sah danach aber nur noch 3-4
           // Verbindungen. Mit 10 bleiben nach dem Dedup ~6-10 übrig.
-          `&transitModes=${encodeURIComponent(transitModes)}&numItineraries=10&maxTransfers=5&detailedTransfers=false`;
+          `&transitModes=${encodeURIComponent(modes)}&numItineraries=10&maxTransfers=5&detailedTransfers=false` +
+          fare.extra;
         type PlanResponse = {
           itineraries?: MotisItinerary[];
           /** Reine Fußwege. MOTIS liefert sie in einem EIGENEN Feld — ihre bloße

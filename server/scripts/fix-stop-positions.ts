@@ -5,11 +5,16 @@
  * der Station gibt (bis 1 km daneben). `import-gtfs.ts` schreibt es künftig selbst so — diese
  * Korrektur muss VOR dem nächsten Abgleich laufen, sonst fände er die Zeile am neuen Ort nicht.
  *
- * Geschrieben wird nur, wo die Zeile JETZT noch am alten Ort steht (± 1 m).
+ * Geschrieben wird nur, wo die Zeile JETZT noch am alten Ort steht (± 1 m). Jede verschobene
+ * Zeile bekommt `position_fixed_at` (Migration 0039): Der Monatsabgleich schreibt ihre Lage dann
+ * nicht mehr zurück — Quellen wie trainline führen manche Bahnhöfe Hunderte Meter daneben.
+ * `--mark` verschiebt nichts, sondern markiert Zeilen, die schon am neuen Ort stehen (Läufe von
+ * vor der Spalte).
  *
  * PROBELAUF IST DIE VORGABE.
  *   FIX_OUT=… npx tsx --env-file=.env scripts/fix-stop-positions.ts --plan=position-plan.json
  *   FIX_OUT=… npx tsx --env-file=.env scripts/fix-stop-positions.ts --plan=position-plan.json --apply
+ *   FIX_OUT=… npx tsx --env-file=.env scripts/fix-stop-positions.ts --plan=position-plan.json --mark --apply
  *   FIX_OUT=… npx tsx --env-file=.env scripts/fix-stop-positions.ts --undo=<FIX_OUT>/positions-backup-….json --apply
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -17,6 +22,7 @@ import { pool } from "../src/db/client.js";
 import { haversineMeters } from "./lib/locationDedup.js";
 
 const APPLY = process.argv.includes("--apply");
+const MARK = process.argv.includes("--mark");
 const arg = (name: string) => process.argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3);
 const PLAN = arg("plan");
 const UNDO = arg("undo");
@@ -35,22 +41,31 @@ interface PlanEntry {
   d: number;
 }
 
-async function write(changes: Array<{ code: string; at: Point }>, label: string): Promise<void> {
+/** `fixedAt`: aus der Sicherung (Rücknahme) — ohne ihn gilt die Zeile ab jetzt als korrigiert. */
+async function write(changes: Array<{ code: string; at: Point; fixedAt?: string | null }>, label: string, undo = false): Promise<void> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const backup = await client.query(
-      `SELECT code, latitude::float8 AS lat, longitude::float8 AS lng FROM locations WHERE code = ANY($1::text[]) ORDER BY code FOR UPDATE`,
+      `SELECT code, latitude::float8 AS lat, longitude::float8 AS lng, position_fixed_at AS fixed_at
+         FROM locations WHERE code = ANY($1::text[]) ORDER BY code FOR UPDATE`,
       [changes.map((c) => c.code)],
     );
     const file = `${OUT}/positions-backup-${STAMP}.json`;
-    writeFileSync(file, JSON.stringify(backup.rows.map((r) => ({ code: r.code, at: { lat: r.lat, lng: r.lng } }))));
+    writeFileSync(
+      file,
+      JSON.stringify(backup.rows.map((r) => ({ code: r.code, at: { lat: r.lat, lng: r.lng }, fixedAt: r.fixed_at }))),
+    );
     console.log(`Sicherung: ${file}`);
     const res = await client.query(
-      `UPDATE locations l SET latitude = round(x.lat::numeric, 6), longitude = round(x.lng::numeric, 6)
-         FROM jsonb_to_recordset($1::jsonb) AS x(code text, lat float8, lng float8)
+      `UPDATE locations l SET latitude = round(x.lat::numeric, 6), longitude = round(x.lng::numeric, 6),
+              position_fixed_at = CASE WHEN $2 THEN x.fixed_at ELSE now() END
+         FROM jsonb_to_recordset($1::jsonb) AS x(code text, lat float8, lng float8, fixed_at timestamptz)
         WHERE l.code = x.code`,
-      [JSON.stringify(changes.map((c) => ({ code: c.code, lat: c.at.lat, lng: c.at.lng })))],
+      [
+        JSON.stringify(changes.map((c) => ({ code: c.code, lat: c.at.lat, lng: c.at.lng, fixed_at: c.fixedAt ?? null }))),
+        undo,
+      ],
     );
     if (res.rowCount !== changes.length) throw new Error(`Abweichung: ${res.rowCount} geschrieben, erwartet ${changes.length}`);
     await client.query("COMMIT");
@@ -67,9 +82,9 @@ async function main() {
   if (!OUT) throw new Error("FIX_OUT fehlt — Bericht und Sicherung gehören nicht ins Repo.");
   mkdirSync(OUT, { recursive: true });
   if (UNDO) {
-    const saved = JSON.parse(readFileSync(UNDO, "utf-8")) as Array<{ code: string; at: Point }>;
+    const saved = JSON.parse(readFileSync(UNDO, "utf-8")) as Array<{ code: string; at: Point; fixedAt?: string | null }>;
     console.log(`Rücknahme: ${saved.length} Zeilen aus ${UNDO}`);
-    if (APPLY) await write(saved, "Zurückgesetzt");
+    if (APPLY) await write(saved, "Zurückgesetzt", true);
     else console.log("Probelauf — mit --apply zurücksetzen.");
     return;
   }
@@ -87,7 +102,13 @@ async function main() {
   for (const e of plan) {
     const r = now.get(e.code);
     if (!r) count("fehlt");
-    else if (haversineMeters(r.lat, r.lng, e.old.lat, e.old.lng) > 1) count("steht inzwischen woanders");
+    else if (MARK) {
+      if (haversineMeters(r.lat, r.lng, e.new.lat, e.new.lng) > 1) count("steht nicht am neuen Ort");
+      else {
+        changes.push({ code: e.code, at: { lat: r.lat, lng: r.lng } });
+        count("am neuen Ort → markieren");
+      }
+    } else if (haversineMeters(r.lat, r.lng, e.old.lat, e.old.lng) > 1) count("steht inzwischen woanders");
     else if (!Number.isFinite(e.new.lat) || !Number.isFinite(e.new.lng) || Math.abs(e.new.lat) < 1) count("neue Lage ungültig");
     else {
       changes.push({ code: e.code, at: e.new });
@@ -98,9 +119,9 @@ async function main() {
   for (const [k, n] of [...why].sort((a, b) => b[1] - a[1])) console.log(`  ${k.padEnd(28)} ${n}`);
   const file = `${OUT}/positions-plan-${STAMP}.csv`;
   writeFileSync(file, report.join("\n") + "\n");
-  console.log(`Verschoben würden ${changes.length} Zeilen — Bericht: ${file}`);
+  console.log(`${MARK ? "Markiert" : "Verschoben"} würden ${changes.length} Zeilen — Bericht: ${file}`);
   if (!APPLY) return console.log("Probelauf — mit --apply einspielen.");
-  await write(changes, "Eingespielt");
+  await write(changes, MARK ? "Markiert" : "Eingespielt");
 }
 
 main()

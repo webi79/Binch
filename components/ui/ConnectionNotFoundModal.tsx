@@ -9,6 +9,7 @@
  * eine Illustration + zwei klare CTAs braucht statt einer Button-Liste.
  */
 import React from "react";
+import { TITLE_GAP, GROUP_GAP } from "@/lib/theme/spacing";
 import { Modal, Pressable, StyleSheet, Text, View, ViewStyle } from "react-native";
 import Animated, { FadeIn, FadeOut, ZoomIn, ZoomOut } from "react-native-reanimated";
 import Svg, { Circle, Defs, G, Path, RadialGradient, Stop } from "react-native-svg";
@@ -241,7 +242,7 @@ const styles = scaledStyles({
     letterSpacing: -0.4,
     color: tokens.textPrimary,
     textAlign: "center",
-    marginBottom: 8,
+    marginBottom: TITLE_GAP,
   },
   body: {
     fontSize: 14,
@@ -250,7 +251,7 @@ const styles = scaledStyles({
     color: tokens.textSecondary,
     textAlign: "center",
     paddingHorizontal: 4,
-    marginBottom: 22,
+    marginBottom: GROUP_GAP,
   },
   // Identisch zum „Preise vergleichen"-CTA in SearchHero.tsx — solides Lime,
   // borderRadius 16, paddingVertical 17, centered Text.
@@ -266,7 +267,7 @@ const styles = scaledStyles({
     overflow: "hidden",
   } as ViewStyle,
   primaryButtonTouch: {
-    paddingVertical: 17,
+    paddingVertical: 16,
     paddingHorizontal: 24,
     flexDirection: "row",
     alignItems: "center",

@@ -106,7 +106,7 @@ export function VoiceBubble({
 }
 
 const styles = scaledStyles({
-  row: { flexDirection: "row", alignItems: "center", gap: 10, minWidth: 190 },
+  row: { flexDirection: "row", alignItems: "center", gap: 8, minWidth: 190 },
   btn: { width: 32, height: 32, alignItems: "center", justifyContent: "center" },
   wave: { flex: 1, flexDirection: "row", alignItems: "center", gap: 2, height: 26 },
   bar: { width: 3, borderRadius: 2 },

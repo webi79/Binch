@@ -150,12 +150,25 @@ export function familyOfSubtype(subtype: string | null, type: string): StandFami
  * ersten mit einer). Nur die Lage zählt — die Kinder heißen im Feed oft
  * verkürzt anders als ihre Station („AMEOS Klinikum2", „ABG, Geraer Str/Gym 01").
  */
+/**
+ * Steig-Bezeichnung für die Spalte `platform` (16 Zeichen). Österreichs Verbund-Feeds führen im
+ * Feld auch Beschreibungen — „Mast1 (Millstätter Straße)", „Erdberger Lände 26A",
+ * „L200 Ri. Alberschwende" —, die `cleanPlatform` wegen ihrer Ziffer durchlässt; die erste lange
+ * brach den Import ab, die kurzen stünden als „Steig Mast1" in der App. Ein ausgeschriebenes Wort
+ * (4 Buchstaben am Stück) ist keine Steig-Bezeichnung: „A", „K1", „11a", „2 (U5)" bleiben.
+ */
+function standPlatform(raw: string | null | undefined): string | null {
+  const p = cleanPlatform(raw);
+  if (!p || p.length > 16 || /\p{L}{4,}/u.test(p)) return null;
+  return p;
+}
+
 export function physicalStands(children: FeedChild[], counts: Map<string, Map<Subtype, number>>): FeedStand[] {
   const out: FeedStand[] = [];
   for (const c of children) {
     const own = counts.get(c.id);
     if (!own || own.size === 0) continue;
-    const platform = cleanPlatform(c.platformCode) ?? null;
+    const platform = standPlatform(c.platformCode);
     const same = out.find((s) => haversineMeters(s.lat, s.lng, c.lat, c.lng) <= STAND_MERGE_M);
     if (same) {
       same.ids.push(c.id);

@@ -2,6 +2,7 @@ import { Easing, makeMutable, runOnJS, withTiming } from "react-native-reanimate
 import { markTransitionBusy } from "./transitionBusy";
 import { setSheetMoving } from "./searchHandoff";
 import { getDeviceCornerRadius } from "@/modules/screen-corners";
+import { slideTiming } from "@/lib/nav/slideMotion";
 
 /**
  * Push-Übergänge — Werte aus echten Referenz-Implementierungen, nicht geschätzt.
@@ -343,7 +344,7 @@ export function startResultsPush(): void {
   pushGenSv.value = myGen;
   lastPushAt = Date.now();
   resultsPush.value = 0;
-  resultsPush.value = withTiming(1, PUSH_SPRING, () => {
+  resultsPush.value = withTiming(1, slideTiming(PUSH_SPRING), () => {
     "worklet";
     if (pushGenSv.value !== myGen) return;
     runOnJS(setSheetMoving)(false, "results");
@@ -370,7 +371,7 @@ export function startResultsPush(): void {
   if (heroClipArmed) {
     heroClipArmed = false;
     heroClipPush.value = 0;
-    heroClipPush.value = withTiming(1, PUSH_SPRING);
+    heroClipPush.value = withTiming(1, slideTiming(PUSH_SPRING));
   }
 }
 
@@ -446,7 +447,7 @@ export function startSearchHeroPush(): void {
   // Kein Rückwurf auf 0 — dieselbe Begründung wie bei `startDetailsPush`: Wer
   // mitten in der Ausfahrt erneut tippt, soll von dort weiterfahren, statt
   // erst eine volle Breite nach rechts aus dem Bild zu springen.
-  searchHeroPush.value = withTiming(1, PUSH_SPRING, (finished) => {
+  searchHeroPush.value = withTiming(1, slideTiming(PUSH_SPRING), (finished) => {
     "worklet";
     if (!finished) return;
     runOnJS(searchHeroArrived)();
@@ -567,6 +568,30 @@ export const SHEET_IN = { duration: 300, easing: SHEET_EASE } as const;
 export const SHEET_OUT = { duration: 260, easing: SHEET_EASE } as const;
 
 /**
+ * Die WEICHE Fahrt der kleinen Blätter, die von selbst oder auf einen Tipp hin
+ * erscheinen: Berechtigungs-Blatt und Aufnahme-Blatt (04.11.2026, „soll soft
+ * sein … eleganter, sowohl auf- als auch zugehend").
+ *
+ * Sie fuhren mit `SHEET_IN` über die GANZE Bildhöhe, obwohl sie nur einen Teil
+ * davon hoch sind — bei gleicher Dauer also mit vollem Tempo: „schießt hoch".
+ * Jetzt fährt jedes nur seine eigene Höhe, mit Googles Standardkurve
+ * (0.2, 0, 0, 1): aus dem Stand an, lang und ruhig landend. Hinaus
+ * beschleunigend (0.3, 0, 0.8, 0.15), wie Material es für Abgänge vorsieht —
+ * erst zögernd, dann zügig weg, statt am Rand zu kriechen.
+ *
+ * Die Dauer wächst mit der Strecke (Punkte): ein großes Blatt etwas länger als
+ * ein kleines, damit beide gleich ruhig wirken.
+ */
+const SOFT_IN_EASE = Easing.bezier(0.2, 0, 0, 1);
+const SOFT_OUT_EASE = Easing.bezier(0.3, 0, 0.8, 0.15);
+export function softSheetMotion(distance: number) {
+  return {
+    in: { duration: Math.round(Math.min(460, Math.max(340, 260 + distance * 0.27))), easing: SOFT_IN_EASE },
+    out: { duration: Math.round(Math.min(300, Math.max(220, 180 + distance * 0.15))), easing: SOFT_OUT_EASE },
+  } as const;
+}
+
+/**
  * Ort- und Datumswähler fahren etwas zügiger als die großen Blätter.
  *
  * Eigene Zahlen und nicht die gemeinsamen verstellt: An `SHEET_IN` hängen auch
@@ -672,7 +697,7 @@ export const ASSISTANT_DRAWER_SCALE = 0.72;
 export function startAssistantDrawer(done?: () => void): void {
   markTransitionBusy(SHEET_IN.duration);
   setSheetMoving(true, "assistantDrawer");
-  assistantDrawer.value = withTiming(1, SHEET_IN, (finished) => {
+  assistantDrawer.value = withTiming(1, slideTiming(SHEET_IN), (finished) => {
     "worklet";
     if (!finished) return;
     runOnJS(setSheetMoving)(false, "assistantDrawer");
@@ -691,7 +716,7 @@ export function startAssistantDrawer(done?: () => void): void {
 export function endAssistantDrawer(done?: () => void): void {
   markTransitionBusy(SHEET_OUT.duration);
   setSheetMoving(true, "assistantDrawer");
-  assistantDrawer.value = withTiming(0, SHEET_OUT, (finished) => {
+  assistantDrawer.value = withTiming(0, slideTiming(SHEET_OUT), (finished) => {
     "worklet";
     if (!finished) return;
     runOnJS(setSheetMoving)(false, "assistantDrawer");
@@ -777,12 +802,12 @@ export function startTicketPush(): void {
   ticketGen += 1;
   const myGen = ticketGen;
   ticketGenSv.value = myGen;
-  ticketPush.value = withTiming(1, PUSH_SPRING, () => {
+  ticketPush.value = withTiming(1, slideTiming(PUSH_SPRING), () => {
     "worklet";
     if (ticketGenSv.value !== myGen) return;
     runOnJS(setSheetMoving)(false, "ticket");
   });
-  overlayCover.value = withTiming(1, COVER_IN_SPRING);
+  overlayCover.value = withTiming(1, slideTiming(COVER_IN_SPRING));
 }
 
 export function endTicketPush(): void {
@@ -841,14 +866,14 @@ export function startDetailsPush(): void {
   detailsGen += 1;
   const myGen = detailsGen;
   detailsGenSv.value = myGen;
-  detailsPush.value = withTiming(1, PUSH_SPRING, () => {
+  detailsPush.value = withTiming(1, slideTiming(PUSH_SPRING), () => {
     "worklet";
     // Abgeräumt wird IMMER, außer eine NEUERE Fahrt hat den Schlüssel gerade
     // selbst gesetzt — siehe die Erklärung an `detailsGenSv`.
     if (detailsGenSv.value !== myGen) return;
     runOnJS(setSheetMoving)(false, "details");
   });
-  overlayCover.value = withTiming(1, COVER_IN_SPRING);
+  overlayCover.value = withTiming(1, slideTiming(COVER_IN_SPRING));
 }
 
 /** Vom Blatt gesetzt, wenn es seine Rückfahrt fährt — die schreibt es selbst,
@@ -938,7 +963,7 @@ export function startAssistantPush(): void {
   setSheetMoving(true, "assistant");
   assistantMoving = true;
   // Kein Rückwurf auf 0 — siehe `startDetailsPush`.
-  assistantPush.value = withTiming(1, ASSISTANT_IN, (finished) => {
+  assistantPush.value = withTiming(1, slideTiming(ASSISTANT_IN), (finished) => {
     "worklet";
     if (!finished) return;
     runOnJS(setSheetMoving)(false, "assistant");
@@ -981,7 +1006,7 @@ export function endAssistantPush(): void {
   markTransitionBusy(ASSISTANT_OUT.duration);
   setSheetMoving(true, "assistant");
   assistantMoving = false;
-  assistantPush.value = withTiming(0, ASSISTANT_OUT, (finished) => {
+  assistantPush.value = withTiming(0, slideTiming(ASSISTANT_OUT), (finished) => {
     "worklet";
     if (!finished) return;
     runOnJS(setSheetMoving)(false, "assistant");

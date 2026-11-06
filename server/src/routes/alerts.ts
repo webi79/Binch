@@ -5,6 +5,9 @@ import { db } from "../db/client.js";
 import { priceAlerts, pushTokens } from "../db/schema.js";
 import { requireUser } from "../services/authSession.js";
 import { ipLimiter } from "../util/rateLimit.js";
+import { fareProfileFor } from "../util/fareProfile.js";
+import { replaceReminders } from "../services/tripReminders.js";
+import { sendPush } from "../services/priceAlerts.js";
 
 /**
  * Preis-Alarme — Anlegen, Auflisten, Pausieren, Löschen.
@@ -44,6 +47,10 @@ const registerSchema = z.object({
   timezone: z.string().max(64).optional(),
   /** Marke und Modell — nur für die Fehlersuche. Siehe `pushTokens.deviceModel`. */
   deviceModel: z.string().max(64).optional(),
+  /** Die Schalter aus den Einstellungen der App — fehlen sie (ältere Fassung), bleibt der Stand. */
+  notificationsEnabled: z.boolean().optional(),
+  priceAlertsEnabled: z.boolean().optional(),
+  boUpdatesEnabled: z.boolean().optional(),
 });
 
 /**
@@ -123,6 +130,8 @@ const createSchema = z.object({
   /** Reisende und Klasse gehören zum Preis — siehe Schema. */
   passengers: z.coerce.number().int().min(1).max(9).default(1),
   travelClass: z.string().max(60).default(""),
+  /** Tarifprofil der Suche, aus der der Alarm stammt — vereinheitlicht über `fareProfileFor`. */
+  fareProfile: z.string().max(40).default(""),
   basePrice: z.number().positive().max(1_000_000),
   desiredPrice: z.number().positive().max(1_000_000),
   notifyOnRise: z.boolean().default(false),
@@ -151,8 +160,113 @@ function pushTokenOf(req: {
   return typeof q === "string" && q.length > 0 ? q : null;
 }
 
+const REMINDER_HORIZON_MS = 60 * 86_400_000;
+const remindersSchema = z.object({
+  items: z
+    .array(
+      z.object({
+        key: z.string().min(1).max(160),
+        kind: z.enum(["departure", "arrival"]),
+        fireAt: z.string().datetime({ offset: true }),
+        expiresAt: z.string().datetime({ offset: true }),
+        title: z.string().min(1).max(120),
+        body: z.string().min(1).max(300),
+      }),
+    )
+    .max(80),
+});
+
+const testSchema = z.object({
+  title: z.string().min(1).max(80),
+  body: z.string().min(1).max(200),
+  delaySec: z.number().int().min(0).max(15).default(0),
+});
+const TEST_COOLDOWN_MS = 20_000;
+const TEST_TTL_MS = 120_000;
+/** Letzter Test je Gerät — im Speicher genügt: Nach einem Neustart darf man wieder. */
+const lastTestAt = new Map<string, number>();
+
 export async function alertsRoutes(app: FastifyInstance) {
   const preHandler = ipLimiter("alerts", ALERT_LIMITS);
+
+  /**
+   * Erinnerungen eines Geräts ERSETZEN (services/tripReminders.ts).
+   *
+   * Die App schickt bei jedem Abgleich die ganze Liste — leere Liste = keine.
+   * Ausweis ist wie bei den Alarmen die Push-Kennung im Kopf; ohne bekanntes
+   * Gerät gibt es keinen Empfänger.
+   */
+  app.put("/api/reminders", { preHandler }, async (req, reply) => {
+    const token = pushTokenOf(req);
+    if (!token) return reply.code(400).send({ error: "Missing push token" });
+    const parsed = remindersSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Bad request" });
+    const [device] = await db.select({ id: pushTokens.id }).from(pushTokens).where(eq(pushTokens.token, token)).limit(1);
+    if (!device) return reply.code(404).send({ error: "Unknown device" });
+    const now = Date.now();
+    const items = parsed.data.items
+      .map((i) => ({ ...i, fireAt: new Date(i.fireAt), expiresAt: new Date(i.expiresAt) }))
+      // Nichts Vergangenes, nichts ewig Fernes, nichts, was vor dem Schicken schon abliefe.
+      .filter(
+        (i) =>
+          i.fireAt.getTime() > now - 60_000 &&
+          i.fireAt.getTime() < now + REMINDER_HORIZON_MS &&
+          i.expiresAt.getTime() > i.fireAt.getTime(),
+      );
+    const count = await replaceReminders(device.id, items);
+    // Was wartet jetzt? Ohne diese Zeile war „leere Liste" nicht von „verschickt" zu trennen.
+    const next = items.reduce<Date | null>((m, i) => (!m || i.fireAt < m ? i.fireAt : m), null);
+    req.log.info(
+      { reminders: count, received: parsed.data.items.length, next: next?.toISOString() ?? null },
+      "reminders replaced",
+    );
+    return { count };
+  });
+
+  /**
+   * TEST-MITTEILUNG an dieses Gerät — Profil → Einstellungen → Mitteilungen.
+   *
+   * WOZU: Ob eine Mitteilung auf dem Handy ERSCHEINT, weiß nur das Handy.
+   * Firebase nimmt auch an, was der Hersteller danach verwirft (Xiaomi ohne
+   * Autostart, Akku-Sparen). Mit diesem Knopf prüft man die letzte Meile selbst
+   * — auch bei geschlossener App: Der Versand wartet `delaySec`, damit man sie
+   * vorher schließen kann.
+   *
+   * Nur an die EIGENE Kennung (Kopf `X-Push-Token`, muss angemeldet sein), Text
+   * von der App (ihre Sprache), höchstens einmal je 20 s und Gerät. Kurze
+   * Lebensdauer: Ein Test, der eine Stunde später ankommt, sagt nichts aus.
+   */
+  app.post("/api/alerts/test", { preHandler }, async (req, reply) => {
+    const token = pushTokenOf(req);
+    if (!token) return reply.code(400).send({ error: "Missing push token" });
+    const parsed = testSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Bad request" });
+    const [device] = await db
+      .select({ id: pushTokens.id })
+      .from(pushTokens)
+      .where(eq(pushTokens.token, token))
+      .limit(1);
+    if (!device) return reply.code(404).send({ error: "Unknown device" });
+    const last = lastTestAt.get(device.id) ?? 0;
+    if (Date.now() - last < TEST_COOLDOWN_MS) return reply.code(429).send({ error: "Too many tests" });
+    lastTestAt.set(device.id, Date.now());
+    const { title, body, delaySec } = parsed.data;
+    setTimeout(() => {
+      void sendPush([
+        {
+          to: token,
+          title,
+          body,
+          tag: "test",
+          channelId: "trip-reminders",
+          data: { type: "test" },
+          ttlMs: TEST_TTL_MS,
+        },
+      ]);
+    }, delaySec * 1000).unref?.();
+    req.log.info({ device: device.id.slice(0, 8), delaySec }, "test push queued");
+    return reply.code(202).send({ delaySec });
+  });
 
   /**
    * Die Push-Kennung des Geräts hinterlegen.
@@ -166,6 +280,13 @@ export async function alertsRoutes(app: FastifyInstance) {
     const parsed = registerSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "Bad request" });
     const me = await requireUser(req);
+    // Nur, was mitkam: Eine ältere App-Fassung schickt die Schalter nicht, und
+    // dann darf ihr Stand nicht auf die Vorgabe zurückspringen.
+    const prefs = {
+      ...(parsed.data.notificationsEnabled !== undefined ? { notificationsEnabled: parsed.data.notificationsEnabled } : {}),
+      ...(parsed.data.priceAlertsEnabled !== undefined ? { priceAlertsEnabled: parsed.data.priceAlertsEnabled } : {}),
+      ...(parsed.data.boUpdatesEnabled !== undefined ? { boUpdatesEnabled: parsed.data.boUpdatesEnabled } : {}),
+    };
     const [row] = await db
       .insert(pushTokens)
       .values({
@@ -174,6 +295,7 @@ export async function alertsRoutes(app: FastifyInstance) {
         ...(parsed.data.locale ? { locale: parsed.data.locale } : {}),
         ...(parsed.data.timezone ? { timezone: parsed.data.timezone } : {}),
         ...(parsed.data.deviceModel ? { deviceModel: parsed.data.deviceModel } : {}),
+        ...prefs,
         userId: me?.id ?? null,
       })
       .onConflictDoUpdate({
@@ -185,8 +307,10 @@ export async function alertsRoutes(app: FastifyInstance) {
           ...(parsed.data.locale ? { locale: parsed.data.locale } : {}),
           ...(parsed.data.timezone ? { timezone: parsed.data.timezone } : {}),
           ...(parsed.data.deviceModel ? { deviceModel: parsed.data.deviceModel } : {}),
-          // Eine bestehende Verknüpfung NICHT löschen, nur setzen: Wer sich
-          // abmeldet, soll seine Alarme nicht verlieren.
+          ...prefs,
+          // Eine bestehende Verknüpfung NICHT löschen, nur setzen: Anfragen ohne
+          // Anmeldung kommen auch vor, während das Konto noch angemeldet ist.
+          // Gelöst wird sie beim Abmelden (`/api/auth/logout`).
           ...(me ? { userId: me.id } : {}),
           updatedAt: new Date(),
         },
@@ -276,6 +400,7 @@ export async function alertsRoutes(app: FastifyInstance) {
         currency: d.currency.toUpperCase(),
         passengers: d.passengers,
         travelClass: d.travelClass,
+        fareProfile: fareProfileFor(d.mode, d.fareProfile),
         basePrice: String(d.basePrice),
         desiredPrice: String(d.desiredPrice),
         notifyOnRise: d.notifyOnRise,
@@ -297,6 +422,7 @@ export async function alertsRoutes(app: FastifyInstance) {
           priceAlerts.passengers,
           priceAlerts.travelClass,
           priceAlerts.currency,
+          priceAlerts.fareProfile,
         ],
         set: {
           basePrice: String(d.basePrice),

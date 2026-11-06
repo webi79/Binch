@@ -2,6 +2,7 @@ import Constants from "expo-constants";
 import { Location, SearchParams, SearchResponse, TravelMode } from "@/types/search";
 import { clientIdHeader } from "./clientId";
 import type { LiveFlightInfo, LiveTrip } from "@/lib/live/types";
+import { fareProfileFor } from "@/lib/travel/fareProfile";
 
 export const API_BASE_URL: string =
   (Constants.expoConfig?.extra as { apiBaseUrl?: string })?.apiBaseUrl ?? "http://localhost:3000";
@@ -172,6 +173,7 @@ function searchParamsForApi(p: SearchParams, opt?: SearchOptions) {
     // der Server die Hin&Rück-Auswahl bzw. die Klasse komplett.
     ...(p.returnDate ? { returnDate: p.returnDate } : {}),
     ...(p.travelClass ? { travelClass: p.travelClass } : {}),
+    ...(p.fareProfile ? { fareProfile: p.fareProfile } : {}),
     // departTime nur durchreichen wenn explizit gesetzt (Surroundings-Tap).
     // Bei normaler Suche bleibt's leer → Server snapt auf Standard-Zeit.
     ...(p.departTime ? { departTime: p.departTime } : {}),
@@ -206,10 +208,31 @@ export function searchCruises(p: SearchParams, opt?: SearchOptions): Promise<Sea
 }
 
 export function searchByMode(p: SearchParams, opt?: SearchOptions): Promise<SearchResponse> {
-  if (p.mode === "FLIGHT") return searchFlights(p, opt);
-  if (p.mode === "TRAIN") return searchTrains(p, opt);
-  if (p.mode === "CRUISE") return searchCruises(p, opt);
-  return searchBuses(p, opt);
+  // Ohne ausdrückliches Tarifprofil das aus den Einstellungen — so rechnet
+  // jede Zugsuche der App (Ergebnisse, Umgebung, Stadt-Blatt) mit der Karte.
+  const q = p.mode === "TRAIN" && p.fareProfile === undefined ? { ...p, fareProfile: fareProfileFor("TRAIN") } : p;
+  const run =
+    q.mode === "FLIGHT"
+      ? searchFlights(q, opt)
+      : q.mode === "TRAIN"
+        ? searchTrains(q, opt)
+        : q.mode === "CRUISE"
+          ? searchCruises(q, opt)
+          : searchBuses(q, opt);
+  return run.then((res) => withSearchContext(res, q));
+}
+
+/**
+ * Jeden Treffer mit dem versehen, womit gesucht wurde (siehe `SearchResult.travelClass`).
+ * Ohne das schrieb die Detail-Ansicht feste Vorgaben hin („2. Klasse", „Einfach").
+ */
+function withSearchContext(res: SearchResponse, p: SearchParams): SearchResponse {
+  const ctx = {
+    travelClass: p.travelClass || undefined,
+    fareProfile: p.fareProfile || undefined,
+    roundTrip: !!p.returnDate,
+  };
+  return { ...res, results: res.results.map((r) => ({ ...r, ...ctx })) };
 }
 
 export function fetchLocations(query: string, mode: TravelMode | "ALL" = "ALL"): Promise<Location[]> {
@@ -789,8 +812,33 @@ export function authOAuth(input: {
   return postJson("/api/auth/oauth", input);
 }
 
-export function authLogout(token: string): Promise<void> {
-  return postJson<void>("/api/auth/logout", {}, token);
+/** @param pushToken Dieses Gerät — der Server löst es dabei vom Konto. */
+export function authLogout(token: string, pushToken?: string | null): Promise<void> {
+  return postJson<void>("/api/auth/logout", pushToken ? { pushToken } : {}, token);
+}
+
+/**
+ * Konto löschen — endgültig, samt allem, was daran hängt (siehe
+ * server/src/routes/account.ts). Wirft bei jedem Fehler: Der Aufrufer darf das
+ * Konto lokal erst abmelden, wenn der Server es wirklich gelöscht hat.
+ */
+export async function authDeleteAccount(token: string): Promise<void> {
+  const url = buildUrl("/api/auth/me");
+  const res = await fetchWithTimeout(url, {
+    method: "DELETE",
+    headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+  }, 20000);
+  if (!res.ok) throw new Error(`API ${res.status} ${res.statusText}`);
+}
+
+/** Alles, was der Server zu diesem Konto speichert, als JSON-Objekt (siehe account.ts). */
+export async function authExportData(token: string): Promise<Record<string, unknown>> {
+  const url = buildUrl("/api/auth/me/export");
+  const res = await fetchWithTimeout(url, {
+    headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+  }, 30000);
+  if (!res.ok) throw new Error(`API ${res.status} ${res.statusText}`);
+  return (await res.json()) as Record<string, unknown>;
 }
 
 export async function authMe(token: string): Promise<AuthUser> {
@@ -897,6 +945,8 @@ export interface CreatePriceAlertInput {
   /** Reisende und Klasse gehören zum Preis — siehe `PriceAlert`. */
   passengers: number;
   travelClass: string;
+  /** Tarifprofil der Suche, aus der der Alarm stammt — er vergleicht nur Preise desselben Tarifs. */
+  fareProfile?: string;
   currency: string;
   basePrice: number;
   desiredPrice: number;

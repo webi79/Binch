@@ -10,11 +10,21 @@ import {
   type StyleProp,
   type ViewStyle,
 } from "react-native";
-import Animated, { useAnimatedStyle } from "react-native-reanimated";
+import Animated, {
+  cancelAnimation,
+  Easing,
+  useAnimatedStyle,
+  useSharedValue,
+  withDelay,
+  withTiming,
+} from "react-native-reanimated";
 import type { PriceAlert, SavedTrip, Ticket } from "@/types/saved";
 import type { TravelMode } from "@/types/search";
 import { PriceAlertCard } from "@/components/saved/PriceAlertCard";
 import { SavedFilterRow, type SavedFilter } from "@/components/saved/SavedFilterRow";
+import { INTRO_TOTAL, IntroRow } from "@/components/saved/IntroRow";
+import { StatePanel } from "@/components/ui/StatePanel";
+import { onTabEnter } from "@/lib/nav/tabEnter";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useIsFocused } from "@react-navigation/native";
 import { useT } from "@/lib/i18n/useT";
@@ -25,11 +35,15 @@ import { AddTicketModal } from "@/components/saved/AddTicketModal";
 import { EmptyState } from "@/components/saved/EmptyState";
 import { AddTicketButton } from "@/components/saved/AddTicketButton";
 import { SegmentedToggle } from "@/components/ui/SegmentedToggle";
-import { GUTTER, SPACE, HEADING_TOP, HEADING_GAP, useNavbarSpace } from "@/lib/theme/spacing";
+import { BELL_OVERHANG, BELL_SIZE, GUTTER, SPACE, HEADING_TOP, HEADING_GAP, useNavbarSpace, ITEM_GAP } from "@/lib/theme/spacing";
+import { CalendarDays } from "lucide-react-native";
+import { scaledStyles } from "@/lib/ui/compact";
+import { RippleTouch } from "@/components/ui/RippleTouch";
+import { haptic } from "@/lib/haptics";
 import { ScreenHeading } from "@/components/ui/ScreenHeading";
 import { SlidingPanels } from "@/components/ui/SlidingPanels";
 import { useAccent } from "@/lib/theme/accent";
-import { useAppBg } from "@/lib/theme/appBg";
+import { useAppBg, usePalette } from "@/lib/theme/appBg";
 import { overlayCover, UNDERLAY_TRAVEL_FRAC } from "@/lib/nav/overlayCover";
 import { subscribeLayer, releaseLayer } from "@/lib/nav/transitionLayer";
 
@@ -135,7 +149,63 @@ export default function SavedScreen() {
    * eine gemerkte Auswahl ließe ihn glauben, seine Reisen seien weg.
    */
   const [filter, setFilter] = useState<SavedFilter>("all");
+
+  /**
+   * EINLAUF der Karten — dieselbe Bewegung wie die Einträge im Kalender-Blatt
+   * (components/saved/IntroRow.tsx).
+   *
+   * Nur bei zwei Anlässen: beim Betreten über die Tab-Leiste und beim Wechsel
+   * der Kategorie. Nicht beim Zurückkehren aus einer Unterseite, nicht beim
+   * App-Start — eine Bewegung, die bei jedem Blick kommt, wird zur Störung.
+   * Der Wert steht beim Betreten schon auf 0, bevor der Tab sichtbar ist (die
+   * Meldung kommt direkt nach dem Wechsel), und läuft erst nach dem Vorlauf an:
+   * Dann sind die Durchgänge des Tab-Wechsels vorbei, und keiner fällt in die
+   * Bewegung (siehe reanimated-commit-race).
+   */
+  const intro = useSharedValue(1);
+  /** Sofort auf 0 — als schlichte Zuweisung, damit auch NEU gebaute Karten verdeckt beginnen. */
+  const hideIntro = useCallback(() => {
+    cancelAnimation(intro);
+    intro.value = 0;
+  }, [intro]);
+  const runIntro = useCallback(
+    (delayMs: number) => {
+      intro.value = withDelay(delayMs, withTiming(1, { duration: INTRO_TOTAL, easing: Easing.linear }));
+    },
+    [intro],
+  );
+  useEffect(
+    () =>
+      onTabEnter("/saved", () => {
+        hideIntro();
+        runIntro(INTRO_TAB_DELAY);
+      }),
+    [hideIntro, runIntro],
+  );
+  /**
+   * Kategorie-Wechsel: verdecken VOR dem Durchgang, einlaufen erst NACH ihm —
+   * die neuen Karten entstehen erst darin. Liefe die Welle schon vorher an,
+   * stünden sie im ersten Bild voll da und sprängen dann zurück.
+   */
+  const filterRef = useRef(filter);
+  filterRef.current = filter;
+  const introAfterCommit = useRef(false);
+  const onFilter = useCallback(
+    (next: SavedFilter) => {
+      if (next === filterRef.current) return;
+      hideIntro();
+      introAfterCommit.current = true;
+      setFilter(next);
+    },
+    [hideIntro],
+  );
+  useEffect(() => {
+    if (!introAfterCommit.current) return;
+    introAfterCommit.current = false;
+    runIntro(INTRO_FILTER_DELAY);
+  }, [filter, runIntro]);
   const [showModal, setShowModal] = useState(false);
+  const palette = usePalette();
   const isFocused = useIsFocused();
   const navbarSpace = useNavbarSpace();
   /**
@@ -231,6 +301,8 @@ export default function SavedScreen() {
   const tickets = ticketsSnapshot;
   const priceAlerts = priceAlertsSnapshot;
   const addTicket = useSearchStore.getState().addTicket;
+  const prepareCalendar = useSearchStore.getState().prepareCalendar;
+  const openCalendar = useSearchStore.getState().openCalendar;
 
   // Früher stand hier ein Skelett, das beim ERSTEN Besuch 220ms lang anstelle
   // der echten Karten lief — damit sich nicht alle gleichzeitig im Wechsel-Frame
@@ -332,26 +404,44 @@ export default function SavedScreen() {
       ],
     [visibleAlerts, today, earlier, t],
   );
+  /**
+   * Wo jeder Abschnitt in der Einlauf-Welle beginnt — die Zeilen zählen über
+   * alle Abschnitte hinweg, sonst liefe die erste Karte jedes Abschnitts
+   * gleichzeitig ein. Als Ref, damit die Zeichen-Funktionen stabil bleiben.
+   */
+  const sectionStart = useRef(new Map<string, number>());
+  sectionStart.current = useMemo(() => {
+    const m = new Map<string, number>();
+    let n = 0;
+    for (const sec of tripSections) {
+      m.set(sec.key, n);
+      n += sec.data.length;
+    }
+    return m;
+  }, [tripSections]);
   const renderTrip = useCallback(
-    ({ item }: { item: TripRow }) => (
-      <View style={rowGap}>
+    ({ item, index, section }: { item: TripRow; index: number; section: { key: string } }) => (
+      <IntroRow index={(sectionStart.current.get(section.key) ?? 0) + index} intro={intro} style={rowGap}>
         {item.kind === "alert" ? (
           <PriceAlertCard alert={item.alert} />
         ) : (
           <ResultCard result={item.trip} passengers={item.trip.passengers} underlay="saved" />
         )}
-      </View>
+      </IntroRow>
     ),
-    [],
+    [intro],
   );
   const renderTripSection = useCallback(
-    ({ section }: { section: { title: string } }) =>
+    ({ section }: { section: { key: string; title: string } }) =>
       // Leerer Titel = kein Kopf. `null` und nicht ein leerer `Text`: Der
       // brächte trotzdem seine Außenabstände mit und risse eine Lücke.
+      // Der Kopf läuft mit seiner ersten Karte ein.
       section.title ? (
-        <Text className="text-[15px] font-semibold text-white mt-1 mb-2.5">{section.title}</Text>
+        <IntroRow index={sectionStart.current.get(section.key) ?? 0} intro={intro}>
+          <Text className="text-[15px] font-semibold text-white mt-2 mb-3">{section.title}</Text>
+        </IntroRow>
       ) : null,
-    [],
+    [intro],
   );
   const tripKey = useCallback(
     // Die Kennung MIT der Art: Eine Reise und ein Alarm könnten dieselbe
@@ -361,8 +451,12 @@ export default function SavedScreen() {
     [],
   );
   const renderTicket = useCallback(
-    ({ item }: { item: Ticket }) => <TicketCard ticket={item} />,
-    [],
+    ({ item, index }: { item: Ticket; index: number }) => (
+      <IntroRow index={index} intro={intro}>
+        <TicketCard ticket={item} />
+      </IntroRow>
+    ),
+    [intro],
   );
   const ticketKey = useCallback((item: Ticket) => item.id, []);
   const openAddTicket = useCallback(() => setShowModal(true), []);
@@ -370,21 +464,42 @@ export default function SavedScreen() {
   const ticketCountKey = tickets.length === 1 ? "saved.tickets.count.one" : "saved.tickets.count.many";
   const ticketCountLine = t(ticketCountKey).replace("{count}", String(tickets.length));
 
-  // Keine gestaffelte Einblend-Welle mehr — siehe Landingscreen.
+  // Keine Einblend-Welle beim AUFBAU (siehe Landingscreen) — die Karten laufen
+  // nur über `intro` ein: beim Betreten über die Tab-Leiste und beim
+  // Kategorie-Wechsel, als reine Bewegung auf dem UI-Strang.
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: appBg }} edges={["top"]}>
       <ParallaxLayer style={[{ flex: 1 }, parallaxStyle]}>
       {/* Titel = Chrome, bleibt stehen (siehe Home). Abstände über das geteilte
           Raster — dieser Screen ist die Vorlage, an der die anderen ausgerichtet
           sind (siehe HEADING_TOP/HEADING_GAP in lib/theme/spacing.ts). */}
-      <View style={{ paddingHorizontal: GUTTER, paddingTop: HEADING_TOP }}>
-        <ScreenHeading>Saved</ScreenHeading>
+      {/* Rechts der Kalender-Knopf — Stelle, Größe, Fläche und Welle wie die
+          Glocke im Startbildschirm (`headerRow`/`bell` dort, gleiche Werte durch
+          dasselbe `scaledStyles`). Er öffnet das Kalender-Blatt
+          (components/saved/CalendarSheet.tsx), das an der Unterkante dieser
+          Zeile stehen bleibt — wie das Mitteilungs-Blatt an der der Glocke. */}
+      <View style={headerStyles.headerRow}>
+        <ScreenHeading>{t("bottomnav.saved")}</ScreenHeading>
+        <RippleTouch
+          style={[headerStyles.calendarBtn, { backgroundColor: palette.s2 }]}
+          hitSlop={6}
+          borderless
+          accessibilityRole="button"
+          accessibilityLabel={t("saved.calendar.open")}
+          // Den Kalender schon in der Berührung bauen, nicht im ersten Bild der Fahrt.
+          onTouchStart={prepareCalendar}
+          onPress={() => {
+            haptic("button");
+            openCalendar();
+          }}
+        >
+          <CalendarDays size={19} color="#F4F4F5" />
+        </RippleTouch>
       </View>
 
       <View
         style={{
           paddingHorizontal: GUTTER,
-          paddingTop: HEADING_GAP,
           paddingBottom: SPACE.lg,
         }}
       >
@@ -445,7 +560,7 @@ export default function SavedScreen() {
              * feste Leiste unter „Reisen | Tickets" hätte den Bildschirm oben
              * zugebaut, bevor die erste Karte anfängt.
              */
-            ListHeaderComponent={<SavedFilterRow value={filter} onChange={setFilter} />}
+            ListHeaderComponent={<SavedFilterRow value={filter} onChange={onFilter} />}
             /**
              * Der leere Zustand DER AUSWAHL — nicht der leere Zustand des
              * Reiters.
@@ -456,7 +571,20 @@ export default function SavedScreen() {
              * oder die App hängt.
              */
             ListEmptyComponent={
-              <Text style={emptyFilterText}>{t("saved.filter.none")}</Text>
+              /* Wie die Karten: läuft mit der Einlauf-Welle von unten ein
+                 (`IntroRow`, je Kategorie neu) — vorher stand der Satz nackt
+                 und ohne Bewegung da, während die Karten anderer Kategorien
+                 einliefen (04.11.2026). Dazu dieselbe Zeichnung wie der leere
+                 Reiter, EINE für alle Kategorien. */
+              <IntroRow key={filter} index={0} intro={intro}>
+                <StatePanel
+                  art="favorites"
+                  active={isFocused && tab === "trips"}
+                  surface={appBg}
+                  title={t("saved.filter.emptyTitle")}
+                  body={t("saved.filter.emptyBody")}
+                />
+              </IntroRow>
             }
             stickySectionHeadersEnabled={false}
             contentContainerStyle={padBottomGutter}
@@ -495,7 +623,7 @@ export default function SavedScreen() {
             <>
               <AddTicketButton onPress={openAddTicket} bgColor={appBg} />
               {tickets.length > 0 && (
-                <Text className="text-[13px] text-[#56565C] font-medium mx-5 mb-2.5">
+                <Text className="text-[13px] text-[#56565C] font-medium mx-5 mb-3">
                   {ticketCountLine}
                 </Text>
               )}
@@ -525,22 +653,51 @@ export default function SavedScreen() {
   );
 }
 
+/**
+ * Vorlauf des Einlaufs: beim Betreten länger (die Durchgänge des Tab-Wechsels
+ * sollen vorbei sein), beim Kategorie-Wechsel kurz (ein Durchgang: die neue
+ * Auswahl).
+ */
+const INTRO_TAB_DELAY = 90;
+const INTRO_FILTER_DELAY = 40;
+
 /** Zeilenabstand der Reise-Liste — als Konstante, nicht als Literal im JSX.
  *  Ein Objektliteral dort ist bei jedem Bild ein NEUES Objekt, also für jede
  *  Zeile ein Stil-Vergleich, der garantiert scheitert. */
-const rowGap = { marginBottom: 12 } as const;
-
-/** Der Hinweis, wenn die gewählte Kategorie nichts enthält. */
-const emptyFilterText = {
-  fontSize: 14,
-  fontWeight: "500",
-  color: "#8E8E93",
-  paddingHorizontal: 20,
-  paddingTop: 8,
-} as const;
+const rowGap = { marginBottom: ITEM_GAP } as const;
 
 /** Füllt den Bereich im Blätter-Container. Siehe Begründung an der SectionList. */
 const FILL = { flex: 1 } as const;
+
+/**
+ * Kopfzeile mit Kalender-Knopf — dieselben Werte wie `headerRow`/`bell` im
+ * Startbildschirm, und ausdrücklich durch `scaledStyles` wie dort.
+ *
+ * Als einfache Konstanten waren sie UNSKALIERT, die Glocke aber skaliert: Auf
+ * Handys unter 900 Punkten Fensterhöhe saß der Knopf deshalb größer und tiefer
+ * als die Glocke. Die Unterkante dieser Zeile ist außerdem der Ruhepunkt des
+ * Kalender-Blatts (`HOME_HEADER_H`, ebenfalls skaliert gerechnet).
+ *
+ * Kein `overflow: "hidden"` am Knopf: Die Welle ist randlos und reicht wie an
+ * der Glocke über den Kreis hinaus.
+ */
+const headerStyles = scaledStyles({
+  headerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: GUTTER,
+    paddingTop: HEADING_TOP - BELL_OVERHANG,
+    paddingBottom: HEADING_GAP - BELL_OVERHANG,
+  },
+  calendarBtn: {
+    width: BELL_SIZE,
+    height: BELL_SIZE,
+    borderRadius: BELL_SIZE / 2,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+});
 
 /** Ruhestellung — als Konstante, damit das Worklet kein neues Objekt pro Bild baut. */
 const NO_PARALLAX = { transform: [{ translateX: 0 }] } as const;

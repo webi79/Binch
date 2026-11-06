@@ -12,7 +12,6 @@ import {
   View,
   Text,
   Pressable,
-  ActivityIndicator,
   RefreshControl,
   StyleSheet,
   useWindowDimensions,
@@ -20,7 +19,6 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { usePathname, useRouter } from "expo-router";
 
-import { RotateCcw, WifiOff, Compass } from "lucide-react-native";
 import { useQuery } from "@tanstack/react-query";
 import Animated, {
   FadeIn,
@@ -33,6 +31,7 @@ import Animated, {
 } from "react-native-reanimated";
 import { TravelMode, SearchResult, SearchResponse } from "@/types/search";
 import { searchByMode } from "@/lib/api/client";
+import { useFareProfile } from "@/lib/travel/fareProfile";
 import { createSearchAlert } from "@/lib/notifications/createSearchAlert";
 import { FilterChips } from "@/components/ui/FilterChips";
 import { ResultCard } from "@/components/results/ResultCard";
@@ -42,7 +41,6 @@ import { SearchEditPanel } from "@/components/results/SearchEditPanel";
 import { PriceAlertSheet } from "@/components/results/PriceAlertSheet";
 import type { SearchHeroInitial, TripType } from "@/components/search/SearchHero";
 import { RandomSearchLoader } from "@/components/results/search-loaders/RandomSearchLoader";
-import { Bo } from "@/components/assistant/Bo";
 import { useT } from "@/lib/i18n/useT";
 import { overlayCover, resultsPush, pushProgress, UNDERLAY_TRAVEL_FRAC, PUSH_SPRING, POP_SPRING, SCREEN_CORNER_RADIUS, startResultsPush, msSinceResultsPush, pushGeneration } from "@/lib/nav/overlayCover";
 import { useSearchStore } from "@/stores/searchStore";
@@ -55,10 +53,12 @@ import { tripSignature } from "@/lib/results/signature";
 import { useAccent } from "@/lib/theme/accent";
 import { MOTION, revealEntering } from "@/lib/motion";
 import { endSearchHandoff, isSearchHandoff } from "@/lib/nav/searchHandoff";
-import { GUTTER, SPACE } from "@/lib/theme/spacing";
+import { GUTTER, SPACE, ITEM_GAP, GROUP_GAP } from "@/lib/theme/spacing";
 import { prepareLayer, releaseLayer, subscribeLayer } from "@/lib/nav/transitionLayer";
-import { scaledStyles } from "@/lib/ui/compact";
+import { ms, scaledStyles } from "@/lib/ui/compact";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
+import { slideTiming } from "@/lib/nav/slideMotion";
+import { StatePanel } from "@/components/ui/StatePanel";
 
 type SortKey = "cheapest" | "fastest" | "direct";
 
@@ -702,7 +702,7 @@ export function ResultsView() {
     if (useSearchStore.getState().pendingResultsRoute) {
       // Route steht noch aus: selbst zurückfahren und danach ausblenden.
       useSearchStore.getState().setPendingResultsRoute(null);
-      resultsPush.value = withTiming(0, POP_SPRING, (finished?: boolean) => {
+      resultsPush.value = withTiming(0, slideTiming(POP_SPRING), (finished?: boolean) => {
         "worklet";
         if (finished) runOnJS(clearResultsParams)();
       });
@@ -814,8 +814,11 @@ export function ResultsView() {
   useEffect(() => setNearbyRequested(false), [origin, destination, departDate]);
 
 
+  /** BahnCard und Deutschlandticket aus den Einstellungen — nur bei Zügen gesetzt (lib/travel/fareProfile.ts). */
+  const fareProfile = useFareProfile(mode);
   const { data, isLoading, isFetching, isError, error, refetch, isRefetching } = useQuery<SearchResponse>({
-    queryKey: ["search", mode, origin, destination, departDate, departTime, returnDate, passengers, currency, travelClass, nearbyRequested],
+    // Mit dem Tarifprofil: Wer die BahnCard ändert, bekommt neue Preise statt der gespeicherten.
+    queryKey: ["search", mode, origin, destination, departDate, departTime, returnDate, passengers, currency, travelClass, fareProfile, nearbyRequested],
     queryFn: () => {
       const opt = {
         ...(forceFreshRef.current ? { nocache: true } : {}),
@@ -835,6 +838,7 @@ export function ResultsView() {
           passengers,
           currency,
           travelClass: travelClass || undefined,
+          fareProfile,
         },
         opt,
       );
@@ -933,6 +937,10 @@ export function ResultsView() {
       tripType: p.tripType === "roundtrip" ? "roundtrip" : "oneway",
       passengers,
       currency,
+      // Klasse und Uhrzeit gehören dazu — sonst zeigte der Verlauf eine andere
+      // Suche als die, die lief, und ein Tipp darauf startete sie auch anders.
+      ...(travelClass ? { travelClass } : {}),
+      ...(departTime ? { departTime } : {}),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data, storeParams]);
@@ -951,7 +959,14 @@ export function ResultsView() {
   const nearbyBusy = mode === "FLIGHT" && nearbyRequested && isFetching;
   const nearbyOffer =
     mode === "FLIGHT" && (!nearbyRequested || nearbyBusy)
-      ? { onSearch: () => setNearbyRequested(true), busy: nearbyBusy }
+      ? {
+          // Eine neue Suche — also auch die Szene, wie bei `searchAgain`.
+          onSearch: () => {
+            setShowResults(false);
+            setNearbyRequested(true);
+          },
+          busy: nearbyBusy,
+        }
       : null;
   /** Umgebungssuche ABGESCHLOSSEN und trotzdem leer → kein Knopf mehr, nur die
    *  Info. Erst wenn nichts mehr läuft, sonst siehe oben. */
@@ -1066,6 +1081,21 @@ export function ResultsView() {
     return refetch();
   };
 
+  /**
+   * Neu suchen aus dem Leer- oder Fehlerzustand — MIT der Such-Szene.
+   *
+   * Vorher lief die Suche still im Hintergrund: Der Knopf „Nochmal versuchen"
+   * blieb stehen, nichts bewegte sich, und man hielt die App für tot
+   * (05.11.2026). Jetzt spielt dieselbe Szene wie bei jeder Suche — sie endet
+   * wie immer erst am Ende eines Durchlaufs, wenn die Antwort da ist
+   * (`onLoaderCyclePulse`). Das Ziehen zum Auffrischen einer vollen Liste
+   * bleibt beim Kreisel oben; dort steht ja schon etwas.
+   */
+  const searchAgain = () => {
+    setShowResults(false);
+    void refreshFresh();
+  };
+
   // Silent Background-Refresh: alle 5 Min frische Preise vom SERVER-Cache
   // holen — ohne `nocache`. Das ist clever weil:
   //   1. Server hat eh schon SWR-Logik: bei >50% TTL läuft ein Refresh im
@@ -1129,6 +1159,7 @@ export function ResultsView() {
             passengers,
             currency,
             travelClass: travelClass || undefined,
+            fareProfile,
           },
           /**
            * Die Umgebungs-Option MUSS mit.
@@ -1183,7 +1214,7 @@ export function ResultsView() {
       clearInterval(id);
       sub.remove();
     };
-  }, [mode, origin, destination, originLabel, destLabel, departDate, departTime, returnDate, passengers, currency, travelClass, nearbyRequested, queryKey, queryClient]);
+  }, [mode, origin, destination, originLabel, destLabel, departDate, departTime, returnDate, passengers, currency, travelClass, fareProfile, nearbyRequested, queryKey, queryClient]);
 
   // Hin- oder Rückreise-Ansicht. Nur für Train/Bus relevant — Flüge bekommen
   // keine separaten Rück-Treffer (SerpAPI/Google Flights pre-bundled die schon
@@ -1310,6 +1341,7 @@ export function ResultsView() {
           passengers,
           currency,
           travelClass: travelClass || undefined,
+          fareProfile,
           ...(extraDepartTime ? { departTime: extraDepartTime } : {}),
         },
         opt,
@@ -1496,6 +1528,8 @@ export function ResultsView() {
           returnDate,
           passengers,
           travelClass,
+          // Derselbe Tarif wie die Suche, deren günstigsten Preis der Alarm beobachtet.
+          fareProfile,
           currency,
           cheapestPrice,
           desiredPrice,
@@ -1524,6 +1558,7 @@ export function ResultsView() {
       returnDate,
       passengers,
       travelClass,
+      fareProfile,
       currency,
       cheapestPrice,
       t,
@@ -1758,31 +1793,23 @@ export function ResultsView() {
         )
       ) : isError ? (
         <View style={styles.errorWrap}>
-          <View style={styles.errorIcon}>
-            <WifiOff size={32} color={accent.solid} strokeWidth={2} />
-          </View>
-          <Text style={styles.errorTitle}>{t("results.error")}</Text>
-          <Text style={styles.errorBody}>{t("results.error.body")}</Text>
-          {/* Die rohe Fehlermeldung ist Entwickler-Text: unübersetzt (kommt aus
-              lib/api/client.ts), enthält die interne Server-URL und braucht drei
-              Zeilen, die das Layout auseinanderziehen. Dem User sagen Titel und
-              Text oben bereits alles. Im Dev-Build bleibt sie zum Debuggen. */}
+          <StatePanel
+            art="offline"
+            title={t("results.error")}
+            body={t("results.error.body")}
+            action={t("state.retry")}
+            onAction={() => {
+              haptic("button");
+              searchAgain();
+            }}
+          />
+          {/* Die rohe Fehlermeldung ist Entwickler-Text (unübersetzt, mit interner
+              Server-URL) — nur im Dev-Build, zum Debuggen. */}
           {__DEV__ && error instanceof Error ? (
             <Text style={styles.errorDetail} numberOfLines={3}>
               {error.message}
             </Text>
           ) : null}
-          <RippleTouch
-            onPress={() => {
-              haptic("button");
-              refreshFresh();
-            }}
-            style={styles.retryBtn}
-          >
-            <GradientFill />
-            <RotateCcw size={16} color={C.black} strokeWidth={2.4} />
-            <Text style={styles.retryBtnText}>{t("results.retry")}</Text>
-          </RippleTouch>
         </View>
       ) : showDirectionToggle ? (
         // Outbound + Return side-by-side im Pager — Hin/Rück-Toggle triggert
@@ -1801,13 +1828,15 @@ export function ResultsView() {
             mode={mode}
             isRefetching={isRefetching}
             refreshFresh={refreshFresh}
+            searchAgain={searchAgain}
             isLoadingMore={isLoadingMore}
             loadMore={handleShowMore}
             accentSolid={accent.solid}
             nearbyOffer={null}
             nearbyExhausted={false}
+            tEmptyTitle={t("results.empty.title")}
             tEmpty={t("results.empty")}
-            tRetry={t("results.retry")}
+            tRetry={t("state.retry")}
             tLater={t("results.later")} tMore={t("results.more")}
             tLoading={t("results.loading")}
           />
@@ -1823,13 +1852,15 @@ export function ResultsView() {
             mode={mode}
             isRefetching={isRefetching}
             refreshFresh={refreshFresh}
+            searchAgain={searchAgain}
             isLoadingMore={isLoadingMore}
             loadMore={handleShowMore}
             accentSolid={accent.solid}
             nearbyOffer={null}
             nearbyExhausted={false}
+            tEmptyTitle={t("results.empty.title")}
             tEmpty={t("results.empty")}
-            tRetry={t("results.retry")}
+            tRetry={t("state.retry")}
             tLater={t("results.later")} tMore={t("results.more")}
             tLoading={t("results.loading")}
           />
@@ -1847,13 +1878,15 @@ export function ResultsView() {
           mode={mode}
           isRefetching={isRefetching}
           refreshFresh={refreshFresh}
+          searchAgain={searchAgain}
           isLoadingMore={isLoadingMore}
           loadMore={handleShowMore}
           accentSolid={accent.solid}
           nearbyOffer={nearbyOffer}
           nearbyExhausted={nearbyExhausted}
+          tEmptyTitle={t("results.empty.title")}
           tEmpty={t("results.empty")}
-          tRetry={t("results.retry")}
+          tRetry={t("state.retry")}
           tLater={t("results.later")} tMore={t("results.more")}
           tLoading={t("results.loading")}
         />
@@ -1914,8 +1947,6 @@ export function ResultsView() {
         onClose={closePriceAlert}
         currentPrice={cheapestPrice}
         currency={currency}
-        fromLabel={stationLabel(originLabel)}
-        toLabel={stationLabel(destLabel)}
         onCreate={submitPriceAlert}
       />
     </ResultsShell>
@@ -2124,6 +2155,8 @@ interface ResultsListViewProps {
   mode: TravelMode;
   isRefetching: boolean;
   refreshFresh: () => void;
+  /** Aus dem Leerzustand neu suchen — mit der Such-Szene (siehe dort). */
+  searchAgain: () => void;
   isLoadingMore: boolean;
   loadMore: () => Promise<void> | void;
   /** Wie viele Treffer INSGESAMT vorliegen (`data` ist auf visibleCount beschnitten).
@@ -2137,6 +2170,7 @@ interface ResultsListViewProps {
   nearbyOffer: { onSearch: () => void; busy: boolean } | null;
   /** true = die Umgebungssuche lief bereits und fand ebenfalls nichts. */
   nearbyExhausted: boolean;
+  tEmptyTitle: string;
   tEmpty: string;
   tRetry: string;
   tLater: string;
@@ -2159,7 +2193,7 @@ interface ResultsListViewProps {
  * Eltern-Render ein frisch geschnittenes Array bekommt — die Karten fängt `memo`
  * ab, die Trenner nicht.
  */
-const ListSeparator = () => <View style={{ height: 12 }} />;
+const ListSeparator = () => <View style={{ height: ITEM_GAP }} />;
 
 function ResultsListView({
   data,
@@ -2172,12 +2206,14 @@ function ResultsListView({
   mode,
   isRefetching,
   refreshFresh,
+  searchAgain,
   isLoadingMore,
   loadMore,
   totalCount,
   accentSolid,
   nearbyOffer,
   nearbyExhausted,
+  tEmptyTitle,
   tEmpty,
   tRetry,
   tLater,
@@ -2361,10 +2397,15 @@ function ResultsListView({
        * `ResultsListHeader` steht auf Modulebene unter `memo`. React gleicht
        * über den Typ ab, die Schranke fängt den Rest.
        */
+      /* Ohne Treffer gibt es nichts zu zählen und nichts zu sortieren — „0
+         Ergebnisse" und drei Sortier-Knöpfe über dem Leerzustand waren nur
+         Lärm. Der Leerzustand steht dann mittig im freien Raum. */
       ListHeaderComponent={
-        <ResultsListHeader count={totalCount} sort={sort} onSort={onSort} zoneHint={zoneHint} />
+        data.length > 0 ? (
+          <ResultsListHeader count={totalCount} sort={sort} onSort={onSort} zoneHint={zoneHint} />
+        ) : null
       }
-      contentContainerStyle={styles.listContent}
+      contentContainerStyle={data.length > 0 ? styles.listContent : styles.listContentEmpty}
       itemLayoutAnimation={animateReorder ? LinearTransition.duration(320) : undefined}
       refreshControl={
         <RefreshControl
@@ -2377,48 +2418,41 @@ function ResultsListView({
           colors={[accentSolid]}
         />
       }
+      /* Beide Leerzustände wie jeder Zustand der App (`StatePanel`): Zeichnung,
+         Titel, Satz, EIN Knopf — derselbe wie überall („Nochmal versuchen"
+         sah hier anders aus als sonst). */
       ListEmptyComponent={
         nearbyOffer || nearbyExhausted ? (
           // Klare Ansage statt untergeschobener Alternativen: Erst sagen, dass
           // es für DIESE Strecke nichts gibt — die Umgebung nur auf Wunsch.
-          <View style={styles.emptyWrap}>
-            <Bo state="sad" size={138} paused />
-            <Text style={styles.nearbyTitle}>{tt("results.nearby.title")}</Text>
-            <Text style={styles.nearbyBody}>
-              {nearbyExhausted ? tt("results.nearby.none") : tt("results.nearby.body")}
-            </Text>
-            {nearbyOffer ? (
-              <RippleTouch
-                onPress={() => {
-                  haptic("button");
-                  nearbyOffer.onSearch();
-                }}
-                disabled={nearbyOffer.busy}
-                style={[styles.retryBtn, nearbyOffer.busy && { opacity: 0.6 }]}
-              >
-                <GradientFill />
-                <Compass size={16} color={C.black} strokeWidth={2.4} />
-                <Text style={styles.retryBtnText}>
-                  {nearbyOffer.busy ? tt("results.nearby.searching") : tt("results.nearby.cta")}
-                </Text>
-              </RippleTouch>
-            ) : null}
-          </View>
+          <StatePanel
+            art="noRoute"
+            title={tt("results.nearby.title")}
+            body={nearbyExhausted ? tt("results.nearby.none") : tt("results.nearby.body")}
+            action={nearbyOffer ? tt("results.nearby.cta") : undefined}
+            busy={nearbyOffer?.busy ?? false}
+            onAction={
+              nearbyOffer
+                ? () => {
+                    haptic("button");
+                    nearbyOffer.onSearch();
+                  }
+                : undefined
+            }
+            style={styles.emptyState}
+          />
         ) : (
-          <View style={styles.emptyWrap}>
-            <Text style={styles.emptyText}>{tEmpty}</Text>
-            <RippleTouch
-              onPress={() => {
-                haptic("button");
-                refreshFresh();
-              }}
-              style={styles.retryBtn}
-            >
-              <GradientFill />
-              <RotateCcw size={16} color={C.black} strokeWidth={2.4} />
-              <Text style={styles.retryBtnText}>{tRetry}</Text>
-            </RippleTouch>
-          </View>
+          <StatePanel
+            art="noRoute"
+            title={tEmptyTitle}
+            body={tEmpty}
+            action={tRetry}
+            onAction={() => {
+              haptic("button");
+              searchAgain();
+            }}
+            style={styles.emptyState}
+          />
         )
       }
       ListFooterComponent={
@@ -2501,18 +2535,18 @@ const styles = scaledStyles({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    gap: 7,
+    gap: 8,
     backgroundColor: C.surface3,
     borderRadius: 9999,
-    paddingVertical: 9,
-    paddingHorizontal: 15,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
   },
   rhChangeText: { fontSize: 12, fontWeight: "700", color: C.text },
 
 
   // Hin/Rück-Toggle — visuell wie im Saved-Tab (Reise/Tickets-Segment):
   // dunkler Pill-Container, aktive Pille mit Lime-Background.
-  dirToggleWrap: { paddingHorizontal: GUTTER, paddingTop: 12 },
+  dirToggleWrap: { paddingHorizontal: GUTTER, paddingTop: GROUP_GAP },
   dirToggle: {
     flexDirection: "row",
     backgroundColor: "#171719",
@@ -2521,7 +2555,7 @@ const styles = scaledStyles({
   },
   dirSeg: {
     flex: 1,
-    paddingVertical: 10,
+    paddingVertical: 8,
     borderRadius: 12,
     alignItems: "center",
     justifyContent: "center",
@@ -2564,7 +2598,7 @@ const styles = scaledStyles({
    * beiden alten Inhalts-Polster (4 + 8) — im Ruhezustand ändert sich dadurch
    * nichts, beim Scrollen alles.
    */
-  listViewport: { flex: 1, paddingTop: 12 },
+  listViewport: { flex: 1, paddingTop: GROUP_GAP },
   /**
    * Filter und Sortierung — zwei gleich breite Knöpfe.
    *
@@ -2604,8 +2638,7 @@ const styles = scaledStyles({
 
   // Oben ohne Polster: siehe `listViewport` — der Abstand gehört an den Rahmen,
   // nicht in den Inhalt, sonst scrollt er mit.
-  listContent: { paddingHorizontal: GUTTER, paddingBottom: 110 },
-  center: { flex: 1, alignItems: "center", justifyContent: "center" },
+  listContent: { paddingHorizontal: GUTTER, paddingBottom: 112 },
   errorWrap: {
     flex: 1,
     alignItems: "center",
@@ -2613,55 +2646,13 @@ const styles = scaledStyles({
     paddingHorizontal: 32,
     gap: 12,
   },
-  errorIcon: {
-    width: 72,
-    height: 72,
-    borderRadius: 36,
-    backgroundColor: "rgba(127,234,77,0.10)",
-    alignItems: "center",
-    justifyContent: "center",
-    marginBottom: 4,
-  },
-  errorTitle: { color: C.text, fontWeight: "700", fontSize: 18, letterSpacing: -0.3 },
-  errorBody: {
-    color: C.sub,
-    fontSize: 14,
-    lineHeight: 20,
-    textAlign: "center",
-    marginHorizontal: 8,
-  },
   errorDetail: { color: C.subDim, fontSize: 11, textAlign: "center", marginTop: -4 },
-  retryBtn: {
-    marginTop: 12,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    paddingHorizontal: GUTTER,
-    paddingVertical: 12,
-    borderRadius: 9999,
-    overflow: "hidden",
-  },
-  retryBtnText: { color: C.black, fontWeight: "700", fontSize: 14 },
-  emptyWrap: { paddingVertical: 60, alignItems: "center", gap: 14 },
-  nearbyTitle: {
-    fontSize: 17,
-    fontWeight: "700",
-    color: C.text,
-    textAlign: "center",
-    marginTop: 4,
-  },
-  nearbyBody: {
-    fontSize: 13.5,
-    lineHeight: 19,
-    color: C.sub,
-    textAlign: "center",
-    paddingHorizontal: 36,
-    marginTop: -6,
-  },
-  emptyText: { color: C.sub },
+  /** Leerzustand: Die Liste wächst auf volle Höhe, der Zustand steht mittig darin. */
+  listContentEmpty: { flexGrow: 1, paddingHorizontal: GUTTER },
+  emptyState: { flex: 1, justifyContent: "center" },
 
   /* „Später"-Pagination-Button am Listenende */
-  laterWrap: { paddingTop: 16, paddingBottom: 8, alignItems: "center" },
+  laterWrap: { paddingTop: GROUP_GAP, paddingBottom: 8, alignItems: "center" },
   laterBtn: {
     flexDirection: "row",
     alignItems: "center",

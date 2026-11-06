@@ -14,6 +14,7 @@
  * bleibt.
  */
 import React from "react";
+import { TITLE_GAP } from "@/lib/theme/spacing";
 import { Modal, Pressable, StyleSheet, Text, View } from "react-native";
 import Animated, { FadeIn, FadeOut, ZoomIn, ZoomOut } from "react-native-reanimated";
 import Svg, { Circle, Path } from "react-native-svg";
@@ -178,8 +179,8 @@ const styles = scaledStyles({
     borderWidth: 1,
     borderRadius: 28,
     paddingTop: 28,
-    paddingHorizontal: 22,
-    paddingBottom: 18,
+    paddingHorizontal: 24,
+    paddingBottom: 16,
     alignItems: "center",
   },
 
@@ -192,7 +193,7 @@ const styles = scaledStyles({
     backgroundColor: tokens.danger,
     alignItems: "center",
     justifyContent: "center",
-    marginBottom: 18,
+    marginBottom: 16,
     marginTop: 4,
   },
 
@@ -202,15 +203,15 @@ const styles = scaledStyles({
     letterSpacing: -0.6,
     color: tokens.white,
     textAlign: "center",
-    marginBottom: 8,
+    marginBottom: TITLE_GAP,
   },
   message: {
     fontSize: 14,
     lineHeight: 21,
     color: tokens.gray300,
     textAlign: "center",
-    paddingHorizontal: 6,
-    marginBottom: 22,
+    paddingHorizontal: 8,
+    marginBottom: 24,
   },
 
   // Primary-CTA — Style 1:1 wie der „Zur Suche"-Button im
@@ -225,7 +226,7 @@ const styles = scaledStyles({
     overflow: "hidden",
   },
   primaryButtonTouch: {
-    paddingVertical: 17,
+    paddingVertical: 16,
     paddingHorizontal: 24,
     flexDirection: "row",
     alignItems: "center",

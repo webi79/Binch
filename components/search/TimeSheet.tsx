@@ -75,6 +75,7 @@ import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
 import { primeTick, releaseTick, wheelTick } from "@/lib/ui/tick";
 import { fs, ms, scaledStyles } from "@/lib/ui/compact";
+import { GROUP_GAP } from "@/lib/theme/spacing";
 
 /**
  * Die Vorgabe — dieselbe, auf die der Datumswähler beim Schließen zurückfällt.
@@ -512,6 +513,9 @@ export function TimeSheet({
   minuteStep,
   onClose,
   onApply,
+  title,
+  subtitle,
+  defaultTime,
 }: {
   visible: boolean;
   hour: number;
@@ -519,6 +523,11 @@ export function TimeSheet({
   minuteStep: number;
   onClose: () => void;
   onApply: (hour: number, minute: number) => void;
+  /** Anderer Zusammenhang als die Abfahrt der Suche (Bos geplante Aufgaben). */
+  title?: string;
+  subtitle?: string;
+  /** Worauf „Zurücksetzen" fährt. Vorgabe: `DEFAULT_TIME`. */
+  defaultTime?: { hour: number; minute: number };
 }) {
   /** Erst unten, dann übernehmen — wie beim Reisenden- und Klassen-Blatt. */
   const applied = useRef<{ hour: number; minute: number } | null>(null);
@@ -537,6 +546,9 @@ export function TimeSheet({
           hour={hour}
           minute={minute}
           minuteStep={minuteStep}
+          title={title}
+          subtitle={subtitle}
+          defaultTime={defaultTime}
           onApply={(h, m) => {
             applied.current = { hour: h, minute: m };
             close();
@@ -552,13 +564,21 @@ function TimeBody({
   minute,
   minuteStep,
   onApply,
+  title,
+  subtitle,
+  defaultTime = DEFAULT_TIME,
 }: {
   hour: number;
   minute: number;
   minuteStep: number;
   onApply: (hour: number, minute: number) => void;
+  title?: string;
+  subtitle?: string;
+  defaultTime?: { hour: number; minute: number };
 }) {
   const t = useT();
+  const resetHour = defaultTime.hour;
+  const resetMinute = defaultTime.minute;
   const palette = usePalette();
   const accent = useAccent();
 
@@ -612,8 +632,8 @@ function TimeBody({
   const resetStyle = useAnimatedStyle(() => {
     if (hourMoving.value || minMoving.value) return { opacity: 1 };
     const atDefault =
-      valueAt(HOURS, hourOffset.value) === DEFAULT_TIME.hour &&
-      valueAt(minuteValues, minOffset.value) === DEFAULT_TIME.minute;
+      valueAt(HOURS, hourOffset.value) === resetHour &&
+      valueAt(minuteValues, minOffset.value) === resetMinute;
     return { opacity: atDefault ? 0.4 : 1 };
   });
 
@@ -621,8 +641,8 @@ function TimeBody({
     <>
       <View style={styles.head}>
         <View style={styles.headText}>
-          <Text style={styles.title}>{t("search.time.title")}</Text>
-          <Text style={styles.subtitle}>{t("search.time.subtitle")}</Text>
+          <Text style={styles.title}>{title ?? t("search.time.title")}</Text>
+          <Text style={styles.subtitle}>{subtitle ?? t("search.time.subtitle")}</Text>
         </View>
         {/* Ein Textfeld, kein Text: So schreibt der UI-Strang die Zahl direkt,
             ohne den Umweg über einen Zustand. Derselbe Weg wie bei der Uhr der
@@ -679,8 +699,8 @@ function TimeBody({
           <RippleTouch
             onPress={() => {
               haptic("button");
-              spinTo(hourOffset, hourMoving, HOURS, DEFAULT_TIME.hour);
-              spinTo(minOffset, minMoving, minuteValues, DEFAULT_TIME.minute);
+              spinTo(hourOffset, hourMoving, HOURS, resetHour);
+              spinTo(minOffset, minMoving, minuteValues, resetMinute);
             }}
             style={[styles.reset, { backgroundColor: palette.s2 }]}
           >
@@ -731,10 +751,10 @@ const styles = scaledStyles({
 
   box: { borderRadius: 24, overflow: "hidden" },
 
-  footer: { flexDirection: "row", gap: 10, marginTop: 14 },
+  footer: { flexDirection: "row", gap: 8, marginTop: GROUP_GAP },
   reset: {
     height: 50,
-    paddingHorizontal: 22,
+    paddingHorizontal: 24,
     borderRadius: 16,
     alignItems: "center",
     justifyContent: "center",
@@ -765,8 +785,8 @@ const w = StyleSheet.create({
     fontWeight: "700",
     textAlign: "center",
     textTransform: "uppercase",
-    paddingTop: ms(14),
-    paddingBottom: ms(6),
+    paddingTop: ms(16),
+    paddingBottom: ms(8),
   },
   viewport: { height: WHEEL_H, overflow: "hidden" },
   /** Drei Runden hoch, oben angeschlagen — die Lage macht die Verschiebung. */

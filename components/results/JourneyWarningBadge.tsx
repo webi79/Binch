@@ -41,10 +41,10 @@ const s = scaledStyles({
     flexDirection: "row",
     alignItems: "center",
     alignSelf: "flex-start",
-    gap: 5,
+    gap: 4,
     borderRadius: 9999,
-    paddingHorizontal: 9,
-    paddingVertical: 3,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
   },
   text: { fontSize: 12, fontWeight: "700", letterSpacing: -0.1 },
 });

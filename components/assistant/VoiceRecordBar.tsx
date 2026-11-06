@@ -447,11 +447,11 @@ const styles = scaledStyles({
     borderTopLeftRadius: 28,
     borderTopRightRadius: 28,
     paddingHorizontal: 20,
-    paddingTop: 22,
+    paddingTop: 24,
   },
   topRow: { flexDirection: "row", alignItems: "center" },
   timeBox: { flexDirection: "row", alignItems: "center", marginRight: 16 },
-  dot: { width: 8, height: 8, borderRadius: 4, marginRight: 9 },
+  dot: { width: 8, height: 8, borderRadius: 4, marginRight: 8 },
   time: {
     fontSize: 26,
     fontWeight: "700",
@@ -475,7 +475,7 @@ const styles = scaledStyles({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    marginTop: 18,
+    marginTop: 16,
   },
   iconBtn: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
 

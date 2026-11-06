@@ -9,7 +9,7 @@ import { View, Text, StyleSheet } from "react-native";
 import { useNavigation } from "@react-navigation/native";
 import {
   Plane,
-  TrainFront,
+  Train,
   Bus,
   Ship,
   type LucideIcon,
@@ -38,7 +38,7 @@ const C = {
 
 const MODE_ICON: Record<TravelMode, LucideIcon> = {
   FLIGHT: Plane,
-  TRAIN: TrainFront,
+  TRAIN: Train,
   BUS: Bus,
   CRUISE: Ship,
 };
@@ -345,7 +345,7 @@ export function useDepartureCountdown(departTime?: string) {
 }
 
 const styles = scaledStyles({
-  headPad: { padding: 18 },
+  headPad: { padding: 16 },
   eyebrow: {
     fontSize: 11,
     color: C.gray300,
@@ -356,7 +356,7 @@ const styles = scaledStyles({
     fontSize: 18,
     fontWeight: "700",
     color: C.white,
-    marginTop: 3,
+    marginTop: 4,
   },
 
   timesRow: {
@@ -370,8 +370,8 @@ const styles = scaledStyles({
   timeline: {
     flexDirection: "row",
     alignItems: "center",
-    marginTop: 10,
-    marginBottom: 14,
+    marginTop: 8,
+    marginBottom: 16,
   },
   dot: { width: 8, height: 8, borderRadius: 4 },
   dash: {
@@ -402,14 +402,14 @@ const styles = scaledStyles({
     color: C.white,
     letterSpacing: -0.4,
   },
-  station: { fontSize: 12, color: C.gray300, marginTop: 2 },
+  station: { fontSize: 12, color: C.gray300, marginTop: 4 },
 
   divider: { height: 1, backgroundColor: C.border, marginVertical: 16 },
   booking: {
     fontSize: 18,
     fontWeight: "800",
     color: C.white,
-    marginTop: 3,
+    marginTop: 4,
     letterSpacing: -0.2,
   },
 
@@ -420,7 +420,7 @@ const styles = scaledStyles({
     fontSize: 18,
     fontWeight: "800",
     color: C.white,
-    marginTop: 3,
+    marginTop: 4,
   },
 
   perfWrap: { height: 2, justifyContent: "center" },
@@ -437,7 +437,7 @@ const styles = scaledStyles({
     borderTopWidth: 2,
     borderTopColor: C.border,
     borderStyle: "dashed",
-    marginHorizontal: 18,
+    marginHorizontal: 16,
   },
 
   track: {

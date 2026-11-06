@@ -1,6 +1,6 @@
 import { memo, useMemo } from "react";
 import { GeoJSONSource, Layer } from "@maplibre/maplibre-react-native";
-import { MapMarker } from "@/lib/surroundings/mockData";
+import { markersForMode, type MapMarker } from "@/lib/surroundings/mockData";
 import { useAccent } from "@/lib/theme/accent";
 import { declutter, DECLUTTER_ZOOM } from "@/lib/surroundings/declutter";
 import { TRANSIT_COLOR } from "@/lib/theme/transitColors";
@@ -245,6 +245,14 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
     () => ({ type: "FeatureCollection" as const, features: aircrFeatures }),
     [aircrFeatures],
   );
+  /**
+   * Als fertige Zeichenkette an die Quellen — die Bibliothek ruft sonst bei
+   * JEDEM Render `JSON.stringify` auf (`GeoJSONSource.tsx`), auch wenn sich nur
+   * `hidden` ändert. Das passiert jetzt bei jedem Wechsel der Verkehrsart.
+   */
+  const dataMain = useMemo(() => JSON.stringify(geojsonMain), [geojsonMain]);
+  const dataBus = useMemo(() => JSON.stringify(geojsonBus), [geojsonBus]);
+  const dataAircr = useMemo(() => JSON.stringify(geojsonAircr), [geojsonAircr]);
 
   // Train/Subway/Tram-Source clustert IMMER bis zoom 11 — beim Reinzoomen
   // zerfallen die Cluster automatisch in Einzel-Marker (clusterMaxZoom={11}).
@@ -273,7 +281,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
     <>
       <GeoJSONSource
         id={SRC_ID}
-        data={geojsonMain}
+        data={dataMain}
         cluster={clusterMain}
         clusterMaxZoom={11}
         clusterRadius={60}
@@ -409,7 +417,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
           dicht sie gerendert sind. */}
       <GeoJSONSource
         id={SRC_ID_BUS}
-        data={geojsonBus}
+        data={dataBus}
         cluster={false}
         onPress={(e) => {
           if (!onMarkerPress) return;
@@ -439,7 +447,7 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
           Detection lahm. */}
       <GeoJSONSource
         id={SRC_ID_AIRCR}
-        data={geojsonAircr}
+        data={dataAircr}
         cluster={clusterAircr}
         clusterMaxZoom={13}
         clusterRadius={60}
@@ -505,5 +513,109 @@ export const MarkerLayer = memo(function MarkerLayer({ markers, onMarkerPress, h
       />
       </GeoJSONSource>
     </>
+  );
+});
+
+/**
+ * Flughäfen bzw. Häfen — eine feste Ebene je Art, einmal gefüllt und danach nur
+ * noch ein- und ausgeblendet (04.11.2026, „das laggt übertrieben").
+ *
+ * Vorher lief jeder Wechsel Transit ↔ Airport ↔ Cruise über `MarkerLayer` mit
+ * `key` der Art: drei Quellen und sechzehn Ebenen raus aus dem Stil und wieder
+ * hinein, dazu 3276 Flughäfen durch `declutter`, in Merkmale und per
+ * `JSON.stringify` als rund 400 kB an die Karte — auf dem UI-Strang genau dann,
+ * wenn die Kamera losfährt. Deren Kurve läuft Bild für Bild auf demselben
+ * Strang (`runSmooth` im MLRN-Patch), also ruckelte beides.
+ *
+ * Jetzt: Die Daten stehen fest (Modul-Ablage, ohne Ausweichen — Flughäfen
+ * liegen auf Stufe 15 nie übereinander), und ein Wechsel ändert nur
+ * `visibility` an drei Ebenen. Unsichtbare Quellen kosten MapLibre nichts: Es
+ * lädt Kacheln nur für Quellen mit sichtbaren Ebenen.
+ */
+export type PinKind = "airport" | "cruise";
+
+const pinsData: Partial<Record<PinKind, string>> = {};
+
+function pinsGeoJSON(kind: PinKind): string {
+  return (pinsData[kind] ??= JSON.stringify({
+    type: "FeatureCollection",
+    features: markersForMode(kind).map((m) => ({
+      type: "Feature",
+      geometry: { type: "Point", coordinates: [m.coord.longitude, m.coord.latitude] },
+      properties: { id: m.id },
+    })),
+  }));
+}
+
+export const StaticPinsLayer = memo(function StaticPinsLayer({
+  kind,
+  visible,
+  onPinPress,
+}: {
+  kind: PinKind;
+  visible: boolean;
+  /** Wie `onMarkerPress` — die Kennung des Punktes („airport:FRA"). */
+  onPinPress: (id: string) => void;
+}) {
+  const accent = useAccent();
+  const vis = visible ? SHOWN : HIDDEN;
+  const data = useMemo(() => pinsGeoJSON(kind), [kind]);
+  const box =
+    kind === "cruise"
+      ? "marker-box-cruise"
+      : accent.id === "mint"
+        ? "marker-box-airport-mint"
+        : "marker-box-airport-lime";
+  return (
+    <GeoJSONSource
+      id={`surroundings-pins-${kind}-src`}
+      data={data}
+      cluster
+      clusterMaxZoom={13}
+      clusterRadius={60}
+      onPress={(e) => {
+        const feature = e.nativeEvent.features.find(
+          (f) => !f.properties?.point_count && typeof f.properties?.id === "string",
+        );
+        if (feature) onPinPress(feature.properties!.id as string);
+      }}
+    >
+      <Layer
+        id={`surroundings-pins-${kind}-cluster`}
+        type="circle"
+        filter={["has", "point_count"]}
+        layout={vis}
+        paint={{
+          "circle-color": kind === "cruise" ? CRUISE_BLUE : accent.dark,
+          "circle-stroke-color": CLUSTER_RING,
+          "circle-stroke-width": 2.5,
+          "circle-radius": ["step", ["get", "point_count"], 16, 10, 20, 50, 24],
+        }}
+      />
+      <Layer
+        id={`surroundings-pins-${kind}-count`}
+        type="symbol"
+        filter={["has", "point_count"]}
+        layout={{
+          ...vis,
+          "text-field": ["get", "point_count_abbreviated"],
+          "text-font": ["Noto Sans Bold"],
+          "text-size": 13,
+        }}
+        paint={{ "text-color": CLUSTER_TEXT }}
+      />
+      <Layer
+        id={`surroundings-pins-${kind}-box`}
+        type="symbol"
+        filter={["!", ["has", "point_count"]]}
+        layout={{
+          ...vis,
+          "icon-image": box,
+          "icon-size": BOX_SIZE as never,
+          "icon-allow-overlap": true,
+          "icon-ignore-placement": true,
+        }}
+      />
+    </GeoJSONSource>
   );
 });

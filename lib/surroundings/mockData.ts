@@ -131,7 +131,12 @@ export function markersForMode(mode: SheetMode): MapMarker[] {
  * neuen Durchlauf aus. Auf zwei Nachkommastellen — rund einen Kilometer — ändert
  * sich an der Reihenfolge nichts, was jemand bemerkt.
  */
-let listCache: { key: string; items: StopListItem[] } | null = null;
+const listCache: Partial<Record<SheetMode, { key: string; items: StopListItem[] }>> = {};
+/*
+ * Je Art EIN Eintrag (04.11.2026): Vorher teilten sich Flughäfen und Häfen
+ * einen — jeder Wechsel Airport ↔ Cruise sortierte die 3276 Flughäfen neu,
+ * mitten im Umschalten.
+ */
 
 /**
  * Der Standort ist PFLICHT, und ohne ihn gibt es keine Liste.
@@ -145,13 +150,14 @@ let listCache: { key: string; items: StopListItem[] } | null = null;
 export function listForMode(mode: SheetMode, user: Coord | null): StopListItem[] {
   if (mode !== "airport" && mode !== "cruise") return [];
   if (!user) return [];
-  const key = `${mode}|${user.latitude.toFixed(2)}|${user.longitude.toFixed(2)}`;
-  if (listCache?.key === key) return listCache.items;
+  const key = `${user.latitude.toFixed(2)}|${user.longitude.toFixed(2)}`;
+  const hit = listCache[mode];
+  if (hit?.key === key) return hit.items;
   const items =
     mode === "airport"
       ? airportListSorted(AIRPORT_PINS, user)
       : cruiseListSorted(CRUISE_PORT_PINS, user);
-  listCache = { key, items };
+  listCache[mode] = { key, items };
   return items;
 }
 

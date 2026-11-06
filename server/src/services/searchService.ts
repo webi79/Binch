@@ -24,6 +24,7 @@ import {
   timelineProblem,
   warningRank,
 } from "../util/journeyTimeline.js";
+import { fareProfileFor } from "../util/fareProfile.js";
 
 export interface SearchInput extends ProviderSearchInput {
   mode: TravelMode;
@@ -180,10 +181,17 @@ const RESULT_SCHEMA_EPOCH = new Date("2026-07-14T00:01:00Z");
  *   („RB 59") statt Betreiber-Kürzel + Zugnummer („ERB 90339", siehe
  *   util/line.ts). Gespeicherte Treffer haben nur den fertigen Text, nicht
  *   DBs Kennung — nachträglich richtigstellen lässt er sich nicht.
+ * 2026-10-28T14:30Z: Die 1. Klasse wird jetzt wirklich bei der DB angefragt
+ *   (`firstClass`); vorher standen bei „1. Klasse" die Preise der 2. Klasse im
+ *   Zwischenspeicher. Dazu das Tarifprofil (`fare_profile`, BahnCard und
+ *   Deutschlandticket).
+ * 2026-10-28T19:17Z: Die Preis-Anreicherung (trainPricing.ts) rechnet jetzt mit
+ *   Klasse und Tarif der Suche — vorher trug sie Treffern ohne Preis (MOTIS,
+ *   mit BahnCard 100 fast alle) den VOLLEN Preis der 2. Klasse nach.
  *
  * Gleiche Regel: nie in die Zukunft setzen.
  */
-const TRAIN_RESULT_EPOCH = new Date("2026-09-27T14:20:00Z");
+const TRAIN_RESULT_EPOCH = new Date("2026-10-28T19:17:00Z");
 
 /**
  * Ab hier trägt jede gespeicherte Suche ihre Klasse (`travel_class`).
@@ -245,6 +253,8 @@ function cacheKey(input: SearchInput): string {
     // dbVendo-Suchfenster. Ohne Key-Anteil würde ein 09:00-Tap die gecachten
     // 14:00-Ergebnisse derselben Strecke/Tag serviert bekommen.
     input.departTime ?? "",
+    // Und das Tarifprofil: Ein BahnCard-Preis gehört nur dem mit BahnCard.
+    input.fareProfile ?? "",
   ].join("|");
 }
 
@@ -301,6 +311,10 @@ async function loadFromCache(input: SearchInput, maxAgeMs?: number): Promise<Cac
         travelClass
           ? eq(searchRequests.travelClass, travelClass)
           : isNull(searchRequests.travelClass),
+        // Tarifprofil wie die Klasse: leer heißt ohne Karte, nie „egal".
+        input.fareProfile
+          ? eq(searchRequests.fareProfile, input.fareProfile)
+          : isNull(searchRequests.fareProfile),
         eq(searchRequests.passengers, input.passengers),
         eq(searchRequests.currency, input.currency),
         gte(searchRequests.createdAt, effectiveSince),
@@ -541,6 +555,7 @@ async function runLive(input: SearchInput): Promise<SearchOutput> {
       currency: input.currency,
       // Teil der Cache-Identität (siehe loadFromCache) — Standard = leer.
       travelClass: normalizeTravelClass(input.travelClass) || null,
+      fareProfile: input.fareProfile || null,
     })
     .returning({ id: searchRequests.id });
 
@@ -1055,7 +1070,9 @@ async function searchNearbyFallback(rawInput: SearchInput): Promise<SearchOutput
 }
 
 export async function runSearch(input: SearchInput): Promise<SearchOutput> {
-  const rawInput = await withCurrentCodes(input);
+  // EINE Schreibweise des Tarifprofils, und nur bei Zügen (util/fareProfile.ts) —
+  // vor allem anderen, denn Cache-Schlüssel und Provider lesen beide daraus.
+  const rawInput = await withCurrentCodes({ ...input, fareProfile: fareProfileFor(input.mode, input.fareProfile) });
   const out = await runSearchUncut(rawInput);
   const primary = guardTimelines(applyRequestedTime(out, rawInput), rawInput);
   if (rawInput.mode !== "FLIGHT" || primary.results.length > 0) return primary;

@@ -16,8 +16,10 @@ import Animated, {
   useAnimatedProps,
   useAnimatedReaction,
   useAnimatedStyle,
+  useDerivedValue,
   useSharedValue,
   withTiming,
+  type SharedValue,
 } from "react-native-reanimated";
 
 import { BinchSwitch } from "@/components/ui/BinchSwitch";
@@ -27,7 +29,7 @@ import { haptic } from "@/lib/haptics";
 import { useT } from "@/lib/i18n/useT";
 import { useAccent } from "@/lib/theme/accent";
 import { usePalette } from "@/lib/theme/appBg";
-import { CLOSE_ICON_SIZE, FIELD_H, SPACE } from "@/lib/theme/spacing";
+import { CLOSE_ICON_SIZE, FIELD_H, GROUP_GAP, ITEM_GAP, SECTION_GAP, SPACE } from "@/lib/theme/spacing";
 import { primeTick, releaseTick, wheelTick } from "@/lib/ui/tick";
 import { ms, scaledStyles } from "@/lib/ui/compact";
 
@@ -45,12 +47,12 @@ import { ms, scaledStyles } from "@/lib/ui/compact";
  * der Nutzer richtet eine Kaufentscheidung danach aus, und liegt die Zahl
  * daneben, hat ihn die App das Geld gekostet, das sie ihm sparen sollte.
  *
- * DAS ABZEICHEN ÜBER DER ZAHL IST KEINE PROGNOSE. Es speist sich AUSSCHLIESSLICH
- * aus dem Prozentsatz, den der Nutzer gerade selbst eingestellt hat — siehe
- * `tierAt()`. Es liest weder Strecke noch Datum, weder Verkehrsmittel noch
- * Preishöhe, und es fragt nichts ab. Es sagt nur, was für sich genommen wahr
- * ist und keine Daten braucht: Je größer der geforderte Preissturz, desto
- * unwahrscheinlicher, dass er eintritt.
+ * DIE STUFE („Eher unwahrscheinlich") IST KEINE PROGNOSE. Sie speist sich
+ * AUSSCHLIESSLICH aus dem Prozentsatz, den der Nutzer gerade selbst eingestellt
+ * hat — siehe `tierAt()`. Sie liest weder Strecke noch Datum, weder
+ * Verkehrsmittel noch Preishöhe, und sie fragt nichts ab. Sie sagt nur, was für
+ * sich genommen wahr ist und keine Daten braucht: Je größer der geforderte
+ * Preissturz, desto unwahrscheinlicher, dass er eintritt.
  *
  * Daraus folgt auch die Wortwahl. Die Vorlage schreibt „Unlikely for this route
  * and dates" — DAS DÜRFEN WIR NICHT, weil wir Strecke und Datum gerade nicht
@@ -58,9 +60,9 @@ import { ms, scaledStyles } from "@/lib/ui/compact";
  * unwahrscheinlich" / „Sehr unwahrscheinlich": eine Aussage über die Höhe der
  * Hürde, nicht über diese Verbindung.
  *
- * Wer das später „mit echten Daten verbessern" will: Es gibt keine. Das
- * Abzeichen an eine Herkunft zu hängen, die wir nicht haben, macht aus einer
- * ehrlichen Skala genau die Prognose, die oben verboten ist.
+ * Wer das später „mit echten Daten verbessern" will: Es gibt keine. Die Stufe
+ * an eine Herkunft zu hängen, die wir nicht haben, macht aus einer ehrlichen
+ * Skala genau die Prognose, die oben verboten ist.
  *
  * Was sonst bleibt, ist überprüfbar: ein Preis, den wir wirklich vorliegen
  * haben, und eine Schwelle, die der Nutzer selbst setzt.
@@ -71,6 +73,25 @@ import { ms, scaledStyles } from "@/lib/ui/compact";
  * vollständig aus `SheetModal` — dafür gibt es sie. Der Zuschnitt (Titel,
  * Auswahl, Knopf unten) folgt `TravelOptionsSheets.tsx`, inklusive der Regel,
  * dass erst ÜBERNOMMEN wird, wenn das Blatt unten angekommen ist.
+ *
+ * Der KOPF — Stufen-Pille, große Prozentzahl, Balken, Regler — folgt zwei
+ * Nutzer-Entscheidungen vom 05.11.2026: Pille und Zahl mittig wie bisher (keine
+ * Überschrift „Target price", keine Preisachse), die Strecke unter dem Titel
+ * entfällt. Aus seiner Preisfilter-Vorlage stammen die BALKEN über dem Regler
+ * und der UNTERE Teil: zwei beschriftete Felder (Aktueller Preis / Alarm bei),
+ * darunter die Option, eine einzige Linie dazwischen.
+ *
+ * ── DIE BALKEN SIND EINE ZEICHNUNG, KEINE STATISTIK ───────────────────────
+ *
+ * In der Vorlage zählen sie echte Angebote je Preisstufe. Hier zählen sie
+ * NICHTS, und so sind sie auch gebaut: keine Achse, keine Zahl, keine Anzahl,
+ * keine Datenquelle. Sie zeichnen dieselbe Setzung wie die Pille — „je größer
+ * der geforderte Sturz, desto unwahrscheinlicher" — als Form: links der
+ * höchste, nach rechts immer kleiner (Nutzerwunsch, wörtlich). Die Form ist
+ * für jede Strecke, jedes Datum und jeden Preis DIESELBE; sie liest nichts.
+ *
+ * Wer sie „mit echten Daten füllen" will: siehe oben. Es gibt keine, und eine
+ * geschätzte Verteilung wäre die verbotene Prognose in Balkenform.
  */
 
 const C = {
@@ -80,7 +101,7 @@ const C = {
   closeIcon: "#E5E7EB",
   white: "#FFFFFF",
   /**
-   * Die mittlere Stufe des Abzeichens — KEIN neuer Ton.
+   * Die mittlere Stufe der Pille — KEIN neuer Ton.
    *
    * Es ist das `amber` aus dem Streckenblatt (`LegTimelineOverlay.tsx`), und
    * dort steht es bereits für genau diese Bedeutung: `stopsAccent` gibt einer
@@ -135,8 +156,94 @@ const DEFAULT_PCT = 10;
  */
 const TRACK_H = ms(4);
 const HANDLE = ms(28);
+/** Rand des Griffs in Blattfarbe (siehe `sl.handle`) — sichtbar ist der Griff ohne ihn. */
+const HANDLE_RING = 2;
 /** Zeile, in der der Regler liegt — auf Fingerbreite, nicht auf Griffbreite. */
 const SLIDER_ROW_H = ms(44);
+/** Von der sichtbaren Unterkante des Griffs bis zum Ende der Reglerzeile. */
+const BELOW_HANDLE = SLIDER_ROW_H / 2 - (HANDLE / 2 - HANDLE_RING);
+
+/**
+ * Die Luft, die der Kasten der großen Zahl unter ihren Ziffern mitbringt
+ * (Unterlänge der Schrift — Ziffern haben keine). Am Gerät gemessen
+ * (06.11.2026): 7, oben knapp 8. Abgezogen, damit die Abstände an den
+ * SICHTBAREN Kanten stimmen, wie überall in der App.
+ */
+const PCT_BOX_BOTTOM = ms(7);
+/** Die Beschriftung über den Feldern bringt über ihren Buchstaben gut 1 mit. */
+const LABEL_BOX_TOP = ms(1.5);
+
+/**
+ * Die Balken über dem Regler — siehe „Die Balken sind eine Zeichnung" oben.
+ *
+ * 25 Balken über die 50 Werte des Reglers. Am linken Anschlag ist der erste
+ * an, am rechten sind alle an.
+ *
+ * VON KANTE ZU KANTE (Nutzer 06.11.2026: „das Histogramm bitte wirklich bis zu
+ * den Kanten links und rechts"): Die Balken nehmen die volle Breite der Spur
+ * ein, mit dem normalen seitlichen Rand des Blattes.
+ *
+ * DIE FARBGRENZE STEHT ÜBER DER GRIFFMITTE (Nutzer 06.11.2026: „Histogramm und
+ * Slider sind off — das soll synchron zueinander passen"). Vorher schlug je
+ * zwei Prozent ein GANZER Balken um, gerechnet nach dem Wert; die Balken
+ * stehen aber über der vollen Breite, die Griffmitte läuft nur von
+ * `HANDLE / 2` bis `Spur − HANDLE / 2`. Die Grenze sprang so in Schritten von
+ * gut 15 Punkten und lag bis zu 10 neben dem Griff. Jetzt ist es dieselbe Form
+ * wie Spur und Füllung: die Balken einmal gedämpft, darüber dieselben im
+ * Akzent, und die obere Lage nur bis zur Griffmitte sichtbar (`histEdge`) —
+ * ein Balken unter der Grenze ist also zum Teil gefüllt, genau wie die Spur.
+ *
+ * Höhe 56 (`FIELD_H`): so hoch wie die Felder darunter — eine Form, die sich
+ * neben dem Knopf nicht vordrängt. Der kleinste bleibt 6 hoch, sichtbar
+ * („die Balken sind immer noch zu sehen").
+ */
+const HIST_BARS = 25;
+const HIST_H = ms(FIELD_H);
+const BAR_MIN_H = ms(6);
+const BAR_GAP = ms(SPACE.xs);
+/**
+ * Luft zwischen Balkenfuß und GRIFF — ITEM_GAP, sie gehören zusammen.
+ *
+ * Bis 06.11.2026 maß sie bis zur Spur. Der Griff ragt aber 10 Punkte über die
+ * Spur hinaus und stand damit genau AUF den Balkenfüßen — am Gerät eine
+ * Berührung, die nach Versehen aussah. In der Vorlage steht zwischen Balken und
+ * Griff sichtbar Luft; jetzt auch hier: 8 bis zur Oberkante des Griffs (ohne
+ * seinen Rand in Blattfarbe, den sieht man nicht), die Spur liegt dadurch 18
+ * unter den Balken.
+ *
+ * Die Reglerzeile ist 44 hoch, die Spur liegt in ihrer Mitte; die Balken
+ * reichen um diesen Betrag in die Zeile hinein (negativer Abstand).
+ */
+const HIST_OVERLAP = BELOW_HANDLE - ms(ITEM_GAP);
+
+/**
+ * Wo die Balken vom Akzent ins Gedämpfte wechseln, bei Wertanteil `f` und
+ * Spurbreite `w` — ÜBER DER GRIFFMITTE.
+ *
+ * Nur zum rechten Anschlag hin eilt sie der Mitte voraus, bis zur Kante: Dort
+ * steht die Griffmitte einen halben Griff vor dem Ende, und der letzte Balken
+ * bliebe auch bei 50 % gedämpft. Kubisch, damit sie fast den ganzen Weg genau
+ * über der Mitte bleibt (bei drei Vierteln knapp 2 Punkte voraus, am Anschlag
+ * einen halben Griff) — immer innerhalb des Griffs. Links braucht es das
+ * nicht: Am Anschlag steht die Mitte schon hinter dem ersten Balken.
+ */
+function histEdgeAt(f: number, w: number): number {
+  "worklet";
+  const center = HANDLE / 2 + f * (w - HANDLE);
+  const u = 2 * f - 1;
+  return u > 0 ? center + (HANDLE / 2) * u * u * u : center;
+}
+
+/**
+ * Die Höhen — streng fallend: eine Glockenschulter (links fast flach, dann
+ * steil) mit einem leichten Gefälle darunter, damit auch der letzte Balken
+ * noch kleiner ist als sein Nachbar. Einmal beim Laden gerechnet.
+ */
+const BAR_HEIGHTS = Array.from({ length: HIST_BARS }, (_, i) => {
+  const t = i / (HIST_BARS - 1);
+  const f = 0.92 * Math.exp(-((t / 0.45) ** 2)) + 0.08 * (1 - t);
+  return BAR_MIN_H + (HIST_H - BAR_MIN_H) * f;
+});
 
 /** Trefferfläche des X — dieselbe Rechnung wie an den anderen freien Zeichen. */
 const ICON_HIT_SLOP = (44 - CLOSE_ICON_SIZE) / 2;
@@ -231,31 +338,7 @@ function desiredAt(basePrice: number, pct: number): number {
   return Math.max(1, Math.min(raw, basePrice - 1));
 }
 
-/**
- * Der ABZUG — abgeleitet aus dem gerundeten Wunschpreis, nicht getrennt
- * gerechnet.
- *
- * Hier stand `basePrice * pct / 100`, und im Build kam dabei
- * „10% (2.9899999999999984 EUR)" heraus. Zwei Fehler auf einmal:
- *
- *  - Er lief ungerundet in die Anzeige. Fließkommazahlen sind selten glatt,
- *    und 29,99 × 0,1 ist es eben nicht.
- *  - Selbst gerundet hätte er der Karte widersprochen. Die drei Zeilen sind
- *    eine Rechnung, die der Nutzer nachvollzieht: oben der Preis, in der Mitte
- *    der Abzug, unten das Ergebnis. Getrennt gerechnet ergäbe „30 minus 3
- *    macht 27" mit einer 2,99 in der Mitte — die Karte widerspräche sich
- *    selbst.
- *
- * Deshalb ist der Abzug die DIFFERENZ der beiden anderen Zeilen, und beide
- * gehen vom selben gerundeten Grundpreis aus. Damit stimmt die Rechnung
- * zwangsläufig, statt zufällig.
- */
-function dropAt(basePrice: number, pct: number): number {
-  "worklet";
-  return basePrice - desiredAt(basePrice, pct);
-}
-
-/** Die Stufe des Abzeichens — allein aus dem eingestellten Prozentsatz.
+/** Die Stufe — allein aus dem eingestellten Prozentsatz.
  *  0 = gut möglich, 1 = eher unwahrscheinlich, 2 = sehr unwahrscheinlich. */
 function tierAt(pct: number): number {
   "worklet";
@@ -282,8 +365,6 @@ export interface PriceAlertSheetProps {
   currentPrice: number;
   /** ISO-Währungscode aus den Such-Parametern, z.B. "EUR". */
   currency: string;
-  fromLabel: string;
-  toLabel: string;
   /** Übernehmen. `desiredPrice` in derselben Währung, auf ganze Einheiten gerundet. */
   onCreate: (desiredPrice: number, notifyOnRise: boolean) => void;
 }
@@ -293,8 +374,6 @@ export const PriceAlertSheet = memo(function PriceAlertSheet({
   onClose,
   currentPrice,
   currency,
-  fromLabel,
-  toLabel,
   onCreate,
 }: PriceAlertSheetProps) {
   /**
@@ -325,8 +404,6 @@ export const PriceAlertSheet = memo(function PriceAlertSheet({
         <PriceAlertBody
           currentPrice={currentPrice}
           currency={currency}
-          fromLabel={fromLabel}
-          toLabel={toLabel}
           onDismiss={close}
           onSubmit={(price, rise) => {
             created.current = { price, rise };
@@ -341,15 +418,11 @@ export const PriceAlertSheet = memo(function PriceAlertSheet({
 function PriceAlertBody({
   currentPrice,
   currency,
-  fromLabel,
-  toLabel,
   onDismiss,
   onSubmit,
 }: {
   currentPrice: number;
   currency: string;
-  fromLabel: string;
-  toLabel: string;
   onDismiss: () => void;
   onSubmit: (desiredPrice: number, notifyOnRise: boolean) => void;
 }) {
@@ -443,7 +516,9 @@ function PriceAlertBody({
    * bei einer Drehung oder einem anderen Fensterzuschnitt korrigiert es die
    * Schätzung, statt dass sie stehen bleibt.
    */
-  const trackW = useSharedValue(Math.max(0, winW - SHEET_PAD_H * 2));
+  /** Der seitliche Rand des Blattes geht dort durch `scaledStyles` — hier also auch. */
+  const estTrackW = Math.max(0, winW - ms(SHEET_PAD_H) * 2);
+  const trackW = useSharedValue(estTrackW);
 
   /**
    * Liegt ein Finger auf dem Regler? 0 = nein, 1 = ja — dazwischen die weiche
@@ -478,31 +553,6 @@ function PriceAlertBody({
     (cur, prev) => {
       if (prev === null || cur === prev) return;
       runOnJS(wheelTick)();
-    },
-  );
-
-  /**
-   * Die Stufe des Abzeichens ist das EINZIGE am Regler, das durch React läuft
-   * — und das ist kein Rückfall, sondern die richtige Grenze.
-   *
-   * Der Unterschied zur Prozentzahl: Die ändert sich bei jeder Fingerbewegung,
-   * die Stufe höchstens zweimal über den ganzen Weg. Beobachtet wird deshalb
-   * `tierAt` und nicht `pctAt` — die Reaktion feuert nur beim echten Wechsel,
-   * nicht bei jedem Prozent.
-   *
-   * Warum überhaupt React: Die Pille passt sich ihrer Beschriftung an, und die
-   * ist in vier Sprachen verschieden lang. Ein Textfeld, das der UI-Strang
-   * beschreibt, wächst nicht mit seinem Inhalt — es müsste eine feste Breite
-   * bekommen, die für „Sehr unwahrscheinlich" und „Muy improbable"
-   * gleichermaßen passt. Das wäre eine Pille mit Luft an den Seiten, deren
-   * Menge von der Sprache abhängt.
-   */
-  const [tier, setTier] = useState(tierAt(DEFAULT_PCT));
-  useAnimatedReaction(
-    () => tierAt(pctAt(progress.value)),
-    (cur, prev) => {
-      if (prev === null || cur === prev) return;
-      runOnJS(setTier)(cur);
     },
   );
 
@@ -590,6 +640,19 @@ function PriceAlertBody({
   });
 
   /**
+   * Die Grenze der Balken (`histEdgeAt`) — aus demselben eingerasteten Wert wie
+   * Griff und Füllung, also im selben Bild und im selben Schritt. Nur
+   * Verschiebungen, kein Layout; zwei Stile statt 25 (vorher einer je Balken).
+   */
+  const histEdge = useDerivedValue(() => histEdgeAt(fracAt(progress.value), trackW.value));
+  const histCutStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: histEdge.value - trackW.value }],
+  }));
+  const histHoldStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: trackW.value - histEdge.value }],
+  }));
+
+  /**
    * Der Griff: Kreis im Ruhezustand, stehende Pille unter dem Finger.
    *
    * Animiert werden BREITE, HÖHE und RADIUS — nicht `scaleX`/`scaleY`, obwohl
@@ -640,36 +703,10 @@ function PriceAlertBody({
     return { text: `${pctAt(progress.value)}` };
   });
 
-  const dropProps = useAnimatedProps<TextInputProps & { text: string }>(() => {
-    "worklet";
-    const pct = pctAt(progress.value);
-    return { text: `${pct}% (${dropAt(basePrice, pct)} ${code})` };
-  });
-
-  const desiredProps = useAnimatedProps<TextInputProps & { text: string }>(() => {
+  const atProps = useAnimatedProps<TextInputProps & { text: string }>(() => {
     "worklet";
     return { text: `${desiredAt(basePrice, pctAt(progress.value))} ${code}` };
   });
-
-  /**
-   * Der Ton der Pille. Grün ist der AKZENT, nicht ein eigenes Grün.
-   *
-   * Das Streckenblatt macht es genauso (`stopsAccent`): direkte Verbindung →
-   * Akzent, mit Umstiegen → Amber. Ein zweites Grün daneben wären zwei Grüns in
-   * einem Blatt, die nichts voneinander wissen. Beide Akzente der App (Lime und
-   * Mint) lesen sich als „gut" — Mint ist ein Blaugrün, aber unverkennbar auf
-   * der grünen Seite.
-   *
-   * Fläche gedämpft, Schrift in der Vollfarbe: dasselbe Verhältnis wie in der
-   * Vorlage und wie überall sonst in der App, wo eine Pille eine Eigenschaft
-   * trägt.
-   */
-  const tone =
-    tier === 0
-      ? { fg: accent.solid, bg: accent.subtle }
-      : tier === 1
-        ? { fg: C.amber, bg: C.amberSoft }
-        : { fg: C.red, bg: C.redSoft };
 
   const submit = () => {
     if (!hasPrice) return;
@@ -681,15 +718,13 @@ function PriceAlertBody({
 
   return (
     <>
+      {/* Nur der Titel: Die Strecke darunter ist weg (Nutzer 05.11.2026, „das
+          brauchen wir nicht mehr") — das Blatt öffnet über genau der Suche, zu
+          der es gehört, ihr Kopf steht dahinter. */}
       <View style={styles.head}>
-        <View style={styles.headText}>
-          <Text style={styles.title}>{t("alert.title")}</Text>
-          {/* Die Strecke steht als Unterzeile — das Blatt gehört zu EINER Suche,
-              und ohne sie wüsste man nach dem Öffnen nicht mehr, zu welcher. */}
-          <Text style={styles.subtitle} numberOfLines={1}>
-            {`${fromLabel} – ${toLabel}`}
-          </Text>
-        </View>
+        <Text style={styles.title} numberOfLines={1}>
+          {t("alert.title")}
+        </Text>
         {/* Das X ist streng genommen doppelt — die Hülle bringt Wischen, die
             Verdunkelung und die Zurück-Taste schon mit. Es bleibt trotzdem: Von
             diesen dreien ist keiner sichtbar, und ein Blatt, das eine Eingabe
@@ -706,51 +741,25 @@ function PriceAlertBody({
       </View>
 
       {/**
-        * Das Abzeichen — und was es NICHT ist, steht oben in der Datei.
-        *
-        * Es hängt allein an `tier`, und `tier` allein am eingestellten
-        * Prozentsatz. Kein Netzaufruf, keine Strecke, kein Datum.
+        * Die Stufen-Pille — und was sie NICHT ist, steht oben in der Datei.
+        * Sie hängt allein am eingestellten Prozentsatz: kein Netzaufruf, keine
+        * Strecke, kein Datum. Ein eigenes Bauteil (`TierBadge`), damit ihr
+        * Wechsel nur die Pille neu zeichnet.
         */}
-      <View style={[styles.badge, { backgroundColor: tone.bg }]}>
-        <Text style={[styles.badgeText, { color: tone.fg }]} numberOfLines={1}>
-          {t(TIER_KEYS[tier] ?? TIER_KEYS[0])}
-        </Text>
-      </View>
+      <TierBadge progress={progress} />
 
       {/**
         * Die große Zahl ist ZWEIGETEILT: die Ziffern kräftig, das Prozentzeichen
-        * schwächer und kleiner. Zwei Töne, ein Element.
+        * schwächer und kleiner. Der Wert wird vom UI-Strang geschrieben, und
+        * `animatedProps` setzt den GANZEN Inhalt eines Feldes — also lebt nur
+        * das linke Feld, das Zeichen daneben ändert sich nie.
         *
-        * Dass daraus zwei Knoten werden, ist keine Stilfrage, sondern folgt aus
-        * dem Weg: Der Wert wird vom UI-Strang geschrieben, und `animatedProps`
-        * setzt den GANZEN Inhalt eines Feldes. Ein Feld mit zwei verschieden
-        * gesetzten Teilen gibt es damit nicht. Also lebt nur das linke Feld, das
-        * Zeichen daneben ist ein gewöhnlicher Text und ändert sich nie.
-        *
-        * Die feste Mindestbreite der Ziffern ist der Grund, warum nichts
-        * wandert: Zwei Stellen sind reserviert, ob sie belegt sind oder nicht,
-        * und die Ziffern stehen rechtsbündig darin. Dieselbe Vorkehrung wie am
-        * Zähler der Reisenden — dort steht sie mit derselben Begründung.
-        *
-        * ZENTRIERT wiegt das schwerer als vorher, nicht leichter. Links
-        * ausgerichtet hätte ein fehlendes Reservat nur das Prozentzeichen
-        * verschoben; mittig ausgerichtet verschiebt es die GANZE Gruppe, und
-        * zwar bei jedem Wechsel zwischen 9 und 10 — mitten im Ziehen, also
-        * genau dann, wenn man hinsieht. Mit dem Reservat ist die Breite der
-        * Gruppe konstant, sie bleibt also stehen.
-        *
-        * Der Preis dafür, ehrlich benannt: Bei einstelligen Werten steht in der
-        * reservierten Fläche links eine leere Ziffernbreite, die Gruppe wirkt
-        * dadurch um eine halbe Ziffer nach rechts versetzt. Das ist die
-        * günstigere Hälfte des Tauschs — die Alternative wäre, die Gruppe bei
-        * jedem Überschreiten der 9 springen zu lassen, und ein Sprung fällt
-        * ungleich mehr auf als ein Versatz, den man ohne Vergleich gar nicht
-        * bemerkt. Ganz zu haben ist beides nicht: Ein Text veränderlicher
-        * Breite kann entweder feste Kanten haben oder eine feste Mitte.
-        *
-        * Reserviert ist bewusst großzügig: Bleibt Platz übrig, sieht man ihn
-        * kaum; reicht er nicht, wächst das Feld und die Gruppe wandert doch —
-        * also genau der Fehler, den das Reservat verhindern soll.
+        * Zwei Stellen sind reserviert (`minWidth`), die Ziffern stehen
+        * rechtsbündig darin. So bleibt die Breite der mittig ausgerichteten
+        * Gruppe konstant, und sie springt nicht bei jedem Wechsel zwischen 9
+        * und 10 — mitten im Ziehen, also genau dann, wenn man hinsieht. Der
+        * Preis: Bei einstelligen Werten steht sie eine halbe Ziffer rechts der
+        * Mitte. Ein Versatz fällt weniger auf als ein Sprung.
         */}
       <View style={styles.pctRow}>
         <AnimatedTextInput
@@ -764,75 +773,108 @@ function PriceAlertBody({
         <Text style={styles.pctSign}>%</Text>
       </View>
 
+      {/**
+        * Balken und Regler sind EIN Bedienteil: Die Geste liegt auf beiden, ein
+        * waagerechter Zug über die Balken stellt also auch ein — eine größere
+        * Fläche für den Finger, und es ist dieselbe Achse. Gemessen wird die
+        * Hülle; sie ist so breit wie die Spur.
+        *
+        * Ungewählter Teil von Spur UND Balken in `accent.subtle`, nicht mehr im
+        * Grau der Flächen: Spur und Balken sind eine Form in zwei Stufen, wie in
+        * der Vorlage — hell, was gilt, gedämpft, was nicht.
+        */}
       <GestureDetector gesture={pan}>
         <View
-          style={sl.sliderRow}
+          style={sl.control}
           onLayout={(e) => {
             trackW.value = e.nativeEvent.layout.width;
           }}
         >
-          <View style={[sl.track, { backgroundColor: palette.s3 }]}>
+          <View
+            style={sl.hist}
+            pointerEvents="none"
+            accessibilityElementsHidden
+            importantForAccessibility="no-hide-descendants"
+          >
+            <HistBars color={accent.subtle} />
+            {/* Dieselben Balken im Akzent, sichtbar bis zur Grenze am Griff:
+                Das Fenster fährt mit der Grenze, sein Inhalt genau gegenläufig
+                — die Balken stehen still, nur der Ausschnitt wandert. */}
+            <Animated.View style={[sl.histCut, histCutStyle]}>
+              <Animated.View style={[sl.histLayer, histHoldStyle]}>
+                <HistBars color={accent.solid} />
+              </Animated.View>
+            </Animated.View>
+          </View>
+          <View style={sl.sliderRow}>
+            <View style={[sl.track, { backgroundColor: accent.subtle }]}>
+              <Animated.View
+                style={[sl.fill, { backgroundColor: accent.solid }, fillStyle]}
+              />
+            </View>
+            {/* Helle Füllung, Rand in der Farbe des Blattes — siehe `sl.handle`.
+                Der Akzent bleibt dem zurückgelegten Teil der Spur vorbehalten. */}
             <Animated.View
-              style={[sl.fill, { backgroundColor: accent.solid }, fillStyle]}
+              style={[
+                sl.handle,
+                { backgroundColor: C.white, borderColor: palette.s1 },
+                handleStyle,
+              ]}
             />
           </View>
-          {/* Helle Füllung, Rand in der Farbe des Blattes — siehe `sl.handle`.
-              Der Akzent bleibt dem zurückgelegten Teil der Spur vorbehalten. */}
-          <Animated.View
-            style={[
-              sl.handle,
-              { backgroundColor: C.white, borderColor: palette.s1 },
-              handleStyle,
-            ]}
-          />
         </View>
       </GestureDetector>
 
       {hasPrice ? (
-        <View style={[styles.card, { backgroundColor: palette.s2 }]}>
-          <View style={styles.cardRow}>
-            <Text style={styles.cardLabel}>{t("alert.current")}</Text>
-            <Text style={styles.cardValue}>{`${basePrice} ${code}`}</Text>
-          </View>
-
+        <>
           {/**
-            * Die EINZIGE Trennlinie der Karte, und sie steht mit Absicht genau
-            * hier: Über ihr steht, was IST — ein Preis, den wir vorliegen haben.
-            * Darunter steht, was der Nutzer daraus MACHT. Zwischen diesen beiden
-            * Sorten von Zeile verläuft die einzige Grenze, die es in dieser
-            * Karte zu ziehen gibt; eine Linie zwischen je zwei Zeilen wäre eine
-            * Tabelle und würde nichts mehr aussagen.
+            * Zwei beschriftete Felder wie „Minimum / Maximum" in der Vorlage:
+            * links der Preis, den wir WIRKLICH vorliegen haben, rechts der
+            * Auslöser — im Akzent, er ist das Ergebnis der Einstellung. Der
+            * Abschlag dazwischen steht groß darüber; zusammen geht die Rechnung
+            * auf, weil beide Beträge vom selben gerundeten Grundpreis kommen
+            * (`desiredAt`).
+            *
+            * Nur Anzeige, kein Eingabefeld: Das Blatt weicht der Tastatur
+            * nicht aus (`SheetModal`), sie läge über genau diesen Feldern.
             */}
-          <View style={[sl.divider, { backgroundColor: palette.border }]} />
+          <View style={styles.fields}>
+            <View style={styles.field}>
+              <Text style={styles.fieldLabel} numberOfLines={1}>
+                {t("alert.current")}
+              </Text>
+              <View style={[styles.fieldBox, { backgroundColor: palette.s2 }]}>
+                <Text style={styles.fieldValue} numberOfLines={1}>
+                  {`${basePrice} ${code}`}
+                </Text>
+              </View>
+            </View>
+            <View style={styles.field}>
+              <Text style={styles.fieldLabel} numberOfLines={1}>
+                {t("alert.at")}
+              </Text>
+              <View style={[styles.fieldBox, { backgroundColor: palette.s2 }]}>
+                <AnimatedTextInput
+                  editable={false}
+                  pointerEvents="none"
+                  underlineColorAndroid="transparent"
+                  defaultValue={`${desiredAt(basePrice, DEFAULT_PCT)} ${code}`}
+                  animatedProps={atProps}
+                  style={[styles.fieldValue, { color: accent.solid }]}
+                />
+              </View>
+            </View>
+          </View>
 
-          <View style={styles.cardRow}>
-            <Text style={styles.cardLabel}>{t("alert.drop")}</Text>
-            <AnimatedTextInput
-              editable={false}
-              pointerEvents="none"
-              underlineColorAndroid="transparent"
-              defaultValue={`${DEFAULT_PCT}% (${dropAt(basePrice, DEFAULT_PCT)} ${code})`}
-              animatedProps={dropProps}
-              style={styles.cardValueLive}
-            />
-          </View>
-          <View style={styles.cardRow}>
-            <Text style={styles.cardLabel}>{t("alert.desired")}</Text>
-            <AnimatedTextInput
-              editable={false}
-              pointerEvents="none"
-              underlineColorAndroid="transparent"
-              defaultValue={`${desiredAt(basePrice, DEFAULT_PCT)} ${code}`}
-              animatedProps={desiredProps}
-              style={[styles.cardValueLive, { color: accent.solid }]}
-            />
-          </View>
+          {/* Die einzige Linie des Blattes: Darüber steht die Auswahl, darunter
+              eine Einstellung dazu. */}
+          <View style={[sl.divider, styles.optionDivider, { backgroundColor: palette.border }]} />
 
           {/* Die Schalterzeile hält ihren Zustand selbst — die Begründung
-              steht bei `RiseRow` weiter unten, sie ist der Grund, warum die
-              Karte beim Umlegen nicht mehr aufblitzt. */}
+              steht bei `RiseRow` weiter unten, sie ist der Grund, warum das
+              Blatt beim Umlegen nicht aufblitzt. */}
           <RiseRow label={t("alert.rise")} onChange={(v) => (notifyOnRiseRef.current = v)} />
-        </View>
+        </>
       ) : (
         /* Ohne Preis wird hier NICHTS gerechnet und nichts gezeigt, was nach
            einer Zahl aussieht. Der Regler bleibt stehen — er ist das Bedienteil
@@ -856,18 +898,72 @@ function PriceAlertBody({
 }
 
 /**
+ * Die Stufen-Pille über der Zahl — ein EIGENES Bauteil.
+ *
+ * Sie ist das Einzige am Regler, das durch React läuft, und zwar nur beim
+ * echten Wechsel: Beobachtet wird `tierAt`, nicht `pctAt` — über den ganzen
+ * Weg höchstens zweimal. Hier unten, damit so ein Wechsel nur die Pille neu
+ * zeichnet. Lag der Zustand im Blatt (bis 05.11.2026), rendete jeder Wechsel
+ * mitten im Ziehen das ganze Blatt samt seinen Textfeldern — dieselbe Falle
+ * wie beim Schalter (`RiseRow`).
+ *
+ * Warum überhaupt React: Die Pille passt sich ihrer Beschriftung an, und die
+ * ist in vier Sprachen verschieden lang. Ein Textfeld, das der UI-Strang
+ * beschreibt, wächst nicht mit seinem Inhalt. Ihre Breite verschiebt nichts:
+ * Sie steht mittig für sich, ihre Höhe bleibt gleich.
+ *
+ * Grün ist der AKZENT, kein eigenes Grün — wie `stopsAccent` im Streckenblatt
+ * (direkt → Akzent, mit Umstiegen → Amber). Fläche gedämpft, Schrift in der
+ * Vollfarbe, wie jede Eigenschafts-Pille der App.
+ */
+const TierBadge = memo(function TierBadge({ progress }: { progress: SharedValue<number> }) {
+  const t = useT();
+  const accent = useAccent();
+  const [tier, setTier] = useState(tierAt(DEFAULT_PCT));
+  useAnimatedReaction(
+    () => tierAt(pctAt(progress.value)),
+    (cur, prev) => {
+      if (prev === null || cur === prev) return;
+      runOnJS(setTier)(cur);
+    },
+  );
+  const tone =
+    tier === 0
+      ? { fg: accent.solid, bg: accent.subtle }
+      : tier === 1
+        ? { fg: C.amber, bg: C.amberSoft }
+        : { fg: C.red, bg: C.redSoft };
+  return (
+    <View style={[styles.badge, { backgroundColor: tone.bg }]}>
+      <Text style={[styles.badgeText, { color: tone.fg }]} numberOfLines={1}>
+        {t(TIER_KEYS[tier] ?? TIER_KEYS[0])}
+      </Text>
+    </View>
+  );
+});
+
+/**
+ * Die Balken in EINER Farbe — einmal gedämpft, einmal im Akzent (siehe
+ * `histCutStyle`). Statisch: Beim Ziehen rendert hier nichts.
+ */
+const HistBars = memo(function HistBars({ color }: { color: string }) {
+  return (
+    <View style={sl.histRow}>
+      {BAR_HEIGHTS.map((h, i) => (
+        <View key={i} style={[sl.bar, { height: h, backgroundColor: color }]} />
+      ))}
+    </View>
+  );
+});
+
+/**
  * Die Schalterzeile — ein EIGENES Bauteil, und zwar aus einem Grund.
  *
  * Sie hält ihren Zustand selbst und meldet ihn nur nach oben. Damit rendert
  * beim Umlegen ausschließlich diese Zeile, nicht das ganze Blatt. Läge der
- * Zustand oben, zeichnete jeder Tipp die Karte darüber neu — und deren
- * Werte-Zeilen sind `AnimatedTextInput`, die dabei kurz auf ihren
- * `defaultValue` zurückfallen. Genau das war als Aufblitzen der ganzen Karte
- * zu sehen.
- *
- * AUSRICHTUNG: Dieselbe `cardRow` wie die drei Zeilen darüber, und der Text
- * trägt wie sie `flex: 1`. Damit steht er auf derselben Fluchtlinie wie
- * „Aktueller Preis" und der Schalter dort, wo die Werte stehen.
+ * Zustand oben, zeichnete jeder Tipp das Blatt neu — und dessen Werte sind
+ * `AnimatedTextInput`, die dabei kurz auf ihren `defaultValue` zurückfallen.
+ * Genau das war als Aufblitzen zu sehen.
  *
  * Der Schalter ist ABSICHTLICH nicht selbst bedienbar: Die ganze Zeile ist die
  * Trefferfläche. Lägen beide Ziele übereinander, schaltete ein Tipp auf den
@@ -898,7 +994,10 @@ const RiseRow = memo(function RiseRow({
       accessibilityRole="switch"
       accessibilityState={{ checked: on }}
       accessibilityLabel={label}
-      style={styles.cardRow}
+      // Die Zeile ist so hoch wie der Schalter; die Trefferfläche reicht
+      // trotzdem auf Fingerhöhe, ohne die Abstände zu verschieben.
+      hitSlop={RISE_HIT_SLOP}
+      style={styles.riseRow}
     >
       <Text style={styles.riseLabel}>{label}</Text>
       <BinchSwitch value={on} readOnly />
@@ -906,67 +1005,54 @@ const RiseRow = memo(function RiseRow({
   );
 });
 
-const styles = scaledStyles({
-  head: { flexDirection: "row", alignItems: "flex-start", gap: SPACE.md },
-  headText: { flex: 1, minWidth: 0 },
-  closeBtn: { alignItems: "center", justifyContent: "center" },
-  title: { ...SHEET_TITLE, marginBottom: SPACE.sm },
-  subtitle: { ...SHEET_SUBTITLE },
+const RISE_HIT_SLOP = { top: ms(SPACE.sm), bottom: ms(SPACE.sm) };
 
-  /**
-   * Ziffern und Zeichen sitzen auf EINER Grundlinie.
-   *
-   * `alignItems: "baseline"` und nicht `"flex-end"`: Die beiden sind
-   * verschieden groß, ihre Unterkanten liegen also nicht dort, wo ihre
-   * Grundlinien liegen. An der Unterkante ausgerichtet hinge das kleinere
-   * Zeichen sichtbar zu tief. Damit die Grundlinie auf Android überhaupt
-   * verlässlich ist, tragen BEIDE Knoten `includeFontPadding: false` — sonst
-   * rechnet Android bei ihnen unterschiedlich viel Luft mit ein.
-   */
+const styles = scaledStyles({
+  /** Titel und X auf einer Mittellinie; das X ist nur so groß wie sein
+   *  Zeichen (Trefferfläche über `hitSlop`), die Zeile so hoch wie der Titel. */
+  head: { flexDirection: "row", alignItems: "center", gap: SPACE.md },
+  closeBtn: { alignItems: "center", justifyContent: "center" },
+  title: { ...SHEET_TITLE, flex: 1, minWidth: 0 },
+
   /**
    * Die Pille sitzt über der Zahl und mittig — `alignSelf`, weil das Blatt
    * seine Kinder sonst über die volle Breite zieht.
    */
+  /** Titel → Pille: GROUP_GAP — der Titel benennt das Blatt, die Pille
+   *  beginnt die Einstellung darunter. */
   badge: {
     alignSelf: "center",
     borderRadius: 9999,
-    paddingVertical: 5,
+    paddingVertical: 4,
     paddingHorizontal: SPACE.md,
-    marginTop: SPACE.xl,
+    marginTop: GROUP_GAP,
   },
   /** 12/700 — die Stufe der „Ändern"-Pille im Ergebnis-Screen, also die, die
    *  die App für kurze Beschriftungen auf einer Fläche führt. */
   badgeText: { fontSize: 12, fontWeight: "700", letterSpacing: 0.2 },
 
+  /**
+   * Ziffern und Zeichen sitzen auf EINER Grundlinie: `alignItems: "baseline"`,
+   * nicht `"flex-end"` — die beiden sind verschieden groß, an der Unterkante
+   * ausgerichtet hinge das kleinere Zeichen sichtbar zu tief. BEIDE Knoten
+   * tragen `includeFontPadding: false`, sonst rechnet Android bei ihnen
+   * unterschiedlich viel Luft mit ein.
+   */
   pctRow: {
     flexDirection: "row",
     alignItems: "baseline",
-    // Mittig — wie in der Vorlage. Möglich nur, weil die Ziffern eine feste
-    // Breite reservieren; ohne die wanderte die ganze Gruppe (siehe Baum).
     justifyContent: "center",
-    marginTop: SPACE.sm,
+    // Pille und Zahl sind EINE Aussage („eher unwahrscheinlich — 27 %"): 8
+    // sichtbar. Die bringt der Zahlenkasten über seinen Ziffern selbst mit
+    // (knapp 8, gemessen wie `PCT_BOX_BOTTOM`).
+    marginTop: 0,
   },
-
   /**
-   * Die Ziffern — Maße von der Uhrzeit im Zeit-Blatt (`headTime`), nicht neu
-   * erfunden.
-   *
-   * Es ist dieselbe Sache: die eine lebende Zahl im Kopf eines Blattes, vom
-   * UI-Strang in ein Textfeld geschrieben. Zwei davon dürfen nicht verschieden
-   * aussehen. `tabular-nums` ist dabei nicht Kosmetik, sondern der Grund, warum
-   * hier nicht die Bildschirm-Überschrift steht: Ohne gleich breite Ziffern
-   * wandert die Zahl beim Ziehen seitlich, weil eine 1 schmaler ist als eine 8.
-   * `includeFontPadding` und die genullten Abstände nehmen dem Textfeld die
-   * Android-Polsterung, mit der es tiefer säße als ein Text.
-   *
-   * Die Farbe ist die starke Textfarbe, NICHT der Akzent. Sie war es vorher,
-   * und die Vorlage hält es anders: Dort trägt der Akzent den zurückgelegten
-   * Teil des Reglers, die Zahl steht in der Textfarbe. Das ist auch die
-   * ruhigere Aufteilung — der Akzent zeigt dann an EINER Stelle, wo man steht,
-   * statt an zweien dasselbe zu sagen.
-   *
-   * `minWidth`: Platz für zwei Stellen, mehr kann der Regler nicht liefern
-   * (Deckel bei 50). Zur Herleitung siehe den Kommentar im Baum.
+   * Die Ziffern — Maße von der Uhrzeit im Zeit-Blatt (`headTime`): dieselbe
+   * Sache, die eine lebende Zahl im Kopf eines Blattes. `tabular-nums`, damit
+   * die Zahl beim Ziehen nicht seitlich wandert (eine 1 ist schmaler als eine
+   * 8). Textfarbe, nicht Akzent: Der Akzent zeigt an EINER Stelle, wo man
+   * steht — auf der Spur. `minWidth` = zwei Stellen (Deckel bei 50).
    */
   pctNum: {
     fontSize: 30,
@@ -980,15 +1066,7 @@ const styles = scaledStyles({
     includeFontPadding: false,
     fontVariant: ["tabular-nums"],
   },
-
-  /**
-   * Das Prozentzeichen — schwächer und kleiner als die Ziffern.
-   *
-   * 22/800 ist keine neue Stufe: Es ist die Größe der Stationsnamen im
-   * Ergebnis-Screen, also die nächstkleinere kräftige Stufe, die der Bestand
-   * ohnehin führt. Die gedämpfte Textfarbe macht den Rest — zusammen liest sich
-   * das als eine Angabe mit einer Einheit, nicht als zwei Angaben.
-   */
+  /** Das Prozentzeichen: 22/800 gedämpft — eine Angabe mit Einheit, nicht zwei. */
   pctSign: {
     fontSize: 22,
     fontWeight: "800",
@@ -998,24 +1076,31 @@ const styles = scaledStyles({
     includeFontPadding: false,
   },
 
-  card: { borderRadius: 16, padding: SPACE.lg, gap: SPACE.md },
-  cardRow: { flexDirection: "row", alignItems: "center", gap: SPACE.md },
-  cardLabel: { flex: 1, minWidth: 0, fontSize: 15, fontWeight: "600", color: C.sub },
-  cardValue: { fontSize: 15, fontWeight: "700", color: C.text },
-  /** Wie `cardValue`, nur als Textfeld — deshalb ohne Polsterung und mit
-   *  gleich breiten Ziffern, damit die Zeile beim Ziehen nicht zappelt. */
-  cardValueLive: {
-    fontSize: 15,
+  /** Kein eigener Abstand oben: Die Reglerzeile bringt ihn mit — 24 sichtbar
+   *  vom Griff bis zu den Buchstaben (siehe `sl.control`). */
+  fields: { flexDirection: "row", gap: ITEM_GAP },
+  field: { flex: 1, minWidth: 0 },
+  fieldLabel: { fontSize: 13, fontWeight: "500", color: C.sub, marginBottom: SPACE.sm },
+  /** Feldhöhe und Radius wie der Knopf darunter — eine Form für „ein Wert". */
+  fieldBox: {
+    height: FIELD_H,
+    borderRadius: 16,
+    paddingHorizontal: SPACE.lg,
+    justifyContent: "center",
+  },
+  fieldValue: {
+    fontSize: 17,
     fontWeight: "700",
     color: C.text,
-    textAlign: "right",
     padding: 0,
     margin: 0,
     includeFontPadding: false,
     fontVariant: ["tabular-nums"],
   },
 
-  riseLabel: { flex: 1, minWidth: 0, fontSize: 15, fontWeight: "600", color: C.text },
+  optionDivider: { marginTop: GROUP_GAP, marginBottom: GROUP_GAP },
+  riseRow: { flexDirection: "row", alignItems: "center", gap: SPACE.md },
+  riseLabel: { flex: 1, minWidth: 0, fontSize: 15, fontWeight: "500", color: C.text },
 
   noPrice: { ...SHEET_SUBTITLE },
 
@@ -1025,7 +1110,7 @@ const styles = scaledStyles({
     borderRadius: 16,
     alignItems: "center",
     justifyContent: "center",
-    marginTop: SPACE.lg,
+    marginTop: SECTION_GAP,
   },
   /** Ohne bekannten Preis gesperrt — sichtbar, aber erkennbar aus dem Spiel.
    *  Derselbe Wert wie am „Zurücksetzen" der Optionen-Blätter. */
@@ -1055,11 +1140,36 @@ const styles = scaledStyles({
 const sl = StyleSheet.create({
   divider: { height: StyleSheet.hairlineWidth },
 
+  /**
+   * Zahl → Balken: GROUP_GAP, Griff → Beschriftung der Felder: SECTION_GAP —
+   * beides an den sichtbaren Kanten (Ziffern, Balken, Griff, Buchstaben),
+   * deshalb sind die mitgebrachten Lüfte abgezogen.
+   */
+  control: {
+    marginTop: ms(GROUP_GAP) - PCT_BOX_BOTTOM,
+    marginBottom: ms(SECTION_GAP) - BELOW_HANDLE - LABEL_BOX_TOP,
+  },
+  hist: {
+    height: HIST_H,
+    marginBottom: -HIST_OVERLAP,
+  },
+  histRow: {
+    height: HIST_H,
+    flexDirection: "row",
+    alignItems: "flex-end",
+    columnGap: BAR_GAP,
+  },
+  /** Das wandernde Fenster: so groß wie die Balken, schneidet rechts an der Grenze ab. */
+  histCut: { ...StyleSheet.absoluteFillObject, overflow: "hidden" },
+  histLayer: StyleSheet.absoluteFillObject,
+  /** Oben und unten gleich gerundet (Nutzer 06.11.2026). */
+  bar: {
+    flex: 1,
+    borderRadius: ms(3),
+  },
   sliderRow: {
     height: SLIDER_ROW_H,
     justifyContent: "center",
-    marginTop: ms(SPACE.xs),
-    marginBottom: ms(SPACE.lg),
   },
   track: {
     height: TRACK_H,
@@ -1097,6 +1207,6 @@ const sl = StyleSheet.create({
      * Ergebnis-Kopfes und der Punkt der Glocke benutzen. Die Farbe kommt
      * deshalb von außen, sie hängt am Theme.
      */
-    borderWidth: 2,
+    borderWidth: HANDLE_RING,
   },
 });

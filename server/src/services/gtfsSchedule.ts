@@ -13,6 +13,7 @@ import { formatInTimeZone, fromZonedTime } from "date-fns-tz";
 import { db } from "../db/client.js";
 import type { StopBoard, StopBoardItem, StopBoardResponse } from "./stopInfoService.js";
 import { timetableStopName } from "../util/stopDisplayName.js";
+import { BoundedTtlCache } from "../util/boundedCache.js";
 
 /** Feed-Id pro Land. Was Wertelisten haben sollen, muss zur `feed_id`-Wert im
  *  GTFS-Importer passen (`GTFS_FEED_ID` env var beim Import). */
@@ -129,12 +130,18 @@ function weekdayColumn(date: string): string {
  *  calendar (Default-Wochenmuster) UND calendar_dates (Ausnahmen: hinzugefügt
  *  oder entfernt). Cache hier — der Service-Set ändert sich nur einmal pro
  *  Tag. */
-const serviceIdsCache = new Map<string, { ids: Set<string>; expiresAt: number }>();
+/**
+ * Gedeckelt: Der Schlüssel enthält das DATUM — jeden Tag kamen je Feed neue
+ * Einträge dazu, abgelaufene blieben liegen (nur beim Lesen geprüft, nie
+ * gelöscht). Jeder hält alle Service-IDs eines Feed-Tages, beim britischen
+ * Feed Zehntausende: ein langsames Leck über Wochen Laufzeit.
+ */
+const serviceIdsCache = new BoundedTtlCache<Set<string>>(64, 10 * 60_000);
 
 async function activeServiceIds(feedId: string, dateStr: string): Promise<Set<string>> {
   const cacheKey = `${feedId}:${dateStr}`;
   const cached = serviceIdsCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return cached.ids;
+  if (cached) return cached;
 
   const weekday = weekdayColumn(dateStr);
   // Inline-SQL für Wochentag-Spalte — Drizzle hat hier keine elegante
@@ -162,7 +169,7 @@ async function activeServiceIds(feedId: string, dateStr: string): Promise<Set<st
   // Zehn Minuten, nicht eine Stunde: Nach dem wöchentlichen Neuimport können
   // die Service-IDs anders heißen. Mit den alten fände die Tafel eine Stunde
   // lang nichts — und eine LEERE Tafel (statt keiner) blockt den MOTIS-Ersatz.
-  serviceIdsCache.set(cacheKey, { ids, expiresAt: Date.now() + 10 * 60_000 });
+  serviceIdsCache.set(cacheKey, ids);
   return ids;
 }
 

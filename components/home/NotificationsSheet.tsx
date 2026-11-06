@@ -11,7 +11,7 @@ import {
 import { AlertHitList } from "@/components/home/AlertHitList";
 import { ClearSearchHistoryAlert } from "@/components/ui/ClearSearchHistoryAlert";
 import { RippleTouch } from "@/components/ui/RippleTouch";
-import { SHEET_TITLE } from "@/components/ui/SheetModal";
+import { SHEET_HEAD_TOP, SHEET_TITLE } from "@/components/ui/SheetModal";
 import { SHEET_IN } from "@/lib/nav/overlayCover";
 import { useSheetSlide } from "@/lib/nav/sheetSlide";
 import { haptic } from "@/lib/haptics";
@@ -484,28 +484,22 @@ const styles = scaledStyles({
   },
 
   /**
-   * Maße aus dem ORTSWÄHLER, nicht aus dem Datumswähler.
+   * Maße aus dem ORTSWÄHLER, nicht aus dem Datumswähler: `gap: 12`, seitlich 20
+   * (der Rand jedes Bildschirms), unten 16.
    *
-   * Die beiden Blätter waren sich hier nie einig, und dieses hatte den falschen
-   * von beiden übernommen. Der Ortswähler ist der Vorbild-Fall: `gap: 12`,
-   * seitlich 20 (der Rand jedes Bildschirms), unten 16.
-   *
-   * `paddingTop` ist GLEICH dem seitlichen Abstand, und das war er nicht immer.
-   *
-   * Hier standen 24 gegen 20 an den Seiten — abgeschrieben vom Datumswähler,
-   * der sie ÜBER seiner sicheren Fläche lässt. Nur hat dieses Blatt keine zu
-   * überbrücken, und die vier Punkte Unterschied sah man: Das X stand weiter
-   * von der Oberkante entfernt als vom Rand.
-   *
-   * Eine Ecke ist eine Ecke. Steht in ihr ein Zeichen, muss es zu beiden Kanten
-   * denselben Abstand haben, sonst wirkt das Blatt schief aufgehängt.
+   * Oben `SHEET_HEAD_TOP` — Oberkante bis Titel ist in JEDEM Blatt gleich, mit
+   * Griff oder ohne (Nutzer 05.11.2026: „das ist ganz wichtig, bei jeder
+   * Slide"). Hier stand vorher der seitliche Abstand (20), damit das X in der
+   * Ecke zu beiden Kanten gleich weit stand; die Regel über alle Blätter geht
+   * vor — vier Punkte, die man nur im Vergleich mit dem Rand sieht, gegen
+   * einen Titel, der von Blatt zu Blatt springt.
    */
   header: {
     flexDirection: "row",
     alignItems: "center",
     gap: SPACE.md,
     paddingHorizontal: GUTTER,
-    paddingTop: GUTTER,
+    paddingTop: SHEET_HEAD_TOP,
     paddingBottom: SPACE.lg,
   },
   /**

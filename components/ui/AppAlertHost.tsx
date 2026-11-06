@@ -1,7 +1,8 @@
 import { Modal, Pressable, StyleSheet, Text, View } from "react-native";
+import { TITLE_GAP, GROUP_GAP } from "@/lib/theme/spacing";
 import Animated, { FadeIn, FadeOut, ZoomIn, ZoomOut } from "react-native-reanimated";
 import { CircleAlert, Info } from "lucide-react-native";
-import { Bo } from "@/components/assistant/Bo";
+import { StateArt } from "@/components/ui/StateArt";
 import { useAlertStore, type AlertButton } from "@/lib/alert";
 import { haptic } from "@/lib/haptics";
 import { useT } from "@/lib/i18n/useT";
@@ -20,17 +21,11 @@ const C = {
 };
 
 /**
- * Bos Größe im Dialog — durch `ms()` gedreht, NICHT roh.
- *
- * Sie ist eine Eigenschaft, kein Stilwert, wird von `scaledStyles` also nicht
- * miterfasst. Roh stehen gelassen würde Bo auf einem kurzen Gerät als einziger
- * Teil der Karte seine volle Größe behalten, während Ränder, Titel und Knöpfe
- * um ihn herum schrumpfen — er säße dann sichtbar zu groß darin.
- *
- * 104 statt der 138 aus den leeren Listen: Dort trägt Bo die ganze Fläche, hier
- * steht ein Titel mit Text und zwei Knöpfen unter ihm.
+ * Größe der Zeichnung im Dialog — durch `ms()` gedreht, NICHT roh: Sie ist
+ * eine Eigenschaft, kein Stilwert, `scaledStyles` erfasst sie also nicht. Roh
+ * behielte sie auf einem kurzen Gerät als einzige ihre volle Größe.
  */
-const BO_SIZE = ms(104);
+const ART_SIZE = ms(104);
 
 /**
  * Einmal an der Wurzel gehängt, zeigt alles an, was über `showAlert(...)` kommt.
@@ -61,9 +56,10 @@ const BO_SIZE = ms(104);
  *    Stelle.
  *
  * Das Symbol oben leitet der Host selbst her. Nur wo das zu wenig ist, sagt es
- * der Aufruf über `showAlert(..., "bo-sad")`: Dann steht dort ein trauriger Bo
- * statt des Zeichens — heute beim Abmelden, wo das rote Ausrufezeichen nach
- * einem Unglück aussah statt nach „schade, dass du gehst". Alles andere an der
+ * der Aufruf über `showAlert(..., "logout" | "delete")`: Dann zeichnet sich
+ * dort eine Strichzeichnung statt des Zeichens (Tür mit Pfeil, Eimer; vorher ein
+ * trauriger Bo) — beim Abmelden sah das rote Ausrufezeichen nach einem Unglück
+ * aus statt nach „schade, dass du gehst". Alles andere an der
  * Karte bleibt gleich; es ist bewusst KEIN eigener Dialog geworden, sondern
  * dieselbe Karte mit einem anderen Bild.
  */
@@ -131,13 +127,11 @@ export function AppAlertHost() {
             onPress={() => {}}
             accessible={false}
           >
-            {art === "bo-sad" ? (
-              /* Ohne `paused` — der Dialog steht nur ein paar Sekunden, und in
-                 der Zeit darf Bo atmen. Die leeren Listen halten ihn deshalb
-                 still, weil er dort dauerhaft hängt; hier baut ihn das Fenster
-                 mit ab. */
-              <View style={styles.boSlot}>
-                <Bo state="sad" size={BO_SIZE} />
+            {art ? (
+              /* Die Zeichnung zeichnet sich, während der Dialog aufzoomt, und
+                 steht dann; das Fenster baut sie beim Schließen mit ab. */
+              <View style={styles.artSlot}>
+                <StateArt kind={art} size={ART_SIZE} surface={palette.s2} />
               </View>
             ) : (
               <View
@@ -252,8 +246,8 @@ const styles = scaledStyles({
     borderWidth: 1,
     borderColor: C.border,
     paddingTop: 28,
-    paddingHorizontal: 22,
-    paddingBottom: 18,
+    paddingHorizontal: 24,
+    paddingBottom: 16,
     alignItems: "center",
   },
   iconCircle: {
@@ -263,32 +257,31 @@ const styles = scaledStyles({
     alignItems: "center",
     justifyContent: "center",
     marginTop: 4,
-    marginBottom: 18,
+    marginBottom: 16,
   },
   /**
-   * Kein eigener Abstand nach unten: Bos Rahmen ist absichtlich höher als die
-   * Figur (`boFrameHeight` = Größe × 1,62, der Körper endet bei × 1,25), unter
-   * dem Kinn liegen also schon rund 38 Punkte für Schatten und Leuchten. Noch
-   * ein Rand darunter risse Bild und Titel auseinander.
+   * Die Zeichnung belegt nur noch ihre Tinte (`StateArt`, Ausschnitt) — der
+   * Abstand zum Titel ist damit ein echter, sichtbarer: der Gruppen-Abstand.
+   * Oben trägt der Innenrand der Karte allein.
    */
-  boSlot: { marginTop: 2 },
+  artSlot: { marginBottom: GROUP_GAP },
   title: {
     fontSize: 21,
     fontWeight: "800",
     letterSpacing: -0.6,
     color: C.white,
     textAlign: "center",
-    marginBottom: 8,
+    marginBottom: TITLE_GAP,
   },
   /** Ohne Fließtext trägt der Titel dessen Abstand zum ersten Knopf. */
-  titleAlone: { marginBottom: 22 },
+  titleAlone: { marginBottom: GROUP_GAP },
   body: {
     fontSize: 14,
     lineHeight: 21,
     color: C.gray1,
     textAlign: "center",
-    paddingHorizontal: 6,
-    marginBottom: 22,
+    paddingHorizontal: 8,
+    marginBottom: GROUP_GAP,
   },
 
   /** Gefüllter Knopf — Maße wie der „Preise vergleichen"-Knopf im Such-Screen. */
@@ -300,7 +293,7 @@ const styles = scaledStyles({
     overflow: "hidden",
   },
   solidTouch: {
-    paddingVertical: 17,
+    paddingVertical: 16,
     paddingHorizontal: 24,
     flexDirection: "row",
     alignItems: "center",

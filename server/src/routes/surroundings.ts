@@ -213,8 +213,18 @@ async function fetchTransitNearby(
       longitude: locations.longitude,
       parentCode: locations.parentCode,
       platform: locations.platform,
-      /** Angezeigter Name der Station eines Steigs — gruppiert wird nach ihm (siehe unten). */
-      parentName: sql<string | null>`(SELECT coalesce(p.display_name, p.label) FROM locations p WHERE p.code = ${locations.parentCode})`,
+      /**
+       * Angezeigter Name der Station eines Steigs — gruppiert wird nach ihm (siehe unten).
+       *
+       * Der Verweis nach außen steht AUSGESCHRIEBEN („locations"."parent_code"): In der
+       * Feldliste setzt drizzle `${locations.parentCode}` ohne Tabelle ein, als „parent_code" —
+       * und das griff in der Unterabfrage auf `p` selbst (p.code = p.parent_code). Beide Werte
+       * waren seit den Steigen (22.10.) immer leer; die U1 am Wiener Hauptbahnhof stand deshalb
+       * mit zwei Markern da (Gleise mit verschiedenen eigenen Namen).
+       */
+      parentName: sql<string | null>`(SELECT coalesce(p.display_name, p.label) FROM locations p WHERE p.code = "locations"."parent_code")`,
+      /** Quellname der Station — Rückfall, wenn vom angezeigten nichts übrig bleibt (siehe unten). */
+      parentLabel: sql<string | null>`(SELECT p.label FROM locations p WHERE p.code = "locations"."parent_code")`,
     })
     .from(locations)
     .where(
@@ -363,10 +373,15 @@ async function fetchTransitNearby(
      * Und ein Steig zählt mit dem Namen SEINER STATION: Übernommene Zeilen (MVG
      * „Hbf" unter „Hbf (U, Tram)", OSM-Masten) behalten ihren eigenen Namen —
      * die Gleise einer U-Bahn-Station wurden sonst zwei Marker. Bleibt vom
-     * Namen nichts übrig („Hbf"), zählt der Quellname.
+     * Namen nichts übrig („Hbf"), zählt der Quellname — bei einem Steig der
+     * seiner STATION: Wiens Stationen heißen wie bei den Wiener Linien
+     * „Hauptbahnhof" (bleibt nichts übrig), die beiden U1-Steige trugen aber
+     * verschiedene eigene Quellnamen („Wien Hauptbahnhof" / „Matzleinsdorf
+     * Südtiroler Pl. - Hbf.") — zwei U-Bahn-Marker statt einem.
      */
     const norm =
-      normalizeName(item.row.parentName ?? item.row.displayName ?? item.row.label) || normalizeName(item.row.label);
+      normalizeName(item.row.parentName ?? item.row.displayName ?? item.row.label) ||
+      normalizeName(item.row.parentLabel ?? item.row.label);
     if (!norm) {
       groups.push([item]);
       continue;

@@ -78,8 +78,15 @@ while IFS='|' read -r feed_id url country prefix active ids rest; do
     ok=$((ok + 1))
     continue
   fi
-  fetch "$dir" "$url" </dev/null
-  rc=$?
+  # „mvo:52,53,…": der österreichweite Fahrplan — Anmeldung (MVO_USER/MVO_PASSWORD) und mehrere
+  # Datensätze, zu EINEM GTFS zusammengeführt (scripts/fetch-at-gtfs.ts). Gleiche Rückgaben wie fetch.
+  if [[ "$url" == mvo:* ]]; then
+    AT_GTFS_OUT="$dir" AT_GTFS_SETS="${url#mvo:}" npx tsx scripts/fetch-at-gtfs.ts </dev/null
+    rc=$?
+  else
+    fetch "$dir" "$url" </dev/null
+    rc=$?
+  fi
   if [[ $rc -eq 2 ]]; then
     echo "Quelle unverändert — der letzte Abgleich gilt weiter."
     ok=$((ok + 1))
@@ -90,25 +97,29 @@ while IFS='|' read -r feed_id url country prefix active ids rest; do
     fail=$((fail + 1))
     continue
   fi
-  if [[ "$(head -c 2 "$dir/feed.zip" | od -An -c | tr -d ' \n')" != "PK" ]]; then
-    echo "❌ $feed_id: keine ZIP-Datei"
-    rm -f "$dir/feed.zip"
-    fail=$((fail + 1))
-    continue
-  fi
-  rm -rf "$dir/extracted" && mkdir -p "$dir/extracted"
-  # Ein halb entpacktes Archiv (Platte voll, kaputte ZIP) darf nicht als
-  # „abgeglichen" durchgehen — sonst fehlten Halte bis zum nächsten Monat.
-  if ! unzip -q -o "$dir/feed.zip" -d "$dir/extracted" </dev/null; then
-    echo "❌ $feed_id: Entpacken fehlgeschlagen"
-    rm -rf "$dir/extracted"
-    fail=$((fail + 1))
-    continue
-  fi
-  gtfs_dir="$dir/extracted"
-  if [[ ! -f "$gtfs_dir/stops.txt" ]]; then
-    found=$(find "$gtfs_dir" -maxdepth 3 -name "stops.txt" -print -quit)
-    [[ -n "$found" ]] && gtfs_dir=$(dirname "$found")
+  if [[ "$url" == mvo:* ]]; then
+    gtfs_dir="$dir/merged"
+  else
+    if [[ "$(head -c 2 "$dir/feed.zip" | od -An -c | tr -d ' \n')" != "PK" ]]; then
+      echo "❌ $feed_id: keine ZIP-Datei"
+      rm -f "$dir/feed.zip"
+      fail=$((fail + 1))
+      continue
+    fi
+    rm -rf "$dir/extracted" && mkdir -p "$dir/extracted"
+    # Ein halb entpacktes Archiv (Platte voll, kaputte ZIP) darf nicht als
+    # „abgeglichen" durchgehen — sonst fehlten Halte bis zum nächsten Monat.
+    if ! unzip -q -o "$dir/feed.zip" -d "$dir/extracted" </dev/null; then
+      echo "❌ $feed_id: Entpacken fehlgeschlagen"
+      rm -rf "$dir/extracted"
+      fail=$((fail + 1))
+      continue
+    fi
+    gtfs_dir="$dir/extracted"
+    if [[ ! -f "$gtfs_dir/stops.txt" ]]; then
+      found=$(find "$gtfs_dir" -maxdepth 3 -name "stops.txt" -print -quit)
+      [[ -n "$found" ]] && gtfs_dir=$(dirname "$found")
+    fi
   fi
   # 6. Spalte „unstable": Der Feed nummeriert jede Veröffentlichung neu (gtfs.de)
   # — der Abgleich ordnet dann über Name + Lage zu (import-gtfs.ts, GTFS_IDS).
@@ -127,9 +138,9 @@ while IFS='|' read -r feed_id url country prefix active ids rest; do
     echo "❌ $feed_id: Import fehlgeschlagen"
     fail=$((fail + 1))
   fi
-  # Entpackt wird nur für den Import gebraucht; die ZIP bleibt für die
-  # bedingte Nachfrage beim nächsten Mal.
-  rm -rf "$dir/extracted"
+  # Entpackt (bzw. zusammengeführt) wird nur für den Import gebraucht; die ZIPs
+  # bleiben für die bedingte Nachfrage beim nächsten Mal.
+  rm -rf "$dir/extracted" "$dir/merged"
 done < "$CONF"
 
 echo ""

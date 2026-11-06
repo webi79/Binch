@@ -133,7 +133,7 @@ const styles = scaledStyles({
     right: 0,
     alignItems: "center",
     // Fester Abstand Blasenspitze → Bos Kopf. Sie gehören zusammen.
-    gap: 6,
+    gap: 8,
   },
   bubbleTxt: {
     color: "#F4F4F5",

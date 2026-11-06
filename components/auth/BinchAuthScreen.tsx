@@ -80,6 +80,7 @@ import {
 import { usePressBounce } from "@/lib/motion";
 import { SCREEN_CORNER_RADIUS, SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import { scaledStyles } from "@/lib/ui/compact";
+import { slideTiming } from "@/lib/nav/slideMotion";
 
 /** Siehe `styles.body`: Fenstermaß beim Laden, also ohne Tastatur. */
 const WINDOW_H = Dimensions.get("window").height;
@@ -179,7 +180,7 @@ function Sheet() {
       sheetY.value = WINDOW_H;
       rafRef.current = requestAnimationFrame(() => {
         markSheetMoving(SHEET_IN.duration);
-        sheetY.value = withTiming(0, SHEET_IN, (finished) => {
+        sheetY.value = withTiming(0, slideTiming(SHEET_IN), (finished) => {
           "worklet";
           if (!finished) return;
           runOnJS(setMoving)(false);
@@ -209,7 +210,7 @@ function Sheet() {
     closeGenRef.current += 1;
     const myGen = closeGenRef.current;
     closeGen.value = myGen;
-    sheetY.value = withTiming(WINDOW_H, SHEET_OUT, () => {
+    sheetY.value = withTiming(WINDOW_H, slideTiming(SHEET_OUT), () => {
       "worklet";
       if (closeGen.value !== myGen) return;
       runOnJS(setMoving)(false);
@@ -1372,12 +1373,12 @@ const styles = scaledStyles({
     backgroundColor: C.bg,
     borderTopLeftRadius: 26,
     borderTopRightRadius: 26,
-    paddingHorizontal: 26,
-    paddingTop: 18,
+    paddingHorizontal: 24,
+    paddingTop: 16,
     paddingBottom: 28,
   },
 
-  navRow: { flexDirection: "row", alignItems: "center", gap: 14, marginBottom: 20, minHeight: 38 },
+  navRow: { flexDirection: "row", alignItems: "center", gap: 16, marginBottom: 20, minHeight: 38 },
   backBtn: {
     width: 38,
     height: 38,
@@ -1405,7 +1406,7 @@ const styles = scaledStyles({
     fontWeight: "700",
     letterSpacing: 1,
     textTransform: "uppercase",
-    marginBottom: 10,
+    marginBottom: 8,
   },
   h1: {
     color: C.white,
@@ -1414,16 +1415,16 @@ const styles = scaledStyles({
     lineHeight: 31,
     letterSpacing: -0.5,
   },
-  sub: { color: C.textSecondary, fontSize: 15, lineHeight: 21, marginTop: 9 },
+  sub: { color: C.textSecondary, fontSize: 15, lineHeight: 21, marginTop: 8 },
 
-  field: { marginTop: 22 },
+  field: { marginTop: 24 },
   fieldLabel: { color: C.textTertiary, fontSize: 13, fontWeight: "600", marginBottom: 8, marginLeft: 4 },
   inputRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 10,
+    gap: 8,
     height: 56,
-    paddingHorizontal: 14,
+    paddingHorizontal: 16,
     backgroundColor: C.surface2,
     borderWidth: 1,
     borderColor: C.border,
@@ -1436,23 +1437,23 @@ const styles = scaledStyles({
   chip: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 9,
+    gap: 8,
     alignSelf: "flex-start",
-    marginTop: 18,
+    marginTop: 16,
     backgroundColor: C.surface2,
     borderWidth: 1,
     borderColor: C.border,
     borderRadius: 999,
     paddingVertical: 8,
-    paddingLeft: 14,
+    paddingLeft: 16,
     paddingRight: 8,
   },
   chipMail: { color: C.white, fontSize: 13, fontWeight: "600", maxWidth: 180 },
-  chipEdit: { backgroundColor: C.surface3, paddingVertical: 5, paddingHorizontal: 11, borderRadius: 999 },
+  chipEdit: { backgroundColor: C.surface3, paddingVertical: 4, paddingHorizontal: 12, borderRadius: 999 },
   chipEditTxt: { fontSize: 12, fontWeight: "700" },
 
-  strength: { marginTop: 14 },
-  segs: { flexDirection: "row", gap: 6 },
+  strength: { marginTop: 16 },
+  segs: { flexDirection: "row", gap: 8 },
   seg: { flex: 1, height: 5, borderRadius: 99 },
   strengthLbl: { color: C.textTertiary, fontSize: 12, marginTop: 8 },
 
@@ -1471,20 +1472,20 @@ const styles = scaledStyles({
    */
   body: { height: WINDOW_H },
   footer: { flex: 1, justifyContent: "flex-end", paddingTop: 16 },
-  primaryInline: { marginTop: 22 },
+  primaryInline: { marginTop: 24 },
   primary: {
     height: 56,
     borderRadius: 999,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    gap: 9,
+    gap: 8,
     overflow: "hidden", // wichtig für den GradientFill darunter
   },
   primaryDisabled: { backgroundColor: C.surface3 },
   primaryTxt: { fontSize: 16, fontWeight: "700" },
 
-  dividerRow: { flexDirection: "row", alignItems: "center", gap: 14, marginVertical: 16 },
+  dividerRow: { flexDirection: "row", alignItems: "center", gap: 16, marginVertical: 16 },
   line: { flex: 1, height: 1, backgroundColor: C.border },
   dividerTxt: { color: C.textTertiary, fontSize: 13 },
   socials: { flexDirection: "row", gap: 12 },
@@ -1499,7 +1500,7 @@ const styles = scaledStyles({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    gap: 9,
+    gap: 8,
   },
   socTxt: { color: C.white, fontSize: 15, fontWeight: "600" },
   socialErr: { color: C.error, fontSize: 13, textAlign: "center", marginTop: 12, lineHeight: 18 },
@@ -1511,22 +1512,22 @@ const styles = scaledStyles({
     backgroundColor: "rgba(8,8,8,0.86)",
     alignItems: "center",
     justifyContent: "center",
-    paddingHorizontal: 30,
+    paddingHorizontal: 32,
   },
   successText: { alignItems: "center", marginTop: -4 },
   badge: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 6,
-    marginBottom: 14,
+    gap: 8,
+    marginBottom: 16,
     backgroundColor: "rgba(127,234,77,0.12)",
     borderWidth: 1,
-    paddingVertical: 6,
-    paddingHorizontal: 13,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
     borderRadius: 999,
   },
   badgeTxt: { fontSize: 12, fontWeight: "700", letterSpacing: 1, textTransform: "uppercase" },
   successTitle: { color: C.white, fontSize: 28, fontWeight: "800", letterSpacing: -0.5, textAlign: "center" },
-  successSub: { color: C.textSecondary, fontSize: 15, lineHeight: 22, textAlign: "center", marginTop: 10, maxWidth: 300 },
-  successBtn: { marginTop: 26, paddingHorizontal: 40, alignSelf: "center" },
+  successSub: { color: C.textSecondary, fontSize: 15, lineHeight: 22, textAlign: "center", marginTop: 8, maxWidth: 300 },
+  successBtn: { marginTop: 24, paddingHorizontal: 40, alignSelf: "center" },
 });

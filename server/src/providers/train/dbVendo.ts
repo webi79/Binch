@@ -20,6 +20,7 @@ import type {
   NormalizedResult,
   LegInfo,
 } from "../types.js";
+import { dbVendoFareParams, parseFareProfile } from "../../util/fareProfile.js";
 
 /**
  * Deutsche-Bahn Train-Provider via self-hosted db-rest (HAFAS-Wrapper).
@@ -74,6 +75,8 @@ interface DbLeg {
   arrival?: string;
   plannedDeparture?: string;
   plannedArrival?: string;
+  /** Echtzeit in Minuten: 0 = pünktlich, `null` = noch keine Echtzeit. */
+  departureDelay?: number | null;
   departurePlatform?: string;
   plannedDeparturePlatform?: string;
   arrivalPlatform?: string;
@@ -178,16 +181,25 @@ export const dbVendoProvider: SearchProvider = {
     // auf den konkreten Ziel-Zeitpunkt — ohne das würde HAFAS bei einem Klick
     // auf einen Zug 4h in der Zukunft womöglich nur Verbindungen ab "jetzt"
     // liefern (10er-Limit), und der Ziel-Zug wäre nicht in den Results.
+    /**
+     * Klasse und Tarifprofil für die DB. Bis 28.10.2026 ging die Klasse gar
+     * nicht mit — eine Suche in der 1. Klasse zeigte Preise der 2.
+     */
+    const fare = dbVendoFareParams(
+      parseFareProfile(input.fareProfile),
+      input.travelClass === "search.class.first",
+    );
     const outboundPromise = fetchJourneys(
       fromId,
       toId,
       input.departDate,
+      fare,
       signal,
       input.paginationToken,
       input.departTime,
     );
     const returnPromise = input.returnDate
-      ? fetchJourneys(toId, fromId, input.returnDate, signal)
+      ? fetchJourneys(toId, fromId, input.returnDate, fare, signal)
       : Promise.resolve(null);
 
     const [outbound, returnLeg] = await Promise.all([outboundPromise, returnPromise]);
@@ -204,7 +216,7 @@ export const dbVendoProvider: SearchProvider = {
     let outbound2: JourneyFetch | null = null;
     const firstLaterRef = (outbound.raw as { laterRef?: string } | null)?.laterRef;
     if (outbound.ok && !input.paginationToken && firstLaterRef) {
-      outbound2 = await fetchJourneys(fromId, toId, input.departDate, signal, firstLaterRef).catch(
+      outbound2 = await fetchJourneys(fromId, toId, input.departDate, fare, signal, firstLaterRef).catch(
         () => null,
       );
     }
@@ -329,6 +341,7 @@ async function fetchJourneys(
   fromId: string,
   toId: string,
   date: string,
+  fare: Record<string, string>,
   signal?: AbortSignal,
   laterRef?: string,
   targetDepartTime?: string,
@@ -371,6 +384,9 @@ async function fetchJourneys(
   url.searchParams.set("results", "10");
   url.searchParams.set("language", "de");
   url.searchParams.set("stopovers", "true");
+  // Klasse und Tarif (BahnCard, Deutschlandticket) — auch beim Blättern, denn
+  // jede Seite ist eine eigene Anfrage mit eigenen Preisen.
+  for (const [k, v] of Object.entries(fare)) url.searchParams.set(k, v);
 
   const res = await fetch(url, { headers: { Accept: "application/json" }, signal });
   await reportIfBlocked(lane, res);
@@ -759,6 +775,13 @@ function dbDelayMinutes(
   return d > 0 ? d : undefined;
 }
 
+/** Das Echtzeit-Gleis, wenn es vom geplanten abweicht — sonst nichts (siehe `LegInfo.departPlatformRt`). */
+function platformChange(planned?: string, actual?: string): string | undefined {
+  const p = cleanPlatform(planned);
+  const a = cleanPlatform(actual);
+  return p && a && p !== a ? a : undefined;
+}
+
 /**
  * Meldet DB selbst, dass diese Verbindung gefährdet ist?
  *
@@ -889,6 +912,7 @@ function parseJourneys(
         arriveDelayMinutes: dbDelayMinutes(seg.plannedArrival, seg.arrival, segDestTz),
         durationMinutes: segDuration,
         departPlatform: cleanPlatform(seg.plannedDeparturePlatform ?? seg.departurePlatform),
+        departPlatformRt: platformChange(seg.plannedDeparturePlatform, seg.departurePlatform),
         arrivePlatform: cleanPlatform(seg.plannedArrivalPlatform ?? seg.arrivalPlatform),
         // Zone DIESES Halts aus dem Offset des Zeitstempels ("…+02:00"). DB
         // liefert keine IANA-Namen, aber der Offset reicht zum Anzeigen — sonst
@@ -957,6 +981,7 @@ function parseJourneys(
       arriveTime: arriveIso,
       departDelayMinutes,
       arriveDelayMinutes,
+      departRealtime: first.departureDelay != null ? true : undefined,
       warning,
       // Zonen aus den Koordinaten der ECHTEN Endhalte dieser Verbindung — genauer
       // als die Auflösung über den gesuchten Ort (der User sucht „Köln", der Zug

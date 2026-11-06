@@ -1,0 +1,30 @@
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+group = 'expo.modules.mapcover'
+version = '0.1.0'
+
+def expoModulesCorePlugin = new File(project(":expo-modules-core").projectDir.absolutePath, "ExpoModulesCorePlugin.gradle")
+apply from: expoModulesCorePlugin
+applyKotlinExpoModulesCorePlugin()
+useCoreDependencies()
+useDefaultAndroidSdkVersions()
+useExpoPublishing()
+
+android {
+  namespace "expo.modules.mapcover"
+  defaultConfig {
+    versionCode 1
+    versionName "0.1.0"
+  }
+  lintOptions {
+    abortOnError false
+  }
+}
+
+dependencies {
+  // Für das Auffinden der Karten-Ansicht (`UIManagerHelper`), wie modules/live-models.
+  implementation 'com.facebook.react:react-android'
+  // Dieselbe MapLibre wie maplibre-react-native (plugins/withMaplibreGlobe.js).
+  implementation "org.maplibre.gl:android-sdk-opengl:${rootProject.findProperty('org.maplibre.reactnative.nativeVersion') ?: '13.6.1-globe.6'}"
+}

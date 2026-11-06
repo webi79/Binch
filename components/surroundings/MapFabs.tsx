@@ -1,8 +1,10 @@
-import { useCallback, useState } from "react";
-import { View, type LayoutChangeEvent } from "react-native";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { StyleSheet, View, type LayoutChangeEvent } from "react-native";
 import Animated, {
+  cancelAnimation,
   Easing,
   runOnJS,
+  useAnimatedProps,
   useAnimatedReaction,
   useAnimatedStyle,
   useSharedValue,
@@ -10,10 +12,12 @@ import Animated, {
   withTiming,
   type SharedValue,
 } from "react-native-reanimated";
-import Svg, { Path } from "react-native-svg";
+import { Gesture, GestureDetector } from "react-native-gesture-handler";
+import Svg, { Circle, ClipPath, Defs, Path, Rect } from "react-native-svg";
 import { Layers } from "lucide-react-native";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useAccent } from "@/lib/theme/accent";
+import { useT } from "@/lib/i18n/useT";
 import { ms, scaledStyles } from "@/lib/ui/compact";
 import { chromeShift, travelFabs } from "@/lib/surroundings/mapChrome";
 
@@ -188,11 +192,25 @@ export function MapFabs({
 /**
  * „Zu meinem Standort" — unten rechts über dem Auswahlfenster, wie bei Google.
  *
- * Dieselbe Hülle wie die Knöpfe oben (`Fab`: Fläche, Rand, Schatten), darin
- * DASSELBE Zeichen wie der eigene Standort auf der Karte (`UserPin` in
- * MapMarkers.tsx): der Punkt im Akzent mit seinem weichen Hof. Vorher stand
- * hier ein Fadenkreuz — ein Zeichen, das auf der Karte nirgends vorkommt. Der
- * Punkt sagt ohne Umweg, wohin der Knopf führt.
+ * FORM VON GOOGLE, FARBEN VON BINCH (Nutzer 06.11.2026: „passt überhaupt nicht
+ * zum Design — ganz andere Farben"). Die abgerundete Kachel des
+ * Material-3-FAB bleibt (56 × 56, Radius 16 — derselbe Radius wie Felder und
+ * Knöpfe der App), aber Fläche, Rand und Schatten sind die der Knöpfe oben
+ * (`fab`): dasselbe Schwarz wie die Suchleiste, dieselbe feine Kante. Vorher
+ * stand hier Googles Grau (#38383B) — ein Ton, den es sonst nirgends in der App
+ * gibt.
+ *
+ * Darin das Zeichen des eigenen Standorts, wie es auf der Karte steht
+ * (`UserPin` in MapMarkers.tsx): Punkt im Akzent, weicher Hof, und ein Ring in
+ * der FARBE DER FLÄCHE, der den Punkt aus dem Hof stanzt — dasselbe
+ * „ausgestanzt" wie am Griff des Preisalarm-Reglers. Größen wie am Vorbild
+ * gemessen (Hof zwei Drittel der Kachel, Punkt mit Ring 16).
+ *
+ * EIGENE EBENE (`renderToHardwareTextureAndroid`): Der Knopf blendet mit dem
+ * Aufziehen des Blattes aus, über die Deckkraft seines Halters. Ohne Ebene
+ * kam der halbdurchsichtige runde Hof dabei als eckige Box heraus (Gerät,
+ * 06.11.2026). Der Schatten gehört dem Halter und bleibt außerhalb der Ebene,
+ * wird also nicht abgeschnitten.
  *
  * Die Lage bestimmt nicht der Knopf, sondern wer ihn hält — über dem
  * Auswahlfenster das Blatt selbst (`accessory` in SurroundingsSheet.tsx; ist
@@ -208,14 +226,112 @@ export function LocateFab({
   locating?: boolean;
 }) {
   const accent = useAccent();
+  const t = useT();
+  const pressRef = useRef(onPress);
+  pressRef.current = onPress;
+  const press = useCallback(() => pressRef.current(), []);
+
+  /**
+   * DIE WELLE IN DER FORM DES KNOPFES (Nutzer 06.11.2026: „der Ripple ist
+   * immer noch ein Kreis").
+   *
+   * Die native Welle von Android lässt sich nur rechteckig oder rund begrenzen.
+   * In die Rundung beschneiden ginge über `overflow: hidden` — und genau das
+   * flackert hier an den Ecken, weil der Knopf bei jeder Bewegung des Blattes
+   * per Verschiebung mitfährt (`noClip` in RippleTouch.tsx). Deshalb eine eigene
+   * Welle: ein Kreis, der vom Finger aus wächst, in der Zeichnung selbst auf die
+   * abgerundete Kachel beschnitten (SVG-`clipPath`, kein Ansichts-Beschnitt).
+   * Alles auf dem UI-Strang: Die Geste setzt die Werte, nichts rendert.
+   */
+  const cx = useSharedValue(0);
+  const cy = useSharedValue(0);
+  const rad = useSharedValue(0);
+  const glow = useSharedValue(0);
+  const tap = useMemo(
+    () =>
+      Gesture.Tap()
+        .maxDuration(60_000)
+        .maxDistance(24)
+        .onBegin((e) => {
+          // Ereignis-Lage gilt ab der Außenkante, die Zeichnung beginnt innen am Rand.
+          const x = Math.min(LOC_INNER, Math.max(0, e.x - LOC_EDGE));
+          const y = Math.min(LOC_INNER, Math.max(0, e.y - LOC_EDGE));
+          cx.value = x;
+          cy.value = y;
+          // Bis in die fernste Ecke — dann deckt die Welle die ganze Kachel.
+          const far = Math.hypot(Math.max(x, LOC_INNER - x), Math.max(y, LOC_INNER - y));
+          cancelAnimation(rad);
+          cancelAnimation(glow);
+          rad.value = far * 0.3;
+          rad.value = withTiming(far, { duration: 420, easing: Easing.out(Easing.cubic) });
+          glow.value = withTiming(RIPPLE_ALPHA, { duration: 80 });
+        })
+        .onEnd((_e, success) => {
+          if (success) runOnJS(press)();
+        })
+        .onFinalize(() => {
+          // Kurz stehen lassen, dann auslaufen — ein schneller Tipp sieht die Welle sonst nie.
+          glow.value = withDelay(90, withTiming(0, { duration: 300, easing: Easing.out(Easing.quad) }));
+        }),
+    [cx, cy, rad, glow, press],
+  );
+  const rippleProps = useAnimatedProps(() => ({
+    cx: cx.value,
+    cy: cy.value,
+    r: rad.value,
+    fillOpacity: glow.value,
+  }));
+
   return (
-    <Fab onPress={onPress} dimmed={locating}>
-      <View style={[styles.locHalo, { backgroundColor: accent.subtle }]}>
-        <View style={[styles.locDot, { backgroundColor: accent.solid }]} />
+    <GestureDetector gesture={tap}>
+      <View
+        renderToHardwareTextureAndroid
+        accessible
+        accessibilityRole="button"
+        accessibilityLabel={t("map.locate")}
+        accessibilityActions={[{ name: "activate" }]}
+        onAccessibilityAction={(e) => {
+          if (e.nativeEvent.actionName === "activate") press();
+        }}
+        style={[styles.locFab, locating ? styles.locBusy : null]}
+      >
+        <View style={[styles.locHalo, { backgroundColor: accent.subtle }]}>
+          <View style={[styles.locDot, { backgroundColor: accent.solid }]} />
+        </View>
+        <Svg style={StyleSheet.absoluteFill} pointerEvents="none">
+          <Defs>
+            <ClipPath id="locate-fab-shape">
+              <Rect x={0} y={0} width={LOC_INNER} height={LOC_INNER} rx={LOC_INNER_R} ry={LOC_INNER_R} />
+            </ClipPath>
+          </Defs>
+          <AnimatedCircle
+            clipPath="url(#locate-fab-shape)"
+            fill="#FFFFFF"
+            animatedProps={rippleProps}
+          />
+        </Svg>
       </View>
-    </Fab>
+    </GestureDetector>
   );
 }
+
+const AnimatedCircle = Animated.createAnimatedComponent(Circle);
+
+/** Kantenlänge des Standort-Knopfes — Material-3-FAB wie bei Google (vor `ms`). */
+const LOC_FAB = 56;
+/** Rand der Kachel und die Fläche darin — dort wird die Welle gezeichnet. */
+const LOC_EDGE = 1;
+const LOC_INNER = ms(LOC_FAB) - 2 * LOC_EDGE;
+/** Innere Rundung: die äußere (16) minus Rand. */
+const LOC_INNER_R = ms(16) - LOC_EDGE;
+/** Stärke der Welle — wie die helle Welle der übrigen Knöpfe auf dunklem Grund. */
+const RIPPLE_ALPHA = 0.16;
+
+/** Fläche und Kante ALLER Karten-Knöpfe — dasselbe Schwarz wie die Suchleiste. */
+const FAB_SURFACE = "rgba(13,13,13,0.92)";
+const FAB_EDGE = "#212123";
+/** Der Ring um den Standort-Punkt: die Fläche, deckend — er stanzt den Punkt aus dem Hof. */
+const FAB_PUNCH = "#0D0D0D";
 
 /**
  * Eine Kompassnadel — Nordhälfte im Akzent, Südhälfte hell und zurückgenommen.
@@ -274,8 +390,8 @@ const styles = scaledStyles({
     width: 44,
     height: 44,
     borderRadius: 22,
-    backgroundColor: "rgba(13,13,13,0.92)",
-    borderColor: "#212123",
+    backgroundColor: FAB_SURFACE,
+    borderColor: FAB_EDGE,
     borderWidth: 1,
     alignItems: "center",
     justifyContent: "center",
@@ -287,21 +403,40 @@ const styles = scaledStyles({
   },
   // fabActive entfernt — borderColor wird inline aus accent.solid gesetzt.
   /**
-   * Der Standort-Punkt im Kleinen — Verhältnis wie auf der Karte (Hof 26,
-   * Punkt 10 mit Rand 3, `UserPin`), auf die Knopfgröße gebracht. Der dunkle
-   * Rand der Karte entfällt: Er trennt dort den Punkt vom hellen Untergrund,
-   * hier liegt er ohnehin auf der dunklen Knopffläche.
+   * Der Standort-Knopf: Googles Kachel in den Farben der Knöpfe oben (`fab`) —
+   * Fläche, Rand und Schatten 1:1 von dort.
    */
+  locFab: {
+    width: LOC_FAB,
+    height: LOC_FAB,
+    borderRadius: 16,
+    backgroundColor: FAB_SURFACE,
+    borderColor: FAB_EDGE,
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.4,
+    shadowRadius: 12,
+    elevation: 6,
+  },
+  /** Ortung läuft — gedimmt, damit niemand ins Leere tippt. */
+  locBusy: { opacity: 0.5 },
+  /** Hof: zwei Drittel der Kachel, wie am Vorbild gemessen. */
   locHalo: {
-    width: 22,
-    height: 22,
-    borderRadius: 11,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     alignItems: "center",
     justifyContent: "center",
   },
+  /** Punkt 16 mit Ring 2,5 in der Farbe der Fläche — innen bleiben 11 im Akzent. */
   locDot: {
-    width: 10,
-    height: 10,
-    borderRadius: 5,
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    borderWidth: 2.5,
+    borderColor: FAB_PUNCH,
   },
 });

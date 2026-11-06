@@ -136,8 +136,8 @@ export function LinePill({
 }
 
 const styles = scaledStyles({
-  pill: { paddingHorizontal: 11, paddingVertical: 6, borderRadius: 10 },
+  pill: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10 },
   text: { fontSize: 12, fontWeight: "800", color: "#F4F4F5", letterSpacing: -0.2 },
-  pillCompact: { paddingHorizontal: 7, paddingVertical: 3, borderRadius: 7 },
+  pillCompact: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 7 },
   textCompact: { fontSize: 12, fontWeight: "800", color: "#F4F4F5", letterSpacing: -0.2 },
 });

@@ -17,6 +17,7 @@
  * Bo-Screen. Ein Dialog INNERHALB der Schublade läge halb darunter.
  */
 import { useEffect, useState } from "react";
+import { TITLE_GAP } from "@/lib/theme/spacing";
 import {
   Keyboard,
   KeyboardAvoidingView,
@@ -204,8 +205,8 @@ const styles = scaledStyles({
     borderWidth: 1,
     borderColor: tokens.border,
     paddingTop: 28,
-    paddingHorizontal: 22,
-    paddingBottom: 18,
+    paddingHorizontal: 24,
+    paddingBottom: 16,
     alignItems: "center",
   },
   iconCircle: {
@@ -214,7 +215,7 @@ const styles = scaledStyles({
     borderRadius: ICON_CIRCLE / 2,
     alignItems: "center",
     justifyContent: "center",
-    marginBottom: 18,
+    marginBottom: 16,
   },
   title: {
     fontSize: 21,
@@ -224,7 +225,7 @@ const styles = scaledStyles({
     textAlign: "center",
   },
   body: {
-    marginTop: 8,
+    marginTop: TITLE_GAP,
     fontSize: 14,
     lineHeight: 21,
     color: tokens.gray200,
@@ -241,7 +242,7 @@ const styles = scaledStyles({
     color: tokens.white,
   },
   solidBtn: { alignSelf: "stretch", marginTop: 20, borderRadius: 16, overflow: "hidden" },
-  solidLabel: { fontSize: 17, fontWeight: "700", textAlign: "center", paddingVertical: 17 },
+  solidLabel: { fontSize: 17, fontWeight: "700", textAlign: "center", paddingVertical: 16 },
   disabled: { opacity: 0.4 },
   ghostBtn: {
     alignSelf: "stretch",

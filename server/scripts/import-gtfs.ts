@@ -102,6 +102,16 @@ const OTHER_PREFIXES = (process.env.GTFS_OTHER_PREFIXES ?? "")
  * die Verbünde nur mit 5–25 m anderer Lage — jeder Steig käme doppelt.
  */
 const WITH_STANDS = process.env.GTFS_STANDS !== "0";
+/**
+ * `GTFS_STANDS_FIRST=1` — der ERSTE Abgleich eines Landes, dessen Halte bisher aus anderen
+ * Quellen kamen (Österreich, Okt. 2026: 55 000 OSM-Halte, dazu StaDa). Eine Station mit ≥ 2
+ * Steigen kommt dann auch dazu, wenn in der Nähe eine gleichnamige Zeile steht — wie im
+ * unstable-Zweig: Wo die vorhandene Zeile auf einem Steig steht, wird sie dessen Zeile
+ * (gtfsStands.ts). Ohne das fiel fast jede Station als „gibt es schon" heraus („Wien
+ * Hauptbahnhof" neben „Wien Hbf") und mit ihr alle ihre Steige. Danach findet der normale
+ * Abgleich die Stationen an ihrer Kennung — der Schalter ist nur für diesen einen Lauf.
+ */
+const STANDS_FIRST = process.env.GTFS_STANDS_FIRST === "1";
 /** `GTFS_REPORT=<verzeichnis>` — die geplanten Änderungen als CSV (stations.csv, stands.csv). */
 const REPORT_DIR = process.env.GTFS_REPORT;
 const GTFS_DIR = process.env.GTFS_DIR ?? "/tmp/gtfs";
@@ -1108,7 +1118,9 @@ async function main() {
         feedTwin ||
         (UNSTABLE_IDS
           ? !multiStand && foreignIndex.hasDuplicate(r.label, r.subtype, r.type, lat, lng)
-          : WITH_STANDS && standalonePoles.has(r.code) && dedupFamily(r.subtype, r.type) !== "RAIL"
+          : STANDS_FIRST && WITH_STANDS && multiStand
+            ? false
+            : WITH_STANDS && standalonePoles.has(r.code) && dedupFamily(r.subtype, r.type) !== "RAIL"
             ? samePoleExists(r, lat, lng)
             : index.hasDuplicate(r.label, r.subtype, r.type, lat, lng));
       if ((uic && knownHafas.has(uic)) || dup) {
@@ -1235,8 +1247,9 @@ async function main() {
           target: locations.code,
           set: REFRESH
             ? {
-                latitude: sql`excluded.latitude`,
-                longitude: sql`excluded.longitude`,
+                // Korrigierte Lage (`position_fixed_at`, fix-stop-positions.ts) bleibt.
+                latitude: sql`CASE WHEN ${locations.positionFixedAt} IS NULL THEN excluded.latitude ELSE ${locations.latitude} END`,
+                longitude: sql`CASE WHEN ${locations.positionFixedAt} IS NULL THEN excluded.longitude ELSE ${locations.longitude} END`,
                 /**
                  * Die Art (`type`) schreibt der Abgleich nie — also auch keine
                  * Verkehrsart, die nicht zu ihr passt. Sonst entstanden
@@ -1294,8 +1307,8 @@ async function main() {
            * den Steig bei MOTIS. Name und Art bleiben, wie oben.
            */
           set: {
-            latitude: sql`excluded.latitude`,
-            longitude: sql`excluded.longitude`,
+            latitude: sql`CASE WHEN ${locations.positionFixedAt} IS NULL THEN excluded.latitude ELSE ${locations.latitude} END`,
+            longitude: sql`CASE WHEN ${locations.positionFixedAt} IS NULL THEN excluded.longitude ELSE ${locations.longitude} END`,
             subtype: sql`CASE WHEN excluded.type = ${locations.type} THEN excluded.subtype ELSE ${locations.subtype} END`,
             kinds: sql`CASE WHEN excluded.type = ${locations.type} THEN excluded.kinds ELSE ${locations.kinds} END`,
             parentCode: sql`excluded.parent_code`,

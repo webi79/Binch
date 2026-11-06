@@ -356,13 +356,13 @@ const styles = scaledStyles({
    * ändert, ändert es dort mit.
    */
   /** Dieselbe Aufteilung und dieselben Zahlen wie `PriceAlertCard`. */
-  card: { borderRadius: 20, paddingVertical: 14, paddingHorizontal: 16 },
+  card: { borderRadius: 20, paddingVertical: 16, paddingHorizontal: 16 },
   /** Kurzes Abdunkeln statt Ripple — siehe die Begründung an der Karte. */
   cardPressed: { opacity: 0.7 },
   head: { flexDirection: "row", alignItems: "flex-start", gap: SPACE.md },
   headText: { flex: 1, minWidth: 0 },
   route: { fontSize: 17, fontWeight: "700", color: C.text, lineHeight: 23 },
-  meta: { fontSize: 14, fontWeight: "500", color: C.sub, marginTop: SPACE.xs + 2 },
+  meta: { fontSize: 14, fontWeight: "500", color: C.sub, marginTop: SPACE.sm },
   /** Zahl für Zahl das Herz-Feld der Alarm-Karte — siehe dort. */
   heart: {
     width: 34,
@@ -373,7 +373,7 @@ const styles = scaledStyles({
     backgroundColor: "rgba(255,255,255,0.08)",
     marginTop: -2,
   },
-  divider: { height: 1, backgroundColor: "#212123", marginVertical: 14 },
+  divider: { height: 1, backgroundColor: "#212123", marginVertical: 16 },
   /**
    * Maße und Abstände wie die Schalterzeile der Alarm-Karte: Feld, Zwölfer-Lücke,
    * Beschriftung mit `flex: 1`, rechts der Inhalt. Zwei Karten, die dieselbe

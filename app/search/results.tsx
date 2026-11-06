@@ -27,6 +27,7 @@ import { useSearchStore } from "@/stores/searchStore";
 import { resultsPush, POP_SPRING } from "@/lib/nav/overlayCover";
 import { markTransitionBusy } from "@/lib/nav/transitionBusy";
 import { skipNextScreenEntrance } from "@/lib/motion";
+import { slideTiming } from "@/lib/nav/slideMotion";
 
 export default function ResultsRoute() {
   const navigation = useNavigation();
@@ -117,7 +118,7 @@ export default function ResultsRoute() {
       if (timerRef.current) clearTimeout(timerRef.current);
       timerRef.current = setTimeout(finish, POP_SPRING.duration + 300);
       requestAnimationFrame(() => {
-        resultsPush.value = withTiming(0, POP_SPRING, (finished?: boolean) => {
+        resultsPush.value = withTiming(0, slideTiming(POP_SPRING), (finished?: boolean) => {
           "worklet";
           if (finished) runOnJS(finish)();
         });

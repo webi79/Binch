@@ -1,0 +1,2 @@
+ALTER TABLE "push_tokens" ADD COLUMN "notifications_enabled" boolean DEFAULT true NOT NULL;--> statement-breakpoint
+ALTER TABLE "push_tokens" ADD COLUMN "price_alerts_enabled" boolean DEFAULT true NOT NULL;

@@ -14,13 +14,12 @@ import {
   Text,
   Pressable,
   FlatList,
-  ActivityIndicator,
   StyleSheet,
   useWindowDimensions,
 } from "react-native";
 import { usePalette } from "@/lib/theme/appBg";
 import { useQuery } from "@tanstack/react-query";
-import { X, Navigation, Plane, Train, Bus, Ship, Flag } from "lucide-react-native";
+import { X, Navigation, Plane, Train, Bus, Ship, Flag, House, Briefcase } from "lucide-react-native";
 import { SubwayIcon } from "@/components/ui/SubwayIcon";
 import Animated, { withTiming } from "react-native-reanimated";
 import { Location, TravelMode } from "@/types/search";
@@ -35,6 +34,16 @@ import { SHEET_TITLE } from "@/components/ui/SheetModal";
 import { scaledStyles } from "@/lib/ui/compact";
 import { FadePress } from "@/components/ui/FadePress";
 import { standDetail } from "@/lib/surroundings/standLabel";
+import { slideTiming } from "@/lib/nav/slideMotion";
+import { GridLoader } from "@/components/ui/GridLoader";
+import { LoadGate } from "@/components/ui/LoadGate";
+import { StatePanel } from "@/components/ui/StatePanel";
+import { KeyboardCenter } from "@/components/ui/KeyboardCenter";
+
+/** Die Liste nach dem Laden füllt den Raum wie vorher. */
+const pickerContentStyle = { flex: 1 };
+/** Der Lader waagerecht mittig (`KeyboardCenter` sorgt für die Höhe). */
+const pickerLoaderRow = { alignItems: "center" } as const;
 
 type Field = "from" | "to";
 
@@ -95,8 +104,10 @@ const EMPTY_LOCATIONS: Location[] = [];
 /** Stabile Vorgaben für die Liste — siehe dort. */
 type SuggestItem =
   | { kind: "header"; key: string; title: string }
-  | { kind: "row"; key: string; loc: Location; suggested?: boolean };
+  | { kind: "row"; key: string; loc: Location; suggested?: boolean; place?: "home" | "work" };
 const LIST_PAD = { paddingBottom: 32 } as const;
+/** Trefferliste: wächst auf volle Höhe, damit „Nichts gefunden" mittig stehen kann. */
+const RESULTS_PAD = { flexGrow: 1, paddingBottom: 32 } as const;
 
 /**
  * GEMERKT — sonst rendert der ganze Wähler im ersten Bild der Ausfahrt neu.
@@ -182,18 +193,39 @@ const LocationPickerInner = function LocationPicker({
   // Im ALL-Mode zeigen wir alle gespeicherten Stationen, sonst nur die zum
   // aktuellen Mode passenden. ALL-Type-Stationen (z.B. Cities) sind mode-
   // agnostisch und werden überall mit angezeigt.
+  /**
+   * „Zuhause" aus Profil → Einstellungen → Reisen — ganz oben, eigener
+   * Abschnitt, nur wenn es zum Verkehrsmittel passt (ein Bahnhof gehört nicht
+   * in den Flughafen-Wähler). In den Listen darunter steht es dann nicht noch
+   * einmal.
+   */
+  const homeStation = useSearchStore((s) => s.homeStation);
+  const workStation = useSearchStore((s) => s.workStation);
+  const fits = useCallback(
+    (l: Location | null): l is Location => !!l && (mode === "ALL" || l.type === mode || l.type === "ALL"),
+    [mode],
+  );
+  /** Zuhause und Arbeit, soweit sie zum Verkehrsmittel passen — Zuhause zuerst. */
+  const placeList = useMemo(() => {
+    const out: Location[] = [];
+    if (fits(homeStation)) out.push(homeStation);
+    if (fits(workStation) && workStation.code !== homeStation?.code) out.push(workStation);
+    return out;
+  }, [homeStation, workStation, fits]);
+  const placeCodes = useMemo(() => new Set(placeList.map((l) => l.code)), [placeList]);
+  const homeCode = fits(homeStation) ? homeStation.code : null;
   const filteredSaved = useMemo(() => {
-    if (mode === "ALL") return savedStations;
-    return savedStations.filter((s) => s.type === mode || s.type === "ALL");
-  }, [savedStations, mode]);
+    const list = mode === "ALL" ? savedStations : savedStations.filter((s) => s.type === mode || s.type === "ALL");
+    return list.filter((s) => !placeCodes.has(s.code));
+  }, [savedStations, mode, placeCodes]);
 
   // Gespeicherte Stationen erscheinen NUR unter „Gespeichert" — aus den
   // Vorschlägen und Recents ausblenden, sonst steht dieselbe Station doppelt
   // in der Liste (z.B. direkt nach dem Speichern aus den Vorschlägen heraus).
   const savedCodes = useMemo(() => new Set(savedStations.map((s) => s.code)), [savedStations]);
   const visibleRecent = useMemo(
-    () => recent.filter((l) => !savedCodes.has(l.code)),
-    [recent, savedCodes],
+    () => recent.filter((l) => !savedCodes.has(l.code) && !placeCodes.has(l.code)),
+    [recent, savedCodes, placeCodes],
   );
   // Vorschläge, deren Code beim Start-Check nicht zu ihrem Label passte, fliegen
   // raus. Die Liste ist hartkodiert (POPULAR_LOCATIONS) und kann von der DB
@@ -204,9 +236,9 @@ const LocationPickerInner = function LocationPicker({
   const visibleSuggested = useMemo(
     () =>
       suggested.filter(
-        (l) => !savedCodes.has(l.code) && !invalidSuggestionCodes.includes(l.code),
+        (l) => !savedCodes.has(l.code) && !placeCodes.has(l.code) && !invalidSuggestionCodes.includes(l.code),
       ),
-    [suggested, savedCodes, invalidSuggestionCodes],
+    [suggested, savedCodes, placeCodes, invalidSuggestionCodes],
   );
 
   /**
@@ -231,7 +263,7 @@ const LocationPickerInner = function LocationPicker({
 
   /** Liegt ein Auftrag an? Fällt schon im Berührungs-Bild — siehe `enabled`. */
   const request = useSearchStore((st) => st.locationPickerRequest !== null);
-  const { data: results, isLoading, isError, error } = useQuery({
+  const { data: results, isLoading, isError, isFetching, refetch } = useQuery({
     queryKey: ["locations", mode, debounced],
     queryFn: () => fetchLocations(debounced, mode),
     /**
@@ -434,7 +466,7 @@ const LocationPickerInner = function LocationPicker({
    */
   const slide = useCallback(
     (show: boolean) => {
-      const cfg = show ? PICKER_IN : PICKER_OUT;
+      const cfg = slideTiming(show ? PICKER_IN : PICKER_OUT);
       /**
        * Beim Schließen ZUERST die Tastatur — vor allem anderen.
        *
@@ -701,20 +733,31 @@ const LocationPickerInner = function LocationPicker({
     const add = (title: string, list: Location[], key: string, suggested?: boolean) => {
       if (list.length === 0) return;
       out.push({ kind: "header", key: `h-${key}`, title });
-      for (const loc of list) out.push({ kind: "row", key: `${key}-${loc.code}`, loc, suggested });
+      for (const loc of list) {
+        const place = key === "place" ? (loc.code === homeCode ? "home" : "work") : undefined;
+        out.push({ kind: "row", key: `${key}-${loc.code}`, loc, suggested, place });
+      }
     };
+    // Ein Abschnitt für beide; die Überschrift sagt, was drinsteht.
+    const placeTitle =
+      placeList.length === 2
+        ? t("search.location.homeWork")
+        : placeList[0]?.code === homeCode
+          ? t("search.location.home")
+          : t("search.location.work");
+    add(placeTitle, placeList, "place");
     add(t("search.location.saved"), filteredSaved, "saved");
     add(t("search.location.recent"), visibleRecent, "recent");
     add(t("search.location.suggested"), visibleSuggested, "sugg", true);
     return out;
-  }, [filteredSaved, visibleRecent, visibleSuggested, t]);
+  }, [placeList, homeCode, filteredSaved, visibleRecent, visibleSuggested, t]);
 
   const renderSuggest = useCallback(
     ({ item }: { item: SuggestItem }) =>
       item.kind === "header" ? (
         <Text className="text-base font-bold text-white mt-4 mb-2 px-5">{item.title}</Text>
       ) : (
-        <PickerRow loc={item.loc} onSelect={handleSelect} suggested={item.suggested} />
+        <PickerRow loc={item.loc} onSelect={handleSelect} suggested={item.suggested} place={item.place} />
       ),
     [handleSelect],
   );
@@ -936,30 +979,47 @@ const LocationPickerInner = function LocationPicker({
         </View>
 
         {showSearchResults ? (
-          isLoading ? (
-            <View className="py-8 items-center">
-              {/**
-                * Während der Fahrt steht der Kreisel STILL statt zu
-                * verschwinden.
-                *
-                * Er dreht sich nativ, also ändert er in jedem Bild den Inhalt
-                * der Hülle — und die wird für die Fahrt als Textur gehalten,
-                * die damit in jedem Bild neu gerastert werden müsste. Ihn
-                * auszubauen wäre die schlechtere Lösung: Das ist ein Commit
-                * plus Neuvermessung mitten in der Bewegung, und die Liste
-                * darunter springt.
-                */}
-              <ActivityIndicator color={accent.solid} animating={!moving} />
-            </View>
-          ) : isError ? (
-            <View className="px-5 py-6">
-              <Text className="text-sm font-semibold text-pink-400 mb-1">
-                Connection error
-              </Text>
-              <Text className="text-xs text-gray-500" numberOfLines={3}>
-                {error instanceof Error ? error.message : "Could not reach the server."}
-              </Text>
-            </View>
+          <LoadGate
+            loading={isLoading}
+            fill
+            contentStyle={pickerContentStyle}
+            loader={
+              /**
+               * Während der Fahrt steht der Lader STILL statt zu verschwinden:
+               * Bewegte er sich, änderte er in jedem Bild den Inhalt der Hülle —
+               * und die wird für die Fahrt als Textur gehalten. Ihn auszubauen
+               * wäre schlechter: ein Commit plus Neuvermessung mitten in der
+               * Bewegung, und die Liste darunter spränge.
+               *
+               * Mittig im Teil ÜBER der Tastatur (`KeyboardCenter`) — die Fläche
+               * reicht bis zum Bildschirmrand, also unter die Tastatur.
+               */
+              <KeyboardCenter>
+                <View style={pickerLoaderRow}>
+                  <GridLoader size={48} active={!moving} />
+                </View>
+              </KeyboardCenter>
+            }
+          >
+          {() => isError ? (
+            /* Wie jeder Fehler der App: Zeichnung, Titel, Satz, EIN Knopf —
+               vorher stand hier ein fest englischer, roter „Connection error"
+               samt roher Fehlermeldung. Mittig im Raum über der Tastatur. */
+            <KeyboardCenter>
+              <StatePanel
+                compact
+                art="offline"
+                surface={palette.bg}
+                title={t("state.error.title")}
+                body={t("results.error.body")}
+                action={t("state.retry")}
+                busy={isFetching}
+                onAction={() => {
+                  haptic("button");
+                  void refetch();
+                }}
+              />
+            </KeyboardCenter>
           ) : (
             <FlatList
               data={results ?? []}
@@ -971,7 +1031,7 @@ const LocationPickerInner = function LocationPicker({
               onScrollBeginDrag={() => releaseLayer("pickerLocation")}
               // Kein seitlicher Abstand mehr hier — er sitzt in den Zeilen,
               // damit ihr Wellen-Effekt bis an beide Ränder läuft (siehe dort).
-              contentContainerStyle={LIST_PAD}
+              contentContainerStyle={RESULTS_PAD}
               renderItem={renderResultRow}
               // Virtualisierung — bei langen Autocomplete-Listen (z.B. die 25
               // Treffer für „Berlin") spart das CPU/Memory und macht's smooth.
@@ -979,13 +1039,25 @@ const LocationPickerInner = function LocationPicker({
               initialNumToRender={10}
               maxToRenderPerBatch={8}
               removeClippedSubviews
+              /* Nichts gefunden: Zeichnung und zwei ruhige Zeilen, mittig im
+                 Raum ÜBER der Tastatur — statt eines kleinen „No matches." oben
+                 links (04.11.2026). Die Liste wächst dafür auf volle Höhe; sie
+                 reicht bis zum Bildschirmrand, also unter die Tastatur, und
+                 endet ihr unterer Rand (`RESULTS_PAD`) davor. */
               ListEmptyComponent={
-                <Text className="text-sm text-gray-500 mt-6 px-5">
-                  No matches.
-                </Text>
+                <KeyboardCenter bottomOffset={RESULTS_PAD.paddingBottom}>
+                  <StatePanel
+                    compact
+                    art="noMatch"
+                    surface={palette.bg}
+                    title={t("picker.noMatches.title")}
+                    body={t("picker.noMatches.body")}
+                  />
+                </KeyboardCenter>
               }
             />
-          )
+          )}
+          </LoadGate>
         ) : (
           <FlatList
             /**
@@ -1061,7 +1133,7 @@ const LocationPickerInner = function LocationPicker({
                       <Text className="text-base font-semibold text-white">
                         {t("search.location.current")}
                       </Text>
-                      <Text className="text-sm text-gray-500 mt-0.5">
+                      <Text className="text-sm text-gray-500 mt-1">
                         {t("search.location.usecurrent")}
                       </Text>
                     </View>
@@ -1133,14 +1205,17 @@ const PickerRow = memo(function PickerRow({
   loc,
   onSelect,
   suggested = false,
+  place: placeKind,
 }: {
   loc: Location;
   onSelect: (loc: Location) => void;
   /** Vorschlags-Variante: Länder (type ALL) zeigen „Country" als Subtitle. */
   suggested?: boolean;
+  /** „Zuhause" oder „Arbeit" — mit Haus bzw. Koffer statt Verkehrsmittel-Symbol. */
+  place?: "home" | "work";
 }) {
   const t = useT();
-  const Icon = iconFor(loc);
+  const Icon = placeKind === "home" ? House : placeKind === "work" ? Briefcase : iconFor(loc);
   const place = suggested && loc.type === "ALL" ? "Country" : loc.country || loc.city;
   // Steht ein gleichnamiger Halt daneben, kommt der Zusatz („Rochdale Road ·
   // Stop RA", bei einem Bus-Steig „Steig 3") in die leise Zeile darunter — nie
@@ -1200,7 +1275,7 @@ const PickerRow = memo(function PickerRow({
       <Icon color="#E5E7EB" size={20} />
       <View className="flex-1">
         <Text className="text-base font-semibold text-white">{loc.label}</Text>
-        <Text className="text-sm text-gray-500 mt-0.5" numberOfLines={1}>{subtitle}</Text>
+        <Text className="text-sm text-gray-500 mt-1" numberOfLines={1}>{subtitle}</Text>
       </View>
       <SaveStar loc={loc} />
     </Pressable>

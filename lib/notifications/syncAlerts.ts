@@ -64,6 +64,7 @@ export async function syncPriceAlerts(): Promise<void> {
             returnDate: a.returnDate || undefined,
             passengers: a.passengers,
             travelClass: a.travelClass,
+            fareProfile: a.fareProfile ?? "",
             currency: a.currency,
             basePrice: a.basePrice,
             desiredPrice: a.desiredPrice,

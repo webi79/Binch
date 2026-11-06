@@ -67,16 +67,7 @@ import Animated, {
 } from "react-native-reanimated";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
-import {
-  GUTTER,
-  SPACE,
-  HEADING_TOP,
-  HEADING_GAP,
-  BELL_SIZE,
-  BELL_OVERHANG,
-  HOME_HEADER_H,
-  useNavbarSpace,
-} from "@/lib/theme/spacing";
+import { GUTTER, SPACE, HEADING_TOP, HEADING_GAP, BELL_SIZE, BELL_OVERHANG, HOME_HEADER_H, useNavbarSpace, ITEM_GAP, TITLE_GAP, GROUP_GAP, SECTION_GAP } from "@/lib/theme/spacing";
 import { ScreenHeading } from "@/components/ui/ScreenHeading";
 import { MOTION } from "@/lib/motion";
 import { RippleTouch } from "@/components/ui/RippleTouch";
@@ -87,6 +78,7 @@ import { TravelMode } from "@/types/search";
 import { useAccent } from "@/lib/theme/accent";
 import { useAppBg, usePalette } from "@/lib/theme/appBg";
 import { fs, ms, scaledStyles } from "@/lib/ui/compact";
+import { CommuteRow } from "@/components/home/CommuteRow";
 
 // === Design Tokens ============================================================
 const C = {
@@ -1267,15 +1259,6 @@ function CategoryChips({ value, onChange }: { value: CategoryId; onChange: (id: 
   );
 }
 
-/**
- * Abstand von einer Bedienzeile zu dem, was sie steuert.
- *
- * Zweimal auf diesem Bildschirm: Suchleiste über den Transport-Tabs, und
- * Kategorie-Chips über dem Reiseziel-Stapel. Beide Male dieselbe Beziehung,
- * also dieselbe Zahl — vorher standen dort 12 und 18, und der Unterschied fiel
- * genau deshalb auf, weil die beiden Stellen sich sonst gleichen.
- */
-const CONTROL_GAP = 12;
 
 const HEART_RED = "#FF3B5C";
 
@@ -2484,6 +2467,8 @@ export default function HomeScreen() {
 
           
             <TransportTabs />
+            {/* „Zur Arbeit" / „Nach Hause" — nur mit Zuhause UND Arbeit (Einstellungen → Reisen). */}
+            <CommuteRow />
 
           {recentSearches.length > 0 && (
             // Kein ScrollReveal um den GANZEN Block — sonst blenden die Karten
@@ -2549,7 +2534,7 @@ export default function HomeScreen() {
             {/* „Alle anzeigen" ist raus — es führte nirgendwohin (leerer
                 Pressable ohne onPress), und die vier Kategorie-Chips darunter
                 sind ohnehin der Weg zu mehr Zielen. */}
-            <View style={styles.popularHeader}>
+            <View style={[styles.popularHeader, recentSearches.length === 0 && styles.popularHeaderFirst]}>
               <Text style={styles.sectionTitle}>{t("home.destinations.title")}</Text>
               <DeckToggle open={deckOpen} onPress={toggleDeck} />
             </View>
@@ -2667,38 +2652,38 @@ const styles = scaledStyles({
   },
 
   // SearchBar spacing
-  searchBarSpacing: { marginHorizontal: GUTTER, marginBottom: CONTROL_GAP },
+  searchBarSpacing: { marginHorizontal: GUTTER, marginBottom: GROUP_GAP },
 
   // Transport tabs
   tabsRow: {
     flexDirection: "row",
-    gap: 8,
+    gap: ITEM_GAP,
     paddingHorizontal: GUTTER,
-    paddingBottom: 8,
+    paddingBottom: 0,
   },
   tabWrap: { flex: 1 },
-  tabContent: { alignItems: "center", justifyContent: "center", gap: 6 },
+  tabContent: { alignItems: "center", justifyContent: "center", gap: 8 },
   tabIdle: { backgroundColor: C.surface2 },
   tabLabelIdle: { color: C.white, fontWeight: "600" },
   tab: {
     flex: 1,
     borderRadius: 22,
-    paddingVertical: 14,
+    paddingVertical: 16,
     paddingHorizontal: 4,
     alignItems: "center",
     justifyContent: "center",
-    gap: 6,
+    gap: 8,
     overflow: "hidden",
   },
   tabLabel: { fontSize: 12, letterSpacing: -0.1 },
 
   // Recent
-  recentSection: { paddingTop: 18, paddingBottom: 4 },
+  recentSection: { paddingTop: SECTION_GAP },
   sectionHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "baseline",
-    marginBottom: 12,
+    marginBottom: TITLE_GAP,
     paddingHorizontal: GUTTER,
   },
   sectionTitleSmall: {
@@ -2714,15 +2699,18 @@ const styles = scaledStyles({
     alignItems: "center",
     justifyContent: "center",
     gap: 4,
-    paddingVertical: 12,
+    // Unten ITEM_GAP Luft wie unter einer Karte — der nächste Abschnitt zieht sie ab.
+    paddingVertical: ITEM_GAP,
     marginHorizontal: GUTTER,
-    marginTop: 4,
-    marginBottom: 8,
+    marginTop: 0,
+    marginBottom: 0,
     borderRadius: 16,
   },
   recentToggleText: { fontSize: 13, fontWeight: FONT.semibold },
 
   // Popular header
+  /** Ohne „Zuletzt gesucht" steht über ihm nichts mit eigenem Rand. */
+  popularHeaderFirst: { paddingTop: SECTION_GAP },
   popularHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -2737,8 +2725,9 @@ const styles = scaledStyles({
      */
     alignItems: "center",
     paddingHorizontal: GUTTER,
-    paddingTop: 20,
-    paddingBottom: 14,
+    // Über ihm endet „Zuletzt gesucht" mit ITEM_GAP — der zählt mit.
+    paddingTop: SECTION_GAP - ITEM_GAP,
+    paddingBottom: TITLE_GAP,
   },
   /**
    * Der Auffächer-Schalter. Kein Hintergrund, keine Kante — auf dem dunklen
@@ -2753,7 +2742,7 @@ const styles = scaledStyles({
     height: 32,
     alignItems: "center",
     justifyContent: "center",
-    gap: 5,
+    gap: 4,
   },
   deckBar: {
     width: DECK_BAR_WIDE,
@@ -2773,9 +2762,9 @@ const styles = scaledStyles({
   // Category chips
   chipsRow: {
     flexDirection: "row",
-    gap: 8,
+    gap: ITEM_GAP,
     paddingHorizontal: GUTTER,
-    paddingTop: 4,
+    paddingTop: 0,
     // Kein unterer Rand: Der Abstand zum Stapel steht an DIESEM als `marginTop`,
     // und zwar als derselbe Wert, der auch unter der Suchleiste steht. Hier
     // zusätzlich vier Punkte zu vergeben hieße, den Abstand an zwei Stellen zu
@@ -2785,7 +2774,7 @@ const styles = scaledStyles({
   chip: {
     flex: 1,
     borderRadius: 9999,
-    paddingVertical: 10,
+    paddingVertical: 8,
     paddingHorizontal: SPACE.sm,
     alignItems: "center",
     justifyContent: "center",
@@ -2807,7 +2796,7 @@ const styles = scaledStyles({
    */
   deck: {
     marginHorizontal: GUTTER,
-    marginTop: CONTROL_GAP,
+    marginTop: GROUP_GAP,
     /**
      * 40 unten gegen 12 oben — und das ist Absicht, kein Versehen.
      *
@@ -2824,7 +2813,7 @@ const styles = scaledStyles({
      * füllt die Karte ihren Platz aus, und der Abstand steht jetzt als Zahl da,
      * statt aus einem Rechenfehler zu stammen.
      */
-    marginBottom: 40,
+    marginBottom: SECTION_GAP,
   },
   /**
    * Höhe der Stapelfläche.
@@ -3002,7 +2991,7 @@ const styles = scaledStyles({
      * Grund vom Foto ab, und der Verlauf darunter stützt sie zusätzlich.
      */
     // Ringsum gleich — auch innerhalb des Feldes.
-    padding: 14,
+    padding: 16,
     flexDirection: "row",
     alignItems: "flex-end",
     justifyContent: "space-between",
@@ -3011,8 +3000,8 @@ const styles = scaledStyles({
   metaRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 6,
-    marginTop: 6,
+    gap: 8,
+    marginTop: 8,
   },
   metaText: { fontSize: 12, color: C.gray1, fontWeight: FONT.semibold },
   /** Trennpunkt zwischen den Merkmalen — kein Zeichen, damit er nicht mitfärbt. */
@@ -3021,13 +3010,13 @@ const styles = scaledStyles({
     height: 3,
     borderRadius: 2,
     backgroundColor: C.gray3,
-    marginHorizontal: 2,
+    marginHorizontal: 4,
   },
   countryPill: {
     height: DECK_CTRL_RAW,
     flexDirection: "row",
     alignItems: "center",
-    gap: 6,
+    gap: 8,
     flexShrink: 1,
     borderRadius: DECK_CTRL_RAW / 2,
     paddingHorizontal: 12,

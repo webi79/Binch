@@ -1,9 +1,13 @@
-import { memo, useMemo, type ComponentProps } from "react";
+import { memo, useEffect, useMemo, useState, type ComponentProps } from "react";
 import { GeoJSONSource, Layer } from "@maplibre/maplibre-react-native";
 import { useQuery } from "@tanstack/react-query";
 import { fetchWalkRoute } from "@/lib/api/client";
+import { SHEET_IN } from "@/lib/nav/overlayCover";
+import { isTransitionBusy } from "@/lib/nav/transitionBusy";
+import { whenMapQuiet } from "@/lib/surroundings/mapViewport";
 import { useAccent } from "@/lib/theme/accent";
 import { useResolvedMapStyle } from "@/lib/theme/mapStyleChoice";
+import { useSearchStore } from "@/stores/searchStore";
 import {
   LINE_SOURCE_MAXZOOM,
   LINE_SOURCE_TOLERANCE,
@@ -79,19 +83,94 @@ function roundStart(v: number): number {
   return Math.round(v * 4000) / 4000;
 }
 
-export const WalkPathLayer = memo(function WalkPathLayer({
-  from,
-  to,
-}: {
-  from: Coord;
-  to: Coord;
-}) {
+/**
+ * Wohin der Weg führt: im Stadt-Blatt zur Startstation der gewählten
+ * Verbindung, sonst zur angetippten Haltestelle.
+ */
+function walkTargetOf(s: ReturnType<typeof useSearchStore.getState>): Coord | null {
+  if (s.selectedCity) {
+    const start = s.cityRoutes?.plans[s.cityRoutes.selected]?.waypoints[0];
+    return start ? { latitude: start.latitude, longitude: start.longitude } : null;
+  }
+  const st = s.selectedStop;
+  return st?.latitude != null && st.longitude != null
+    ? { latitude: st.latitude, longitude: st.longitude }
+    : null;
+}
+
+function sameCoord(a: Coord | null, b: Coord | null): boolean {
+  return a === b || (a != null && b != null && a.latitude === b.latitude && a.longitude === b.longitude);
+}
+
+export const WalkPathLayer = memo(function WalkPathLayer({ from }: { from: Coord }) {
   const dotLayout = useWalkDotLayout();
   const fLat = roundStart(from.latitude);
   const fLng = roundStart(from.longitude);
+  /**
+   * Das ZIEL holt sich der Weg selbst — und übernimmt es erst, wenn Blatt und
+   * Karte ruhen.
+   *
+   * Bisher reichte es der Karten-Tab herein und abonnierte dafür die
+   * angetippte Haltestelle. Jeder Tipp rendete damit den ganzen Bildschirm im
+   * selben Durchgang wie das Blatt, und dessen Commit rückte mitten in die
+   * Einfahrt — dorthin, wo sie am schnellsten ist (`SHEET_EASE`). Ein Commit
+   * während einer Fahrt trägt die Lage des Blattes ein, die beim Einhängen ein,
+   * zwei Bilder später schon veraltet ist (siehe `startDragHeal` in
+   * lib/ui/sheetSwipe.ts): Das Blatt sprang zurück, gemeldet als „ein Ruckler
+   * in der Hälfte der Fahrt". Lag der Weg schon im Zwischenspeicher, hängte
+   * derselbe Durchgang außerdem eine neue Kartenquelle ein.
+   *
+   * Jetzt erscheint er kurz nach dem Blatt und geht beim Schließen erst nach
+   * der Ausfahrt — beides ohne Durchgang des Karten-Tabs.
+   */
+  const [to, setTo] = useState<Coord | null>(null);
+  useEffect(() => {
+    let alive = true;
+    /** Nur der jüngste Auftrag zählt — `whenMapQuiet` lässt sich nicht abbrechen. */
+    let gen = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const schedule = (delayMs: number) => {
+      clearTimeout(timer);
+      const mine = ++gen;
+      timer = setTimeout(
+        () =>
+          whenMapQuiet(() => {
+            if (!alive || mine !== gen) return;
+            // Fährt inzwischen ein Blatt (Suchtreffer: erst die Kamera, dann
+            // das Blatt), auch das abwarten.
+            if (isTransitionBusy()) {
+              schedule(80);
+              return;
+            }
+            const next = walkTargetOf(useSearchStore.getState());
+            setTo((prev) => (sameCoord(prev, next) ? prev : next));
+          }),
+        delayMs,
+      );
+    };
+    // Länger als jede Fahrt des Blattes (herein 300, hinaus 260 ms).
+    schedule(SHEET_IN.duration + 80);
+    const unsub = useSearchStore.subscribe((s, prev) => {
+      if (
+        s.selectedStop !== prev.selectedStop ||
+        s.selectedCity !== prev.selectedCity ||
+        s.cityRoutes !== prev.cityRoutes
+      ) {
+        schedule(SHEET_IN.duration + 80);
+      }
+    });
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+      unsub();
+    };
+  }, []);
+  const toLat = to?.latitude.toFixed(5);
+  const toLng = to?.longitude.toFixed(5);
   const { data } = useQuery({
-    queryKey: ["walk", fLat, fLng, to.latitude.toFixed(5), to.longitude.toFixed(5)],
-    queryFn: () => fetchWalkRoute({ latitude: fLat, longitude: fLng }, to),
+    queryKey: ["walk", fLat, fLng, toLat, toLng],
+    queryFn: () => fetchWalkRoute({ latitude: fLat, longitude: fLng }, to!),
+    enabled: to != null,
     staleTime: 30 * 60 * 1000,
     retry: 1,
     /**
@@ -101,8 +180,7 @@ export const WalkPathLayer = memo(function WalkPathLayer({
      * der alte Weg dagegen falsch.
      */
     placeholderData: (prev, prevQuery) =>
-      prevQuery?.queryKey[3] === to.latitude.toFixed(5) &&
-      prevQuery?.queryKey[4] === to.longitude.toFixed(5)
+      to != null && prevQuery?.queryKey[3] === toLat && prevQuery?.queryKey[4] === toLng
         ? prev
         : undefined,
   });

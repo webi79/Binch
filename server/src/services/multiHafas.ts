@@ -34,6 +34,7 @@ import { profile as zvvProfile } from "hafas-client/p/zvv/index.js";
 import { profile as tpgProfile } from "hafas-client/p/tpg/index.js";
 
 import type { MultiHafasProfileKey } from "./countryProfile.js";
+import { normStationName } from "../util/stationName.js";
 
 const USER_AGENT = "binch-mobile/0.1";
 
@@ -68,23 +69,29 @@ function getClient(profile: MultiHafasProfileKey): HafasClient {
   return c;
 }
 
+/** Produkt-Kennungen des Profils (`nationalExpress`, `bus`, …) — für den `products`-Filter. */
+export function productIdsOf(profile: MultiHafasProfileKey): string[] {
+  return PROFILES[profile].products.map((p) => p.id);
+}
+
 /** Abfahrten an einem Stop. `stationId` ist die HAFAS-ID die das Profile
  *  versteht (z.B. ÖBB-Stationsnummer für oebb). Wenn der Aufrufer eine andere
  *  ID-Form hat, vorher per `resolveStation` auflösen. */
 export async function fetchDepartures(
   profile: MultiHafasProfileKey,
   stationId: string,
-  opts: { duration?: number; results?: number } = {},
+  opts: { duration?: number; results?: number; products?: Record<string, boolean> } = {},
 ): Promise<Alternative[]> {
   const client = getClient(profile);
   // Manche Profile (z.B. oebb) lehnen `stopovers`/`remarks` als
   // "opt.X is not supported"-Error ab — die akzeptierten Options unterscheiden
-  // sich pro Profil. Wir geben nur die Minimal-Felder (duration, results) mit,
-  // alles andere bleibt Default.
+  // sich pro Profil. Wir geben nur die Minimal-Felder (duration, results,
+  // products) mit, alles andere bleibt Default.
   try {
     const res = await client.departures(stationId, {
       duration: opts.duration ?? 120,
       results: opts.results ?? 20,
+      ...(opts.products ? { products: opts.products } : {}),
     });
     return [...res.departures];
   } catch (e) {
@@ -96,13 +103,14 @@ export async function fetchDepartures(
 export async function fetchArrivals(
   profile: MultiHafasProfileKey,
   stationId: string,
-  opts: { duration?: number; results?: number } = {},
+  opts: { duration?: number; results?: number; products?: Record<string, boolean> } = {},
 ): Promise<Alternative[]> {
   const client = getClient(profile);
   try {
     const res = await client.arrivals(stationId, {
       duration: opts.duration ?? 120,
       results: opts.results ?? 20,
+      ...(opts.products ? { products: opts.products } : {}),
     });
     return [...res.arrivals];
   } catch (e) {
@@ -148,10 +156,15 @@ export async function resolveStationByCoord(
       { type: "location", latitude: lat, longitude: lon },
       { results: 5, distance: 300, stops: true, poi: false },
     );
-    // Bevorzuge Treffer mit Namens-Match (case-insensitive substring), sonst
-    // den nächstgelegenen Stop.
+    // Bevorzuge den gleichnamigen Treffer (Abkürzungen aufgelöst), dann einen,
+    // der unseren Namen enthält, sonst den nächstgelegenen Stop. Nur mit dem
+    // wörtlichen Teilstring fand „Graz Hbf" nie „Graz Hauptbahnhof" — die Tafel
+    // kam vom nächstbesten Halt daneben (4 Abfahrten in 80 Minuten).
+    const want = normStationName(name);
     const lcName = name.toLowerCase();
-    const byName = list.find((s) => "name" in s && s.name?.toLowerCase().includes(lcName));
+    const byName =
+      list.find((s) => "name" in s && !!s.name && normStationName(s.name) === want) ??
+      list.find((s) => "name" in s && s.name?.toLowerCase().includes(lcName));
     const pick = byName ?? list[0];
     return pick && "id" in pick ? pick.id ?? null : null;
   } catch {

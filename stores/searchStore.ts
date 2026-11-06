@@ -1,3 +1,4 @@
+import type { SettingsSubId } from "@/lib/nav/settingsPreload";
 import { create } from "zustand";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import { persist, type PersistStorage, type StorageValue } from "zustand/middleware";
@@ -14,6 +15,8 @@ import { trimPolyline } from "@/lib/routing/trimPolyline";
 import type { MapStyleChoice } from "@/lib/theme/mapStyleChoice";
 import { systemLocale } from "@/lib/i18n/systemLocale";
 import type { LiveSession } from "@/lib/live/types";
+import type { RailCard, TransferMinutes } from "@/lib/travel/fareProfile";
+import type { ArrivalLead, ReminderLead } from "@/lib/notifications/tripReminders";
 
 export type Locale = "en" | "de" | "fr" | "es";
 
@@ -373,6 +376,10 @@ export interface RecentSearch {
   tripType?: "roundtrip" | "oneway" | "multicity";
   passengers: number;
   currency: string;
+  /** i18n-Schlüssel der gesuchten Klasse — fehlt bei Einträgen von vor dem 28.10.2026 (= Vorgabe). */
+  travelClass?: string;
+  /** Gewählte Abfahrtszeit (UTC-ISO), wie sie an die Suche ging. */
+  departTime?: string;
   timestamp: number;
 }
 
@@ -446,8 +453,57 @@ interface SearchStore {
   setNotificationsEnabled: (on: boolean) => void;
   priceAlertsEnabled: boolean;
   setPriceAlertsEnabled: (on: boolean) => void;
+  /** Mitteilungen aus Bos geplanten Aufgaben (Einstellungen → Mitteilungen → Bo-Updates). */
+  boUpdatesEnabled: boolean;
+  setBoUpdatesEnabled: (on: boolean) => void;
   savedToastPosition: SavedToastPosition;
   setSavedToastPosition: (p: SavedToastPosition) => void;
+  /**
+   * Reise-Vorlieben (Profil → Einstellungen → Reisen).
+   *
+   * `homeStation`: „Zuhause" — steht im Ortswähler ganz oben.
+   * `defaultPassengers` / `defaultTrainClass`: womit eine NEUE Suche beginnt;
+   * ein Formular, das eine bestehende Suche öffnet, behält deren Werte.
+   * `railCard` / `dTicket`: das Tarifprofil der Zugsuche (lib/travel/fareProfile.ts).
+   */
+  homeStation: Location | null;
+  setHomeStation: (loc: Location | null) => void;
+  /** „Arbeit" — mit Zuhause zusammen die Pendel-Knöpfe auf dem Startbildschirm. */
+  workStation: Location | null;
+  setWorkStation: (loc: Location | null) => void;
+  defaultPassengers: number;
+  setDefaultPassengers: (n: number) => void;
+  defaultTrainClass: "search.class.second" | "search.class.first";
+  setDefaultTrainClass: (c: "search.class.second" | "search.class.first") => void;
+  railCard: RailCard | null;
+  setRailCard: (c: RailCard | null) => void;
+  dTicket: boolean;
+  setDTicket: (on: boolean) => void;
+  /** Nur Verbindungen, die das Deutschlandticket abdeckt (gilt nur mit `dTicket`). */
+  dTicketOnly: boolean;
+  setDTicketOnly: (on: boolean) => void;
+  /** Mindest-Umstiegszeit in Minuten; 0 = wie die Bahn es vorsieht. */
+  transferMinutes: TransferMinutes;
+  setTransferMinutes: (m: TransferMinutes) => void;
+  /** Nur Verbindungen mit Fahrrad-Mitnahme. */
+  bikeCarriage: boolean;
+  setBikeCarriage: (on: boolean) => void;
+  /**
+   * „Bewegung reduzieren" in der App: AN → Bildschirme, Blätter und Wähler
+   * springen statt zu gleiten. NUR die Slides (lib/nav/slideMotion.ts) — alles
+   * andere läuft weiter, so gewünscht.
+   */
+  reduceMotion: boolean;
+  setReduceMotion: (on: boolean) => void;
+  /** Datensparen: Luftbild und 3D-Häuser nur im WLAN (lib/net/dataSaver.ts). */
+  dataSaver: boolean;
+  setDataSaver: (on: boolean) => void;
+  /** Erinnerung vor der Abfahrt gespeicherter Reisen/Tickets, in Minuten; 0 = aus (lib/notifications/tripReminders.ts). */
+  tripReminderMinutes: ReminderLead;
+  setTripReminderMinutes: (m: ReminderLead) => void;
+  /** Erinnerung vor der ANKUNFT („gleich aussteigen"), in Minuten; 0 = aus. */
+  arrivalReminderMinutes: ArrivalLead;
+  setArrivalReminderMinutes: (m: ArrivalLead) => void;
   savedToast: SavedToast | null;
   showSavedToast: (result: SearchResult) => void;
   hideSavedToast: () => void;
@@ -495,6 +551,23 @@ interface SearchStore {
   openNotifications: (restY?: number) => void;
   closeNotifications: () => void;
   clearNotifications: () => void;
+  /**
+   * Das Kalender-Blatt des Gespeichert-Reiters (components/saved/CalendarSheet.tsx).
+   * Am Speicher aus demselben Grund wie `notificationsOpen`: Es liegt am
+   * Wurzel-Layout, um die Tab-Leiste mit abzudecken. Nicht persistiert.
+   */
+  calendarOpen: boolean;
+  /**
+   * Den Kalender schon BAUEN, ohne ihn zu öffnen — beim Aufsetzen des Fingers
+   * auf den Knopf. Der Aufbau fällt so in die Berührung, nicht in die Fahrt;
+   * bis dahin kostet ein nie geöffneter Kalender nichts.
+   */
+  calendarPrepared: boolean;
+  /** Zählt jede Berührung des Knopfs — dann holt der Kalender Reisen und Tickets nach (siehe CalendarSheet). */
+  calendarStamp: number;
+  prepareCalendar: () => void;
+  openCalendar: () => void;
+  closeCalendar: () => void;
   searchOverlayMode: TravelMode | null;
   /** Ursprungs-Rect (Fensterkoordinaten) + Farbe der angetippten Kategorie-
    *  Kachel. Treibt den „aus der Kachel wachsenden"-Launch-Übergang in
@@ -563,8 +636,8 @@ interface SearchStore {
    *  genau den Expand. Erst beim Reveal einschalten. */
   /** Offener Unterschirm im Profil-Tab. Liegt im Speicher, weil der Tab ihn
    *  auslöst und das Wurzel-Layout ihn anzeigt. */
-  settingsSub: "details" | "settings" | "support" | null;
-  setSettingsSub: (v: "details" | "settings" | "support" | null) => void;
+  settingsSub: SettingsSubId | null;
+  setSettingsSub: (v: SettingsSubId | null) => void;
   searchContentVisible: boolean;
   setSearchContentVisible: (v: boolean) => void;
   openSearchOverlay: (mode: TravelMode, launch?: SearchOverlayLaunch) => void;
@@ -1119,12 +1192,42 @@ export const useSearchStore = create<SearchStore>()(
       setHapticsEnabled: (on) => set({ hapticsEnabled: on }),
       notificationsEnabled: true,
       setNotificationsEnabled: (on) => set({ notificationsEnabled: on }),
-      priceAlertsEnabled: false,
+      // AN: Preisalarme wurden schon zugestellt, bevor es den Schalter wirklich gab.
+      priceAlertsEnabled: true,
       setPriceAlertsEnabled: (on) => set({ priceAlertsEnabled: on }),
+      boUpdatesEnabled: true,
+      setBoUpdatesEnabled: (on) => set({ boUpdatesEnabled: on }),
       // Oben — wie die Meldungen es immer taten (die Einstellung war eine Zeit
       // lang ohne Wirkung, siehe `migrate`).
       savedToastPosition: "top",
       setSavedToastPosition: (p) => set({ savedToastPosition: p }),
+      homeStation: null,
+      setHomeStation: (loc) => set({ homeStation: loc }),
+      workStation: null,
+      setWorkStation: (loc) => set({ workStation: loc }),
+      defaultPassengers: 1,
+      setDefaultPassengers: (n) => set({ defaultPassengers: Math.min(9, Math.max(1, Math.round(n))) }),
+      defaultTrainClass: "search.class.second",
+      setDefaultTrainClass: (c) => set({ defaultTrainClass: c }),
+      railCard: null,
+      setRailCard: (c) => set({ railCard: c }),
+      dTicket: false,
+      setDTicket: (on) => set({ dTicket: on }),
+      dTicketOnly: false,
+      setDTicketOnly: (on) => set({ dTicketOnly: on }),
+      transferMinutes: 0,
+      setTransferMinutes: (m) => set({ transferMinutes: m }),
+      bikeCarriage: false,
+      setBikeCarriage: (on) => set({ bikeCarriage: on }),
+      reduceMotion: false,
+      setReduceMotion: (on) => set({ reduceMotion: on }),
+      dataSaver: false,
+      setDataSaver: (on) => set({ dataSaver: on }),
+      // AUS, bis der Nutzer es wählt: Erinnerungen, um die niemand gebeten hat, sind Lärm.
+      tripReminderMinutes: 0,
+      setTripReminderMinutes: (m) => set({ tripReminderMinutes: m }),
+      arrivalReminderMinutes: 0,
+      setArrivalReminderMinutes: (m) => set({ arrivalReminderMinutes: m }),
       savedToast: null,
       showSavedToast: (result) =>
         set({
@@ -1226,6 +1329,13 @@ export const useSearchStore = create<SearchStore>()(
       // Beim Schließen bleibt der Ruhepunkt stehen — das Blatt fährt auf
       // demselben Weg zurück, auf dem es gekommen ist.
       closeNotifications: () => set({ notificationsOpen: false }),
+      calendarOpen: false,
+      calendarPrepared: false,
+      calendarStamp: 0,
+      prepareCalendar: () => set({ calendarPrepared: true, calendarStamp: get().calendarStamp + 1 }),
+      // Mit dem Öffnen auch gebaut — falls die Berührung den Vorbau nicht auslöste (Sprachausgabe).
+      openCalendar: () => set({ calendarOpen: true, calendarPrepared: true }),
+      closeCalendar: () => set({ calendarOpen: false }),
       /**
        * Leert, was unter der Glocke SICHTBAR ist — beides.
        *
@@ -2201,7 +2311,7 @@ export const useSearchStore = create<SearchStore>()(
        * alle, die nie etwas eingestellt haben — die große Mehrheit —, tut die
        * Funktion endlich das, was sie verspricht.
        */
-      version: 2,
+      version: 3,
       migrate: (persisted, version) => {
         // `?? {}` statt eines Zweigs für „nichts gespeichert": Der leere Stand
         // fällt beim Zusammenführen ohnehin auf die Anfangswerte durch.
@@ -2219,6 +2329,15 @@ export const useSearchStore = create<SearchStore>()(
          * wieder wirkt, hätte er die Meldungen unbemerkt nach unten verlegt.
          */
         if (version < 2) st = { ...st, savedToastPosition: "top" };
+        /**
+         * „Preisalarme" einmal auf AN.
+         *
+         * Der Schalter stand bis Oktober 2026 ohne Wirkung da — Alarme wurden
+         * immer zugestellt —, seine Vorgabe war aber AUS. Gespeichert ist bei
+         * fast allen also ein Wert, den nie jemand gewählt hat. Seit er wirkt,
+         * hätte er jeden gesetzten Alarm unbemerkt stummgeschaltet.
+         */
+        if (version < 3) st = { ...st, priceAlertsEnabled: true };
         return st as SearchStore;
       },
       // Siehe createDeferredJSONStorage: serialisiert erst in der Ruhephase,
@@ -2237,7 +2356,21 @@ export const useSearchStore = create<SearchStore>()(
         hapticsEnabled: state.hapticsEnabled,
         notificationsEnabled: state.notificationsEnabled,
         priceAlertsEnabled: state.priceAlertsEnabled,
+        boUpdatesEnabled: state.boUpdatesEnabled,
         savedToastPosition: state.savedToastPosition,
+        homeStation: state.homeStation,
+        workStation: state.workStation,
+        defaultPassengers: state.defaultPassengers,
+        defaultTrainClass: state.defaultTrainClass,
+        railCard: state.railCard,
+        dTicket: state.dTicket,
+        dTicketOnly: state.dTicketOnly,
+        transferMinutes: state.transferMinutes,
+        bikeCarriage: state.bikeCarriage,
+        reduceMotion: state.reduceMotion,
+        dataSaver: state.dataSaver,
+        tripReminderMinutes: state.tripReminderMinutes,
+        arrivalReminderMinutes: state.arrivalReminderMinutes,
         recentSearches: state.recentSearches,
         recentSpots: state.recentSpots,
         lastKnownCoord: state.lastKnownCoord,

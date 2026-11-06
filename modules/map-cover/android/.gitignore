@@ -1,0 +1,4 @@
+# Build-Ausgabe des map-cover Native-Moduls — gehört nie ins Repo,
+# siehe modules/device-heading/android/.gitignore.
+build/
+.gradle/

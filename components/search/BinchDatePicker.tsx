@@ -13,7 +13,7 @@
  *  - DayCell als React.memo damit Selection-Changes nur 2 Cells re-rendern
  */
 import { memo, useCallback, useMemo, useState, type ReactNode, useRef } from "react";
-import { PICKER_HEADER_TOP } from "@/lib/theme/spacing";
+import { PICKER_HEADER_TOP, GROUP_GAP } from "@/lib/theme/spacing";
 import { subscribeLayer, holdLayer, rearmLayer } from "@/lib/nav/transitionLayer";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import { PICKER_IN, PICKER_OUT } from "@/lib/nav/overlayCover";
@@ -43,6 +43,7 @@ import { X, Clock } from "lucide-react-native";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
 import { SlidingPanels } from "@/components/ui/SlidingPanels";
+import { SegmentedToggle } from "@/components/ui/SegmentedToggle";
 import {
   TimeSheetGate,
   DEFAULT_TIME,
@@ -52,6 +53,7 @@ import {
 import { scaledStyles } from "@/lib/ui/compact";
 import { useSearchStore } from "@/stores/searchStore";
 import { FadePress } from "@/components/ui/FadePress";
+import { slideTiming } from "@/lib/nav/slideMotion";
 
 const C = {
   bg: "#0D0D0D",
@@ -377,7 +379,7 @@ const BinchDatePickerInner = function BinchDatePicker({
    */
   const slide = useCallback(
     (show: boolean) => {
-      const cfg = show ? PICKER_IN : PICKER_OUT;
+      const cfg = slideTiming(show ? PICKER_IN : PICKER_OUT);
       /**
        * Fehlt die Ebene, bekommt die Fahrt ein Bild Vorlauf.
        *
@@ -703,7 +705,7 @@ const DatePickerContent = memo(function DatePickerContent({
    * dieser Baum liegt beim Öffnen und Schließen neben der Fahrt.
    */
   const onModeChange = useCallback((m: Mode) => {
-    haptic("button");
+    // Die Haptik gibt der Umschalter selbst.
     setMode(m);
   }, []);
   const weiterBounce = usePressBounce();
@@ -1193,7 +1195,7 @@ const DatePickerContent = memo(function DatePickerContent({
       <View
         style={[
           s.bottomBar,
-          { backgroundColor: palette.s1, paddingBottom: insets.bottom + 14 },
+          { backgroundColor: palette.s1, paddingBottom: insets.bottom + 16 },
         ]}
       >
         <View style={{ flex: 1 }}>
@@ -1266,9 +1268,9 @@ const DatePickerContent = memo(function DatePickerContent({
 });
 
 // ----------------------------------------------------------------------
-// ModeTabs — Tabs mit slidendem Active-Indicator (SearchHero-Design).
-// Box-Style: 14/11px borderRadius, padding 4. Indicator translateX
-// animated via withTiming für smooth aber snappy Wechsel.
+// ModeTabs — feste Daten / flexibel. Derselbe gleitende Umschalter wie im
+// Such-Blatt (`SegmentedToggle`), samt Dehnen beim Drücken; Maße wie bisher:
+// 14 außen, 11 innen, Polster 4.
 // ----------------------------------------------------------------------
 interface ModeTabsProps {
   mode: Mode;
@@ -1277,6 +1279,11 @@ interface ModeTabsProps {
   onChange: (m: Mode) => void;
 }
 
+const MODE_TAB_ITEMS = [
+  { id: "specific", label: "Feste Daten" },
+  { id: "flexible", label: "Flexibel" },
+];
+
 const ModeTabs = memo(function ModeTabs({
   mode,
   accentSolid,
@@ -1284,68 +1291,22 @@ const ModeTabs = memo(function ModeTabs({
   onChange,
 }: ModeTabsProps) {
   const palette = usePalette();
-  const [trackWidth, setTrackWidth] = useState(0);
-  // Indicator-Breite = halbe Track-Breite minus die 4px Padding auf jeder Seite
-  const indicatorWidth = Math.max(0, (trackWidth - 8) / 2);
-  // 0 = "specific" (links), 1 = "flexible" (rechts)
-  const progress = useSharedValue(mode === "specific" ? 0 : 1);
-  useEffect(() => {
-    progress.value = withTiming(mode === "specific" ? 0 : 1, {
-      duration: 240,
-      easing: Easing.out(Easing.cubic),
-    });
-  }, [mode, progress]);
-
-  /**
-   * `width` gehört NICHT in den animierten Stil.
-   *
-   * Es ist hier gar nicht animiert — es ist eine gemessene Zahl. Steht sie
-   * trotzdem darin, fällt der ganze Stil aus Reanimateds synchronem Weg heraus:
-   * Auf Android dürfen nur bestimmte Eigenschaften direkt an die native View
-   * (`transform` gehört dazu, `width` nicht), alles andere läuft pro Bild über
-   * einen Klon des Schattenbaums samt Yoga-Durchlauf. Der Reiter-Wechsel hat
-   * damit 240ms lang den teuren Weg genommen, obwohl sich nur eine
-   * Verschiebung ändert.
-   */
-  const indicatorStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: progress.value * indicatorWidth }],
-  }));
-  const indicatorSize = useMemo(() => ({ width: indicatorWidth }), [indicatorWidth]);
-
+  const activeText = useMemo(() => ({ color: accentTextOnSolid, fontWeight: "700" as const }), [accentTextOnSolid]);
   return (
-    <View
-      style={[s.tabs, { backgroundColor: palette.s2 }]}
-      onLayout={(e) => setTrackWidth(e.nativeEvent.layout.width)}
-    >
-      <Animated.View
-        style={[
-          s.tabIndicator,
-          { backgroundColor: accentSolid },
-          indicatorSize,
-          indicatorStyle,
-        ]}
-      />
-      <Pressable style={s.tab} onPress={() => onChange("specific")}>
-        <Text
-          style={[
-            s.tabTxt,
-            mode === "specific" && { color: accentTextOnSolid },
-          ]}
-        >
-          Feste Daten
-        </Text>
-      </Pressable>
-      <Pressable style={s.tab} onPress={() => onChange("flexible")}>
-        <Text
-          style={[
-            s.tabTxt,
-            mode === "flexible" && { color: accentTextOnSolid },
-          ]}
-        >
-          Flexibel
-        </Text>
-      </Pressable>
-    </View>
+    <SegmentedToggle
+      items={MODE_TAB_ITEMS}
+      selectedId={mode}
+      onChange={(id) => onChange(id as Mode)}
+      containerColor={palette.s2}
+      pillColor={accentSolid}
+      withShadow={false}
+      innerPadding={4}
+      segmentHeight={34}
+      borderRadius={14}
+      activeTextStyle={activeText}
+      inactiveTextStyle={s.tabTxt}
+      style={s.tabs}
+    />
   );
 });
 
@@ -1449,26 +1410,11 @@ const s = scaledStyles({
    */
   title: SHEET_TITLE,
 
-  // Tabs — matched SearchHero's toggleRow: 14px außen, 11px innen, padding 4
+  // Reiter — nur noch der Außenabstand; Spur, Pille und Maße setzt `SegmentedToggle`.
   tabs: {
     marginHorizontal: 16,
-    marginBottom: 14,
-    flexDirection: "row",
-    backgroundColor: C.surface2,
-    borderRadius: 14,
-    padding: 4,
-    position: "relative",
+    marginBottom: GROUP_GAP,
   },
-  // Slidender Active-Indicator. Absolute positioniert, top/bottom 4 = padding
-  // des Containers; left 4; translateX wird in der Animated.View gesetzt.
-  tabIndicator: {
-    position: "absolute",
-    top: 4,
-    bottom: 4,
-    left: 4,
-    borderRadius: 11,
-  },
-  tab: { flex: 1, paddingVertical: 9, borderRadius: 11, alignItems: "center" },
   tabTxt: { fontSize: 13, fontWeight: "700", color: C.gray300 },
 
   field: {
@@ -1477,21 +1423,21 @@ const s = scaledStyles({
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
-    paddingVertical: 13,
-    paddingLeft: 18,
+    paddingVertical: 12,
+    paddingLeft: 16,
     paddingRight: 16,
     backgroundColor: C.surface1,
     borderRadius: 18,
   },
   fieldLabel: { fontSize: 11, color: C.gray300, fontWeight: "600", letterSpacing: 0.4 },
-  fieldValue: { fontSize: 17, color: C.white, fontWeight: "700", marginTop: 1, letterSpacing: -0.2 },
-  fieldPlaceholder: { fontSize: 17, color: C.gray500, fontWeight: "600", marginTop: 1, letterSpacing: -0.2 },
+  fieldValue: { fontSize: 17, color: C.white, fontWeight: "700", letterSpacing: -0.2 },
+  fieldPlaceholder: { fontSize: 17, color: C.gray500, fontWeight: "600", letterSpacing: -0.2 },
   timeChip: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 6,
+    gap: 8,
     height: 38,
-    paddingHorizontal: 14,
+    paddingHorizontal: 16,
     borderRadius: 9999,
   },
   timeChipTxt: { fontSize: 15, fontWeight: "800" },
@@ -1500,18 +1446,18 @@ const s = scaledStyles({
   weekRow: {
     flexDirection: "row",
     paddingHorizontal: 20,
-    paddingVertical: 10,
+    paddingVertical: 8,
     borderTopWidth: 1,
     borderTopColor: C.surface2,
   },
   weekday: { flex: 1, textAlign: "center", fontSize: 12, fontWeight: "600", color: C.gray500 },
 
   monthLabel: { fontSize: 24, lineHeight: 30, includeFontPadding: false, fontWeight: "800", color: C.white, letterSpacing: -0.4, marginBottom: 8 },
-  dayRow: { flexDirection: "row", marginBottom: 3 },
+  dayRow: { flexDirection: "row", marginBottom: 4 },
   dayCell: {
     flex: 1,
     minHeight: 52,
-    marginHorizontal: 1.5,
+    marginHorizontal: 2,
     borderRadius: 13,
     alignItems: "center",
     justifyContent: "center",
@@ -1519,7 +1465,7 @@ const s = scaledStyles({
   dayNum: { fontSize: 15, fontWeight: "600" },
   dayNumNormal: { color: C.white },
   dayNumPast: { color: C.gray700 },
-  dayPrice: { fontSize: 10.5, fontWeight: "600", marginTop: 1 },
+  dayPrice: { fontSize: 10.5, fontWeight: "600" },
   dayPriceNormal: { color: C.gray300 },
 
   flexHead: {
@@ -1537,7 +1483,7 @@ const s = scaledStyles({
     width: "48%",
     minHeight: 112,
     marginBottom: 12,
-    paddingVertical: 18,
+    paddingVertical: 16,
     paddingHorizontal: 12,
     borderRadius: 22,
     backgroundColor: C.surface2,
@@ -1545,7 +1491,7 @@ const s = scaledStyles({
     justifyContent: "center",
   },
   cardName: { fontSize: 19, color: C.white, fontWeight: "700", letterSpacing: -0.2 },
-  cardPrice: { fontSize: 13, fontWeight: "600", color: C.gray300, marginTop: 5 },
+  cardPrice: { fontSize: 13, fontWeight: "600", color: C.gray300, marginTop: 4 },
 
   bottomBar: {
     position: "absolute",
@@ -1553,7 +1499,7 @@ const s = scaledStyles({
     left: 0,
     right: 0,
     paddingHorizontal: 20,
-    paddingTop: 14,
+    paddingTop: 16,
     paddingBottom: 28,
     backgroundColor: C.bg,
     flexDirection: "row",
@@ -1561,7 +1507,7 @@ const s = scaledStyles({
     gap: 12,
   },
   bottomTitle: { fontSize: 13, color: C.white, fontWeight: "700" },
-  estRow: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 3 },
+  estRow: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 4 },
   estTxt: { fontSize: 12, color: C.gray300, fontWeight: "600", textDecorationLine: "underline" },
   infoDot: {
     width: 15,
@@ -1572,7 +1518,7 @@ const s = scaledStyles({
     justifyContent: "center",
   },
   infoTxt: { fontSize: 10, color: C.gray300, fontWeight: "700" },
-  weiter: { paddingVertical: 15, paddingHorizontal: 30, borderRadius: 9999 },
+  weiter: { paddingVertical: 16, paddingHorizontal: 32, borderRadius: 9999 },
   weiterTxt: { fontSize: 15, fontWeight: "700" },
 
 });

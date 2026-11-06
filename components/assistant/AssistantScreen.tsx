@@ -20,6 +20,7 @@ import {
   type FlatListProps,
   type LayoutChangeEvent,
   type StyleProp,
+  type TextStyle,
   type ViewStyle,
   Pressable,
   StyleSheet,
@@ -29,6 +30,7 @@ import {
   ActivityIndicator,
   BackHandler,
   Dimensions,
+  Linking,
 } from "react-native";
 import { useAppBg, usePalette } from "@/lib/theme/appBg";
 import { useRouter } from "expo-router";
@@ -56,13 +58,15 @@ import Animated, {
   Easing,
   cancelAnimation,
   useAnimatedScrollHandler,
+  useAnimatedReaction,
   useDerivedValue,
   runOnJS,
   runOnUI,
   type SharedValue,
   type AnimatedRef,
 } from "react-native-reanimated";
-import { Send, Mic, AlertTriangle, RotateCw, X } from "lucide-react-native";
+import { Mic, AlertTriangle, RotateCw, X, Globe, Brain, Check } from "lucide-react-native";
+import { SendGlyph } from "@/components/ui/SendGlyph";
 import {
   assistantPush,
   setAssistantArrivedHandler,
@@ -86,6 +90,13 @@ import {
 } from "@/lib/nav/overlayCover";
 import { loadAuthToken } from "@/lib/auth/tokenStorage";
 import { Bo, boBodyHeight, type BoMood } from "@/components/assistant/Bo";
+import { TaskProposalCard } from "@/components/assistant/TaskProposalCard";
+import { BoStartPanel, leaveStartPanel, START_LEAVE_MS, type StartAction } from "@/components/assistant/BoStartPanel";
+import { probeEvent, probeThreadScroll } from "@/lib/perf/transitionProbe";
+import { ScheduledPage } from "@/components/assistant/ScheduledPage";
+import { getBoView, setBoView, subscribeBoView, useBoView } from "@/lib/assistant/boView";
+import { closeTaskSheet, onAskBo, openTaskSheet } from "@/lib/assistant/taskSheet";
+import { hasScheduledTaskRequest, onScheduledTaskRequest, takeScheduledTask } from "@/lib/assistant/scheduledLink";
 import { ResultCard } from "@/components/results/ResultCard";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { GradientFill } from "@/components/ui/GradientFill";
@@ -93,8 +104,7 @@ import { useT } from "@/lib/i18n/useT";
 import { useAccent } from "@/lib/theme/accent";
 import { haptic } from "@/lib/haptics";
 import { ScreenHeading, HEADING_LINE_HEIGHT } from "@/components/ui/ScreenHeading";
-import { GUTTER, HEADING_TOP, SPACE, CLOSE_ICON_SIZE, TOPBAR_TOP } from "@/lib/theme/spacing";
-import { MicBox } from "@/components/assistant/MicBox";
+import { GUTTER, HEADING_GAP, HEADING_TOP, SPACE, CLOSE_ICON_SIZE, TOPBAR_TOP, ITEM_GAP, GROUP_GAP } from "@/lib/theme/spacing";
 import { useAudioRecorder, RecordingPresets } from "expo-audio";
 import { joinWavFiles } from "@/lib/assistant/wavJoin";
 import {
@@ -108,23 +118,41 @@ import {
 import { VoiceBubble } from "@/components/assistant/VoiceBubble";
 import * as FileSystem from "expo-file-system/legacy";
 import { useSearchStore } from "@/stores/searchStore";
+import type { Locale } from "@/lib/i18n/dict";
 import { type StopBoardResponse } from "@/lib/api/client";
-import { streamChat, todayLocal, ChatApiError, type ChatStreamEvent, type LastSearchParams } from "@/lib/api/chat";
+import {
+  streamChat,
+  todayLocal,
+  ChatApiError,
+  type ChatSource,
+  type ChatStreamEvent,
+  type LastSearchParams,
+} from "@/lib/api/chat";
 import { pickWelcome } from "@/lib/assistant/welcomes";
 import { useQueryClient } from "@tanstack/react-query";
 import { ChatDrawer } from "@/components/assistant/ChatDrawer";
 import {
+  boTasksKeyFor,
   chatThreadKey,
   chatThreadsKey,
   chatThreadsKeyFor,
+  fetchBoTasks,
   fetchChatThread,
   fetchChatThreads,
   CHAT_THREADS_PAGE_SIZE,
   type ChatMessageRow,
+  type TaskProposal,
 } from "@/lib/api/chats";
 import { StopBoardCard } from "@/components/assistant/StopBoardCard";
 import type { SearchResult } from "@/types/search";
 import { ms, scaledStyles } from "@/lib/ui/compact";
+import { slideTiming } from "@/lib/nav/slideMotion";
+import { releasePrimer, requestWithPrimer } from "@/lib/permissions/primer";
+import { VoiceSheet } from "@/components/assistant/VoiceSheet";
+import { VoicePanel } from "@/components/assistant/VoicePanel";
+
+/** Störung beim Sprachmodell-Anbieter (Guthaben, Kontingent, Überlast) — falls der Server keinen Code mitschickt. */
+const PROVIDER_OUTAGE = /credit balance|billing|quota|rate.?limit|overloaded|insufficient|usage limit|\b529\b/i;
 
 // expo-speech-recognition optional laden — fehlt in Expo Go ohne Dev-Client.
 let ExpoSpeechRecognitionModule: any = null;
@@ -149,11 +177,19 @@ const C = {
   error: "#FF7A6B",
 };
 
+/** Ein Arbeitsschritt Bos — Werkzeug plus kurze Angabe („Köln → Berlin"). */
+interface WorkStep {
+  name: string;
+  detail?: string;
+}
+
 type Msg =
   | {
       id: string;
       kind: "bot";
       text: string;
+      /** Was Bo für diese Antwort getan hat — mit Haken über dem Text. */
+      steps?: WorkStep[];
     }
   /**
    * Abfahrtstafel und „Alle Treffer"-Knopf sind EIGENE Nachrichten.
@@ -195,8 +231,22 @@ type Msg =
    * und der Verlauf, den Bo bekommt, hängt an genau diesem `text`.
    */
   | { id: string; kind: "user"; text: string; audioUri?: string; audioSec?: number }
+  /**
+   * Die Quellen einer Websuche — eine eigene Zeile unter der Antwort.
+   *
+   * Pflicht, sobald Bo Ergebnisse der Websuche wiedergibt: Wer sie zeigt, muss
+   * die Herkunft mit zeigen. Ein Tipp öffnet die Seite im Browser.
+   */
+  | { id: string; kind: "sources"; sources: ChatSource[]; botId: string }
+  /** „Gemerkt: …" / „Vergessen: …" — Bos Gedächtnis, leise unter der Antwort. */
+  | { id: string; kind: "note"; action: "saved" | "updated" | "forgotten"; text: string; botId: string }
+  /** Bos Vorschlag einer geplanten Aufgabe — Karte mit „Anlegen" (TaskProposalCard). */
+  | { id: string; kind: "task"; proposal: TaskProposal; conversationId: string | null; botId: string }
   | { id: string; kind: "error"; message: string }
-  | { id: string; kind: "typing" };
+  /** Bo arbeitet: woran gerade (`current`) und was schon erledigt ist (`done`). */
+  | { id: string; kind: "typing"; current?: WorkStep; done?: WorkStep[] }
+  /** Bos Startbereich unter der Begrüßung — nur in einem frischen Chat (BoStartPanel). */
+  | { id: string; kind: "start" };
 
 /**
  * Module-Level-State für die Bo-Konversation. Überlebt Mount/Unmount-Cycle
@@ -261,7 +311,8 @@ const PARK_X = Dimensions.get("window").width;
  * aller gemounteten Zeilen neu rendert, und unter `adjustResize` wanderte der
  * Wert mit der Tastatur.
  */
-const MIC_BOX_H = Math.round(Dimensions.get("window").height * 0.25);
+/** Höhe des Aufnahme-Blattes ohne sichere Fläche — wie Googles Spracheingabe gut zwei Fünftel. */
+const VOICE_SHEET_H = Math.round(Dimensions.get("window").height * 0.42);
 
 /**
  * Der seitliche Rand DIESES Bildschirms.
@@ -405,11 +456,73 @@ const SPEECH_LANG: Record<string, string> = {
  */
 const TEXT_FLUSH_MS = 100;
 
+/**
+ * Die Liste gilt erst so lange nach der letzten Bewegung als ruhig. Zwischen zwei
+ * Gesten beim Hin-und-her-Scrollen soll weder Bo anlaufen noch die Antwort
+ * einziehen.
+ */
+const SCROLL_REST_MS = 350;
+/** Spätestens dann läuft der Strom wieder — falls das Ende einer Geste ausbleibt. */
+const SCROLL_HOLD_MAX_MS = 8_000;
+/** So oft (je 100ms) wartet das Ende eines Turns auf die aufgeschobene Antwort. */
+const TURN_END_WAIT_TRIES = 120;
+/** Ab hier gilt: Der Nutzer liest weiter oben — siehe `ThreadList`. */
+const HOLD_FROM_PX = 24;
+/** Alter Verlauf geht (kurz, die Rückfahrt läuft schon), neuer kommt. */
+const THREAD_OUT = { duration: 130, easing: Easing.out(Easing.quad) };
+const THREAD_IN = { duration: 200, easing: Easing.out(Easing.cubic) };
+/** Netz für eine unterbrochene Schubladen-Kurve — weit hinter deren Ende. */
+const THREAD_SWAP_SAFETY_MS = 900;
+/** Abstand der Seite „Geplant" unter dem Schriftzug — wie unter jeder Tab-Überschrift. */
+const PAGE_BELOW_TOPBAR = ms(HEADING_GAP);
+
 /** Hebt die „wenige Nachrichten oben"-Verankerung auf — siehe `threadContentStyle`. */
 const NO_END_ANCHOR = { flexGrow: 0, justifyContent: "flex-start" } as const;
 
 let persistedMessages: Msg[] = [];
+/**
+ * Bos Stimmung — als Verteiler, nicht als Zustandsgröße des Bildschirms.
+ *
+ * Gebraucht wird sie an zwei winzigen Stellen, Bo selbst und der Statuszeile.
+ * Als `useState` im Bildschirm renderte jeder Wechsel trotzdem alles neu, und
+ * eine Antwort wechselt sie drei- bis viermal, gern während man scrollt. Über
+ * den Verteiler wachen nur die beiden auf (dieselbe Bauart wie `setBoBlocked`).
+ */
 let persistedMood: BoMood = "waving";
+const moodListeners = new Set<(mood: BoMood) => void>();
+
+function setMood(next: BoMood | ((current: BoMood) => BoMood)): void {
+  const value = typeof next === "function" ? next(persistedMood) : next;
+  if (value === persistedMood) return;
+  persistedMood = value;
+  for (const fn of moodListeners) fn(value);
+}
+
+function useMood(): BoMood {
+  const [mood, set] = useState(persistedMood);
+  useEffect(() => {
+    set(persistedMood);
+    moodListeners.add(set);
+    return () => {
+      moodListeners.delete(set);
+    };
+  }, []);
+  return mood;
+}
+
+/**
+ * Liest der Nutzer weiter oben im Verlauf? Auch das ein Verteiler: Es weckt nur
+ * die Listen-Hülle (`ThreadList`), und `send` fragt es ab, ohne auf den UI-Strang
+ * zu springen.
+ */
+let threadHeld = false;
+const threadHeldListeners = new Set<(held: boolean) => void>();
+
+function setThreadHeld(held: boolean): void {
+  if (threadHeld === held) return;
+  threadHeld = held;
+  for (const fn of threadHeldListeners) fn(held);
+}
 /**
  * Zuletzt gemessene Tastaturhöhe — MODULWEIT, nicht pro Aufbau.
  *
@@ -1000,6 +1113,11 @@ export function AssistantScreen() {
         closeDrawer();
         return true;
       }
+      // „Geplant" liegt über dem Chat: Zurück führt erst dorthin.
+      if (getBoView() === "scheduled") {
+        setBoView("chat");
+        return true;
+      }
       /**
        * Erst die Vorarbeit, dann ein Bild später die Fahrt.
        *
@@ -1105,7 +1223,7 @@ export function AssistantScreen() {
       threadApplyRef.current = null;
     }
     setMood("idle");
-    setMessages([{ id: idGen(), kind: "bot", text: pickWelcome(locale) }]);
+    setMessages(freshMessages(locale));
     // Die Listen beider Konten aus dem Zwischenspeicher nehmen. Nötig ist es
     // seit dem Konto-Schlüssel nicht mehr — es hält den Speicher aber frei von
     // Unterhaltungen, an die niemand mehr herankommt.
@@ -1136,29 +1254,8 @@ export function AssistantScreen() {
   // weil bei „Pause" der User die VoiceRecordBar sehen WILL, aber listening
   // dann false ist.
   const [voiceMode, setVoiceMode] = useState(false);
-  /**
-   * Solange der Mikrofon-Kasten steht, fährt die EINGABEZEILE nach unten aus
-   * dem Bild — Textfeld, Mikrofon und Senden.
-   *
-   * 0 = an ihrem Platz, 1 = um ihre eigene Höhe nach unten. Die Höhe kommt aus
-   * der Vermessung der Zeile (siehe `onLayout` unten), damit der Weg exakt
-   * stimmt: zu wenig, und ein Streifen bliebe stehen; zu viel, und sie fährt
-   * sinnlos weit.
-   *
-   * Der Rückweg hängt am Aufräumen des Effekts, nicht an den beiden Knöpfen im
-   * Kasten: So kommt die Zeile auch dann zurück, wenn der Kasten auf einem
-   * anderen Weg verschwindet — etwa weil Bo geschlossen wird, während er steht.
-   */
-  const barHide = useSharedValue(0);
-  const barTravel = useSharedValue(0);
-  useEffect(() => {
-    if (!voiceMode) return;
-    barHide.value = withTiming(1, SHEET_IN);
-    return () => {
-      barHide.value = withTiming(0, SHEET_OUT);
-    };
-  }, [voiceMode, barHide]);
-  const [mood, setMood] = useState<BoMood>(() => persistedMood);
+  /** Aus dem Berechtigungs-Blatt heraus geöffnet — das Aufnahme-Blatt steht dann ohne Einfahrt. */
+  const voiceInstantRef = useRef(false);
   const [listening, setListening] = useState(false);
 
   // Verlauf deckeln: Läuft er über MAX_CHAT_MESSAGES, die ältesten wegtrimmen.
@@ -1180,21 +1277,36 @@ export function AssistantScreen() {
   useEffect(() => {
     persistedMessages = messages;
   }, [messages]);
-  useEffect(() => {
-    persistedMood = mood;
-  }, [mood]);
 
   const scrollRef = useRef<FlatList<Msg>>(null);
+  /**
+   * Ans untere Ende, ohne dass die Lage-Haltung dagegenhält: Sie löst sich im
+   * selben Commit, und der Sprung läuft dort als Erstes.
+   */
+  const jumpToLatest = useCallback(() => {
+    if (!threadHeld) return;
+    setThreadHeld(false);
+    scrollRef.current?.scrollToOffset({ offset: 0, animated: false });
+  }, []);
   const abortRef = useRef<AbortController | null>(null);
   // Während aktivem Scrollen pausieren wir Bo's Reanimated-Worklets —
   // diese laufen auf der UI-Thread und konkurrieren mit dem ScrollView-
   // Native-Driver um Frame-Time. Bei Discord/WhatsApp-Style chats sind die
   // Avatar-Animationen ebenfalls statisch während des Scrollens.
-  const [isScrolling, setIsScrolling] = useState(false);
-  // Fallback-Timer: bei sehr langsamem Drag kommt onMomentumScrollEnd nie,
-  // und wir würden Bo für immer pausiert lassen. Nach scrollEndDrag warten
-  // wir 120ms — wenn bis dahin kein onMomentumScrollBegin kam, gibt's kein
-  // Momentum und wir clearen isScrolling.
+  //
+  // Als Ablage, nicht als Zustandsgröße: Der Wert hat keinen anderen Zweck, und
+  // als `useState` renderte jeder Anfang und jedes Ende einer Geste den ganzen
+  // Bildschirm neu — beim Hin-und-her-Scrollen also ständig, und jedes Mal im
+  // ersten Bild der Geste, in dem Bo noch läuft.
+  const isScrollingRef = useRef(false);
+  /**
+   * Bis wann Bos Antwort die Liste in Ruhe lässt, solange gescrollt wird. Ein
+   * Zeitstempel, damit ein verpasstes Ende der Geste den Strom nicht für immer
+   * anhält (dieselbe Vorsicht wie in `lib/nav/transitionBusy.ts`).
+   */
+  const scrollHoldUntilRef = useRef(0);
+  // Ruhe erst nach `SCROLL_REST_MS`: Bei sehr langsamem Drag kommt
+  // onMomentumScrollEnd nie, und zwischen zwei Gesten soll nichts anlaufen.
   const scrollEndTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Wir tracken die ID der aktuell streamenden Bot-Message — Text-Deltas
   // landen alle dort. Wenn search_result kommt, hängen wir's an dieselbe ID.
@@ -1313,7 +1425,7 @@ export function AssistantScreen() {
    * berichtigt sie sich wie bisher — nur eben nicht mehr jedes Mal.
    */
   const [inputbarHeight, setInputbarHeight] = useState(
-    () => ms(10) + 1 + ms(44) + Math.max(12, insets.bottom + 8),
+    () => ms(8) + 1 + ms(44) + Math.max(12, insets.bottom + 8),
   );
   // Tor vor kb.height: 1 = Bar folgt dem Keyboard, 0 = Bar bleibt unten.
   //
@@ -1426,6 +1538,10 @@ export function AssistantScreen() {
   // Home-Indicator.
   const baseBottomPad = Math.max(12, insets.bottom + 8);
   const inputbarPadBottom = baseBottomPad;
+  /** Aufnahme-Blatt: Platz für Text, Punkte und Knöpfe, plus die sichere Fläche unten. */
+  const voiceSheetH = VOICE_SHEET_H + insets.bottom;
+  const voiceSheetHRef = useRef(voiceSheetH);
+  voiceSheetHRef.current = voiceSheetH;
   // Content-Padding der FlatList bleibt STATE-SNAP (kbOffset via
   // keyboardDidShow): das ist Layout und läge sonst pro Frame auf dem
   // JS-Thread. Der Snap passiert hinter dem letzten Bubble → unsichtbar.
@@ -1621,10 +1737,9 @@ export function AssistantScreen() {
     return kbHeight + lift;
   });
   const barAnimStyle = useAnimatedStyle(() => ({
-    // Zwei Wege auf derselben Achse: Die Tastatur hebt die Zeile an, der
-    // Mikrofon-Kasten schiebt sie hinunter. Sie addieren sich — offen ist immer
-    // nur einer, die Tastatur wird beim Öffnen des Kastens geschlossen.
-    transform: [{ translateY: -kbShift.value + barHide.value * barTravel.value }],
+    // Die Tastatur hebt die Zeile an. Beim Mikrofon fährt sie nicht mehr
+    // hinunter — das Aufnahme-Blatt legt sich darüber (`VoiceSheet`).
+    transform: [{ translateY: -kbShift.value }],
   }));
 
 
@@ -1646,7 +1761,7 @@ export function AssistantScreen() {
         welcomeTimerRef.current = null;
         setMessages((prev) =>
           prev.length === 0
-            ? [{ id: idGen(), kind: "bot", text: pickWelcome(locale) }]
+            ? freshMessages(locale)
             : prev,
         );
       };
@@ -2529,7 +2644,7 @@ export function AssistantScreen() {
    * zustande, muss das Vorgeschossene auch wieder zurückgenommen werden.
    */
   const abortVoiceMode = useCallback(
-    (reason: "permission" | "focus") => {
+    (reason: "permission" | "focus" | "later") => {
       setListening(false);
       setMicRecording(false);
       setVoiceMode(false);
@@ -2556,7 +2671,17 @@ export function AssistantScreen() {
     pendingSendRef.current = false;
     explicitStopRef.current = false;
     try {
-    const perm = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
+    const speech = ExpoSpeechRecognitionModule;
+    const perm = await requestWithPrimer(
+      "microphone",
+      () => speech.getPermissionsAsync(),
+      () => speech.requestPermissionsAsync(),
+    );
+    if (!perm) {
+      // „Nicht jetzt" im Blatt davor: Kasten still wieder zu, ohne Fehlerzeile.
+      abortVoiceMode("later");
+      return;
+    }
     if (!perm.granted) {
       /**
        * Ohne Erlaubnis wird der Kasten wieder zugemacht.
@@ -2799,7 +2924,7 @@ export function AssistantScreen() {
    * Berechtigung aber, ob der Kasten noch offen ist (sonst gilt die Aufnahme
    * als verworfen) — und stieg deshalb jedes Mal still aus.
    */
-  const openVoiceBox = useCallback(() => {
+  const openVoiceBox = useCallback((instant = false) => {
     /**
      * Erst die Tastatur wegräumen, DANN den Kasten zeigen.
      *
@@ -2815,6 +2940,7 @@ export function AssistantScreen() {
     const begin = () => {
       // Wer in der Wartezeit schließt, bekommt keinen Kasten in die Ausfahrt.
       if (closingRef.current) return;
+      voiceInstantRef.current = instant;
       setVoiceMode(true);
       /**
        * Die Ablage SOFORT mitziehen, nicht erst beim nächsten Durchgang.
@@ -2836,6 +2962,67 @@ export function AssistantScreen() {
     if (hadKeyboard) setTimeout(begin, 220);
     else begin();
   }, [startRecording, startVoice]);
+
+  /**
+   * Mikrofon: erst die Erlaubnis, dann das Aufnahme-Blatt (03.11.2026).
+   *
+   * Fehlt sie, fährt zuerst das Berechtigungs-Blatt hoch. Nach „Weiter" und
+   * Erlaubnis fährt es auf die Höhe des Aufnahme-Blattes zusammen, und dieses
+   * übernimmt ohne eigene Einfahrt (`openVoiceBox(true)`). Steht sie schon,
+   * kommt das Aufnahme-Blatt direkt. „Nicht jetzt" bleibt still.
+   */
+  const beginningVoiceRef = useRef(false);
+  const beginVoice = useCallback(async () => {
+    // Ein zweiter Tipp während der Abfrage startete sonst eine zweite Aufnahme.
+    if (beginningVoiceRef.current || voiceModeRef.current) return;
+    beginningVoiceRef.current = true;
+    try {
+      const speech = ExpoSpeechRecognitionModule;
+      if (!speech) {
+        setMessages((prev) => [
+          ...prev,
+          { id: idGen(), kind: "error", message: t("assistant.voice.unsupported") },
+        ]);
+        return;
+      }
+      let granted = false;
+      try {
+        granted = (await speech.getPermissionsAsync()).granted;
+      } catch {
+        // Ohne Auskunft über das Blatt — es fragt selbst noch einmal nach.
+      }
+      if (granted) {
+        openVoiceBox(false);
+        return;
+      }
+      Keyboard.dismiss();
+      const perm = await requestWithPrimer(
+        "microphone",
+        () => speech.getPermissionsAsync(),
+        () => speech.requestPermissionsAsync(),
+        {
+          handoffHeight: voiceSheetHRef.current,
+          stillWanted: () => !closingRef.current && isFocusedRef.current,
+        },
+      );
+      if (!perm) return;
+      if (!perm.granted) {
+        setMessages((prev) => [
+          ...prev,
+          { id: idGen(), kind: "error", message: t("assistant.voice.nopermission") },
+        ]);
+        return;
+      }
+      // Wer in der Zwischenzeit Bo verlassen hat, bekommt keine Aufnahme — das Blatt geht trotzdem.
+      if (closingRef.current || !isFocusedRef.current) {
+        releasePrimer();
+        return;
+      }
+      openVoiceBox(true);
+    } finally {
+      beginningVoiceRef.current = false;
+    }
+  }, [openVoiceBox, t]);
 
   /**
    * Spracheingabe nach der Einfahrt, wenn Bo über das Mikrofon der Suchleiste
@@ -2885,9 +3072,9 @@ export function AssistantScreen() {
         ]);
         return;
       }
-      openVoiceBox();
+      void beginVoice();
     });
-  }, [openVoiceBox, t]);
+  }, [beginVoice, t]);
   /** Zeiger für den Verteiler — dessen Effekt hängt nicht an `startVoice`. */
   const autoVoiceOnArrivalRef = useRef(autoVoiceOnArrival);
   autoVoiceOnArrivalRef.current = autoVoiceOnArrival;
@@ -3046,7 +3233,7 @@ export function AssistantScreen() {
   // nichts anderes läuft (kein Chat in-flight, Tab fokussiert). Hält die
   // Figur lebendig, suggeriert Aufmerksamkeit ohne aufdringlich zu sein.
   useEffect(() => {
-    if (mood !== "idle" || busy || !isFocused) return;
+    if (busy || !isFocused) return;
     // Inner setTimeout-ID tracken damit wir es im Cleanup auch killen
     // können — sonst fired der setMood("idle") noch ~3s nachdem die
     // Component unmounted ist (kein direkter Leak da setState auf
@@ -3073,7 +3260,7 @@ export function AssistantScreen() {
        * Minute. Ein Winken, das niemand angefordert hat, ist der billigste
        * Verzicht der ganzen App.
        */
-      if (isTransitionBusy()) return;
+      if (isTransitionBusy() || persistedMood !== "idle") return;
       setMood("waving");
       const backToIdle = () => {
         // Auch der Rückweg: Er liegt drei Sekunden später und kann damit
@@ -3091,7 +3278,7 @@ export function AssistantScreen() {
       clearInterval(interval);
       if (innerTimeout) clearTimeout(innerTimeout);
     };
-  }, [mood, busy, isFocused]);
+  }, [busy, isFocused]);
 
   // Auf Unmount: alles aufräumen.
   useEffect(() => {
@@ -3276,6 +3463,22 @@ export function AssistantScreen() {
       // zwischen Messages.
       haptic("button");
 
+      /**
+       * Erst gehen die Vorschläge, dann zieht die Nachricht ein.
+       *
+       * Sonst verschwände die große Karte im selben Bild, in dem die Blase
+       * aufsteigt — zwei Bewegungen übereinander. Das Feld leert sich sofort,
+       * die Wartezeit fällt damit nicht auf.
+       */
+      if (
+        !existingUserMsgId &&
+        messagesRef.current.some((m) => m.kind === "start") &&
+        leaveStartPanel()
+      ) {
+        setInput("");
+        await new Promise((done) => setTimeout(done, START_LEAVE_MS));
+      }
+
       const voice = pendingVoiceRef.current;
       pendingVoiceRef.current = null;
       const userMsg: Msg = voice
@@ -3315,7 +3518,8 @@ export function AssistantScreen() {
       ];
 
       // Inverted FlatList rendert neueste Bubble strukturell am Bottom —
-      // kein manuelles Scroll-Management nötig.
+      // kein manuelles Scroll-Management nötig, außer man las gerade weiter oben.
+      jumpToLatest();
       setMessages((prev) =>
         existingUserMsgId
           ? // Nur den Text nachtragen (für den Verlauf) und Bo antworten lassen
@@ -3396,15 +3600,31 @@ export function AssistantScreen() {
                 ? t("assistant.error.loginrequired")
                 : status === 429
                   ? t("assistant.error.ratelimit")
-                  : // Im Dev-Build die echte Fehlermeldung, damit wir sofort
-                    // sehen ob's 404 (Server-Code alt), 503 (Key fehlt),
-                    // Network o.ä. ist. In Prod fallback auf generisch.
-                    __DEV__
-                    ? rawMessage
+                  : // 503 = Bo ist nicht verfügbar (Schlüssel fehlt, Anbieter gestört).
+                    status === 503 || PROVIDER_OUTAGE.test(rawMessage)
+                    ? t("assistant.error.maintenance")
                     : t("assistant.error.generic"),
           }),
         );
       } finally {
+        /**
+         * Erst die aufgeschobenen Ereignisse, dann der Abschluss.
+         *
+         * Traf das Ende in eine Fahrt oder eine Scroll-Geste, steht die Antwort
+         * noch in der Schlange. Schlösse der Turn jetzt ab, wäre die Kennung
+         * schon geleert, wenn sie eintrifft, und ihr Text bliebe im Strom-Speicher
+         * hängen — sichtbar, aber nie im Verlauf für den nächsten Turn. Gedeckelt
+         * wie die Sperre selbst: Eine Schlange, die nie leer wird, darf den Turn
+         * nicht festhalten.
+         */
+        for (
+          let i = 0;
+          i < TURN_END_WAIT_TRIES &&
+          (eventQueueRef.current.length > 0 || (textBufRef.current?.text.length ?? 0) > 0);
+          i++
+        ) {
+          await new Promise((done) => setTimeout(done, 100));
+        }
         // Rest ausgeben, bevor der Turn zumacht — sonst fehlten die letzten
         // bis zu 50ms Text.
         flushTextRef.current?.(true);
@@ -3464,7 +3684,7 @@ export function AssistantScreen() {
     // jeder Wechsel eine neue `send`-Kennung erzeugt — und über
     // `onBubbleRetry` → `renderItem` die ganze Liste zweimal pro Antwort neu
     // aufgebaut. Genau das, wogegen sie gerade gemerkt wird.
-    [locale, currency, t, resolveAuthToken, openAuthOverlay],
+    [locale, currency, t, resolveAuthToken, openAuthOverlay, jumpToLatest],
   );
 
   /**
@@ -3485,6 +3705,18 @@ export function AssistantScreen() {
    */
   const textBufRef = useRef<{ botId: string; text: string } | null>(null);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * Muss Bos Antwort warten? Während einer Fahrt und während gescrollt wird.
+   *
+   * Jede Änderung an der Liste ist ein neues Datenfeld samt gemounteter Zelle —
+   * unter dem Finger ist das ein Hänger, und der Inhalt springt obendrein. Bo
+   * schickt seinen Text am Stück, verloren geht dabei also kein Tippen: Die
+   * Antwort erscheint, sobald die Liste ruht.
+   */
+  const streamHeld = useCallback(
+    () => isTransitionBusy() || Date.now() < scrollHoldUntilRef.current,
+    [],
+  );
   /** Aufgeschobener Stimmungswechsel — muss beim Abbau sterben. */
   const moodTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Aufgeschobenes Schließen des Tastatur-Tors — muss beim Abbau sterben. */
@@ -3524,7 +3756,7 @@ export function AssistantScreen() {
      * Lesefluss ist eine Verzögerung von unter einer halben Sekunde nicht von
      * der normalen Antwortzeit zu unterscheiden.
      */
-    if (!force && isTransitionBusy()) {
+    if (!force && streamHeld()) {
       flushTimerRef.current = setTimeout(() => flushTextRef.current?.(), 120);
       return;
     }
@@ -3542,10 +3774,11 @@ export function AssistantScreen() {
      * Ende wird der fertige Text übernommen.
      */
     appendStreamText(buf.botId, buf.text);
+    probeEvent("bo:text");
     if (bubbleReadyRef.current === buf.botId) return;
     bubbleReadyRef.current = buf.botId;
     setMessages((prev) => appendBotText(prev, buf.botId, ""));
-  }, []);
+  }, [streamHeld]);
   flushTextRef.current = flushText;
 
   /** Aufgeschobene Strom-Ereignisse, in Eingangsreihenfolge. */
@@ -3559,7 +3792,7 @@ export function AssistantScreen() {
   const scheduleDrain = useCallback(() => {
     if (drainTimerRef.current) return;
     const run = () => {
-      if (isTransitionBusy()) {
+      if (streamHeld()) {
         drainTimerRef.current = setTimeout(run, 120);
         return;
       }
@@ -3573,7 +3806,7 @@ export function AssistantScreen() {
       }
     };
     drainTimerRef.current = setTimeout(run, 120);
-  }, []);
+  }, [streamHeld]);
 
   // Stream-Event-Handler — closure over botId der aktuellen Antwort.
   const handleStreamEvent = useCallback(
@@ -3598,7 +3831,7 @@ export function AssistantScreen() {
        * `done` vor seinem letzten `text` würde die Antwort abschneiden. Solange
        * die Schlange nicht leer ist, geht deshalb auch alles Neue hinein.
        */
-      if (isTransitionBusy() || eventQueueRef.current.length > 0) {
+      if (streamHeld() || eventQueueRef.current.length > 0) {
         eventQueueRef.current.push({ event, botId });
         scheduleDrain();
         return;
@@ -3728,11 +3961,31 @@ export function AssistantScreen() {
             return prev;
           });
           return;
-        case "tool_use":
-          // tool_use ist nur Hint — die Mood-Events vom Server liefern die
-          // sichtbare State-Change. Hier reicht's, das Event zu loggen.
-          if (__DEV__) console.log("[chat] tool_use:", event.name);
+        case "sources":
+          setMessages((prev) => appendSourcesMessage(prev, botId, event.sources));
           return;
+        case "memory":
+          setMessages((prev) => appendNoteMessage(prev, botId, event.action, event.text));
+          return;
+        case "task_proposal": {
+          const conv = conversationIdRef.current;
+          setMessages((prev) => [
+            ...prev.filter((m) => m.kind !== "typing"),
+            { id: `${botId}:task:${prev.length}`, kind: "task", proposal: event.proposal, conversationId: conv, botId },
+          ]);
+          return;
+        }
+        case "tool_use": {
+          // Bos Arbeitsanzeige: Der neue Schritt läuft, der vorige ist erledigt.
+          // Die Websuche meldet der Server erst NACH dem Aufruf — sie ist
+          // gleich erledigt. Reine Bedien-Aktionen zeigen wir nicht.
+          if (event.name === "open_all_results" || event.name === "unsave_trip") return;
+          const work = advanceWork(botId, { name: event.name, detail: event.detail });
+          setMessages((prev) =>
+            prev.map((m) => (m.kind === "typing" ? { ...m, current: work.current, done: work.done } : m)),
+          );
+          return;
+        }
         case "conversation":
           /**
            * Die Kennung kommt vom Server, sobald die Unterhaltung dort steht.
@@ -3760,12 +4013,21 @@ export function AssistantScreen() {
           }
           return;
         case "error":
+          /**
+           * Nie den rohen Text des Servers zeigen — darin stand bei leerem
+           * API-Guthaben die Fehlermeldung des Anbieters, als wäre es Bos
+           * Antwort. Störung beim Anbieter → „Bo ist gerade in Wartung".
+           */
+          if (__DEV__) console.log("[chat] error event:", event.code ?? "-", event.message);
           setMood("error");
           setMessages((prev) =>
             replaceTyping(prev, {
               id: idGen(),
               kind: "error",
-              message: event.message || t("assistant.error.generic"),
+              message:
+                event.code === "maintenance" || PROVIDER_OUTAGE.test(event.message ?? "")
+                  ? t("assistant.error.maintenance")
+                  : t("assistant.error.generic"),
             }),
           );
           return;
@@ -3987,13 +4249,30 @@ export function AssistantScreen() {
   // (siehe useSpeechRecognitionEvent("volumechange") oben)
 
   // ----- Render ---------------------------------------------------------------
-  const moodLabel = useMemo(() => t(`assistant.mood.${mood}`), [mood, t]);
   const canSend = input.trim().length > 0 && !busy;
   const voiceAvailable = ExpoSpeechRecognitionModule != null;
 
   // onRetry für Error-Bubbles MUSS stabile Referenz haben damit der memo'te
   // <Bubble> nicht bei jedem Re-Render alle Bubbles neu zeichnet. messagesRef
   // ist oben deklariert, useCallback dep nur `send`.
+  /**
+   * Tipp im Startbereich: einen Vorschlag senden, ihn zum Ergänzen ins Feld
+   * legen — oder bei der „Heute"-Karte einer geplanten Aufgabe „Geplant" mit
+   * ihr öffnen (dieselbe Verknüpfung wie bei einer Mitteilung).
+   */
+  /** Steht weiter unten bei „Geplant"; die Startkarte braucht sie schon hier. */
+  const showTaskRef = useRef<((taskId: string) => void) | null>(null);
+  const onStartAction = useCallback(
+    (a: StartAction) => {
+      if (a.kind === "send") void send(a.text);
+      else if (a.kind === "prefill") {
+        setInput(a.text);
+        chatInputRef.current?.focus();
+      } else showTaskRef.current?.(a.taskId);
+    },
+    [send],
+  );
+
   const onBubbleRetry = useCallback(() => {
     const lastUser = [...messagesRef.current].reverse().find((x) => x.kind === "user");
     if (lastUser && lastUser.kind === "user") send(lastUser.text);
@@ -4024,7 +4303,12 @@ export function AssistantScreen() {
   // Für inverted FlatList: data wird umgekehrt übergeben damit die neueste
   // Message bei index=0 steht (mit `inverted` ist das visuell der Bottom).
   // useMemo damit nicht bei jedem Render ein neues Array entsteht.
-  const reversedMessages = useMemo(() => [...messages].reverse(), [messages]);
+  const reversedMessages = useMemo(() => {
+    // Der Startbereich gehört zu einem FRISCHEN Chat — mit der ersten eigenen
+    // Nachricht (getippt oder gesprochen) ist er weg. Eine Stelle für alle Wege.
+    const started = messages.some((m) => m.kind === "user");
+    return (started ? messages.filter((m) => m.kind !== "start") : messages).slice().reverse();
+  }, [messages]);
   /** Die fünf neuesten — siehe `data` an der Liste. Eigener Merker, damit die
    *  Schranke der Liste nicht bei jedem Durchgang bricht. */
   /**
@@ -4283,6 +4567,13 @@ export function AssistantScreen() {
   const onThreadScroll = useAnimatedScrollHandler((e) => {
     threadScrollY.value = e.contentOffset.y;
   });
+  // Nur beim Überschreiten — siehe `ThreadList`.
+  useAnimatedReaction(
+    () => threadScrollY.value > HOLD_FROM_PX,
+    (held, prev) => {
+      if (held !== prev) runOnJS(setThreadHeld)(held);
+    },
+  );
   // KEINE Reaktion mehr auf „steht die Liste unten": Der Merker hing an der
   // Ausgleichsbewegung, und die gibt es nicht mehr. Stehengeblieben wäre er ein
   // Worklet, das bei JEDEM Scroll-Bild läuft und einen Wert schreibt, den
@@ -4413,10 +4704,11 @@ export function AssistantScreen() {
         accent={accent.solid}
         onRetry={onBubbleRetry}
         onOpenResults={onOpenResults}
+        onStartAction={onStartAction}
         t={t}
       />
     ),
-    [accent.solid, onBubbleRetry, onOpenResults, t],
+    [accent.solid, onBubbleRetry, onOpenResults, onStartAction, t],
   );
 
   /**
@@ -4450,9 +4742,25 @@ export function AssistantScreen() {
    * darum, wo eine Zeile AUF DEM SCHIRM steht, und das ändert die Verschiebung
    * weiterhin.
    */
+  /**
+   * Blendet den Verlauf beim Wechsel der Unterhaltung aus — siehe `applyThread`.
+   *
+   * Auf der Hülle und nicht je Zeile: Android zieht die Deckkraft hier in die
+   * einzelnen Zeichenaufrufe hinein (keine Zwischenfläche), das kostet nichts,
+   * auch nicht während der Bildschirm zurückfährt.
+   */
+  const threadFade = useSharedValue(1);
   const threadShiftStyle = useAnimatedStyle(() => ({
+    opacity: threadFade.value,
     transform: [{ translateY: slideShift.value }],
   }));
+  /**
+   * Wie weit „Geplant" über dem Chat steht (0 = Chat, 1 = Seite). Schriftzug,
+   * Statuszeile und Bo hängen daran, damit die Kopfzeile EIN Überblenden ist.
+   */
+  const pageFade = useSharedValue(0);
+  const chatHeadStyle = useAnimatedStyle(() => ({ opacity: 1 - pageFade.value }));
+  const pageHeadStyle = useAnimatedStyle(() => ({ opacity: pageFade.value }));
 
 
   const slideStyle = useAnimatedStyle(() => {
@@ -4641,6 +4949,9 @@ export function AssistantScreen() {
       drawerOpenRef.current = false;
       drawerUpRef.current = false;
       setDrawerUp(false);
+      // Beim nächsten Öffnen steht wieder der Chat da.
+      closeTaskSheet();
+      setBoView("chat");
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isFocused]);
@@ -4662,8 +4973,6 @@ export function AssistantScreen() {
    * ändern sie sich, wird die Sperre unten im Effekt neu berechnet.
    */
   const slidingRef = useRef(true);
-  const isScrollingRef = useRef(isScrolling);
-  isScrollingRef.current = isScrolling;
   /**
    * Das Abonnement der Sprachleiste auf Bos Sperre ist WEG — mitsamt seinem
    * Zustand.
@@ -4677,7 +4986,8 @@ export function AssistantScreen() {
    * die Reanimateds Bewegungen anhält.
    */
   const publishPause = useCallback(() => {
-    const blocked = slidingRef.current || !isFocusedRef.current;
+    // Unter „Geplant" sieht ihn niemand — dort läuft auch nichts.
+    const blocked = slidingRef.current || !isFocusedRef.current || getBoView() === "scheduled";
     setDotsPaused(blocked);
     setBoBlocked(blocked || isScrollingRef.current);
   }, []);
@@ -4729,7 +5039,8 @@ export function AssistantScreen() {
    */
   useEffect(() => {
     publishPause();
-  }, [isFocused, isScrolling, publishPause]);
+  }, [isFocused, publishPause]);
+  useEffect(() => subscribeBoView(publishPause), [publishPause]);
 
   const enterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const windowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -4989,21 +5300,30 @@ export function AssistantScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isFocused, openSeq]);
 
+  const setScrolling = useCallback(
+    (on: boolean) => {
+      scrollHoldUntilRef.current = on ? Date.now() + SCROLL_HOLD_MAX_MS : 0;
+      probeThreadScroll(on);
+      if (isScrollingRef.current === on) return;
+      isScrollingRef.current = on;
+      publishPause();
+    },
+    [publishPause],
+  );
   const onDragStart = useCallback(() => {
     if (scrollEndTimeoutRef.current) {
       clearTimeout(scrollEndTimeoutRef.current);
       scrollEndTimeoutRef.current = null;
     }
-    setIsScrolling(true);
-  }, []);
-  const onDragStop = useCallback(() => {
+    setScrolling(true);
+  }, [setScrolling]);
+  const settleScroll = useCallback(() => {
     if (scrollEndTimeoutRef.current) clearTimeout(scrollEndTimeoutRef.current);
     scrollEndTimeoutRef.current = setTimeout(() => {
-      setIsScrolling(false);
       scrollEndTimeoutRef.current = null;
-    }, 120);
-  }, []);
-  const onMomentumStop = useCallback(() => setIsScrolling(false), []);
+      setScrolling(false);
+    }, SCROLL_REST_MS);
+  }, [setScrolling]);
 
   /**
    * Die Liste EINMAL bauen und beim Tippen nicht anfassen.
@@ -5018,7 +5338,7 @@ export function AssistantScreen() {
    */
   const thread = useMemo(
     () => (
-    <AnimatedThread
+    <ThreadList
       ref={scrollRef}
       /**
        * WÄHREND der Fahrt nur die fünf neuesten — und das ist der Hebel gegen
@@ -5099,7 +5419,9 @@ export function AssistantScreen() {
        * ist das nicht: Was fehlt, liegt oberhalb des Bildrands, und
        * Nachrücken bewegt nichts — die Liste hängt am unteren Ende.
        */
-      windowSize={entering ? 1 : 5}
+      // 9 seit dem Grob-Test in `progress`: Eine gemountete Zeile kostet beim Scrollen
+      // kaum noch etwas, ihr Auf- und Abbau beim Hin-und-her dagegen sehr wohl.
+      windowSize={entering ? 1 : 9}
       /**
        * WÄHREND der Fahrt klein, danach groß.
        *
@@ -5145,9 +5467,9 @@ export function AssistantScreen() {
        */
       updateCellsBatchingPeriod={entering ? 700 : 50}
       onScrollBeginDrag={onDragStart}
-      onScrollEndDrag={onDragStop}
+      onScrollEndDrag={settleScroll}
       onMomentumScrollBegin={onDragStart}
-      onMomentumScrollEnd={onMomentumStop}
+      onMomentumScrollEnd={settleScroll}
     />
     ),
     [
@@ -5162,11 +5484,60 @@ export function AssistantScreen() {
       entering,
       enteringSlice,
       onDragStart,
-      onDragStop,
-      onMomentumStop,
+      settleScroll,
     ],
   );
 
+
+  /**
+   * Die laufende Antwort gehört zum Verlauf, der gerade geht: abbrechen, und was
+   * von ihr noch in der Schlange steht, mit wegwerfen — sonst landete es im neuen
+   * Chat. Sie gilt damit als abgelöst, ihr Abbruch setzt also auch keine
+   * Fehler-Blase mehr dorthin.
+   */
+  const dropTurn = useCallback(() => {
+    eventQueueRef.current = [];
+    textBufRef.current = null;
+    if (streamingBotIdRef.current) {
+      streamingBotIdRef.current = null;
+      bubbleReadyRef.current = null;
+      if (busyGuardRef.current) {
+        clearTimeout(busyGuardRef.current);
+        busyGuardRef.current = null;
+      }
+      busyRef.current = false;
+      setBusy(false);
+    }
+    abortRef.current?.abort();
+  }, []);
+
+  /**
+   * Der neue Verlauf steht — bei ausgeblendeter Liste einsetzen.
+   *
+   * Eingeblendet wird erst nach dem Commit (Effekt unten): Sonst käme der alte
+   * Verlauf für ein paar Bilder zurück, bevor der neue steht.
+   *
+   * @param quiet Ein ganzer gespeicherter Verlauf zieht als EINE Fläche ein, nicht
+   *        Zeile für Zeile.
+   */
+  const threadRevealRef = useRef(false);
+  const applyThread = useCallback(
+    (next: Msg[], quiet: boolean) => {
+      jumpToLatest();
+      if (quiet) allowEnter.current = false;
+      messagesRef.current = next;
+      threadRevealRef.current = true;
+      setMood("idle");
+      setMessages(next);
+    },
+    [jumpToLatest],
+  );
+  useEffect(() => {
+    if (!threadRevealRef.current) return;
+    threadRevealRef.current = false;
+    allowEnter.current = true;
+    threadFade.value = withTiming(1, THREAD_IN);
+  }, [messages, threadFade]);
 
   /**
    * „Neuer Chat" — der Verlauf beginnt von vorn.
@@ -5176,20 +5547,133 @@ export function AssistantScreen() {
    * gehört. Die Kennung fällt auf `null` zurück, der Server legt beim nächsten
    * Absenden eine neue Unterhaltung an.
    */
-  const startNewConversation = useCallback(() => {
-    closeDrawer();
-    abortRef.current?.abort();
-    conversationIdRef.current = null;
-    setConversationId(null);
-    lastSearchRef.current = null;
-    // Ein noch laufendes Nachladen darf den frischen Chat nicht überschreiben.
-    if (threadApplyRef.current) {
-      clearTimeout(threadApplyRef.current);
-      threadApplyRef.current = null;
+  const startNewConversation = useCallback(
+    (then?: () => void) => {
+      const fromPage = getBoView() === "scheduled";
+      dropTurn();
+      conversationIdRef.current = null;
+      lastSearchRef.current = null;
+      if (fromPage) setBoView("chat");
+      // Ein noch laufendes Nachladen darf den frischen Chat nicht überschreiben.
+      if (threadApplyRef.current) {
+        clearTimeout(threadApplyRef.current);
+        threadApplyRef.current = null;
+      }
+      // Damit die „Heute"-Karte im ersten Bild steht, statt nachzurutschen.
+      if (authUserId) {
+        void queryClient.prefetchQuery({
+          queryKey: boTasksKeyFor(authUserId),
+          queryFn: fetchBoTasks,
+          staleTime: 60_000,
+        });
+      }
+      const apply = () => {
+        setConversationId(null);
+        // Mit Vorlage direkt zum Satz: Die Karten ständen nur für ein Bild da.
+        const fresh = freshMessages(locale).filter((m) => !then || m.kind !== "start");
+        applyThread(fresh, false);
+        then?.();
+      };
+      if (!drawerOpenRef.current) {
+        apply();
+        return;
+      }
+      /**
+       * Erst fährt der Bildschirm zurück, dann zieht der neue Chat ein.
+       *
+       * Hier stand der Austausch direkt nach dem Antippen: Die Begrüßung und die
+       * vier Vorschläge blendeten ein, während das Fenster noch wuchs — zwei
+       * Bewegungen übereinander, und der größte Commit des Bildschirms in den
+       * ersten Bildern der Kurve. Bis dahin blendet nur der alte Verlauf aus.
+       *
+       * Das Netz daneben, weil eine unterbrochene Kurve ihren Abschluss nicht
+       * mehr meldet (man kann die Schublade im Zurückfahren wieder öffnen).
+       */
+      // Unter „Geplant" steht der alte Verlauf: Er darf beim Abblenden nicht durchscheinen.
+      threadFade.value = fromPage ? 0 : withTiming(0, THREAD_OUT);
+      let applied = false;
+      const once = () => {
+        if (applied) return;
+        applied = true;
+        if (threadApplyRef.current) {
+          clearTimeout(threadApplyRef.current);
+          threadApplyRef.current = null;
+        }
+        apply();
+      };
+      threadApplyRef.current = setTimeout(once, THREAD_SWAP_SAFETY_MS);
+      closeDrawerThen(once);
+    },
+    [applyThread, authUserId, closeDrawerThen, dropTurn, locale, queryClient, threadFade],
+  );
+  /** Für die Schublade — ohne Argument, siehe `closeDrawer`. */
+  const newChatFromDrawer = useCallback(() => startNewConversation(), [startNewConversation]);
+
+  /**
+   * „Geplant" zeigen — wie ein Wechsel der Unterhaltung: Der Chat blendet aus,
+   * während der Bildschirm zurückfährt, die Seite kommt, wenn er steht. Der
+   * Verlauf wird unter ihr wieder sichtbar geschaltet, damit er beim Zurückgehen
+   * einfach dasteht.
+   */
+  const openScheduled = useCallback(() => {
+    if (getBoView() === "scheduled") {
+      closeDrawer();
+      return;
     }
-    setMood("idle");
-    setMessages([{ id: idGen(), kind: "bot", text: pickWelcome(locale) }]);
-  }, [closeDrawer, locale]);
+    threadFade.value = withTiming(0, THREAD_OUT);
+    let shown = false;
+    const show = () => {
+      if (shown) return;
+      shown = true;
+      if (threadApplyRef.current) {
+        clearTimeout(threadApplyRef.current);
+        threadApplyRef.current = null;
+      }
+      setBoView("scheduled");
+      threadFade.value = withDelay(THREAD_IN.duration + 60, withTiming(1, { duration: 1 }));
+    };
+    threadApplyRef.current = setTimeout(show, THREAD_SWAP_SAFETY_MS);
+    closeDrawerThen(show);
+  }, [closeDrawer, closeDrawerThen, threadFade]);
+
+  /** Eine Aufgabe aufschlagen: erst die Seite, dann ihr Blatt. */
+  const showTask = useCallback((taskId: string) => {
+    setBoView("scheduled");
+    setTimeout(() => openTaskSheet({ kind: "detail", taskId }), THREAD_IN.duration + 60);
+  }, []);
+  showTaskRef.current = showTask;
+
+  /** Mitteilung einer geplanten Aufgabe angetippt — nach Bos Einfahrt, nicht in sie hinein. */
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const show = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        const id = takeScheduledTask();
+        if (!id) return;
+        closeDrawer();
+        showTask(id);
+      }, 650);
+    };
+    if (hasScheduledTaskRequest()) show();
+    const off = onScheduledTaskRequest(show);
+    return () => {
+      off();
+      if (timer) clearTimeout(timer);
+    };
+  }, [closeDrawer, showTask]);
+
+  /** „Lieber sagen" im Blatt: neuer Chat, das Feld ist schon angefangen. */
+  useEffect(
+    () =>
+      onAskBo(() => {
+        startNewConversation(() => {
+          setInput(t("bo.task.askPrefill"));
+          requestAnimationFrame(() => chatInputRef.current?.focus());
+        });
+      }),
+    [startNewConversation, t],
+  );
 
   /**
    * Tipp auf die Profil-Karte: Schublade zurück, Bo schließen, Tab wechseln.
@@ -5221,11 +5705,16 @@ export function AssistantScreen() {
    */
   const openConversation = useCallback(
     (id: string) => {
+      const fromPage = getBoView() === "scheduled";
       closeDrawer();
-      if (conversationIdRef.current === id) return;
-      abortRef.current?.abort();
+      if (conversationIdRef.current === id) {
+        if (fromPage) setBoView("chat");
+        return;
+      }
+      dropTurn();
       conversationIdRef.current = id;
-      setConversationId(id);
+      threadFade.value = fromPage ? 0 : withTiming(0, THREAD_OUT);
+      if (fromPage) setBoView("chat");
       void (async () => {
         try {
           const detail = await queryClient.fetchQuery({
@@ -5255,13 +5744,9 @@ export function AssistantScreen() {
             if (conversationIdRef.current !== id) return;
             lastSearchRef.current =
               (detail.conversation.lastSearch as LastSearchParams | null) ?? null;
-            setMood("idle");
-            const restored = messagesFromRows(detail.messages);
-            setMessages(
-              restored.length > 0
-                ? restored
-                : [{ id: idGen(), kind: "bot", text: pickWelcome(locale) }],
-            );
+            setConversationId(id);
+            const restored = messagesFromRows(detail.messages, id);
+            applyThread(restored.length > 0 ? restored : freshMessages(locale), true);
           };
           apply();
         } catch {
@@ -5274,10 +5759,11 @@ export function AssistantScreen() {
           if (conversationIdRef.current !== id) return;
           conversationIdRef.current = null;
           setConversationId(null);
+          threadFade.value = withTiming(1, THREAD_IN);
         }
       })();
     },
-    [closeDrawer, locale, queryClient],
+    [applyThread, closeDrawer, dropTurn, locale, queryClient, threadFade],
   );
 
   return (
@@ -5324,9 +5810,10 @@ export function AssistantScreen() {
           <DrawerGate
             activeId={conversationId}
             onSelect={openConversation}
-            onNewChat={startNewConversation}
+            onNewChat={newChatFromDrawer}
             onClose={closeDrawer}
             onOpenProfile={openProfileTab}
+            onOpenScheduled={openScheduled}
           />
         </Animated.View>
       ) : null}
@@ -5427,40 +5914,22 @@ export function AssistantScreen() {
             {/* Dieselbe Komponente wie in allen anderen Tabs — nicht mehr ein
                 nachgebauter Text. Die Zahlen waren zwar gleich, aber `lineHeight`
                 fehlte, und genau das entscheidet hier über die Position. */}
-            <ScreenHeading>
-              B<Text style={{ color: accent.solid }}>i</Text>nch
-            </ScreenHeading>
+            <View>
+              <Animated.View style={chatHeadStyle}>
+                <ScreenHeading>
+                  B<Text style={{ color: accent.solid }}>i</Text>nch
+                </ScreenHeading>
+              </Animated.View>
+              <Animated.View pointerEvents="none" style={[styles.pageHeading, pageHeadStyle]}>
+                <ScreenHeading>{t("assistant.threads.scheduled")}</ScreenHeading>
+              </Animated.View>
+            </View>
           </View>
           {/* Die Statuszeile sitzt IN der Kopfzeile und senkrecht mittig zum
               Schriftzug — dafür absolut über die volle Breite gelegt und
               zentriert, statt sie zwischen Schriftzug und Knopf einzureihen
               (dort wäre sie von deren Breiten abhängig und nie wirklich mittig). */}
-          <Text
-            style={[
-              styles.mood,
-              // Deckungsgleich mit der Zeile des Schriftzugs: gleiche Oberkante,
-              // gleiche Höhe. Damit liegt die Mitte beider exakt aufeinander,
-              // unabhängig von den Schriftgrößen.
-              /**
-               * Das Kästchen ist die ZEILE selbst, nicht die Höhe des Schriftzugs.
-               *
-               * Vorher stand hier dessen volle Höhe, und mittig gesetzt wurde die
-               * Zeile darin über `textAlignVertical` — das es nur auf Android
-               * gibt. Auf iOS säße sie oben. Ein Kästchen in Zeilenhöhe, um die
-               * halbe Differenz nach unten gerückt, trifft die Mitte überall,
-               * ohne sich auf die Ausrichtung zu verlassen.
-               */
-              {
-                top: insets.top + TOPBAR_TOP + (HEADING_LINE_HEIGHT - MOOD_LINE_H) / 2,
-                height: MOOD_LINE_H,
-              },
-              mood === "error" && { color: C.error },
-            ]}
-            numberOfLines={1}
-            pointerEvents="none"
-          >
-            {moodLabel.toUpperCase()}
-          </Text>
+          <MoodLine top={insets.top + TOPBAR_TOP + (HEADING_LINE_HEIGHT - MOOD_LINE_H) / 2} fadeStyle={chatHeadStyle} />
           <Pressable
             onTouchStart={armClose}
             onPressIn={() => {
@@ -5505,9 +5974,9 @@ export function AssistantScreen() {
             User auf einem anderen Tab ist. Ohne das laufen 5-8 endlose Repeats
             (Schweben, Blinzeln, ggf. Wink/Yap) auf der UI-Thread im Hinter-
             grund weiter — verlangsamt jeden anderen Tab spürbar. */}
-        <View style={[styles.hero, { top: insets.top + HERO_TOP }]} pointerEvents="none">
-          <BoGate state={mood} size={BO_SIZE} />
-        </View>
+        <Animated.View style={[styles.hero, { top: insets.top + HERO_TOP }, chatHeadStyle]} pointerEvents="none">
+          <BoGate size={BO_SIZE} />
+        </Animated.View>
 
         {/* Input-Bar Wrapper — absolut bei bottom:0, die Hochbewegung kommt
             frame-synced mit dem Keyboard via barAnimStyle (useAnimatedKeyboard,
@@ -5517,9 +5986,6 @@ export function AssistantScreen() {
           style={[styles.inputbarWrap, { backgroundColor: palette.bg }, inputbarWrapStyle, barAnimStyle]}
           onLayout={(e) => {
             const h = e.nativeEvent.layout.height;
-            // Ohne Umweg über React: Diesen Wert braucht nur der UI-Strang (der
-            // Fahrweg der Zeile), er kostet damit keinen Durchgang.
-            barTravel.value = h;
             /**
              * NICHT während der Fahrt — jeder Commit hält die Kurve an.
              *
@@ -5615,9 +6081,8 @@ export function AssistantScreen() {
             disabled={!voiceAvailable}
             onPress={() => {
               haptic("button");
-              // Tastatur zuerst schließen: Der Kasten sitzt über der Eingabezeile,
-              // und die wandert mit der Tastatur. Ablauf und Gründe: `openVoiceBox`.
-              openVoiceBox();
+              // Erst die Erlaubnis (Berechtigungs-Blatt), dann das Aufnahme-Blatt — siehe `beginVoice`.
+              void beginVoice();
             }}
             accessibilityLabel="Voice"
           >
@@ -5639,130 +6104,113 @@ export function AssistantScreen() {
             {busy ? (
               <ActivityIndicator color={C.white} size="small" />
             ) : (
-              <Send size={20} color={canSend ? accent.textOnSolid : C.white} strokeWidth={2} />
+              <SendGlyph
+                size={ms(20)}
+                color={canSend ? accent.textOnSolid : C.white}
+                cutColor={canSend ? accent.solid : C.surface3}
+              />
             )}
           </Pressable>
         </View>
         </Animated.View>
 
         {/**
-          * Der Mikrofon-Kasten.
-          *
-          * Unterkante GENAU auf der Unterkante des Mikrofon-Knopfes: Der sitzt in
-          * der Eingabezeile, deren unterer Innenabstand `inputbarPadBottom` ist —
-          * also derselbe Abstand vom Bildschirmrand.
-          *
-          * Er liegt NEBEN der Eingabezeile im Baum, nicht darin: Deren Hülle ist
-          * nur so hoch wie die Zeile selbst, und was darüber hinausragt, läge
-          * außerhalb seines Elternteils — auf Android damit weder sichtbar noch
-          * berührbar.
-          *
-          * `pointerEvents="none"`, solange er leer ist: So bleibt die Zeile
-          * darunter bedienbar, und ein zweiter Druck auf das Mikrofon nimmt ihn
-          * wieder weg.
+          * Die Aufnahme als Blatt (`VoiceSheet`) — statt des Kastens über der
+          * Eingabezeile, die dabei auch nicht mehr hinunterfährt. Es liegt NEBEN
+          * der Eingabezeile im Baum und damit über ihr.
           */}
-        {voiceMode ? (
-          <MicBox
-            /**
-             * An der AUFNAHME, nicht an der Erkennung.
-             *
-             * `listening` gehört dem Erkenner, und der endet bei jeder Sprechpause
-             * und läuft neu an. Die Tonspur fror dabei ein — „auf einmal passiert
-             * gar nichts mehr" —, obwohl weiter aufgenommen wurde. Der Ton läuft
-             * durch, also läuft auch die Spur durch.
-             */
-            recording={micRecording}
-            /**
-             * NICHT an Bos Sperre hängen — das war der Grund für die toten Balken.
-             *
-             * `voiceBarPaused` folgt `boBlocked`, und das ist wahr, sobald Bo
-             * gerade fährt, den Fokus nicht hat ODER die Liste gescrollt wird
-             * (siehe `publishPause`). Der Anfangswert ist ebenfalls wahr. Steht
-             * einer dieser drei Fälle beim Öffnen des Kastens an — oder bleibt er
-             * hängen —, wird der Bild-Rückruf der Tonspur nie eingeschaltet: Es
-             * kommt Pegel an, aber niemand tastet ihn ab.
-             *
-             * Diese Sperre ist für Bos Dauer-Animationen gedacht, die im
-             * Hintergrund weiterliefen. Die Tonspur ist etwas anderes: Sie läuft
-             * nur, solange der Kasten offen ist — also genau dann, wenn der
-             * Nutzer hinsieht.
-             */
-            paused={false}
-            micVolumeSV={micVolumeSV}
-            style={[styles.micBox, { height: MIC_BOX_H, bottom: inputbarPadBottom }]}
-            onToggle={() => {
-              if (listening) {
-                stopVoice();
-                // Der Ton hält mit an — sonst liefe die Pause als Stille mit in
-                // die Aufnahme.
-                setMicRecording(false);
-                try {
-                  if (!MODULE_RECORDS_AUDIO) recorder.pause();
-                } catch {
-                  // Aufnehmer nicht in einem Zustand, in dem sich pausieren
-                  // lässt — dann bleibt es beim Weiterlaufen.
-                }
-              } else {
-                // Fortsetzen, nicht neu anfangen: Text und Ton von vor der Pause
-                // bleiben stehen.
-                resumingRef.current = true;
-                setMicRecording(true);
-                try {
-                  if (!MODULE_RECORDS_AUDIO) recorder.record();
-                } catch {
-                  // siehe oben
-                }
-                void startVoice();
-              }
-            }}
-            onDelete={() => {
-              voiceSendRef.current = false;
-              if (listening) stopVoice();
-              void discardVoiceRecording();
-              setInput("");
-              setVoiceMode(false);
-            }}
-            onSend={() => {
-              /**
-               * Direkt aus der laufenden Aufnahme heraus — kein Umweg über Pause.
-               *
-               * Gestoppt wird hier, eingesammelt wird erst, wenn die Datei
-               * geschlossen ist (siehe `sendMaybeVoice`). Vorher wurde beides in
-               * dieser Reihenfolge verkehrt gemacht, und genau daher kamen die
-               * abgehackten und die ausbleibenden Nachrichten.
-               */
-              voiceSendRef.current = true;
-              if (listening) {
+        <VoiceSheet open={voiceMode} instant={voiceInstantRef.current} height={voiceSheetH}>
+            <VoicePanel
+              transcript={input}
+              bottomInset={insets.bottom}
                 /**
-                 * Abgeschickt wird JETZT, nicht wenn der Erkenner soweit ist.
+                 * An der AUFNAHME, nicht an der Erkennung.
                  *
-                 * Vorher wurde nur gestoppt und auf das Schluss-Ergebnis gewartet
-                 * — kam keines (weil nichts verstanden wurde oder der Dienst sich
-                 * Zeit ließ), sah es aus, als hätte man bloß angehalten.
-                 *
-                 * Jetzt läuft eine kurze Frist mit: Kommt das Schluss-Ergebnis in
-                 * dieser Zeit, geht es damit raus; kommt keines, eben mit dem
-                 * bisherigen Stand. Die Aufnahme selbst ist davon ohnehin
-                 * unabhängig.
+                 * `listening` gehört dem Erkenner, und der endet bei jeder Sprechpause
+                 * und läuft neu an. Die Tonspur fror dabei ein — „auf einmal passiert
+                 * gar nichts mehr" —, obwohl weiter aufgenommen wurde. Der Ton läuft
+                 * durch, also läuft auch die Spur durch.
                  */
-                pendingSendRef.current = true;
-                stopVoice();
-                setVoiceMode(false);
-                const guard = setTimeout(() => {
-                  if (!pendingSendRef.current) return;
-                  pendingSendRef.current = false;
-                  void sendMaybeVoice(transcriptLiveRef.current.trim());
-                }, 700);
-                sendGuardRef.current = guard;
-              } else {
-                // Aus der Ablage, nicht aus `input` — siehe Begründung am
-                // „end"-Zweig: Der Zustand hier stammt aus einem alten Durchgang.
-                setVoiceMode(false);
-                void sendMaybeVoice(transcriptLiveRef.current.trim());
-              }
-            }}
-          />
-        ) : null}
+                recording={micRecording}
+                micVolumeSV={micVolumeSV}
+                onToggle={() => {
+                  if (listening) {
+                    stopVoice();
+                    // Der Ton hält mit an — sonst liefe die Pause als Stille mit in
+                    // die Aufnahme.
+                    setMicRecording(false);
+                    try {
+                      if (!MODULE_RECORDS_AUDIO) recorder.pause();
+                    } catch {
+                      // Aufnehmer nicht in einem Zustand, in dem sich pausieren
+                      // lässt — dann bleibt es beim Weiterlaufen.
+                    }
+                  } else {
+                    // Fortsetzen, nicht neu anfangen: Text und Ton von vor der Pause
+                    // bleiben stehen.
+                    resumingRef.current = true;
+                    setMicRecording(true);
+                    try {
+                      if (!MODULE_RECORDS_AUDIO) recorder.record();
+                    } catch {
+                      // siehe oben
+                    }
+                    void startVoice();
+                  }
+                }}
+                onDelete={() => {
+                  voiceSendRef.current = false;
+                  if (listening) stopVoice();
+                  void discardVoiceRecording();
+                  setInput("");
+                  setVoiceMode(false);
+                }}
+                onSend={() => {
+                  /**
+                   * Direkt aus der laufenden Aufnahme heraus — kein Umweg über Pause.
+                   *
+                   * Gestoppt wird hier, eingesammelt wird erst, wenn die Datei
+                   * geschlossen ist (siehe `sendMaybeVoice`). Vorher wurde beides in
+                   * dieser Reihenfolge verkehrt gemacht, und genau daher kamen die
+                   * abgehackten und die ausbleibenden Nachrichten.
+                   */
+                  voiceSendRef.current = true;
+                  if (listening) {
+                    /**
+                     * Abgeschickt wird JETZT, nicht wenn der Erkenner soweit ist.
+                     *
+                     * Vorher wurde nur gestoppt und auf das Schluss-Ergebnis gewartet
+                     * — kam keines (weil nichts verstanden wurde oder der Dienst sich
+                     * Zeit ließ), sah es aus, als hätte man bloß angehalten.
+                     *
+                     * Jetzt läuft eine kurze Frist mit: Kommt das Schluss-Ergebnis in
+                     * dieser Zeit, geht es damit raus; kommt keines, eben mit dem
+                     * bisherigen Stand. Die Aufnahme selbst ist davon ohnehin
+                     * unabhängig.
+                     */
+                    pendingSendRef.current = true;
+                    stopVoice();
+                    setVoiceMode(false);
+                    const guard = setTimeout(() => {
+                      if (!pendingSendRef.current) return;
+                      pendingSendRef.current = false;
+                      void sendMaybeVoice(transcriptLiveRef.current.trim());
+                    }, 700);
+                    sendGuardRef.current = guard;
+                  } else {
+                    // Aus der Ablage, nicht aus `input` — siehe Begründung am
+                    // „end"-Zweig: Der Zustand hier stammt aus einem alten Durchgang.
+                    setVoiceMode(false);
+                    void sendMaybeVoice(transcriptLiveRef.current.trim());
+                  }
+                }}
+            />
+        </VoiceSheet>
+        <ScheduledLayer
+          fade={pageFade}
+          top={insets.top + TOPBAR_TOP + ms(HEADING_LINE_HEIGHT) + PAGE_BELOW_TOPBAR}
+          bottomInset={insets.bottom + SPACE.md}
+        />
         {/* GANZ ZULETZT und damit ganz oben: Ein Tipp auf den geschrumpften
             Bildschirm fährt zurück. Sie liegt INNERHALB der Hülle, wird also
             mit verkleinert und verschoben — und deckt damit genau den Rest
@@ -5841,8 +6289,16 @@ export function AssistantScreen() {
  * Rückfall unten greift nur, solange NOCH NIE gemessen wurde.
  */
 
-const HERO_PULL_UP = 46;
-const BO_SIZE = 120;
+/**
+ * Bo über dem Chat — 84 statt 120 (Wunsch 30.10.2026: derselbe Geist, nur nicht
+ * mehr so groß und vorherrschend). Alles darunter rechnet sich aus diesen
+ * beiden Zahlen: Abstand der ersten Nachricht, Strecke des Abtauchens.
+ *
+ * Das Hochziehen gleicht den durchsichtigen Rand über seinem Kopf aus (Schein)
+ * — der wächst mit der Figur, also wächst es mit: 46 bei 120.
+ */
+const BO_SIZE = 84;
+const HERO_PULL_UP = Math.round((46 * BO_SIZE) / 120);
 /**
  * Zeilenhöhe der Statuszeile — FEST gesetzt, nicht geschätzt: Sonst bestimmt
  * Android sie aus der Schrift, und Bos Position wäre geräteabhängig.
@@ -5895,6 +6351,8 @@ const BO_MIDDLE_FROM_LIST_TOP = HERO_BOTTOM_FROM_LIST_TOP - boBodyHeight(BO_SIZE
 const RECEDE_LENGTH = RECEDE_START_Y - BO_MIDDLE_FROM_LIST_TOP;
 /** Wie klein eine ganz nach hinten gekippte Nachricht wird. */
 const RECEDE_MIN_SCALE = 0.66;
+/** Spielraum der Grob-Rechnung vor dem Messen — siehe `progress`. */
+const MEASURE_MARGIN = 120;
 /** Und wie dunkel — der Hintergrund ist dunkel, weniger Deckkraft = dunkler. */
 const RECEDE_MIN_OPACITY = 0.12;
 
@@ -6139,6 +6597,17 @@ function makeRecedingCell(
        * da. Nie ist beides gleichzeitig weg.
        */
       const lt = listTop.value;
+      /**
+       * Nur nahe der oberen Kante wird gemessen.
+       *
+       * `measure` lief für JEDE gemountete Zeile in jedem Scroll-Bild. Gemessen am
+       * Gerät fiel dadurch bei 120 Hz bis zu jedes fünfte Bild aus — eine
+       * Dauerlast, keine Hänger. Die Rechnung reicht für „weit weg", und läge sie
+       * daneben, bliebe die Zeile voll sichtbar: im Zweifel gezeigt, nie
+       * fälschlich weggeblendet.
+       */
+      const rough = listH.value - (y.value + hv) + scrollY.value + slide.value;
+      if (rough + hv / 2 > RECEDE_START_Y + MEASURE_MARGIN || rough + hv < -MEASURE_MARGIN) return 0;
       const m = lt === lt ? safeMeasure(cellRef) : null;
       const visualTop =
         m === null ? listH.value - (y.value + hv) + scrollY.value + slide.value : m.pageY - lt;
@@ -6224,7 +6693,29 @@ function makeRecedingCell(
  * Server als offenes Objekt, und eine halb gefüllte Karte ist schlimmer als
  * keine.
  */
-function messagesFromRows(rows: ChatMessageRow[]): Msg[] {
+/** Ein gespeicherter Aufgaben-Vorschlag — nur, wenn er vollständig ist. */
+function proposalFrom(raw: unknown): TaskProposal | null {
+  if (!raw || typeof raw !== "object") return null;
+  const p = raw as Partial<TaskProposal>;
+  const str = (v: unknown) => typeof v === "string" && v.length > 0;
+  if (p.kind !== "route_status" || !str(p.title) || !str(p.origin) || !str(p.destination)) return null;
+  if (!str(p.originLabel) || !str(p.destLabel) || !str(p.time) || typeof p.days !== "number") return null;
+  if (p.notify !== "always" && p.notify !== "issues") return null;
+  return {
+    kind: "route_status",
+    title: p.title!,
+    origin: p.origin!,
+    destination: p.destination!,
+    originLabel: p.originLabel!,
+    destLabel: p.destLabel!,
+    days: p.days,
+    time: p.time!,
+    watchUntil: typeof p.watchUntil === "string" ? p.watchUntil : null,
+    notify: p.notify,
+  };
+}
+
+function messagesFromRows(rows: ChatMessageRow[], conversationId: string | null = null): Msg[] {
   const out: Msg[] = [];
   let botId = "";
   for (const row of rows) {
@@ -6265,6 +6756,26 @@ function messagesFromRows(rows: ChatMessageRow[]): Msg[] {
       });
       continue;
     }
+    if (row.kind === "sources") {
+      const sources = (Array.isArray(payload.sources) ? payload.sources : []).filter(
+        (x): x is ChatSource =>
+          !!x && typeof x === "object" && typeof (x as ChatSource).url === "string" && /^https?:\/\//i.test((x as ChatSource).url),
+      );
+      if (sources.length > 0) out.push({ id: row.id, kind: "sources", sources, botId });
+      continue;
+    }
+    if (row.kind === "task") {
+      const proposal = proposalFrom(payload.proposal);
+      if (proposal) out.push({ id: row.id, kind: "task", proposal, conversationId, botId });
+      continue;
+    }
+    if (row.kind === "note") {
+      const action = payload.action;
+      const text = typeof payload.text === "string" ? payload.text : "";
+      if (!text || (action !== "saved" && action !== "updated" && action !== "forgotten")) continue;
+      out.push({ id: row.id, kind: "note", action, text, botId });
+      continue;
+    }
     if (row.kind === "action") {
       // Nur „alle Treffer" wird zu einem Knopf; speichern/entfernen waren
       // einmalige Wirkungen und haben nie eine Blase erzeugt.
@@ -6291,6 +6802,46 @@ function messagesFromRows(rows: ChatMessageRow[]): Msg[] {
   return out;
 }
 
+/** Ein frischer Chat: Bos Begrüßung (sein Ton, unverändert) und darunter der Startbereich. */
+function freshMessages(locale: Locale): Msg[] {
+  return [
+    { id: idGen(), kind: "bot", text: pickWelcome(locale) },
+    { id: idGen(), kind: "start" },
+  ];
+}
+
+/**
+ * Bos Arbeitsschritte je Antwort — MODULWEIT, wie die übrigen Merker hier.
+ *
+ * Die Tipp-Anzeige verschwindet an vielen Stellen, sobald etwas ankommt (Text,
+ * Karte, Quelle). Die Schritte sollen trotzdem über der Antwort stehen bleiben;
+ * deshalb liegen sie hier und werden beim ersten Text der Antwort abgeholt.
+ */
+const workByBot = new Map<string, { current?: WorkStep; done: WorkStep[] }>();
+
+function advanceWork(botId: string, step: WorkStep): { current?: WorkStep; done: WorkStep[] } {
+  const prev = workByBot.get(botId) ?? { done: [] };
+  const next =
+    step.name === "web_search"
+      ? { current: prev.current, done: [...prev.done, step] }
+      : { current: step, done: prev.current ? [...prev.done, prev.current] : prev.done };
+  workByBot.set(botId, next);
+  if (workByBot.size > 20) {
+    const oldest = workByBot.keys().next().value;
+    if (oldest !== undefined && oldest !== botId) workByBot.delete(oldest);
+  }
+  return next;
+}
+
+/** Alle Schritte einer Antwort (der laufende gilt jetzt als erledigt) — und vergessen. */
+function takeWorkSteps(botId: string): WorkStep[] | undefined {
+  const w = workByBot.get(botId);
+  if (!w) return undefined;
+  workByBot.delete(botId);
+  const all = w.current ? [...w.done, w.current] : w.done;
+  return all.length > 0 ? all : undefined;
+}
+
 function idGen(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -6310,7 +6861,10 @@ function replaceTyping(messages: Msg[], next: Msg): Msg[] {
  */
 function insertBotBefore(messages: Msg[], botId: string, bot: Msg): Msg[] {
   const rest = messages.filter((m) => m.kind !== "typing");
-  const firstCard = rest.findIndex((m) => m.kind === "result" && m.botId === botId);
+  // Alles, was an dieser Antwort hängt — Treffer, Tafel, Knopf, Quellen,
+  // Vermerk. Vorher nur Treffer: Kam eine Tafel oder eine Quelle vor dem
+  // ersten Textstück an, stand die Antwort darunter.
+  const firstCard = rest.findIndex((m) => "botId" in m && m.botId === botId);
   if (firstCard === -1) return [...rest, bot];
   return [...rest.slice(0, firstCard), bot, ...rest.slice(firstCard)];
 }
@@ -6342,7 +6896,10 @@ function appendBotText(messages: Msg[], botId: string, delta: string): Msg[] {
  */
 function commitBotText(messages: Msg[], botId: string, text: string): Msg[] {
   const idx = messages.findIndex((m) => m.id === botId);
-  if (idx === -1) return insertBotBefore(messages, botId, { id: botId, kind: "bot", text });
+  if (idx === -1) {
+    const steps = takeWorkSteps(botId);
+    return insertBotBefore(messages, botId, { id: botId, kind: "bot", text, ...(steps ? { steps } : {}) });
+  }
   return messages.map((m, i) =>
     i === idx && m.kind === "bot" ? { ...m, text: m.text + text } : m,
   );
@@ -6402,6 +6959,33 @@ function appendActionMessage(
   return [...rest, { id: `${botId}:action`, kind: "action", params, botId }];
 }
 
+/** Quellen einer Websuche — kommen weitere im selben Zug, wandern sie in dieselbe Zeile. */
+function appendSourcesMessage(messages: Msg[], botId: string, sources: ChatSource[]): Msg[] {
+  const rest = messages.filter((m) => m.kind !== "typing");
+  const clean = sources.filter((x) => /^https?:\/\//i.test(x.url));
+  if (clean.length === 0) return rest;
+  const id = `${botId}:sources`;
+  const idx = rest.findIndex((m) => m.id === id);
+  if (idx === -1) return [...rest, { id, kind: "sources", sources: clean, botId }];
+  return rest.map((m, i) => {
+    if (i !== idx || m.kind !== "sources") return m;
+    const known = new Set(m.sources.map((x) => x.url));
+    return { ...m, sources: [...m.sources, ...clean.filter((x) => !known.has(x.url))] };
+  });
+}
+
+function appendNoteMessage(
+  messages: Msg[],
+  botId: string,
+  action: "saved" | "updated" | "forgotten",
+  text: string,
+): Msg[] {
+  const rest = messages.filter((m) => m.kind !== "typing");
+  const id = `${botId}:note:${action}:${text}`;
+  if (rest.some((m) => m.id === id)) return rest;
+  return [...rest, { id, kind: "note", action, text, botId }];
+}
+
 // ---------------------------------------------------------------------------
 // Sub-Components
 // ---------------------------------------------------------------------------
@@ -6412,6 +6996,8 @@ interface BubbleProps {
   onRetry: () => void;
   /** Tap-Handler für den „Alle Treffer"-Button. */
   onOpenResults: (params: LastSearchParams) => void;
+  /** Tipp im Startbereich: senden, ins Eingabefeld legen oder eine Aufgabe öffnen. */
+  onStartAction: (a: StartAction) => void;
   t: ReturnType<typeof useT>;
 }
 
@@ -6425,26 +7011,23 @@ const Bubble = memo(BubbleInner, (prev, next) => {
     prev.accent === next.accent &&
     prev.onRetry === next.onRetry &&
     prev.onOpenResults === next.onOpenResults &&
+    prev.onStartAction === next.onStartAction &&
     prev.t === next.t
   );
 });
 
-function BubbleInner({ msg, accent, onRetry, onOpenResults, t }: BubbleProps) {
+function BubbleInner({ msg, accent, onRetry, onOpenResults, onStartAction, t }: BubbleProps) {
   // KEINE FadeInDown.entering Animationen mehr — bei FlatList-Virtualisierung
   // unmounted und remountet die Liste die Items beim Scrollen ständig.
   // Jeder Remount würde die Entering-Animation neu feuern → sichtbares
   // Flackern + JS-Last → Scroll-Ruckeln. Bubbles erscheinen jetzt instant
   // beim Mount (was bei Stream-Deltas eh nur den ersten Frame betrifft).
   if (msg.kind === "typing") {
-    return (
-      <View style={[styles.bubble, styles.botBubble, styles.typing]}>
-        <View style={styles.dots}>
-          <Dot delay={0} />
-          <Dot delay={120} />
-          <Dot delay={240} />
-        </View>
-      </View>
-    );
+    return <ThinkingIndicator current={msg.current} done={msg.done} t={t} />;
+  }
+
+  if (msg.kind === "start") {
+    return <BoStartPanel onAction={onStartAction} />;
   }
 
   if (msg.kind === "result") {
@@ -6488,6 +7071,35 @@ function BubbleInner({ msg, accent, onRetry, onOpenResults, t }: BubbleProps) {
     );
   }
 
+  if (msg.kind === "sources") {
+    return <SourcesRow sources={msg.sources} label={t("assistant.sources")} />;
+  }
+
+  if (msg.kind === "task") {
+    return (
+      <View style={styles.flightWrap}>
+        <TaskProposalCard proposal={msg.proposal} conversationId={msg.conversationId} />
+      </View>
+    );
+  }
+
+  if (msg.kind === "note") {
+    const key =
+      msg.action === "forgotten"
+        ? "assistant.memory.forgotten"
+        : msg.action === "updated"
+          ? "assistant.memory.updated"
+          : "assistant.memory.saved";
+    return (
+      <View style={styles.noteRow} accessibilityRole="text">
+        <Brain size={13} color={C.textTertiary} strokeWidth={2} />
+        <Text style={styles.noteText} numberOfLines={3}>
+          <Text style={styles.noteLabel}>{t(key)}</Text> {msg.text}
+        </Text>
+      </View>
+    );
+  }
+
   if (msg.kind === "error") {
     return (
       <View style={[styles.bubble, styles.botBubble, styles.errBubble]}>
@@ -6509,10 +7121,44 @@ function BubbleInner({ msg, accent, onRetry, onOpenResults, t }: BubbleProps) {
   // damit sie volle Breite haben.
   return (
     <View style={styles.botMessageWrap}>
+      {msg.steps ? <WorkSteps steps={msg.steps} t={t} /> : null}
       <BotText id={msg.id} text={msg.text} accent={accent} />
     </View>
   );
 }
+
+/**
+ * Die Quellen unter einer Antwort mit Websuche — kleine Kästchen mit dem Titel
+ * der Seite, ein Tipp öffnet sie im Browser. Leise gehalten: Sie belegen die
+ * Antwort, sie sind nicht die Antwort.
+ */
+const SourcesRow = memo(function SourcesRow({ sources, label }: { sources: ChatSource[]; label: string }) {
+  return (
+    <View style={styles.sourcesWrap}>
+      <Text style={styles.sourcesLabel}>{label}</Text>
+      <View style={styles.sourcesList}>
+        {sources.map((src, i) => (
+          <RippleTouch
+            key={src.url}
+            style={styles.sourceChip}
+            onPress={() => {
+              haptic("button");
+              void Linking.openURL(src.url).catch(() => {});
+            }}
+            accessibilityRole="link"
+            accessibilityLabel={src.title}
+          >
+            <Text style={styles.sourceIndex}>{i + 1}</Text>
+            <Globe size={12} color={C.textTertiary} strokeWidth={2} />
+            <Text style={styles.sourceTitle} numberOfLines={1}>
+              {src.title}
+            </Text>
+          </RippleTouch>
+        ))}
+      </View>
+    </View>
+  );
+});
 
 /**
  * Die Blase einer Bot-Antwort — mit eigenem Draht zum laufenden Text.
@@ -6629,10 +7275,72 @@ function subscribeBoBlocked(fn: (blocked: boolean) => void): () => void {
 }
 
 /** Bo hinter dem Verteiler — nur DIESER Knoten rendert beim Entsperren neu. */
-const BoGate = memo(function BoGate({ state, size }: { state: BoMood; size: number }) {
+const BoGate = memo(function BoGate({ size }: { size: number }) {
   const [paused, setPaused] = useState(true);
+  const mood = useMood();
   useEffect(() => subscribeBoBlocked(setPaused), []);
-  return <Bo state={state} size={size} paused={paused} />;
+  return <Bo state={mood} size={size} paused={paused} />;
+});
+
+/**
+ * Die Statuszeile in der Kopfzeile.
+ *
+ * Deckungsgleich mit der Zeile des Schriftzugs: gleiche Oberkante, gleiche
+ * Höhe. Damit liegt die Mitte beider exakt aufeinander, unabhängig von den
+ * Schriftgrößen.
+ *
+ * Das Kästchen ist die ZEILE selbst, nicht die Höhe des Schriftzugs. Vorher
+ * stand hier dessen volle Höhe, und mittig gesetzt wurde die Zeile darin über
+ * `textAlignVertical` — das es nur auf Android gibt. Auf iOS säße sie oben. Ein
+ * Kästchen in Zeilenhöhe, um die halbe Differenz nach unten gerückt, trifft die
+ * Mitte überall, ohne sich auf die Ausrichtung zu verlassen.
+ */
+const MoodLine = memo(function MoodLine({ top, fadeStyle }: { top: number; fadeStyle: StyleProp<TextStyle> }) {
+  const t = useT();
+  const mood = useMood();
+  return (
+    <Animated.Text
+      style={[styles.mood, { top, height: MOOD_LINE_H }, mood === "error" && { color: C.error }, fadeStyle]}
+      numberOfLines={1}
+      pointerEvents="none"
+    >
+      {t(`assistant.mood.${mood}`).toUpperCase()}
+    </Animated.Text>
+  );
+});
+
+/**
+ * „Geplant" im Fenster: über Verlauf, Bo und Eingabeleiste, unter der Kopfzeile.
+ *
+ * Erst beim ersten Öffnen gebaut, danach bleibt die Seite stehen. Eingeblendet
+ * wird nach dem Commit, also auf einem fertigen Baum.
+ */
+const ScheduledLayer = memo(function ScheduledLayer({
+  fade,
+  top,
+  bottomInset,
+}: {
+  fade: SharedValue<number>;
+  top: number;
+  bottomInset: number;
+}) {
+  const palette = usePalette();
+  const shown = useBoView() === "scheduled";
+  const [built, setBuilt] = useState(shown);
+  if (shown && !built) setBuilt(true);
+  useEffect(() => {
+    fade.value = withTiming(shown ? 1 : 0, shown ? THREAD_IN : THREAD_OUT);
+  }, [shown, fade]);
+  const style = useAnimatedStyle(() => ({ opacity: fade.value }));
+  if (!built) return null;
+  return (
+    <Animated.View
+      pointerEvents={shown ? "auto" : "none"}
+      style={[styles.scheduledLayer, { top, backgroundColor: palette.bg }, style]}
+    >
+      <ScheduledPage bottomInset={bottomInset} />
+    </Animated.View>
+  );
 });
 
 /**
@@ -6675,12 +7383,14 @@ const DrawerGate = memo(function DrawerGate({
   onNewChat,
   onClose,
   onOpenProfile,
+  onOpenScheduled,
 }: {
   activeId: string | null;
   onSelect: (id: string) => void;
   onNewChat: () => void;
   onClose: () => void;
   onOpenProfile: () => void;
+  onOpenScheduled: () => void;
 }) {
   const [open, setOpen] = useState(drawerOpenNow);
   useEffect(() => subscribeDrawerOpen(setOpen), []);
@@ -6692,6 +7402,7 @@ const DrawerGate = memo(function DrawerGate({
       onNewChat={onNewChat}
       onClose={onClose}
       onOpenProfile={onOpenProfile}
+      onOpenScheduled={onOpenScheduled}
     />
   );
 });
@@ -6783,7 +7494,7 @@ const DrawerDismissLayer = memo(function DrawerDismissLayer({
           runOnJS(onSettleStart)(shouldOpen);
           assistantDrawer.value = withTiming(
             target,
-            { duration, easing: base.easing },
+            slideTiming({ duration, easing: base.easing }),
             (finished) => {
               "worklet";
               if (!finished) return;
@@ -6826,7 +7537,7 @@ function subscribeDotsPaused(fn: (paused: boolean) => void): () => void {
   };
 }
 
-function Dot({ delay }: { delay: number }) {
+function Dot({ delay, small = false }: { delay: number; small?: boolean }) {
   // Wave-Animation auf Reanimated-Worklet: jeder Dot bobst sanft hoch & runter
   // (translateY -6 → 0) und glow't dabei (opacity 0.35 → 1). Mit phase-versetztem
   // `delay` zwischen den drei Dots entsteht eine elegante Welle, wie wenn Bo
@@ -6861,7 +7572,7 @@ function Dot({ delay }: { delay: number }) {
         delay,
         withRepeat(
           withSequence(
-            withTiming(-6, { duration: 320, easing: Easing.inOut(Easing.ease) }),
+            withTiming(small ? -3 : -6, { duration: 320, easing: Easing.inOut(Easing.ease) }),
             withTiming(0, { duration: 320, easing: Easing.inOut(Easing.ease) }),
             withTiming(0, { duration: 360 }), // pause am Boden
           ),
@@ -6886,14 +7597,158 @@ function Dot({ delay }: { delay: number }) {
       cancelAnimation(ty);
       cancelAnimation(op);
     };
-  }, [delay]);
+  }, [delay, small]);
 
   const animStyle = useAnimatedStyle(() => ({
     transform: [{ translateY: ty.value }],
     opacity: op.value,
   }));
 
-  return <Animated.View style={[styles.dot, animStyle]} />;
+  return <Animated.View style={[small ? styles.dotSmall : styles.dot, animStyle]} />;
+}
+
+/** Werkzeuge, die Bos Arbeitsanzeige mit eigenem Wort nennt. */
+const WORK_TOOLS = new Set([
+  "search_journey",
+  "plan_multimodal",
+  "get_stop_board",
+  "web_search",
+  "remember",
+  "forget",
+  "past_chats",
+  "propose_task",
+  "save_trip",
+]);
+
+function workLabel(step: WorkStep | undefined, t: ReturnType<typeof useT>, mode: "work" | "done"): string {
+  if (!step) return t("assistant.work.thinking");
+  const base = WORK_TOOLS.has(step.name)
+    ? t(`assistant.${mode}.${step.name}`)
+    : t(mode === "work" ? "assistant.work.thinking" : "assistant.done.default");
+  return step.detail ? `${base} · ${step.detail}` : base;
+}
+
+/**
+ * BO ARBEITET — statt nur drei Punkten (Wunsch 30.10.2026: „wie bei Claude").
+ *
+ * Ein kleiner Bo schwebt sanft, daneben steht, woran er gerade ist („Sucht
+ * Verbindungen · Köln → Berlin"), gefolgt von den Punkten; darüber die
+ * erledigten Schritte mit Haken. Man sieht nicht nur, DASS er beschäftigt ist,
+ * sondern WOMIT — und nichts davon ist erfunden: Jede Zeile ist ein Werkzeug,
+ * das gerade wirklich läuft.
+ *
+ * Alle Dauerläufer hängen am Merker der Punkte (`subscribeDotsPaused`): Über
+ * Bos Ausfahrt liegt eine GPU-Textur, die jede laufende Animation darunter in
+ * jedem Bild ungültig machen würde. Der kleine Bo selbst steht still
+ * (`paused`) — es bewegt sich nur seine Hülle, und eine verschobene Hülle
+ * zeichnet nichts neu.
+ */
+const ThinkingIndicator = memo(function ThinkingIndicator({
+  current,
+  done,
+  t,
+}: {
+  current?: WorkStep;
+  done?: WorkStep[];
+  t: ReturnType<typeof useT>;
+}) {
+  const label = workLabel(current, t, "work");
+  return (
+    <View style={styles.thinkWrap} accessibilityLiveRegion="polite" accessibilityLabel={label}>
+      {done && done.length > 0 ? <WorkSteps steps={done} t={t} /> : null}
+      <View style={styles.thinkRow}>
+        <FloatingBo />
+        <BreathingLabel text={label} />
+        <View style={styles.dotsSmall}>
+          <Dot delay={0} small />
+          <Dot delay={120} small />
+          <Dot delay={240} small />
+        </View>
+      </View>
+    </View>
+  );
+});
+
+/** Erledigte Schritte — leise, mit Haken; über der Antwort bleiben sie stehen. */
+const WorkSteps = memo(function WorkSteps({ steps, t }: { steps: WorkStep[]; t: ReturnType<typeof useT> }) {
+  return (
+    <View style={styles.workSteps}>
+      {steps.map((s, i) => (
+        <View key={`${s.name}:${i}`} style={styles.workStep}>
+          <Check size={14} color={C.textTertiary} strokeWidth={2.4} />
+          <Text style={styles.workStepText} numberOfLines={1}>
+            {workLabel(s, t, "done")}
+          </Text>
+        </View>
+      ))}
+    </View>
+  );
+});
+
+const THINK_BO = 22;
+
+/** Der kleine Bo der Arbeitsanzeige: steht still, schwebt nur als Ganzes sanft auf und ab. */
+function FloatingBo() {
+  const y = useSharedValue(0);
+  useEffect(() => {
+    const apply = (paused: boolean) => {
+      cancelAnimation(y);
+      if (paused) {
+        y.value = 0;
+        return;
+      }
+      y.value = withRepeat(
+        withSequence(
+          withTiming(-2.5, { duration: 950, easing: Easing.inOut(Easing.sin) }),
+          withTiming(0, { duration: 950, easing: Easing.inOut(Easing.sin) }),
+        ),
+        -1,
+      );
+    };
+    const off = subscribeDotsPaused(apply);
+    return () => {
+      off();
+      cancelAnimation(y);
+    };
+  }, [y]);
+  const style = useAnimatedStyle(() => ({ transform: [{ translateY: y.value }] }));
+  return (
+    <Animated.View style={[styles.thinkBo, style]}>
+      <Bo state="thinking" size={THINK_BO} paused />
+    </Animated.View>
+  );
+}
+
+/** Die Beschriftung atmet sanft — ruhiger als ein Lauflicht, und es kostet nur Deckkraft. */
+function BreathingLabel({ text }: { text: string }) {
+  const op = useSharedValue(1);
+  useEffect(() => {
+    const apply = (paused: boolean) => {
+      cancelAnimation(op);
+      if (paused) {
+        op.value = 1;
+        return;
+      }
+      op.value = withRepeat(
+        withSequence(
+          withTiming(0.5, { duration: 1100, easing: Easing.inOut(Easing.sin) }),
+          withTiming(1, { duration: 1100, easing: Easing.inOut(Easing.sin) }),
+        ),
+        -1,
+      );
+    };
+    const off = subscribeDotsPaused(apply);
+    return () => {
+      off();
+      cancelAnimation(op);
+    };
+  }, [op]);
+  const style = useAnimatedStyle(() => ({ opacity: op.value }));
+  return (
+    <Animated.Text style={[styles.thinkLabel, style]} numberOfLines={1}>
+      {text}
+    </Animated.Text>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -6965,6 +7820,33 @@ const AnimatedThread = Animated.createAnimatedComponent(
   FlatList,
 ) as unknown as React.ComponentType<ThreadProps>;
 
+const HOLD_POSITION = { minIndexForVisible: 0 } as const;
+
+/**
+ * Die Liste — und wer weiter oben liest, dem läuft nichts weg.
+ *
+ * In einer umgedrehten Liste liegt das Neueste am ANFANG des Inhalts. Kommt dort
+ * etwas dazu, rutscht alles Ältere nach: Wer eine frühere Nachricht liest, sieht
+ * sie um die Höhe der neuen Blase springen. Am unteren Ende ist genau das
+ * gewollt, dann schiebt die Antwort den Verlauf hoch. Deshalb hält die Lage nur,
+ * wer sich vom Ende entfernt hat (wie bei Claude und ChatGPT: Man liest in Ruhe,
+ * das Neue wächst unter dem Bildrand weiter).
+ *
+ * Als eigener Knoten, damit das Umschalten nur die Liste weckt und nicht den
+ * ganzen Bildschirm. Es fällt nur beim Überschreiten von `HOLD_FROM_PX` an.
+ */
+function ThreadList(props: ThreadProps) {
+  const [held, setHeld] = useState(threadHeld);
+  useEffect(() => {
+    setHeld(threadHeld);
+    threadHeldListeners.add(setHeld);
+    return () => {
+      threadHeldListeners.delete(setHeld);
+    };
+  }, []);
+  return <AnimatedThread {...props} maintainVisibleContentPosition={held ? HOLD_POSITION : undefined} />;
+}
+
 /**
  * Wo Bo schwebt — gemessen von der sicheren Fläche.
  *
@@ -7018,10 +7900,12 @@ const styles = scaledStyles({
   },
 
   // Position des Schriftzugs — 1:1 zum Landingscreen, siehe TOPBAR_TOP oben.
+  scheduledLayer: { position: "absolute", left: 0, right: 0, bottom: 0 },
+  pageHeading: { position: "absolute", left: 0, top: 0, width: 240 },
   topbar: {
     // GUTTER statt 22 — dieselbe Kante wie überall sonst.
     paddingHorizontal: GUTTER,
-    paddingBottom: 14,
+    paddingBottom: 16,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
@@ -7054,7 +7938,7 @@ const styles = scaledStyles({
     marginVertical: -(44 - MARK_H) / 2,
     marginHorizontal: -(44 - MARK_W) / 2,
   },
-  mark: { gap: 7 },
+  mark: { gap: 8 },
   markLine: {
     width: MARK_W,
     height: MARK_LINE_H,
@@ -7155,13 +8039,13 @@ const styles = scaledStyles({
     flexGrow: 1,
     justifyContent: "flex-end",
     paddingHorizontal: CHAT_EDGE,
-    gap: 10,
+    gap: ITEM_GAP,
   },
 
   bubble: {
     maxWidth: "82%",
-    paddingVertical: 11,
-    paddingHorizontal: 15,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
     borderRadius: 24,
   },
   botBubble: {
@@ -7181,24 +8065,34 @@ const styles = scaledStyles({
   userText: { fontSize: 15, lineHeight: 21, fontWeight: "500" },
   boldAccent: { fontWeight: "700" },
 
-  errRow: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 3 },
+  errRow: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 4 },
   errTitle: { color: C.error, fontWeight: "600", fontSize: 15 },
   retry: {
-    marginTop: 10,
+    marginTop: 8,
     alignSelf: "flex-start",
     flexDirection: "row",
     alignItems: "center",
-    gap: 7,
+    gap: 8,
     backgroundColor: C.surface4,
     paddingVertical: 8,
-    paddingHorizontal: 14,
+    paddingHorizontal: 16,
     borderRadius: 9999,
   },
   retryText: { color: C.white, fontWeight: "600", fontSize: 13 },
 
-  typing: { paddingVertical: 14, paddingHorizontal: 16 },
-  dots: { flexDirection: "row", gap: 6 },
+  typing: { paddingVertical: 16, paddingHorizontal: 16 },
+  dots: { flexDirection: "row", gap: 8 },
   dot: { width: 8, height: 8, borderRadius: 4, backgroundColor: C.textTertiary },
+  dotSmall: { width: 5, height: 5, borderRadius: 2.5, backgroundColor: C.textTertiary },
+  // Bo arbeitet — ohne Blase, wie bei Claude: Figur, Wort, Punkte.
+  thinkWrap: { alignSelf: "flex-start", gap: 8, paddingVertical: 8, paddingLeft: 4, maxWidth: "92%" },
+  thinkRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  thinkBo: { width: THINK_BO, height: THINK_BO * 1.25, alignItems: "center" },
+  thinkLabel: { flexShrink: 1, fontSize: 14.5, fontWeight: "500", color: "#C8C8CC" },
+  dotsSmall: { flexDirection: "row", gap: 4, paddingTop: 4 },
+  workSteps: { gap: 4, paddingLeft: 4 },
+  workStep: { flexDirection: "row", alignItems: "center", gap: 8 },
+  workStepText: { flexShrink: 1, fontSize: 13, color: C.textTertiary },
 
   // Bot-Message-Wrap: Container für Text-Bubble + optionale ResultCard.
   // Beide stacken vertikal mit kleinem gap. Wrap selber ist full-width damit
@@ -7206,15 +8100,45 @@ const styles = scaledStyles({
   botMessageWrap: { gap: 8, alignSelf: "stretch" },
   // ResultCard wird full-width gerendert, mit kleiner Ränder-Korrektur damit
   // sie nicht ganz an den Bildschirmrand stößt (Thread hat paddingHorizontal:16).
-  flightWrap: { marginTop: 2 },
+  flightWrap: { marginTop: 4 },
+  // Quellen einer Websuche — unter der Antwort, leiser als sie.
+  sourcesWrap: { alignSelf: "stretch", gap: 8, marginTop: -2 },
+  sourcesLabel: {
+    color: C.textTertiary,
+    fontSize: 11,
+    fontWeight: "600",
+    letterSpacing: 0.4,
+    textTransform: "uppercase",
+    marginLeft: 4,
+  },
+  sourcesList: { flexDirection: "row", flexWrap: "wrap", gap: ITEM_GAP },
+  sourceChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    maxWidth: "100%",
+    paddingVertical: 8,
+    paddingHorizontal: 8,
+    borderRadius: 9999,
+    backgroundColor: C.surface2,
+    borderWidth: 1,
+    borderColor: C.border,
+    overflow: "hidden",
+  },
+  sourceIndex: { color: C.textTertiary, fontSize: 11, fontWeight: "700" },
+  sourceTitle: { color: C.white, fontSize: 12.5, flexShrink: 1, maxWidth: 230 },
+  // „Gemerkt: …" — Bos Gedächtnis, ein Vermerk statt einer Blase.
+  noteRow: { flexDirection: "row", alignItems: "flex-start", gap: 8, marginLeft: 4, maxWidth: "90%" },
+  noteText: { color: C.textTertiary, fontSize: 12.5, lineHeight: 17, flexShrink: 1 },
+  noteLabel: { fontWeight: "600" },
   // „Alle Treffer anzeigen"-Button — spiegelt den Home-CTA-Style:
   // RippleTouch + GradientFill (Akzent-Gradient) + Bold-Schwarz-Text.
   // overflow:hidden ist nötig damit der GradientFill von borderRadius
   // beschnitten wird (sonst quillt der Gradient an den Pill-Enden raus).
   resultsButton: {
     alignSelf: "flex-start",
-    paddingVertical: 13,
-    paddingHorizontal: 22,
+    paddingVertical: 12,
+    paddingHorizontal: 24,
     borderRadius: 9999,
     overflow: "hidden",
     alignItems: "center",
@@ -7234,19 +8158,6 @@ const styles = scaledStyles({
    * Halbdurchsichtiger Kasten über der Eingabezeile. Seitenabstand ist
    * `CHAT_EDGE` — dieselbe Kante wie die Nachrichten und die Eingabezeile.
    */
-  /**
-   * Nur die LAGE — Fläche, Kante und Innenabstand stehen in `MicBox`.
-   *
-   * Die Höhe steht bewusst nicht hier, sondern am Element: Dieses Stilblatt
-   * läuft durch `scaledStyles`, und `MIC_BOX_H` ist bereits aus der echten
-   * Fensterhöhe gerechnet. Hier bekäme es den Faktor ein zweites Mal — aus
-   * einem Viertel würde auf einem kurzen Gerät ein Fünftel.
-   */
-  micBox: {
-    position: "absolute",
-    left: CHAT_EDGE,
-    right: CHAT_EDGE,
-  },
   inputbarWrap: {
     position: "absolute",
     left: 0,
@@ -7271,23 +8182,23 @@ const styles = scaledStyles({
     bottom: "100%",
     alignItems: "center",
     paddingHorizontal: CHAT_EDGE,
-    paddingBottom: 6,
+    paddingBottom: 8,
   },
   voiceStatusText: {
     color: C.textDim,
     fontSize: 12,
     fontWeight: "600",
     paddingHorizontal: 12,
-    paddingVertical: 5,
+    paddingVertical: 4,
     borderRadius: 9999,
     overflow: "hidden",
   },
   inputbar: {
     flexDirection: "row",
     alignItems: "flex-end",
-    gap: 10,
+    gap: 8,
     paddingHorizontal: CHAT_EDGE,
-    paddingTop: 10,
+    paddingTop: 8,
     borderTopWidth: 1,
     borderTopColor: C.border,
     backgroundColor: "#0D0D0D",

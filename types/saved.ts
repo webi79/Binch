@@ -61,6 +61,8 @@ export interface PriceAlert {
   passengers: number;
   /** i18n-Schlüssel der Klasse, oder leer. */
   travelClass: string;
+  /** Tarifprofil (BahnCard, Deutschlandticket), unter dem er angelegt wurde. Fehlt = ohne. */
+  fareProfile?: string;
   currency: string;
   basePrice: number;
   desiredPrice: number;

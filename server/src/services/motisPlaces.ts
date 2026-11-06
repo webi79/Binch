@@ -10,6 +10,7 @@ import {
   motisGeocodeStopSimilar,
   motisGeocodeNearestStop,
   motisReverseGeocodeStop,
+  motisSameNameStops,
   type MotisPlace,
 } from "./motisClient.js";
 
@@ -90,10 +91,11 @@ async function discoverRailStopId(seedStopId: string, signal?: AbortSignal): Pro
   }
 
   const counts = new Map<string, number>();
+  const childOf = new Map<string, string>();
   for (const st of raw.stopTimes ?? []) {
     if (!st.mode || !RAIL_MODES.has(st.mode)) continue;
     const id = st.place?.stopId;
-    if (!id || /reference-data/i.test(id)) continue;
+    if (!id || isReferenceFeedId(id)) continue;
 
     // "<feed>_<dhid>" → Eltern-Knoten = Feed + die ersten drei DHID-Segmente
     // (de:AGS:Halt bzw. at:Region:Halt). Die weiteren Segmente sind
@@ -114,17 +116,28 @@ async function discoverRailStopId(seedStopId: string, signal?: AbortSignal): Pro
 
     const base = `${feed}_${trimmed.join(":")}`;
     counts.set(base, (counts.get(base) ?? 0) + 1);
+    if (!childOf.has(base)) childOf.set(base, id);
   }
 
-  let best: string | null = null;
-  let bestCount = 0;
-  for (const [id, n] of counts) {
-    if (n > bestCount) {
-      bestCount = n;
-      best = id;
-    }
+  // Den gekürzten Eltern-Knoten gibt es nicht in jedem Feed: Berlin Hbf ergab
+  // `de-VBB_de:11000:900003200` — MOTIS kennt ihn nicht (404), Tafel und Suche
+  // liefen ins Leere. Also nachsehen; sonst der nächste Feed, zuletzt der Steig
+  // selbst (seine stopTimes umfassen die ganze Station).
+  const ranked = [...counts].sort((a, b) => b[1] - a[1]).map(([id]) => id);
+  for (const id of ranked.slice(0, 2)) {
+    if (await motisStopExists(id, signal)) return id;
   }
-  return best;
+  return ranked[0] ? childOf.get(ranked[0]) ?? null : null;
+}
+
+/** Kennt MOTIS diese Halt-ID? (`/stoptimes` antwortet sonst mit 404.) */
+async function motisStopExists(id: string, signal?: AbortSignal): Promise<boolean> {
+  try {
+    await motisFetch(`/v6/stoptimes?stopId=${encodeURIComponent(id)}&n=1`, signal);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Fallback-Auflösung der Tafel-Stop-IDs — inkl. negativem Ergebnis (null),
@@ -171,7 +184,7 @@ export async function resolveMotisStopId(
   let hit: MotisPlace | null = null;
   try {
     if (lat != null && lon != null) {
-      hit = await motisReverseGeocodeStop(lat, lon, undefined, signal);
+      hit = await motisReverseGeocodeStop(lat, lon, undefined, signal, name);
       if (!hit && name) hit = await motisGeocodeStopNear(name, lat, lon, signal);
     } else if (name) {
       // Ohne Koordinate (kuratierte Stadt-Codes): wenigstens Namens-Guard —
@@ -186,6 +199,30 @@ export async function resolveMotisStopId(
   }
   stopIdCache.set(code, hit);
   return hit;
+}
+
+/**
+ * Weitere MOTIS-Halte für die Tafel eines Codes: gleichnamige an unserer
+ * Koordinate, ohne `exclude` (den schon versuchten). Für den Fall, dass der
+ * aufgelöste Halt keine einzige Abfahrt liefert — siehe `getMotisStopBoard`.
+ */
+export async function motisBoardAlternatives(
+  code: string,
+  label: string,
+  exclude: string,
+  signal?: AbortSignal,
+): Promise<MotisPlace[]> {
+  const row = await db
+    .select({ lat: locations.latitude, lng: locations.longitude, label: locations.label })
+    .from(locations)
+    .where(eq(locations.code, code))
+    .limit(1)
+    .catch(() => []);
+  const lat = row[0]?.lat != null ? Number(row[0].lat) : NaN;
+  const lng = row[0]?.lng != null ? Number(row[0].lng) : NaN;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return [];
+  const hits = await motisSameNameStops(row[0]?.label ?? label, lat, lng, 400, signal);
+  return hits.filter((h) => h.id !== exclude);
 }
 
 export async function resolveMotisPlace(

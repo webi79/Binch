@@ -49,10 +49,10 @@ const SLIDE_DURATION = 420;
 const ENTER_EASE = Easing.out(Easing.cubic);
 const EXIT_EASE = Easing.in(Easing.cubic);
 /** Nach dem Loslassen eines Wischs, der nicht weit genug war: so lange steht sie noch. */
-const RESUME_HOLD_MS = 1600;
+export const RESUME_HOLD_MS = 1600;
 /** Ab so viel Weg (dp) oder Tempo (dp/s) zum Rand hin gilt ein Wisch als „weg". */
-const SWIPE_DISTANCE = 28;
-const SWIPE_VELOCITY = 500;
+export const SWIPE_DISTANCE = 28;
+export const SWIPE_VELOCITY = 500;
 const RING_DURATION = 420;
 const CHECK_DURATION = 280;
 const CHECK_LEN = 26;
@@ -303,14 +303,14 @@ const styles = scaledStyles({
   toast: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 14,
+    gap: 16,
     backgroundColor: SURFACE,
     borderColor: BORDER,
     borderWidth: 1,
     borderRadius: 24,
-    paddingVertical: 14,
-    paddingLeft: 14,
-    paddingRight: 18,
+    paddingVertical: 16,
+    paddingLeft: 16,
+    paddingRight: 16,
     shadowColor: "#000",
     shadowOpacity: 0.55,
     shadowRadius: 24,
@@ -351,7 +351,7 @@ const styles = scaledStyles({
     color: TEXT_TERTIARY,
     fontSize: 14,
     fontWeight: "600",
-    marginTop: 2,
+    marginTop: 4,
   },
   cta: {
     color: TEXT_PRIMARY,

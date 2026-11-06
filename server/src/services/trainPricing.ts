@@ -7,6 +7,7 @@ import { locations } from "../db/schema.js";
 import { BoundedTtlCache } from "../util/boundedCache.js";
 import { effectiveDurationMinutes, journeyWarningFromLegs, markAtRiskTransfer } from "../util/journeyTimeline.js";
 import type { JourneyWarning, LegInfo, NormalizedResult, StopoverInfo } from "../providers/types.js";
+import { dbVendoFareParams, parseFareProfile } from "../util/fareProfile.js";
 
 /**
  * Zug-Preis-Enrichment + Direkt-Buchungslink über int.bahn.de (dbweb-Profil,
@@ -121,9 +122,12 @@ async function fetchDbwebJourneys(
   fromEva: string,
   toEva: string,
   departure: string,
+  fare: Record<string, string>,
 ): Promise<DbwebJourney[]> {
   const bucket = Math.floor(Date.parse(departure) / (10 * 60_000));
-  const key = `${fromEva}|${toEva}|${bucket}`;
+  // Klasse und Tarif gehören in den Schlüssel — ein BahnCard-Preis gehört nur dem mit BahnCard.
+  const fareKey = new URLSearchParams(fare).toString();
+  const key = `${fromEva}|${toEva}|${bucket}|${fareKey}`;
   const cached = journeyCache.get(key);
   if (cached) return cached;
 
@@ -148,7 +152,16 @@ async function fetchDbwebJourneys(
     `&stopovers=true` +
     // `language=de` wie in der Suche (dbVendo.ts): Mit der Vorgabe „en" sperrt
     // Akamai Teile von int.bahn.de (403 OPS_BLOCKED, siehe routes/trips.ts).
-    `&language=de`;
+    `&language=de` +
+    /**
+     * DIESELBE Klasse und derselbe Tarif wie die Suche (util/fareProfile.ts).
+     *
+     * Fehlte bis 28.10.2026: Was die Suche ohne Preis zurückbrachte — MOTIS-
+     * Treffer, und mit BahnCard 100/GA fast alles, weil die DB für abgedeckte
+     * Fahrten keinen Preis nennt —, bekam hier den VOLLEN Preis der 2. Klasse
+     * nachgetragen. Mit Karte gibt es jetzt den Kartenpreis oder keinen.
+     */
+    (fareKey ? `&${fareKey}` : "");
   /**
    * Mit Zeitgrenze: Ohne sie gilt undicis Vorgabe von 300 s — und diese
    * Anfrage läuft im Auffrischen einer Zugsuche, das die Warteschlange
@@ -373,7 +386,14 @@ function trainAnchors(r: NormalizedResult): { dep: string; arr: string } {
  */
 export async function enrichTrainResults(
   results: NormalizedResult[],
-  input: { origin: string; destination: string; departDate: string; passengers?: number },
+  input: {
+    origin: string;
+    destination: string;
+    departDate: string;
+    passengers?: number;
+    travelClass?: string;
+    fareProfile?: string;
+  },
 ): Promise<void> {
   if (results.length === 0) return;
   const [fromEva, toEva] = await Promise.all([evaFor(input.origin), evaFor(input.destination)]);
@@ -398,7 +418,12 @@ export async function enrichTrainResults(
 
   let journeys: DbwebJourney[];
   try {
-    journeys = await fetchDbwebJourneys(fromEva, toEva, anchor);
+    journeys = await fetchDbwebJourneys(
+      fromEva,
+      toEva,
+      anchor,
+      dbVendoFareParams(parseFareProfile(input.fareProfile), input.travelClass === "search.class.first"),
+    );
   } catch {
     return; // int.bahn.de gedrosselt/aus → MOTIS-Route/Kein-Preis bleiben
   }

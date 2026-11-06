@@ -331,11 +331,11 @@ const styles = scaledStyles({
    * auseinanderlaufen; die Trennlinie bringt ihren eigenen Abstand mit, genau
    * wie dort.
    */
-  card: { borderRadius: 20, paddingVertical: 14, paddingHorizontal: 16 },
+  card: { borderRadius: 20, paddingVertical: 16, paddingHorizontal: 16 },
   head: { flexDirection: "row", alignItems: "flex-start", gap: SPACE.md },
   headText: { flex: 1, minWidth: 0 },
   route: { fontSize: 17, fontWeight: "700", color: C.text, lineHeight: 23 },
-  meta: { fontSize: 14, fontWeight: "500", color: C.sub, marginTop: SPACE.xs + 2 },
+  meta: { fontSize: 14, fontWeight: "500", color: C.sub, marginTop: SPACE.sm },
   /**
    * Das runde Feld ist so hoch wie die Titelzeile und liegt deshalb auf DEREN
    * Höhe, nicht auf der Mitte des ganzen Kopfes: Bei zwei Zeilen Strecke bliebe
@@ -357,7 +357,7 @@ const styles = scaledStyles({
     marginTop: -2,
   },
   /** Zeichen für Zeichen die Linie der Reisekarte. */
-  divider: { height: 1, backgroundColor: "#212123", marginVertical: 14 },
+  divider: { height: 1, backgroundColor: "#212123", marginVertical: 16 },
   switchRow: { flexDirection: "row", alignItems: "center", gap: SPACE.md },
   /**
    * Dieselbe Fläche wie das Feld des Herzens (`rgba(255,255,255,0.08)`), nur

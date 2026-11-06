@@ -1,4 +1,5 @@
 import { useCallback, useRef, useState } from "react";
+import { GROUP_GAP } from "@/lib/theme/spacing";
 import { StyleSheet, Text, View } from "react-native";
 import { Minus, Plus } from "lucide-react-native";
 import { SheetModal, SHEET_SUBTITLE, SHEET_TITLE } from "@/components/ui/SheetModal";
@@ -374,14 +375,14 @@ const styles = scaledStyles({
   row: {
     borderRadius: 16,
     paddingVertical: 12,
-    paddingHorizontal: 14,
+    paddingHorizontal: 16,
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
   },
   rowText: { flex: 1, minWidth: 0 },
   rowLabel: { fontSize: 15, fontWeight: "600", color: "#F4F4F5" },
-  rowHint: { fontSize: 12, color: "#8E8E93", marginTop: 2 },
+  rowHint: { fontSize: 12, color: "#8E8E93", marginTop: 4 },
 
   stepper: { flexDirection: "row", alignItems: "center", gap: 12 },
   stepBtn: {
@@ -396,15 +397,15 @@ const styles = scaledStyles({
   /** Feste Breite — sonst wandern die Knöpfe, sobald aus 9 eine 10 würde. */
   count: { fontSize: 17, fontWeight: "700", color: "#F4F4F5", minWidth: 18, textAlign: "center" },
 
-  limit: { fontSize: 12, color: "#8E8E93", marginTop: 10, lineHeight: 16, minHeight: 16 },
+  limit: { fontSize: 12, color: "#8E8E93", marginTop: 8, lineHeight: 16, minHeight: 16 },
 
   optRow: {
     borderRadius: 16,
     minHeight: 54,
-    paddingHorizontal: 14,
+    paddingHorizontal: 16,
     flexDirection: "row",
     alignItems: "center",
-    gap: 14,
+    gap: 16,
     // Unsichtbar reserviert — der ausgewählte Zustand darf die Höhe nicht
     // verändern, sonst springt die Liste beim Umschalten.
     borderWidth: 1,
@@ -421,10 +422,10 @@ const styles = scaledStyles({
   radioDot: { width: 10, height: 10, borderRadius: 5 },
   optLabel: { flex: 1, fontSize: 15, fontWeight: "600", color: "#F4F4F5" },
 
-  footer: { flexDirection: "row", gap: 10, marginTop: 14 },
+  footer: { flexDirection: "row", gap: 8, marginTop: GROUP_GAP },
   reset: {
     height: 50,
-    paddingHorizontal: 22,
+    paddingHorizontal: 24,
     borderRadius: 16,
     alignItems: "center",
     justifyContent: "center",

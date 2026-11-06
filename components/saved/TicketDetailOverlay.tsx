@@ -6,6 +6,7 @@
  * gemountet, ähnlich zum DetailsOverlay-Pattern.
  */
 import { useCallback, useEffect, useRef, useState, useMemo } from "react";
+import { TITLE_GAP, SECTION_GAP } from "@/lib/theme/spacing";
 import {
   View,
   Text,
@@ -48,6 +49,7 @@ import { holdLayer, layerGeneration, rearmLayer, releaseLayer } from "@/lib/nav/
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { TicketHead, Perforation, bookingRefFor } from "./TicketParts";
 import { scaledStyles } from "@/lib/ui/compact";
+import { slideTiming } from "@/lib/nav/slideMotion";
 
 const C = {
   bg: "#0D0D0D",
@@ -199,7 +201,7 @@ function TicketDetailSheet({
      * nennt dieses Blatt dort namentlich; hier fehlte er noch.
      */
     const raf = requestAnimationFrame(() => {
-      ticketPush.value = withTiming(0, POP_SPRING, (finished?: boolean) => {
+      ticketPush.value = withTiming(0, slideTiming(POP_SPRING), (finished?: boolean) => {
         "worklet";
         if (!finished) return;
         runOnJS(setMoving)(false);
@@ -211,7 +213,7 @@ function TicketDetailSheet({
       // beide gehören zusammen, ein Versatz wäre an der Kante zu sehen.
       if (ownsCoverRef.current) {
         ownsCoverRef.current = false;
-        overlayCover.value = withTiming(0, COVER_OUT_SPRING);
+        overlayCover.value = withTiming(0, slideTiming(COVER_OUT_SPRING));
       }
     });
     return () => cancelAnimationFrame(raf);
@@ -474,8 +476,8 @@ const styles = scaledStyles({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingHorizontal: 18,
-    paddingTop: 6,
+    paddingHorizontal: 16,
+    paddingTop: 8,
     paddingBottom: 4,
   },
   roundBtn: {
@@ -499,7 +501,7 @@ const styles = scaledStyles({
     color: C.white,
     letterSpacing: -0.4,
     paddingTop: 12,
-    paddingBottom: 16,
+    paddingBottom: TITLE_GAP,
   },
 
   card: {
@@ -509,13 +511,13 @@ const styles = scaledStyles({
     overflow: "hidden",
   },
 
-  stub: { paddingHorizontal: 18, paddingTop: 20, paddingBottom: 18 },
+  stub: { paddingHorizontal: 16, paddingTop: 20, paddingBottom: 16 },
   codePanel: {
     backgroundColor: C.codeBg,
     borderRadius: 16,
     paddingHorizontal: 16,
     paddingTop: 16,
-    paddingBottom: 14,
+    paddingBottom: 16,
   },
   codeLabel: {
     textAlign: "center",
@@ -530,8 +532,8 @@ const styles = scaledStyles({
     borderColor: "#2D2D31",
     borderStyle: "dashed",
     borderRadius: 16,
-    paddingHorizontal: 18,
-    paddingVertical: 22,
+    paddingHorizontal: 16,
+    paddingVertical: 24,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -546,7 +548,7 @@ const styles = scaledStyles({
     textAlign: "center",
     fontSize: 11,
     color: C.gray300,
-    marginTop: 14,
+    marginTop: 16,
     lineHeight: 16,
     paddingHorizontal: 8,
   },
@@ -554,13 +556,13 @@ const styles = scaledStyles({
   pdfBtn: {
     marginHorizontal: 16,
     marginTop: 16,
-    marginBottom: 6,
+    marginBottom: 8,
     borderRadius: 9999,
     paddingVertical: 16,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    gap: 9,
+    gap: 8,
     overflow: "hidden",
   },
   pdfBtnText: {
@@ -578,21 +580,21 @@ const styles = scaledStyles({
 
   previewWrap: {
     marginHorizontal: 16,
-    marginTop: 20,
+    marginTop: SECTION_GAP,
   },
   previewLabel: {
     fontSize: 11,
     color: C.gray300,
     letterSpacing: 0.6,
     fontWeight: "700",
-    marginBottom: 8,
+    marginBottom: TITLE_GAP,
     paddingHorizontal: 4,
   },
   previewBox: {
     backgroundColor: C.surface,
     borderRadius: 18,
     overflow: "hidden",
-    padding: 10,
+    padding: 8,
   },
 
   pdfRoot: { flex: 1, backgroundColor: C.black },

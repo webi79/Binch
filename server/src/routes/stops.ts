@@ -3,8 +3,8 @@ import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { locations } from "../db/schema.js";
-import { getStopBoard, resolveHafasByCoord, type StopBoardResponse, type StopBoard } from "../services/stopInfoService.js";
-import { profileForStop, isAtRegionalProfile, type HafasProfileKey } from "../services/countryProfile.js";
+import { getStopBoard, productToKind, resolveHafasByCoord, type StopBoardResponse, type StopBoard } from "../services/stopInfoService.js";
+import { profileForStop, isAtRegionalProfile, isAtVerbundProfile, type HafasProfileKey } from "../services/countryProfile.js";
 import { getFlightBoard } from "../services/flightInfoService.js";
 import { getScheduledStopBoard } from "../services/gtfsSchedule.js";
 import { getMotisStandBoard, getMotisStopBoard } from "../services/motisStops.js";
@@ -130,29 +130,6 @@ function isSingleStand(stop: { parentCode: string | null; subtype: string | null
   if (!stop.parentCode) return false;
   if (stop.subtype) return stop.subtype === "BUS" || stop.subtype === "COACH" || stop.subtype === "TRAM";
   return stop.type === "BUS";
-}
-
-/** Mappt ein HAFAS-Product (z.B. „regional", „tram", „bus", „suburban") auf
- *  unsere Frontend-Kind-Kategorie. Wenn das Product nicht erkannt wird (z.B.
- *  ""/null/unbekannter String): null → wir lassen's durch, lieber zu inklusiv
- *  als verloren. */
-function productToKind(product: string): string | null {
-  const p = product.toLowerCase();
-  if (p === "tram") return "tram";
-  if (p === "subway" || p === "metro" || p === "underground") return "subway";
-  if (p === "bus") return "bus";
-  if (p === "ferry") return "ferry";
-  if (
-    p === "nationalexpress" ||
-    p === "national" ||
-    p === "regionalexpress" ||
-    p === "regional" ||
-    p === "regionalbahn" ||
-    p === "suburban" ||
-    p === "express"
-  )
-    return "train";
-  return null;
 }
 
 /**
@@ -457,12 +434,36 @@ async function boardForStop(
     }
   }
 
-  const resolvedId = await resolveStopHafasId(stop, profile);
-  if (!resolvedId) {
-    return motisFallback(stop.label, code, stop.hafasId, board, stop);
+  // Bahnhöfe mit ÖBB-Nummer (81…) gleich über ÖBB, wie in Wien: Die Verbund-
+  // Profile kennen die Nummer nicht und lösen über unsere Lage auf — die liegt
+  // bei manchem Bahnhof daneben (Graz Hbf 530 m), die Tafel kam dann vom Halt
+  // nebenan (4 Abfahrten in 80 Minuten).
+  const first = isAtVerbundProfile(profile) && /^81\d{5}$/.test(stop.hafasId ?? "") ? "oebb" : profile;
+  const hafas = await hafasBoard(code, stop, board, first, log);
+  if (hafas) return hafas;
+  // Ein Verbund-Endpunkt liefert nichts (VVT und SVV fielen im Oktober 2026
+  // ganz aus, jede Tafel dort blieb leer) → ÖBB, das ganz Österreich samt Bus
+  // und Tram kennt, erst danach MOTIS.
+  if (first !== "oebb" && isAtVerbundProfile(profile)) {
+    const oebb = await hafasBoard(code, stop, board, "oebb", log);
+    if (oebb) return oebb;
   }
+  // dbrest/HAFAS lieferte nichts (z.B. DB-OPS_BLOCK) → MOTIS-Fallback.
+  return motisFallback(stop.label, code, stop.hafasId, board, stop);
+}
+
+/** Die Tafel über ein HAFAS-Profil — null, wenn es den Halt nicht findet, scheitert oder nach dem Filter nichts bleibt. */
+async function hafasBoard(
+  code: string,
+  stop: NonNullable<Awaited<ReturnType<typeof loadStopRow>>>,
+  board: StopBoard,
+  profile: HafasProfileKey,
+  log?: { warn: (obj: unknown, msg: string) => void },
+): Promise<StopBoardApiResponse | null> {
+  const resolvedId = await resolveStopHafasId(stop, profile);
+  if (!resolvedId) return null;
   try {
-    const data = await getStopBoard(resolvedId, board, profile);
+    const data = await getStopBoard(resolvedId, board, profile, { kinds: (stop.kinds ?? null) as string[] | null });
     // Product-Filter passend zum Stop-Typ.
     // HAFAS-Stops aggregieren oft mehrere Verkehrsmittel pro ID — z.B. der
     // Bus-Stop „Westtünnen Bahnhof" liefert RB89-Train-Departures vom
@@ -475,20 +476,17 @@ async function boardForStop(
     // zeigen die zu DIESEM Stop-Eintrag passen — bei einer reinen Tram-
     // Station (kinds=["tram"]) keine Busse.
     const results = filterToStopKinds(data.results, stop);
-    // dbrest/HAFAS lieferte nichts (z.B. DB-OPS_BLOCK) → MOTIS-Fallback.
-    if (results.length === 0) {
-      return motisFallback(stop.label, code, stop.hafasId, board, stop);
-    }
+    if (results.length === 0) return null;
     return {
       ...data,
       results,
       stop: { code: code, label: stop.label, hafasId: resolvedId },
     } satisfies StopBoardApiResponse;
   } catch (err) {
-    log?.warn({ err, code: code }, `${board} upstream failed → MOTIS-Fallback`);
-    return motisFallback(stop.label, code, stop.hafasId, board, stop);
+    log?.warn({ err, code: code }, `${board} upstream failed (${profile})`);
+    return null;
   }
-  }
+}
 
 export async function stopsRoutes(app: FastifyInstance) {
   // Abfahrtstafeln: db-vendo/MOTIS — das DB-60/min-Kontingent hängt hier dran.

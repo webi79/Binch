@@ -36,9 +36,10 @@ export interface ChatMessageRow {
   role: "user" | "assistant";
   /**
    * Was in der Blase steckt. `text` trägt `content`, alles andere `payload` —
-   * ein Suchergebnis, eine Abfahrtstafel, eine ausgeführte Aktion.
+   * ein Suchergebnis, eine Abfahrtstafel, eine ausgeführte Aktion, die Quellen
+   * einer Websuche oder ein Vermerk aus Bos Gedächtnis.
    */
-  kind: "text" | "result" | "board" | "action";
+  kind: "text" | "result" | "board" | "action" | "sources" | "note" | "task";
   content: string | null;
   payload: Record<string, unknown> | null;
   /** Laufende Nummer INNERHALB der Unterhaltung — der Anker fürs Nachladen. */
@@ -156,12 +157,13 @@ async function request<T>(
   path: string,
   init: RequestInit,
   params?: Record<string, string | number | undefined>,
+  timeoutMs = TIMEOUT_MS,
 ): Promise<T> {
   const url = buildUrl(path, params);
   const token = await resolveAuthToken();
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   let res: Response;
   try {
     res = await fetch(url, {
@@ -295,4 +297,168 @@ function patchChatThread(
     `/api/chat/conversations/${encodeURIComponent(id)}`,
     { method: "PATCH", body: JSON.stringify(body) },
   ).then(() => undefined);
+}
+
+// ---------------------------------------------------------------------------
+// Bos Gedächtnis — was er sich über dieses Konto merkt (Profil → Einstellungen → Bo)
+// ---------------------------------------------------------------------------
+
+export interface BoMemoryEntry {
+  id: number;
+  content: string;
+  updatedAt: string;
+}
+
+export interface BoMemoryState {
+  /** Darf Bo sich etwas merken? Aus = er liest und schreibt nichts; Einträge bleiben. */
+  enabled: boolean;
+  items: BoMemoryEntry[];
+}
+
+/** Je Konto — derselbe Grund wie bei `chatThreadsKeyFor`. */
+export function boMemoryKeyFor(userId: string | null) {
+  return ["boMemory", userId ?? "anon"] as const;
+}
+
+export function fetchBoMemory(): Promise<BoMemoryState> {
+  return request<BoMemoryState>("/api/chat/memory", { method: "GET" }).then((r) => ({
+    enabled: r?.enabled ?? true,
+    items: r?.items ?? [],
+  }));
+}
+
+export function setBoMemoryEnabled(enabled: boolean): Promise<{ enabled: boolean }> {
+  return request<{ enabled: boolean }>("/api/chat/memory", {
+    method: "PATCH",
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export function deleteBoMemoryEntry(id: number): Promise<void> {
+  return request<void>(`/api/chat/memory/${encodeURIComponent(String(id))}`, { method: "DELETE" });
+}
+
+export function clearBoMemory(): Promise<void> {
+  return request<void>("/api/chat/memory", { method: "DELETE" });
+}
+
+/* ─────────────────────── Geplante Aufgaben ─────────────────────── */
+
+/**
+ * Bos geplante Aufgaben (server/src/routes/boTasks.ts) — „Geplant" in der
+ * Seitenleiste. Bisher eine Art: die Lage auf einer Strecke zu einer Uhrzeit,
+ * auf Wunsch mit Wache bis `watchUntil`.
+ */
+export type BoTaskNotify = "always" | "issues";
+export type BoTaskStatus = "ok" | "issue" | "unknown";
+
+/** Bos Vorschlag im Chat (Ereignis `task_proposal`) — angelegt erst mit „Anlegen". */
+export interface TaskProposal {
+  kind: "route_status";
+  title: string;
+  origin: string;
+  destination: string;
+  originLabel: string;
+  destLabel: string;
+  /** Wochentage als Bitmaske, Mo = 1 … So = 64. */
+  days: number;
+  time: string;
+  watchUntil: string | null;
+  notify: BoTaskNotify;
+}
+
+export interface BoTask extends TaskProposal {
+  id: string;
+  timezone: string;
+  active: boolean;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  lastStatus: BoTaskStatus | null;
+  lastSummary: string | null;
+  conversationId: string | null;
+  createdAt: string;
+}
+
+export interface BoTaskRun {
+  id: string;
+  ranAt: string;
+  trigger: "schedule" | "watch" | "manual";
+  status: BoTaskStatus;
+  title: string;
+  body: string;
+  facts: {
+    checkedAt?: string;
+    source?: "db" | "motis" | null;
+    reason?: string | null;
+    trips?: BoTaskTrip[];
+  } | null;
+  pushed: boolean;
+}
+
+/** Eine geprüfte Fahrt, wie der Server sie bewertet hat (`TripFact` in services/boTasks.ts). */
+export interface BoTaskTrip {
+  line: string;
+  /** Geplante Abfahrt, UTC-ISO. */
+  depart: string;
+  arrive: string;
+  platform?: string;
+  /** Gleiswechsel: das neue Gleis. */
+  platformRt?: string;
+  delay?: number;
+  /** Echtzeit liegt vor, auch bei 0 Minuten — fehlt bei Läufen vor dieser Angabe. */
+  realtime?: boolean;
+  cancelled: boolean;
+  atRisk: boolean;
+}
+
+export function boTasksKeyFor(userId: string | null) {
+  return ["boTasks", userId ?? "anon"] as const;
+}
+
+export function boTaskRunsKeyFor(taskId: string) {
+  return ["boTaskRuns", taskId] as const;
+}
+
+export function fetchBoTasks(): Promise<{ tasks: BoTask[]; limit: number }> {
+  return request("/api/bo/tasks", { method: "GET" });
+}
+
+export function createBoTask(
+  proposal: TaskProposal,
+  extra: { timezone: string; locale: string; conversationId: string | null },
+): Promise<{ task: BoTask }> {
+  return request("/api/bo/tasks", { method: "POST", body: JSON.stringify({ ...proposal, ...extra }) });
+}
+
+export function updateBoTask(
+  id: string,
+  patch: Partial<
+    Pick<BoTask, "active" | "notify" | "time" | "days" | "watchUntil" | "title" | "origin" | "destination" | "originLabel" | "destLabel">
+  >,
+): Promise<{ task: BoTask }> {
+  return request(`/api/bo/tasks/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(patch) });
+}
+
+export function deleteBoTask(id: string): Promise<void> {
+  return request(`/api/bo/tasks/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+/** „Jetzt prüfen" — wirft bei 429 (einmal je Minute). */
+/**
+ * Mit eigener Frist: Der Server fragt die Strecke bei zwei Quellen nacheinander
+ * (je bis 20 s). Die üblichen 10 s brachen ab, während die Prüfung drüben
+ * weiterlief — die App meldete einen Fehler für ein Ergebnis, das danach im
+ * Verlauf stand.
+ */
+export function runBoTask(id: string): Promise<{ run: BoTaskRun }> {
+  return request(`/api/bo/tasks/${encodeURIComponent(id)}/run`, { method: "POST" }, undefined, 45_000);
+}
+
+export function fetchBoTaskRuns(id: string): Promise<{ runs: BoTaskRun[] }> {
+  return request(`/api/bo/tasks/${encodeURIComponent(id)}/runs`, { method: "GET" });
+}
+
+/** Ist ein Fehler die Obergrenze (409 „limit")? */
+export function isTaskLimitError(err: unknown): boolean {
+  return err instanceof Error && err.message === "limit";
 }

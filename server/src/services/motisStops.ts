@@ -1,6 +1,7 @@
 import { motisFetch } from "./motisClient.js";
 import { cleanPlatform } from "../util/platform.js";
-import { resolveMotisStopId } from "./motisPlaces.js";
+import { motisBoardAlternatives, resolveMotisStopId } from "./motisPlaces.js";
+import type { MotisPlace } from "./motisClient.js";
 import { BoundedTtlCache } from "../util/boundedCache.js";
 import { sameStopByName } from "../util/tripStopMatch.js";
 import type { StopBoard, StopBoardItem, StopBoardResponse } from "./stopInfoService.js";
@@ -193,6 +194,9 @@ export function motisModesFor(kinds: readonly string[] | null | undefined): stri
   return modes.size > 0 ? [...modes].join(",") : null;
 }
 
+/** Code → MOTIS-Halt, der statt des aufgelösten Fahrten lieferte (siehe unten). */
+const boardStopCache = new BoundedTtlCache<MotisPlace>(2000, 24 * 60 * 60 * 1000);
+
 /**
  * @param kinds  Verkehrsarten des Halts — MOTIS liefert dann nur diese. Ohne
  *               den Filter an der Quelle blieben an gemischten Stationen von
@@ -213,7 +217,8 @@ export async function getMotisStopBoard(
   // dann „Gleis 86" (eine Stadtbahn-Gleisnummer) und bei den echten Zügen gar
   // keins. Die geteilte Auflösung verwirft Referenz-Feeds und disambiguiert
   // über unsere gespeicherte Koordinate — dieselbe, die auch die Suche nutzt.
-  const stop = await resolveMotisStopId(code, label);
+  const remembered = boardStopCache.get(code);
+  let stop = remembered ?? (await resolveMotisStopId(code, label));
   if (!stop) return null;
 
   /**
@@ -238,7 +243,28 @@ export async function getMotisStopBoard(
    * Falle. Wer sie einmal übersieht, baut sie wieder ein.
    */
   const modes = motisModesFor(kinds);
-  const results = await fetchStopTimes(stop.id, modes ? `&mode=${modes}` : "", board, limit);
+  const extra = modes ? `&mode=${modes}` : "";
+  let results = await fetchStopTimes(stop.id, extra, board, limit);
+  /**
+   * Keine einzige Fahrt (oder 404) am aufgelösten Halt: fast immer der falsche
+   * Knoten, nicht „hier fährt nichts" — `/stoptimes` blättert bis zur nächsten
+   * Fahrt, auch nachts. Gemessen 27.10.2026: Frankfurt Hbf landete auf dem
+   * belgischen Spiegel („Frankfurt Main (DE)"), Berlin Hbf auf einem Knoten,
+   * den MOTIS nicht kennt — beide Tafeln leer. Dann die gleichnamigen Halte an
+   * unserer Koordinate durchprobieren und den ersten mit Fahrten für einen Tag
+   * merken.
+   */
+  if (!remembered && !results?.length) {
+    for (const alt of (await motisBoardAlternatives(code, label, stop.id).catch(() => [])).slice(0, 2)) {
+      const altResults = await fetchStopTimes(alt.id, extra, board, limit);
+      if (altResults?.length) {
+        results = altResults;
+        stop = alt;
+        boardStopCache.set(code, alt);
+        break;
+      }
+    }
+  }
   if (!results) return null;
   const now = Date.now();
   return {

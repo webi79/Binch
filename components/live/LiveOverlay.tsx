@@ -1,6 +1,5 @@
 import { memo, useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import {
-  ActivityIndicator,
   StyleSheet,
   Text,
   View,
@@ -22,7 +21,7 @@ import { TAB_BAR_H } from "@/components/ui/BinchTabBar";
 import type { CameraPadding, MapSurfaceHandle } from "@/components/surroundings/MapSurface";
 import { useAccent } from "@/lib/theme/accent";
 import { TRANSIT_COLOR, transitCategory } from "@/lib/theme/transitColors";
-import { SPACE } from "@/lib/theme/spacing";
+import { GROUP_GAP, SPACE } from "@/lib/theme/spacing";
 import { ms, scaledStyles } from "@/lib/ui/compact";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
@@ -35,6 +34,8 @@ import type { LiveFrame, LiveModel } from "@/lib/live/model";
 import type { LiveStatus } from "@/lib/live/useLiveModel";
 import type { LiveSession } from "@/lib/live/types";
 import type { ZoomTrack } from "@/lib/live/zoomTrack";
+import { GridLoader } from "@/components/ui/GridLoader";
+import { GateFade, GateLoader, useLoadGate } from "@/components/ui/LoadGate";
 
 /**
  * DIE BEDIENUNG DER LIVE-ANSICHT — Banner oben, Karte unten, zwei Knöpfe — und
@@ -380,16 +381,22 @@ function LivePanel({
     const id = setInterval(() => setNow(Date.now()), 1_000);
     return () => clearInterval(id);
   }, [running]);
+  /**
+   * „Fahrzeug wird gesucht" steht sofort (es ist die Antwort auf den Tipp), läuft
+   * aber mindestens einen vollen Durchlauf und blendet dann aus; die Fahrt
+   * blendet ein (`LoadGate`, Nutzerwunsch 04.11.2026: nichts abrupt beenden).
+   */
+  const gate = useLoadGate(!model && status !== "error", { delayMs: 0, minCycles: 1 });
 
   if (status === "error") {
     return <Text style={styles.message}>{t("live.error")}</Text>;
   }
-  if (!model) {
+  if (gate.phase !== "content" || !model) {
     return (
-      <View style={styles.loadingRow}>
-        <ActivityIndicator color={C.g1} size="small" />
+      <GateLoader phase={gate.phase} onLeft={gate.onLeft} style={styles.loadingRow}>
+        <GridLoader size={36} />
         <Text style={styles.message}>{t("live.loading")}</Text>
-      </View>
+      </GateLoader>
     );
   }
 
@@ -453,7 +460,7 @@ function LivePanel({
   }
 
   return (
-    <>
+    <GateFade fresh={gate.fresh} style={styles.content}>
       <View style={styles.head}>
         <View style={styles.headText}>
           <Text style={styles.eyebrow} numberOfLines={1}>
@@ -485,7 +492,7 @@ function LivePanel({
           <Text style={[styles.etaWhen, { color: accent.solid }]}>{eta.when}</Text>
         </View>
       ) : null}
-    </>
+    </GateFade>
   );
 }
 
@@ -663,14 +670,14 @@ const styles = scaledStyles({
     minHeight: 44,
     flexDirection: "row",
     alignItems: "center",
-    columnGap: 10,
+    columnGap: 8,
     backgroundColor: "rgba(27,27,27,0.95)",
     borderColor: C.border,
     borderWidth: 1,
     borderRadius: 9999,
     paddingLeft: 8,
     paddingRight: 8,
-    paddingVertical: 6,
+    paddingVertical: 8,
     shadowColor: "#000",
     shadowOffset: { width: 0, height: 8 },
     shadowOpacity: 0.5,
@@ -680,10 +687,10 @@ const styles = scaledStyles({
   lineBadge: {
     flexDirection: "row",
     alignItems: "center",
-    columnGap: 5,
+    columnGap: 4,
     borderWidth: 1,
     borderRadius: 9999,
-    paddingHorizontal: 9,
+    paddingHorizontal: 8,
     paddingVertical: 4,
     flexShrink: 0,
     maxWidth: 120,
@@ -699,9 +706,9 @@ const styles = scaledStyles({
   livePill: {
     flexDirection: "row",
     alignItems: "center",
-    columnGap: 5,
+    columnGap: 4,
     borderRadius: 9999,
-    paddingHorizontal: 9,
+    paddingHorizontal: 8,
     paddingVertical: 4,
     backgroundColor: "rgba(255,59,92,0.14)",
     borderColor: "rgba(255,59,92,0.32)",
@@ -742,16 +749,27 @@ const styles = scaledStyles({
     borderColor: C.border,
     borderWidth: 1,
     borderRadius: 24,
-    paddingVertical: 18,
-    paddingHorizontal: 20,
-    rowGap: 16,
+    paddingVertical: SPACE.xl,
+    paddingHorizontal: SPACE.xl,
+    rowGap: GROUP_GAP,
     shadowColor: "#000",
     shadowOffset: { width: 0, height: 8 },
     shadowOpacity: 0.5,
     shadowRadius: 20,
     elevation: 10,
   },
-  loadingRow: { flexDirection: "row", alignItems: "center", columnGap: 12 },
+  /**
+   * Kopf, Balken und „dein Halt" — mit EIGENEM Abstand.
+   *
+   * Seit der Inhalt nach dem Laden weich einblendet, steckt er in einer Hülle
+   * (`GateFade`); der `rowGap` der Karte griff damit nur noch zwischen Karte
+   * und Hülle, nicht mehr zwischen den Zeilen. „Arrives …", der Balken und der
+   * Halt darunter klebten aneinander (05.11.2026). Derselbe Takt wie die
+   * Karte: zusammengehörige Blöcke im Gruppen-Abstand.
+   */
+  content: { rowGap: GROUP_GAP },
+  /** Lader und Satz zusammen mittig in der Karte. */
+  loadingRow: { flexDirection: "row", alignItems: "center", justifyContent: "center", columnGap: 12 },
   message: { color: C.g1, fontSize: 14, fontWeight: "600", flexShrink: 1 },
   head: { flexDirection: "row", alignItems: "center", columnGap: 16 },
   headText: { flex: 1, minWidth: 0 },
@@ -776,7 +794,7 @@ const styles = scaledStyles({
     lineHeight: 30,
     fontVariant: ["tabular-nums"],
   },
-  metricUnit: { color: C.g2, fontSize: 11, fontWeight: "700", marginTop: 1 },
+  metricUnit: { color: C.g2, fontSize: 11, fontWeight: "700" },
   bar: { flexDirection: "row", columnGap: 4 },
   seg: {
     flex: 1,
@@ -786,7 +804,7 @@ const styles = scaledStyles({
     overflow: "hidden",
   },
   segFill: { ...StyleSheet.absoluteFillObject, transformOrigin: "left" },
-  etaRow: { flexDirection: "row", alignItems: "center", columnGap: 10 },
+  etaRow: { flexDirection: "row", alignItems: "center", columnGap: SPACE.md },
   /** Der Ring „deines" Halts auf der Karte, im Kleinen (Akzent-Rand). */
   etaDot: { width: 10, height: 10, borderRadius: 5, borderWidth: 2.5, backgroundColor: C.white },
   etaName: { flex: 1, color: C.white, fontSize: 15, fontWeight: "600" },

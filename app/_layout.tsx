@@ -6,10 +6,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider, initialWindowMetrics } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
-import { AppState, LogBox, StyleSheet, useColorScheme, View } from "react-native";
+import { AppState, LogBox, StyleSheet, View } from "react-native";
 import { useSearchStore } from "@/stores/searchStore";
 import { useAppBg } from "@/lib/theme/appBg";
-import { useEffect, useMemo } from "react";
+import { useEffect } from "react";
 import { DatePickerHost } from "@/components/search/DatePickerHost";
 import { LocationPickerHost } from "@/components/search/LocationPickerHost";
 import { VoiceOverlay } from "@/components/search/VoiceOverlay";
@@ -22,6 +22,11 @@ import { StopDetailSheet } from "@/components/surroundings/StopDetailSheet";
 import { CitySearchPanels } from "@/components/surroundings/CitySearchPanels";
 import { AppAlertHost } from "@/components/ui/AppAlertHost";
 import { NotificationsSheet } from "@/components/home/NotificationsSheet";
+import { CalendarSheet } from "@/components/saved/CalendarSheet";
+import { TaskSheetHost } from "@/components/assistant/TaskSheet";
+import { StatusToastHost } from "@/components/ui/StatusToast";
+import { PermissionSheetHost } from "@/components/permissions/PermissionSheet";
+import { installConnectivity } from "@/lib/net/connectivity";
 import { PriceAlertRouter } from "@/components/notifications/PriceAlertRouter";
 import { ConnectionNotFoundHost } from "@/components/ui/ConnectionNotFoundModal";
 // FloatingTabBar entfernt — der native Tab-Bar des
@@ -35,12 +40,17 @@ import { markLaunchSplashDone } from "@/lib/ui/launchSplash";
 import { KeyboardHeightProbe } from "@/lib/nav/keyboardHeight";
 import { SettingsSubOverlay } from "@/app/(tabs)/settings";
 import { BinchTabBar } from "@/components/ui/BinchTabBar";
+import { TransitionProbeHost } from "@/components/perf/TransitionProbeHost";
 import { AssistantHost } from "@/components/assistant/AssistantHost";
 import { BinchAuthScreen } from "@/components/auth/BinchAuthScreen";
 import { AuthHydrator } from "@/components/auth/AuthHydrator";
 import { migrateTicketImagesToFiles } from "@/lib/saved/ticketImages";
 import Animated, { FadeOut } from "react-native-reanimated";
+import { setSlideReduce } from "@/lib/nav/slideMotion";
 import { useState } from "react";
+
+// Vor der ersten Anfrage: Verbindung zu Binch beobachten (Hinweis bei Offline).
+installConnectivity();
 
 // Transiente MapLibre-Tile-Errors („Software caused connection abort",
 // „Failed to load tile") werden von der nativen MapLibre-Library auf
@@ -93,11 +103,26 @@ const queryClient = new QueryClient({
 });
 
 export default function RootLayout() {
-  const system = useColorScheme();
   // Screen-Hintergrund je nach gewähltem Theme (Grau / echtes Schwarz).
   const appBg = useAppBg();
-  const theme = useSearchStore((s) => s.theme);
-  const isDark = useMemo(() => (theme === "gray" ? system === "dark" : theme === "dark"), [theme, system]);
+  /**
+   * Zeichnet die App dunkel? Dann helle Schrift in der Statusleiste.
+   *
+   * Bis zum 28.10.2026 folgte „Grau" hier dem Design des HANDYS: War das hell
+   * eingestellt, stand dunkle Schrift in der Statusleiste — auf dem fast
+   * schwarzen Grund der App kaum zu sehen. Grau ist aber ein dunkles Thema
+   * (`appBg.ts`), und „Hell" ist noch nicht ausgearbeitet und zeichnet wie
+   * Grau. Jedes Thema ist also dunkel; kommt ein echtes helles, gehört hier
+   * `theme !== "light"` hin.
+   */
+  const isDark = true;
+  /**
+   * „Bewegung reduzieren" (Profil → Darstellung) wirkt NUR auf Slides — siehe
+   * lib/nav/slideMotion.ts. Kein `ReducedMotionConfig` mehr: Der bremste jede
+   * Animation, und dann sah „alles andere komisch aus".
+   */
+  const reduceMotion = useSearchStore((s) => s.reduceMotion);
+  useEffect(() => setSlideReduce(reduceMotion), [reduceMotion]);
 
   // Splash-State: zeigt die animierte BinchSplash beim ersten App-Start.
   // Nach onFinish faded sie via Reanimated FadeOut weg → der Landing-Screen
@@ -279,6 +304,8 @@ export default function RootLayout() {
                 damit der Slide ÜBER der FloatingTabBar UND allen Tab-Pages
                 liegt — wie alle anderen Sheets im Root-Layout. */}
             <StopDetailSheet />
+            {/* Messsonde (vorübergehend) — rendert nichts; siehe lib/perf/transitionProbe.ts. */}
+            <TransitionProbeHost />
             {/* Such-Slide und Preis-Alarm hinter dem Kasten über dem
                 Stadt-Blatt — hier, weil das Stadt-Blatt selbst hier hängt und
                 die Slide darüber liegen muss (siehe CitySearchPanels.tsx). */}
@@ -311,6 +338,14 @@ export default function RootLayout() {
                 Schichtung wie vorher, als er noch eine Route war. */}
             <ResultsView />
             <VoiceOverlay />
+            {/* Kalender des Gespeichert-Reiters: über der Tab-Leiste, aber VOR
+                den Detail-Blättern — die öffnen sich aus ihm heraus darüber,
+                und zurück steht man wieder im Kalender. */}
+            <CalendarSheet />
+            {/* Bos geplante Aufgaben: über Bo, unter Ortswähler und Dialogen, die daraus aufgehen. */}
+            <TaskSheetHost />
+            {/* „Ändern" aus dem Verlauf: ein eigenes Blatt darüber. */}
+            <TaskSheetHost slot="edit" />
             {/* DetailsOverlay zuerst (liegt unten), LegTimelineOverlay
                 danach (liegt drauf) — sonst wäre der von Details aus
                 geöffnete Leg-Timeline-Slide hinter Details versteckt. */}
@@ -345,6 +380,10 @@ export default function RootLayout() {
             <SettingsSubOverlay />
             <BinchAuthScreen />
             <AuthHydrator />
+            {/* Mitteilungen an/aus, Verbindung weg/zurück — über allem. */}
+            {/* Vor den Meldungen: Bei gleicher Höhe liegen die oben. */}
+              <PermissionSheetHost />
+              <StatusToastHost />
             </RouteMirror>
           </View>
         </QueryClientProvider>

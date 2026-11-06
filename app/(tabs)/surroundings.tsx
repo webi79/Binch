@@ -1,4 +1,4 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { prepareLayer } from "@/lib/nav/transitionLayer";
 import { preloadLocationPicker } from "@/lib/nav/pickerPreload";
 import { PICKER_IN, SHEET_IN, SHEET_OUT } from "@/lib/nav/overlayCover";
@@ -10,12 +10,7 @@ import {
   type LayoutChangeEvent,
   type GestureResponderEvent,
 } from "react-native";
-import Animated, {
-  FadeOut,
-  runOnJS,
-  useAnimatedStyle,
-  useSharedValue,
-} from "react-native-reanimated";
+import Animated, { FadeOut, runOnJS, useAnimatedStyle, useSharedValue } from "react-native-reanimated";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useQuery } from "@tanstack/react-query";
@@ -32,24 +27,27 @@ import {
 } from "@/components/surroundings/MapSurface";
 import {
   isMapMoving,
+  quietNotify,
   setMapMoving,
   sheetTargets,
   subscribeViewport,
   whenMapQuiet,
 } from "@/lib/surroundings/mapViewport";
 import { UserPin } from "@/components/surroundings/MapMarkers";
-import { MarkerLayer } from "@/components/surroundings/MarkerLayer";
+import { MarkerLayer, StaticPinsLayer } from "@/components/surroundings/MarkerLayer";
 import { MapTypeSheet } from "@/components/surroundings/MapTypeSheet";
 import { Buildings3DLayer } from "@/components/surroundings/Buildings3DLayer";
 import { EsriImageryLayer } from "@/components/surroundings/EsriImageryLayer";
 import { refreshEsriImagery, useEsriImagery } from "@/lib/imagery/esriImagery";
 import { haptic } from "@/lib/haptics";
 import { useResolvedMapStyle } from "@/lib/theme/mapStyleChoice";
+import { useDataSaverActive } from "@/lib/net/dataSaver";
 import { openStopSheet, stopSheetOpenTarget, stopSheetSnap } from "@/components/surroundings/stopSheetAnimation";
 import { CityRouteLayers } from "@/components/surroundings/CityRouteLayers";
 import { WalkPathLayer } from "@/components/surroundings/WalkPathLayer";
 import { RouteLayer } from "@/components/surroundings/RouteLayer";
 import { LiveVehicleLayer } from "@/components/live/LiveVehicleLayer";
+import { MapCover, type MapCoverHandle } from "@/modules/map-cover";
 import { LiveOverlay } from "@/components/live/LiveOverlay";
 import { useAppActive, useLiveModel } from "@/lib/live/useLiveModel";
 import { PLANE_MAX_ZOOM } from "@/lib/live/camera";
@@ -105,6 +103,8 @@ interface Viewport {
 
 const DEFAULT_VIEWPORT_DISTANCE = 2000;
 const DEFAULT_ZOOM = 13;
+/** Neigung beim Einschalten der 3D-Gebäude — Googles 3D-Ansicht, weit unter der Grenze (60°). */
+const BUILDINGS_PITCH = 45;
 
 /** Ruhe-Fenster, das ein Tab-Tipp braucht, bevor die Karte einfrieren darf. */
 
@@ -234,7 +234,10 @@ export default function SurroundingsScreen() {
    */
   /** Der noch wartende Ausschnitt — siehe `VIEWPORT_SETTLE_MS` in `onRegionChange`. */
   const pendingViewportRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Zählt die gemeldeten Ausschnitte — ein auf Ruhe wartender gilt nur, solange kein neuerer kam. */
+  const viewportGenRef = useRef(0);
   const clearPendingViewport = useCallback(() => {
+    viewportGenRef.current++;
     if (pendingViewportRef.current) {
       clearTimeout(pendingViewportRef.current);
       pendingViewportRef.current = null;
@@ -268,8 +271,41 @@ export default function SurroundingsScreen() {
   const liveZoom = useMemo(() => createZoomTrack(15), []);
   /** Kennung der nativen Karte — die 3D-Ebene der Live-Ansicht hängt sich dort ein. */
   const liveNativeTag = useCallback(() => mapRef.current?.nativeTag() ?? null, []);
+  /**
+   * DAS STANDBILD BEIM WECHSEL DES KARTENTYPS (06.11.2026: erst „es blitzt kurz
+   * auf", dann „es dauert voll lange, vor allem beim Satelliten").
+   *
+   * Ein neuer Kartentyp ist eine NEUE Karte (`key` an der Kartenfläche — ein
+   * Stilwechsel unter laufender Karte stürzt ab), und die ist leer, bis sie
+   * gezeichnet hat. Darüber liegt so lange ein Bild der alten: eine eigene
+   * native Ansicht ÜBER der Karte (modules/map-cover), in einem Teil, der beim
+   * Wechsel stehen bleibt.
+   *  1. `capture` hält das Bild der alten Karte fest und zeigt es.
+   *  2. Steht es auf dem Schirm, wird getauscht (`switchNow`).
+   *  3. `reveal`: Die Ansicht lauscht an der NEUEN Karte selbst und blendet aus,
+   *     sobald die alles geladen hat — ohne Umweg über JS, dessen Strang dann
+   *     mit dem Neuaufbau beschäftigt ist. Beim Luftbild spätestens kurz nach
+   *     dem Stil (`COVER_CAP_SATELLITE_MS`); die letzten scharfen Kacheln
+   *     blenden danach einzeln ein.
+   * Vorher war es eine JPEG-Datei in einem `<Image>` und wartete auf die letzte
+   * Kachel samt aller Einblendungen — gemessen gut 300 ms Vorlauf und beim
+   * Luftbild Sekunden.
+   *
+   * Sofort weg bei einer Berührung der Karte (ein Standbild bewegt sich nicht
+   * mit). Berührungen gehen durch das Bild hindurch an die Karte.
+   */
+  const coverRef = useRef<MapCoverHandle | null>(null);
+  /** Liegt gerade ein Standbild (und blendet noch nicht aus)? */
+  const coverLiveRef = useRef(false);
+  /** Nummer des letzten `reveal` — nur dessen Antwort zählt. */
+  const revealSeqRef = useRef(0);
+
   const onMapTouchStart = useCallback(() => {
     mapTouchRef.current = true;
+    if (coverLiveRef.current) {
+      coverLiveRef.current = false;
+      coverRef.current?.fadeNow(COVER_TOUCH_FADE_MS);
+    }
   }, []);
   const onMapTouchEnd = useCallback((e: GestureResponderEvent) => {
     // Erst, wenn der LETZTE Finger weg ist — `onTouchEnd` kommt je Finger, und
@@ -340,6 +376,8 @@ export default function SurroundingsScreen() {
   const [aerialOfficial, setAerialOfficial] = useState<boolean | null>(null);
   const coverageCacheRef = useRef(new Map<string, { maxZoom: number; amtlich: boolean }>());
   const coverageAskRef = useRef<string | null>(null);
+  /** Das Feld des letzten Halts — ein auf Ruhe wartender Wert gilt nur für dieses. */
+  const aerialCellRef = useRef<string | null>(null);
   /**
    * Der LETZTE Ausschnitt, bei jeder Bewegung mitgeschrieben — ohne Durchgang.
    *
@@ -369,11 +407,10 @@ export default function SurroundingsScreen() {
   const resolvedMapStyle = useResolvedMapStyle();
   /**
    * Der Kartentyp, den die Karte ZEIGT — er läuft dem gewählten um einen Schritt
-   * nach: Vor dem Neuaufbau (siehe `key` an der Kartenfläche) friert die alte
-   * Karte ihr Bild ein, die neue blendet es aus, sobald sie fertig ist
-   * (`freezeForStyleSwitch`). Ohne das war die neue Karte bis zu ihrem ersten
-   * vollständigen Bild leer — der Wechsel blitzte. Höchstens 120 ms Verzug,
-   * dann wird ohnehin umgeschaltet.
+   * nach: Vor dem Neuaufbau (siehe `key` an der Kartenfläche) legt sich ein
+   * Standbild der alten Karte darüber, und erst wenn es steht, wird getauscht
+   * (siehe `coverRef`). Ohne das war die neue Karte bis zu ihrem ersten
+   * vollständigen Bild leer — der Wechsel blitzte.
    */
   const [mapStyleName, setMapStyleName] = useState(resolvedMapStyle);
   /**
@@ -392,16 +429,66 @@ export default function SurroundingsScreen() {
       setMapStyleName(resolvedMapStyle);
       setMapLocale(appLocale);
     };
-    const map = mapRef.current;
-    if (!map) {
+    const tag = mapRef.current?.nativeTag() ?? null;
+    const cover = coverRef.current;
+    // Ohne Karte gibt es nichts festzuhalten; liegt noch ein Standbild (zweiter
+    // Wechsel kurz hintereinander), wird einfach darunter getauscht.
+    if (tag == null || !cover || coverLiveRef.current) {
       switchNow();
       return;
     }
-    void Promise.race([map.freezeForStyleSwitch(), new Promise((r) => setTimeout(r, 120))]).then(switchNow);
+    void cover.capture(tag).then((shown) => {
+      if (cancelled) {
+        // Überholt, bevor das Bild stand. Kam danach ein neueres, meldet die
+        // Ansicht hier `false` (Nummernvergleich); `true` heißt also: Dieses
+        // Bild liegt noch und wartet auf niemanden — nicht stehen lassen.
+        if (shown && !coverLiveRef.current) cover.fadeNow(COVER_TOUCH_FADE_MS);
+        return;
+      }
+      coverLiveRef.current = shown;
+      switchNow();
+    });
     return () => {
       cancelled = true;
     };
   }, [resolvedMapStyle, mapStyleName, appLocale, mapLocale]);
+  /**
+   * Die neue Karte ist eingehängt (neuer `key`): Das Standbild lauscht ab jetzt
+   * an ihr und gibt sie frei, sobald sie steht (siehe `coverRef`). Ihre Kennung
+   * steht nach dem Einhängen fest; fehlt sie ausnahmsweise, ein paar Bilder
+   * nachfragen.
+   */
+  useEffect(() => {
+    if (!coverLiveRef.current) return;
+    const seq = ++revealSeqRef.current;
+    const timing = {
+      capMs: mapStyleName === "satellite" ? COVER_CAP_SATELLITE_MS : COVER_CAP_MS,
+      maxMs: COVER_MAX_MS,
+      fadeMs: COVER_FADE_MS,
+    };
+    let tries = 0;
+    let frame = 0;
+    const go = () => {
+      if (seq !== revealSeqRef.current) return;
+      const tag = mapRef.current?.nativeTag() ?? null;
+      if (tag == null && tries++ < 8) {
+        frame = requestAnimationFrame(go);
+        return;
+      }
+      const cover = coverRef.current;
+      if (!cover) {
+        coverLiveRef.current = false;
+        return;
+      }
+      void cover.reveal(tag ?? -1, timing).then(() => {
+        // Ab dem Ausblenden ist es kein liegendes Standbild mehr: Ein weiterer
+        // Wechsel hält dann wieder das aktuelle Bild fest.
+        if (seq === revealSeqRef.current) coverLiveRef.current = false;
+      });
+    };
+    go();
+    return () => cancelAnimationFrame(frame);
+  }, [mapStyleName, mapLocale]);
   // Kartentyp oder Sprache gewechselt = neue Karte (siehe `key` an der
   // Kartenfläche); eine Bewegung der alten meldet ihr Ende nie mehr.
   useEffect(() => {
@@ -426,7 +513,9 @@ export default function SurroundingsScreen() {
     return () => clearInterval(id);
   }, [mapStyleName]);
   const esriVisible = mapStyleName === "satellite" && !!esriLayer && aerialOfficial === false;
-  const buildings3d = useSearchStore((st) => st.mapBuildings3d);
+  // Datensparen hält die 3D-Häuser ohne WLAN zurück (lib/net/dataSaver.ts).
+  const dataSaving = useDataSaverActive();
+  const buildings3d = useSearchStore((st) => st.mapBuildings3d) && !dataSaving;
   const insets = useSafeAreaInsets();
   const mapRef = useRef<MapSurfaceHandle | null>(null);
   const openLocationPicker = useSearchStore((s) => s.openLocationPicker);
@@ -478,22 +567,6 @@ export default function SurroundingsScreen() {
    */
   const selectedCity = useSearchStore((s) => s.selectedCity);
   const cityRoutes = useSearchStore((s) => s.cityRoutes);
-  const selectedStopForWalk = useSearchStore((s) => s.selectedStop);
-  /**
-   * Wohin der gepunktete Fußweg führt: im Stadt-Blatt zur Startstation der
-   * gewählten Verbindung, sonst zur angetippten Haltestelle. Ohne eigenen
-   * Standort gibt es keinen — dann bliebe nur ein Weg von irgendwo.
-   */
-  const walkTarget = useMemo(() => {
-    if (selectedCity) {
-      const start = cityRoutes?.plans[cityRoutes.selected]?.waypoints[0];
-      return start ? { latitude: start.latitude, longitude: start.longitude } : null;
-    }
-    const st = selectedStopForWalk;
-    return st?.latitude != null && st.longitude != null
-      ? { latitude: st.latitude, longitude: st.longitude }
-      : null;
-  }, [selectedCity, cityRoutes, selectedStopForWalk]);
   const selectCityRoute = useSearchStore((s) => s.selectCityRoute);
   const userCoordRef = useRef(userCoord);
   userCoordRef.current = userCoord;
@@ -554,7 +627,13 @@ export default function SurroundingsScreen() {
       }
     }
     const stopTarget = targets.stop ?? (withStopSheet ? stopSheetOpenTarget() : null);
-    if (stopTarget != null) bottomEdge = Math.min(bottomEdge, fullTop + stopTarget);
+    if (stopTarget != null) {
+      // Ist das Haltestellen-/Stadt-Blatt offen, ist das Auswahlfenster unter
+      // den Rand ausgewichen (SurroundingsSheet, `yieldFor`) — es zählt nur noch
+      // dieses Blatt, auch wenn es eingeklappt tiefer liegt als jenes zuvor.
+      const below = !hidden && routeActiveRef.current ? bottomEdge : screenHeight;
+      bottomEdge = Math.min(below, fullTop + stopTarget);
+    }
     if (bottomEdge - top < 160) return undefined;
     return { top, bottom: Math.max(0, screenHeight - bottomEdge), left: 0, right: 0 };
   }, [insets.top, insets.bottom, screenHeight]);
@@ -1352,10 +1431,11 @@ export default function SurroundingsScreen() {
     return () => cancelAnimationFrame(id);
   }, [isFocused, mapMounted, hasSize, locationStatus, userCoord]);
 
-  // Tab-Tap soll sich sofort anfühlen. Marker-Swap (100+ native Views) ist
-  // teuer und blockt sonst den Tap. useDeferredValue rendert die Marker
-  // verzögert nach, während die Tab-UI sofort umspringt.
-  const deferredMode = useDeferredValue(mode);
+  /**
+   * Hier stand `useDeferredValue(mode)` für den teuren Marker-Tausch. Den gibt
+   * es nicht mehr: Flughäfen und Häfen liegen fest in der Karte
+   * (`StaticPinsLayer`), ein Wechsel blendet nur um. Siehe `handleModeChange`.
+   */
 
   // Effektiver Viewport für Backend-Calls — vor dem ersten Map-Idle-Event
   // nutzen wir den User-Standort als Default.
@@ -1397,8 +1477,21 @@ export default function SurroundingsScreen() {
   // Train-Stationen für Clustering; unter zoom 9 zeigt der Server eh nichts.
   const zoomLimit = keyZoom >= 13 ? 60 : keyZoom >= 11 ? 200 : 400;
 
+  /**
+   * Eine Antwort, die in eine Bewegung trifft, wartet auf Ruhe.
+   *
+   * Mit ihr baut dieser ganze Bildschirm Marker und Liste neu auf. Kam sie
+   * während der Einfahrt des Haltestellen-Blatts (Karte verschoben, gleich
+   * eine Haltestelle angetippt), lag der Durchgang mitten in der Fahrt — und
+   * jeder Commit dort schreibt die Lage des Blattes verspätet zurück
+   * (feedback_reanimated_commit_race): das „gelegentliche" Ruckeln. Jetzt kommt
+   * sie danach, höchstens 2,5 s später; siehe `quietNotify`.
+   */
+  const [, rerenderQuiet] = useReducer((n: number) => n + 1, 0);
+  const notifyWhenQuiet = useMemo(() => quietNotify(rerenderQuiet), []);
   const { data: fresh } = useQuery({
-    queryKey: ["surroundings", deferredMode, keyLat, keyLng, keyDistance, keyZoom],
+    notifyOnChangeProps: notifyWhenQuiet,
+    queryKey: ["surroundings", "transit", keyLat, keyLng, keyDistance, keyZoom],
     queryFn: () =>
       fetchSurroundings({
         latitude: keyLat,
@@ -1406,7 +1499,7 @@ export default function SurroundingsScreen() {
         distance: Math.max(500, keyDistance),
         zoom: keyZoom,
         limit: zoomLimit,
-        mode: deferredMode,
+        mode: "transit",
       }),
     staleTime: 60_000,
     // Eigene Aufbewahrungszeit statt der globalen 30 Minuten.
@@ -1425,7 +1518,7 @@ export default function SurroundingsScreen() {
     // error → dann gilt bewusst der Default), fragen wir.
     enabled:
       everFocused &&
-      deferredMode === "transit" &&
+      mode === "transit" &&
       effectiveViewport != null &&
       (viewport !== null || locationStatus !== "loading"),
     retry: 1,
@@ -1454,27 +1547,24 @@ export default function SurroundingsScreen() {
   // Wenn die Transit-Antwort leer ist (z.B. zoom < 9), bleibt die Liste leer —
   // NICHT auf TRANSIT_MOCK zurückfallen, sonst klebt der Mock-Cluster ewig auf
   // der rausgezoomten Karte.
+  /**
+   * NUR die Haltestellen aus der Umgebungs-Abfrage. Flughäfen und Häfen
+   * zeichnet `StaticPinsLayer` aus festen Daten; diese Ebene bleibt beim
+   * Wechsel eingehängt und wird nur unsichtbar (`hidden`).
+   */
   const markers: MapMarker[] = useMemo(() => {
-    if (deferredMode === "transit") {
-      if (!data) return [];
-      return data.markers.map((m) => ({
-        id: m.id,
-        type: m.type,
-        kinds: m.kinds,
-        coord: { latitude: m.latitude, longitude: m.longitude },
-        label: m.label,
-        detail: m.detail,
-        platform: m.platform,
-        selected: m.selected,
-      }));
-    }
-    // Airport/Cruise sind weltweit (3k+ Pins). Wir geben ALLES an MarkerLayer
-    // weiter — der Layer clustered die Features serverseitig im MapLibre-
-    // Native-Layer (sehr effizient, alles auf der UI-Thread). Beim Rauszoomen
-    // entstehen sinnvolle weltumspannende Cluster („London 12", „NYC 8" etc.),
-    // beim Zoom-In lösen die Cluster sich auf in individuelle Pins.
-    return markersForMode(deferredMode);
-  }, [data, deferredMode]);
+    if (!data) return [];
+    return data.markers.map((m) => ({
+      id: m.id,
+      type: m.type,
+      kinds: m.kinds,
+      coord: { latitude: m.latitude, longitude: m.longitude },
+      label: m.label,
+      detail: m.detail,
+      platform: m.platform,
+      selected: m.selected,
+    }));
+  }, [data]);
 
   const listItems: StopListItem[] = useMemo(() => {
     if (mode === "transit") {
@@ -1493,7 +1583,8 @@ export default function SurroundingsScreen() {
       }));
     }
     return listForMode(mode, userCoord);
-  }, [data, mode, userCoord]);
+    // `t` mit: Die Plakette („Steig 3") ist übersetzt und muss den Sprachwechsel mitmachen.
+  }, [data, mode, userCoord, t]);
 
   /**
    * Eine Station auswählen — von der Karte ODER aus der Liste im Blatt.
@@ -1513,7 +1604,11 @@ export default function SurroundingsScreen() {
   const focusStopRef = useRef<(id: string, fly: boolean) => void>(() => {});
   const focusStop = useCallback(
     (id: string, fly: boolean) => {
-      const m = markers.find((mm) => mm.id === id);
+      // Flughäfen und Häfen stehen nicht in `markers` (eigene feste Ebene).
+      const m =
+        markers.find((mm) => mm.id === id) ??
+        (id.startsWith("airport:") ? markersForMode("airport") : id.startsWith("cruise:") ? markersForMode("cruise") : [])
+          .find((mm) => mm.id === id);
       if (!m) return;
       followUserRef.current = false;
       if (fly) lastCityFitRef.current = null;
@@ -1783,16 +1878,89 @@ export default function SurroundingsScreen() {
   //   - transit: nah ran (Zoom 13, Bushaltestellen-Distanz)
   //   - airport: regional (Zoom 5, Europa-Hubs sichtbar)
   //   - cruise: weiter raus (Zoom 4, Häfen über Kontinent verteilt)
+  /**
+   * Flughäfen und Häfen liegen schon in der Karte, bevor man umschaltet.
+   *
+   * Einmal gefüllt (rund 400 kB für die Flughäfen) — und zwar in Ruhe, ein
+   * paar Sekunden nachdem die Karte steht, nicht erst beim ersten Tipp auf
+   * „Airport". Danach ist jeder Wechsel nur noch Umblenden.
+   */
+  const [pinsArmed, setPinsArmed] = useState(false);
+  useEffect(() => {
+    if (pinsArmed || !mapTilesRendered) return;
+    const id = setTimeout(() => {
+      // In einem RUHIGEN Moment einhängen: Die 400 kB gehen einmal über die
+      // Brücke, MapLibre baut daraus seinen Haufen-Index — nicht mitten in ein
+      // Wischen über die Karte.
+      whenMapQuiet(() => {
+        setPinsArmed(true);
+        // Die Listen dazu gleich mit sortieren (je 3276 bzw. ~200 Entfernungen) —
+        // sonst fiele das in den ersten Wechsel.
+        const here = latestCoordRef.current;
+        if (here) {
+          listForMode("airport", here);
+          listForMode("cruise", here);
+        }
+      });
+    }, PINS_PREWARM_MS);
+    return () => clearTimeout(id);
+  }, [pinsArmed, mapTilesRendered]);
+
+  /**
+   * Erst umbauen, DANN fliegen (04.11.2026, „die Kamerafahrt laggt auch").
+   *
+   * Der Flug lief bisher im selben Augenblick los wie der Umbau von Liste und
+   * Karte. Die Kamerakurve rechnet Bild für Bild auf dem UI-Strang
+   * (`runSmooth` im MLRN-Patch) — und genau dort landete der Umbau. Jetzt
+   * kommt die Wahl erst, wenn die Pille im Blatt angekommen ist (`SheetTabs`),
+   * der Umbau ist klein (Ebenen nur umblenden, Liste zuerst nur die ersten
+   * Zeilen), und der Flug startet ein Bild NACH dessen Commit
+   * (`modeFlyRef` → Effekt unten). Unterwegs passiert sonst nichts.
+   */
+  const modeFlyRef = useRef<(() => void) | null>(null);
+  const modeNowRef = useRef(mode);
+  modeNowRef.current = mode;
   const handleModeChange = useCallback(
     (m: SheetMode) => {
+      // Ohne Standort (abgelehnt, „Nicht jetzt" im Berechtigungs-Blatt, noch
+      // keine Ortung) um die Mitte der Karte — der Wechsel zoomt IMMER, sonst
+      // stand man bei „Airport" mit Straßen-Zoom da und sah keinen Flughafen.
+      const at = userCoord ?? lastRegionRef.current;
+      const fly = at
+        ? () => {
+            lastCityFitRef.current = null;
+            const zoom = m === "transit" ? 13 : m === "airport" ? 5 : 4;
+            mapRef.current?.flyTo(at.latitude, at.longitude, zoom, visiblePadding());
+          }
+        : null;
+      if (m !== "transit") setPinsArmed(true);
+      // Dieselbe Art nochmal: nichts umzubauen, nur zurück an den Ort.
+      if (m === modeNowRef.current) {
+        fly?.();
+        return;
+      }
+      modeFlyRef.current = fly;
       setMode(m);
-      if (!userCoord) return;
-      const zoom = m === "transit" ? 13 : m === "airport" ? 5 : 4;
-      lastCityFitRef.current = null;
-      mapRef.current?.flyTo(userCoord.latitude, userCoord.longitude, zoom, visiblePadding());
     },
     [userCoord, visiblePadding],
   );
+  useEffect(() => {
+    const fly = modeFlyRef.current;
+    if (!fly) return;
+    modeFlyRef.current = null;
+    // Zwei Bilder Luft: Der Commit des Wechsels (Ebenen umblenden, Titel) ist
+    // dann sicher auf dem UI-Strang eingehängt, bevor die Kurve dort losrechnet.
+    // Die Liste baut in der Fahrt nichts mehr (siehe `LIST_SETTLE_MS` im Blatt).
+    let second = 0;
+    const first = requestAnimationFrame(() => {
+      second = requestAnimationFrame(fly);
+    });
+    return () => {
+      cancelAnimationFrame(first);
+      cancelAnimationFrame(second);
+    };
+  }, [mode]);
+
 
   /**
    * Läuft gerade eine Ortung?
@@ -2003,6 +2171,16 @@ export default function SurroundingsScreen() {
     setMapTypeOpen(true);
   }, []);
   const closeMapType = useCallback(() => setMapTypeOpen(false), []);
+  /**
+   * 3D-Gebäude an → die Karte kippt (45°), aus → wieder flach. Man sieht
+   * sofort, was der Schalter tut; der Erklärsatz im Blatt ist entfallen.
+   * Nicht in der Live-Ansicht: Dort führt die Folge-Kamera Neigung und Zoom
+   * selbst und setzte sie mit dem nächsten Takt ohnehin zurück.
+   */
+  const tiltForBuildings = useCallback((on: boolean) => {
+    if (liveActiveRef.current) return;
+    mapRef.current?.tiltTo(on ? BUILDINGS_PITCH : 0);
+  }, []);
 
 
   /**
@@ -2032,10 +2210,23 @@ export default function SurroundingsScreen() {
     if (mapStyleNameRef.current === "satellite" && r.zoom >= 13) {
       const fein = r.zoom >= 15 ? 200 : 50;
       const cell = `${fein}:${Math.round(r.latitude * fein)}:${Math.round(r.longitude * fein)}`;
+      aerialCellRef.current = cell;
       const known = coverageCacheRef.current.get(cell);
+      /**
+       * Gesetzt erst in Ruhe: Ein neuer Wert stellt die Ebenen der Karte um und
+       * schickt den ganzen Bildschirm durch React — in einer Blatt-Fahrt ein
+       * Ruck (siehe `whenMapQuiet`). Gemeldet wurde das Ruckeln ausgerechnet in
+       * der Satellitenansicht, wo diese Frage nach jedem Schwenk kommt. Wer
+       * inzwischen in ein anderes Feld geschwenkt ist, bekommt dessen Wert.
+       */
+      const apply = (c: { maxZoom: number; amtlich: boolean }) =>
+        whenMapQuiet(() => {
+          if (aerialCellRef.current !== cell) return;
+          setAerialMaxZoom((prev) => (prev === c.maxZoom ? prev : c.maxZoom));
+          setAerialOfficial((prev) => (prev === c.amtlich ? prev : c.amtlich));
+        });
       if (known !== undefined) {
-        setAerialMaxZoom((prev) => (prev === known.maxZoom ? prev : known.maxZoom));
-        setAerialOfficial((prev) => (prev === known.amtlich ? prev : known.amtlich));
+        apply(known);
       } else if (coverageAskRef.current !== cell) {
         coverageAskRef.current = cell;
         /*
@@ -2059,10 +2250,7 @@ export default function SurroundingsScreen() {
             const cache = coverageCacheRef.current;
             if (cache.size > 300) cache.clear();
             cache.set(cell, { maxZoom: c.maxZoom, amtlich: c.amtlich });
-            if (coverageAskRef.current === cell) {
-              setAerialMaxZoom((prev) => (prev === c.maxZoom ? prev : c.maxZoom));
-              setAerialOfficial((prev) => (prev === c.amtlich ? prev : c.amtlich));
-            }
+            if (coverageAskRef.current === cell) apply(c);
           })
           .catch(() => {
             // Keine Antwort — dann bleibt die Grenze, wie sie war. Beim nächsten
@@ -2202,10 +2390,20 @@ export default function SurroundingsScreen() {
       setViewport(next);
       return;
     }
+    const gen = ++viewportGenRef.current;
     pendingViewportRef.current = setTimeout(() => {
       pendingViewportRef.current = null;
-      viewportBucketRef.current = bucket;
-      setViewport(next);
+      /**
+       * Auch der Ausschnitt selbst nicht in eine Fahrt hinein: Sein Durchgang
+       * (der ganze Bildschirm) fiel sonst in die Einfahrt eines Blattes, das
+       * man kurz nach dem Schwenk geöffnet hat. Eine neuere Bewegung
+       * (`gen`) macht den wartenden Ausschnitt hinfällig.
+       */
+      whenMapQuiet(() => {
+        if (gen !== viewportGenRef.current) return;
+        viewportBucketRef.current = bucket;
+        setViewport(next);
+      });
     }, VIEWPORT_SETTLE_MS);
   }, [clearPendingViewport, checkAerialCoverage, liveZoom]);
 
@@ -2359,10 +2557,12 @@ export default function SurroundingsScreen() {
             <Buildings3DLayer styleName={mapStyleName} visible={buildings3d} />
           ) : null}
 
-          {/* Unter allem anderen: der gepunktete Fußweg vom Standort. */}
-          {walkTarget && userCoord && !routeActive && !liveActive ? (
-            <WalkPathLayer from={userCoord} to={walkTarget} />
-          ) : null}
+          {/* Unter allem anderen: der gepunktete Fußweg vom Standort. Ohne
+              eigenen Standort gibt es keinen — dann bliebe nur ein Weg von
+              irgendwo. Sein Ziel holt er sich selbst, NICHT über diesen
+              Bildschirm (siehe dort: sonst rendert jeder Tipp den ganzen Tab
+              mitten in die Einfahrt des Blattes). */}
+          {userCoord && !routeActive && !liveActive ? <WalkPathLayer from={userCoord} /> : null}
           {/* Route-Modus: nur RouteLayer + UserPin; Stadt-Blatt: dessen
               Verbindungen; sonst MarkerLayer + POIs. Die Live-Ansicht zeigt
               nur ihr Fahrzeug — die Haltestellen bleiben dabei EINGEHÄNGT,
@@ -2382,18 +2582,36 @@ export default function SurroundingsScreen() {
           ) : routeActive || selectedCity ? null : (
             <>
               <MarkerLayer
-                key={deferredMode}
                 markers={markers}
                 onMarkerPress={selectStopFromMap}
-                hidden={liveActive}
+                hidden={liveActive || mode !== "transit"}
               />
             </>
           )}
+          {/* Flughäfen und Häfen: fest eingehängt, sobald einmal gefüllt —
+              auch über Stadt-Blatt und Route hinweg, nur unsichtbar. */}
+          {pinsArmed ? (
+            <>
+              <StaticPinsLayer
+                kind="airport"
+                visible={mode === "airport" && !liveActive && !routeActive && !selectedCity}
+                onPinPress={selectStopFromMap}
+              />
+              <StaticPinsLayer
+                kind="cruise"
+                visible={mode === "cruise" && !liveActive && !routeActive && !selectedCity}
+                onPinPress={selectStopFromMap}
+              />
+            </>
+          ) : null}
           {liveActive && liveModel ? (
             <LiveVehicleLayer model={liveModel} zoom={liveZoom} running={liveRunning} nativeTag={liveNativeTag} />
           ) : null}
           {userCoord ? <UserPin coord={userCoord} /> : null}
         </MapSurface>
+        {/* Das Standbild beim Wechsel des Kartentyps — über der Karte, unter
+            allem anderen, durchlässig für Berührungen (siehe `coverRef`). */}
+        <MapCover ref={coverRef} />
         </View>
       )}
       {/* Skelett liegt OBEN bis die Tiles wirklich gerendert sind, dann
@@ -2594,7 +2812,7 @@ export default function SurroundingsScreen() {
 
       {/* Das Blatt liegt NEBEN der Karte im Baum, nicht darin: Es ist ein
           Fenster (`Modal`) und gehört nicht in die Kartenfläche. */}
-      <MapTypeSheet visible={mapTypeOpen} onClose={closeMapType} />
+      <MapTypeSheet visible={mapTypeOpen} onClose={closeMapType} onBuildingsChange={tiltForBuildings} />
 
       {routeActive && !liveActive ? (
         /**
@@ -2634,6 +2852,36 @@ export default function SurroundingsScreen() {
  * zweite Fahrt startet erst danach (siehe `cityRouteKey`).
  */
 const CITY_FIT_MS = 820;
+
+/**
+ * So lange (ms), nachdem die Karte zum ersten Mal steht, werden Flughäfen und
+ * Häfen in die Karte gelegt (unsichtbar) — siehe `pinsArmed`.
+ */
+const PINS_PREWARM_MS = 2500;
+
+/**
+ * Das Standbild beim Wechsel des Kartentyps (siehe `coverRef`): so lange
+ * blendet es aus, so lange bei einer Berührung der Karte.
+ */
+const COVER_FADE_MS = 320;
+const COVER_TOUCH_FADE_MS = 140;
+/**
+ * Spätestens so lange nach dem geladenen Stil geht es, auch wenn noch Kacheln
+ * fehlen. Vektor-Karten haben ihre Kacheln fast immer schon auf dem Gerät und
+ * stehen nach wenigen hundert Millisekunden — die Grenze greift nur bei
+ * schlechtem Netz.
+ */
+const COVER_CAP_MS = 1500;
+/**
+ * Luftbild: Die scharfen Kacheln holt der eigene Server bei den Landesdiensten
+ * — im Server-Protokoll im Mittel 0,2 s, die langsamsten über 2 s. Darauf
+ * wartete das Standbild bisher. Das grobe Satellitenbild darunter (EOX, sieben
+ * Tage auf dem Gerät) steht nach wenigen hundert Millisekunden; die scharfen
+ * Kacheln blenden danach einzeln darüber ein (MapLibre, 300 ms).
+ */
+const COVER_CAP_SATELLITE_MS = 550;
+/** Ganz spätestens nach dem Tausch — kein Netz, Stil hängt. */
+const COVER_MAX_MS = 3500;
 
 /**
  * So lange (ms) nach der Einfahrt des Haltestellen-Blatts wartet das

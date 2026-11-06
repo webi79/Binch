@@ -202,6 +202,37 @@ export function stopDragHeal(heal: SharedValue<number>): void {
   heal.value = 0;
 }
 
+/** Halbe Runde des Nachschreibens (siehe `settleHeal`) — VOR der Funktion, wie oben. */
+const SETTLE_HALF_MS = 250;
+
+/**
+ * NACHSCHREIBEN NACH EINER FAHRT — dasselbe Mittel wie `startDragHeal`, für
+ * eine feste Zeit statt für die Dauer einer Berührung.
+ *
+ * Die Lücke, die es schließt: Ein React-Durchgang, der WÄHREND einer Fahrt
+ * angestoßen wird, kommt erst ein, zwei Bilder später (bei einem schweren
+ * Durchgang auch später) auf den Schirm — mit den Werten von unterwegs. Endet
+ * die Fahrt vorher, bewegt sich danach nichts mehr, und die alte Lage bleibt
+ * stehen. Am Gerät gesehen (06.11.2026): Haltestellen-Blatt heruntergewischt,
+ * das Auswahlfenster dahinter blieb unter dem Rand liegen, obwohl der
+ * Standort-Knopf schon richtig darüber stand.
+ *
+ * `ms` ab jetzt: Fahrt plus Nachlauf. Endet auf dem Ausgangswert (gerade Zahl
+ * halber Runden), also auf 0. Eine Berührung ersetzt ihn (`startDragHeal`).
+ */
+export function settleHeal(heal: SharedValue<number>, ms: number): void {
+  "worklet";
+  const halves = Math.max(2, 2 * Math.ceil(ms / (2 * SETTLE_HALF_MS)));
+  // Von 0 aus — kam er aus einem laufenden Puls, endete er sonst irgendwo
+  // dazwischen statt wieder bei 0.
+  heal.value = 0;
+  heal.value = withRepeat(
+    withTiming(1, { duration: SETTLE_HALF_MS, easing: Easing.linear }),
+    halves,
+    true,
+  );
+}
+
 /** Der Beitrag zur Lage — ein Tausendstel Punkt, siehe `startDragHeal`. */
 export function dragHealOffset(heal: SharedValue<number>): number {
   "worklet";

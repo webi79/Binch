@@ -15,7 +15,7 @@
  * die Verbindung über Bo direkt oder im Search-Tab.
  */
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { View, Text, Pressable, StyleSheet, ActivityIndicator } from "react-native";
+import { View, Text, Pressable, StyleSheet } from "react-native";
 import { useQuery } from "@tanstack/react-query";
 import { useIsFocused } from "@react-navigation/native";
 import { useSearchStore } from "@/stores/searchStore";
@@ -36,6 +36,8 @@ import {
 } from "@/lib/api/client";
 import { scaledStyles } from "@/lib/ui/compact";
 import { formatTimeInZone, localTimeHint, shiftIsoByMinutes } from "@/lib/time-format";
+import { GridLoader } from "@/components/ui/GridLoader";
+import { LoadGate } from "@/components/ui/LoadGate";
 
 const C = {
   card: "#171719",
@@ -232,11 +234,9 @@ function StopBoardCardInner({ stop, initialBoard, initialData }: Props) {
         * es gebe keine Abfahrten, und sprang danach auf den Lader und dann auf
         * die Daten. Diesen Zustand gab es vor dem Aufschub nicht.
         */}
-      {isLoading || !queryReady ? (
-        <View style={styles.loadingWrap}>
-          <ActivityIndicator color={accent.solid} size="small" />
-        </View>
-      ) : isError ? (
+      {/* Lader nach der einen Regel (`LoadGate`): erst nach 2 s, dann mindestens zwei Durchläufe. */}
+      <LoadGate loading={isLoading || !queryReady} style={styles.loadingWrap} loader={<GridLoader size={44} />}>
+      {() => isError ? (
         <Text style={styles.emptyText}>{t("assistant.error.generic")}</Text>
       ) : items.length === 0 ? (
         <Text style={styles.emptyText}>
@@ -253,6 +253,7 @@ function StopBoardCardInner({ stop, initialBoard, initialData }: Props) {
           ))}
         </>
       )}
+      </LoadGate>
     </View>
   );
 }
@@ -413,8 +414,8 @@ const styles = scaledStyles({
     borderRadius: 20,
     borderWidth: 1,
     borderColor: C.border,
-    padding: 14,
-    gap: 10,
+    padding: 16,
+    gap: 8,
   },
   headRow: {
     flexDirection: "row",
@@ -433,12 +434,12 @@ const styles = scaledStyles({
 
   // „Ortszeit (UTC+1)" unter dem Namen — leise, nur wenn die Zone des Halts
   // nicht die des Geräts ist.
-  zoneHint: { color: C.sub, fontSize: 11, fontWeight: "500", marginTop: 2 },
-  tabs: { flexDirection: "row", gap: 6 },
+  zoneHint: { color: C.sub, fontSize: 11, fontWeight: "500", marginTop: 4 },
+  tabs: { flexDirection: "row", gap: 8 },
   tab: {
     flex: 1,
-    paddingVertical: 7,
-    paddingHorizontal: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 8,
     borderRadius: 9999,
     backgroundColor: C.cardAlt,
     borderWidth: 1,
@@ -447,7 +448,8 @@ const styles = scaledStyles({
   },
   tabText: { fontSize: 12, fontWeight: "600" },
 
-  loadingWrap: { paddingVertical: 24, alignItems: "center" },
+  /** Fläche für Warten und Lader — so hoch wie der Lader mit Rand (nichts springt), Lader mittig. */
+  loadingWrap: { minHeight: 84, paddingVertical: 24, alignItems: "center", justifyContent: "center" },
   emptyText: {
     color: C.sub,
     fontSize: 13,
@@ -461,7 +463,7 @@ const styles = scaledStyles({
     gap: 12,
     backgroundColor: C.cardAlt,
     borderRadius: 14,
-    padding: 10,
+    padding: 8,
   },
   heroRing: {
     width: 70,
@@ -472,8 +474,8 @@ const styles = scaledStyles({
   heroRingCenter: { position: "absolute", alignItems: "center", justifyContent: "center" },
   heroRingMin: { color: C.text, fontSize: 20, fontWeight: "800" },
   heroRingLabel: { color: C.sub, fontSize: 9, letterSpacing: 0.6, marginTop: -2 },
-  heroBody: { flex: 1, gap: 3 },
-  heroBadgeRow: { flexDirection: "row", alignItems: "center", gap: 5 },
+  heroBody: { flex: 1, gap: 4 },
+  heroBadgeRow: { flexDirection: "row", alignItems: "center", gap: 4 },
   heroLine: { fontSize: 13, fontWeight: "700" },
   heroDest: { color: C.text, fontSize: 14, fontWeight: "600" },
   heroSub: { color: C.sub, fontSize: 12 },
@@ -481,13 +483,13 @@ const styles = scaledStyles({
   row: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 10,
+    gap: 8,
     paddingVertical: 8,
     paddingHorizontal: 4,
     borderTopWidth: 1,
     borderTopColor: C.border,
   },
-  rowTime: { width: 52, gap: 1 },
+  rowTime: { width: 52 },
   rowTimeText: { color: C.text, fontSize: 13, fontWeight: "600" },
   rowTimeStrike: { textDecorationLine: "line-through", color: C.subDim },
   rowTimeReal: { fontSize: 11, fontWeight: "600" },
@@ -495,7 +497,7 @@ const styles = scaledStyles({
     flexDirection: "row",
     alignItems: "center",
     gap: 4,
-    paddingVertical: 3,
+    paddingVertical: 4,
     paddingHorizontal: 8,
     borderRadius: 9999,
     borderWidth: 1,

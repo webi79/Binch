@@ -12,6 +12,7 @@ import { usePalette } from "@/lib/theme/appBg";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useAccent } from "@/lib/theme/accent";
+import { requestWithPrimer } from "@/lib/permissions/primer";
 
 let ExpoSpeechRecognitionModule: any = null;
 let useSpeechRecognitionEvent: (name: string, cb: (e: any) => void) => void = () => {};
@@ -164,7 +165,13 @@ export function VoiceContent({ onClose }: Props) {
       showAlert(t("voice.unsupported"));
       return;
     }
-    const perm = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
+    const speech = ExpoSpeechRecognitionModule;
+    const perm = await requestWithPrimer(
+      "microphone",
+      () => speech.getPermissionsAsync(),
+      () => speech.requestPermissionsAsync(),
+    );
+    if (!perm) return;
     if (!perm.granted) {
       showAlert(t("voice.unsupported"));
       return;

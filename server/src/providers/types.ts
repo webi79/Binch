@@ -25,6 +25,9 @@ export interface ProviderSearchInput {
    *  entscheiden selbst, ob/wie sie filtern. Wenn nicht gesetzt = keine
    *  Klassen-Präferenz. */
   travelClass?: string;
+  /** Tarifprofil (Ermäßigungskarte, Deutschlandticket), kanonisch — siehe
+   *  util/fareProfile.ts. Nur bei Zügen gesetzt; db-vendo rechnet damit. */
+  fareProfile?: string;
   /** „Später"-Pagination: opaques Token aus einer vorherigen Provider-Response
    *  (HAFAS laterRef). Provider die das unterstützen (db-vendo) holen damit
    *  die Folge-Seite statt den Standard-Start. Andere ignorieren's. */
@@ -71,6 +74,12 @@ export interface LegInfo {
   arriveDelayMinutes?: number;
   durationMinutes: number;
   departPlatform?: string;
+  /**
+   * Echtzeit-Gleis der Abfahrt — NUR gesetzt, wenn es vom geplanten
+   * (`departPlatform`) abweicht, also bei einem Gleiswechsel. Bos geplante
+   * Aufgaben melden ihn (services/boTasks.ts).
+   */
+  departPlatformRt?: string;
   arrivePlatform?: string;
   line?: string;
   product?: string;
@@ -117,6 +126,9 @@ export interface NormalizedResult {
    *  Realtime-Daten vorliegen. departTime/arriveTime bleiben die SOLL-Zeit. */
   departDelayMinutes?: number;
   arriveDelayMinutes?: number;
+  /** Für die Abfahrt liegt Echtzeit vor — auch bei 0 Minuten. Die Verspätung
+   *  allein fehlt sonst bei „pünktlich" genauso wie bei „nichts bekannt". */
+  departRealtime?: boolean;
   originTz?: string;
   destinationTz?: string;
   dateOnly?: boolean;

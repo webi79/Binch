@@ -109,8 +109,12 @@ function uicCountryFromCode(code: string): string | null {
  *  [N, W, S, E]. */
 const AT_REGION_BBOXES: Array<{ profile: HafasProfileKey; bbox: [number, number, number, number] }> = [
   { profile: "vvv", bbox: [47.60, 9.53, 47.06, 10.30] }, // Vorarlberg
-  { profile: "vvt", bbox: [47.74, 10.10, 46.65, 12.95] }, // Tirol
-  { profile: "svv", bbox: [48.10, 12.10, 46.95, 13.50] }, // Salzburg
+  // Tirol und Salzburg: Die VVT- und SVV-Schnittstellen antworten (Stand
+  // 27.10.2026) nur noch mit einer HTML-Seite — jede Tafel dort blieb leer
+  // (Innsbruck Hbf). ÖBB kennt beide Länder samt Bus und Tram. Die Boxen
+  // bleiben stehen, sonst fiele Salzburg in die oberösterreichische.
+  { profile: "oebb", bbox: [47.74, 10.10, 46.65, 12.95] }, // Tirol (vvt)
+  { profile: "oebb", bbox: [48.10, 12.10, 46.95, 13.50] }, // Salzburg (svv)
   { profile: "ooevv", bbox: [48.78, 12.74, 47.46, 14.85] }, // Oberösterreich
   { profile: "vkg", bbox: [47.13, 12.65, 46.37, 15.06] }, // Kärnten
   { profile: "stv", bbox: [47.83, 13.55, 46.65, 16.21] }, // Steiermark
@@ -146,10 +150,15 @@ function chRegionFromCoord(lat: number, lon: number): HafasProfileKey | null {
  *  via coord neu resolved werden muss (Verbund-Profile haben eigene ID-Räume
  *  die nicht mit UIC-EVA matchen). */
 export function isAtRegionalProfile(profile: HafasProfileKey): boolean {
+  return isAtVerbundProfile(profile)
+    || profile === "bls" || profile === "zvv" || profile === "tpg";
+}
+
+/** Die österreichischen Verbund-Profile — liefert eines nichts, springt `oebb` ein. */
+export function isAtVerbundProfile(profile: HafasProfileKey): boolean {
   return profile === "vor" || profile === "vvt" || profile === "svv"
     || profile === "ooevv" || profile === "stv" || profile === "vkg"
-    || profile === "vvv"
-    || profile === "bls" || profile === "zvv" || profile === "tpg";
+    || profile === "vvv";
 }
 
 /** Liefert das Profil für einen Stop. Reihenfolge:

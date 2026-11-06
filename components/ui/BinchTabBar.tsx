@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef } from "react";
 import { Image, Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Animated, { useAnimatedStyle } from "react-native-reanimated";
+import { announceTabEnter } from "@/lib/nav/tabEnter";
 import { chromeShift, travelBar } from "@/lib/surroundings/mapChrome";
 import { router, usePathname } from "expo-router";
 
@@ -384,6 +385,8 @@ export function BinchTabBar() {
    */
   // Zähler im Speicher, hier nur „gibt es überhaupt etwas?" — siehe dort.
   const savedBadge = useSearchStore((st) => st.savedBadge > 0);
+  /** Live-Ansicht an? Nur dort scheint die Karte unter der Leiste durch — siehe `opaque`. */
+  const liveActive = useSearchStore((st) => st.liveSession != null);
   const pathname = usePathname();
   /**
    * Verstecken über eine SPERRLISTE, nicht über eine Erlaubnisliste.
@@ -438,7 +441,11 @@ export function BinchTabBar() {
      */
     // ZUERST der Wechsel — alles andere danach. Siehe Kopf der Datei.
     // Auf dem aktiven Tab entfällt er; der Rest unten läuft trotzdem.
-    if (!focused) router.navigate(href as never);
+    if (!focused) {
+      router.navigate(href as never);
+      // Danach melden — Einlauf-Bewegungen des Ziels (lib/nav/tabEnter.ts).
+      announceTabEnter(href);
+    }
 
     /**
      * Was früher am `tabPress`-Ereignis des Navigators hing. Das Ereignis kommt
@@ -555,18 +562,30 @@ export function BinchTabBar() {
   const chromeStyle = useAnimatedStyle(() => ({
     transform: [{ translateY: Math.min(chromeShift.value, chromeTravel) }],
   }));
+  /**
+   * DECKEND im Karten-Tab — außer in der Live-Ansicht.
+   *
+   * Das Auswahlfenster der Umgebung reicht bis unter die Leiste, und durch die
+   * getönte Fläche las man seine Liste („Stops near you", die erste Station)
+   * mitten in den Symbolen — gemeldet als „die Leiste ist durchsichtig". In der
+   * Live-Ansicht liegt darunter nur noch die Karte mit dem Fahrzeug, dort soll
+   * sie wie bisher durchscheinen.
+   */
+  const opaque = pathname === "/surroundings" && !liveActive;
   const barStyle = useMemo(
     () => [
       styles.bar,
       {
         paddingBottom: insets.bottom,
         height: BAR_H + insets.bottom,
-        backgroundColor: BAR_TINT[theme] ?? BAR_TINT.gray,
+        backgroundColor: opaque
+          ? (BAR_SOLID[theme] ?? BAR_SOLID.gray)
+          : (BAR_TINT[theme] ?? BAR_TINT.gray),
       },
       chromeStyle,
       underCoveredStop ? styles.barUnderCoveredStop : null,
     ],
-    [insets.bottom, theme, chromeStyle, underCoveredStop],
+    [insets.bottom, theme, opaque, chromeStyle, underCoveredStop],
   );
 
 
@@ -642,7 +661,7 @@ const styles = scaledStyles({
     alignItems: "center",
     justifyContent: "center",
   },
-  itemInner: { alignItems: "center", justifyContent: "center", gap: 3 },
+  itemInner: { alignItems: "center", justifyContent: "center", gap: 4 },
   iconBox: { width: ICON, height: ICON },
   /**
    * Mittelpunkt GENAU auf der oberen rechten Ecke des ZEICHENS.

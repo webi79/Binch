@@ -20,6 +20,12 @@ export interface SearchParams {
    *  (z.B. "search.class.business", "search.cabin.balcony"). Der Server
    *  bekommt diesen Key roh und lässt ihn an die Provider durch. */
   travelClass?: string;
+  /**
+   * Tarifprofil der Zugsuche (BahnCard, Deutschlandticket) — siehe
+   * lib/travel/fareProfile.ts. Fehlt es bei einer Zugsuche, setzt
+   * `searchByMode` das aus den Einstellungen ein.
+   */
+  fareProfile?: string;
 }
 
 export interface StopoverInfo {
@@ -83,6 +89,15 @@ export interface LegInfo {
 export type JourneyWarning = "connectionAtRisk" | "cancelled";
 
 export interface SearchResult {
+  /**
+   * Womit gesucht wurde — vom Client nach der Antwort eingetragen
+   * (`searchByMode`), nicht vom Server. Die Detail-Ansicht und gespeicherte
+   * Reisen zeigen damit die echte Klasse, den Tarif und Hin/Rück statt fester
+   * Vorgaben. Fehlt bei älteren gespeicherten Reisen.
+   */
+  travelClass?: string;
+  fareProfile?: string;
+  roundTrip?: boolean;
   id: string;
   mode: TravelMode;
   /** "OUTBOUND" = Hinfahrt (Default wenn nicht gesetzt), "RETURN" = Rückfahrt.

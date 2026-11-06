@@ -32,6 +32,7 @@ import { resultsPush, heroClipPush, searchHeroPush, startSearchHeroPush, isSearc
 } from "@/lib/nav/overlayCover";
 import { haptic } from "@/lib/haptics";
 import { scaledStyles } from "@/lib/ui/compact";
+import { slideTiming } from "@/lib/nav/slideMotion";
 
 /**
  * Der Such-Screen — ein Blatt, das von unten hereinfährt.
@@ -465,13 +466,13 @@ export function SearchHeroOverlay() {
     // Beide Federn laufen mit den ECHTEN Konfigurationen, damit wirklich
     // derselbe Pfad durchlaufen wird und nicht bloß ein ähnlicher.
     resultsPush.value = 0;
-    resultsPush.value = withTiming(0.002, PUSH_SPRING, (finished?: boolean) => {
+    resultsPush.value = withTiming(0.002, slideTiming(PUSH_SPRING), (finished?: boolean) => {
       "worklet";
       // Siehe oben — und hier ist die Kante schärfer: `startResultsPush()` fasst
       // denselben Wert an. Ohne diese Prüfung federte eine echte Ergebnis-Slide,
       // die im Aufwärm-Fenster beginnt, sofort wieder auf 0 zurück.
       if (!finished) return;
-      resultsPush.value = withTiming(0, POP_SPRING);
+      resultsPush.value = withTiming(0, slideTiming(POP_SPRING));
     });
     heroClipPush.value = 0;
     // Die vier ubrigen Bewegungswerte gleich mit — Detail-Blatt, Ticket-Blatt,
@@ -480,7 +481,7 @@ export function SearchHeroOverlay() {
     // „beim ersten Mal ruckelt es" zuruck.
     warmPushCurves();
     parallaxCover.value = 0;
-    parallaxCover.value = withTiming(0.002, COVER_IN_SPRING, (finished?: boolean) => {
+    parallaxCover.value = withTiming(0.002, slideTiming(COVER_IN_SPRING), (finished?: boolean) => {
       "worklet";
       if (!finished) return;
       parallaxCover.value = 0;
@@ -714,7 +715,7 @@ export function SearchHeroOverlay() {
         invalidateClose();
         const myCloseGen = closeGenRef.current;
         requestAnimationFrame(() => {
-        searchHeroPush.value = withTiming(0, SLIDE_OUT, () => {
+        searchHeroPush.value = withTiming(0, slideTiming(SLIDE_OUT), () => {
           // Abgeschlossen wird IMMER, außer eine NEUERE Bewegung hat inzwischen
           // begonnen — die räumt dann selbst auf.
           if (closeGen.value === myCloseGen) {

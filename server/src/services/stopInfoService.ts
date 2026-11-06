@@ -21,6 +21,7 @@ import { dbQuotaUsed, reportIfBlocked, tryAcquireDb, type DbLane } from "./dbQuo
 import {
   fetchDepartures as multiFetchDepartures,
   fetchArrivals as multiFetchArrivals,
+  productIdsOf,
   resolveStationByCoord as multiResolveStation,
 } from "./multiHafas.js";
 import type { HafasProfileKey, MultiHafasProfileKey } from "./countryProfile.js";
@@ -97,7 +98,29 @@ const SWR_REFRESH_AT_MS = HOT_TTL_MS / 2; // 2.5 min — Background-Refresh ab
 const HARD_MAX_AGE_MS = 15 * 60_000; // 15 min — über dem wir Cache komplett verwerfen
 const HOT_THRESHOLD = 5; // ≥5 Zugriffe in 1h = hot
 const ACCESS_TRACK_WINDOW_MS = 60 * 60_000; // 1h
-const MAX_RESULTS = 6;
+/**
+ * So viele Abfahrten liefert eine Tafel — wie MOTIS (`getMotisStopBoard(…, 25)`). Bis Okt. 2026
+ * stand hier 6, obwohl nach oben 20 (DB) bzw. 25 (AT/PL/LU/DK) geholt werden: An Wien Hbf
+ * deckten 6 Abfahrten wenige Minuten ab, aus dem Zwischenspeicher (bis 10 min) kam die Tafel
+ * dann mit lauter abgefahrenen Zügen — und die App blendet die aus: „Abfahrten verschwinden".
+ */
+const MAX_RESULTS = 25;
+/** Eine gespeicherte Tafel mit weniger noch kommenden Abfahrten ist verbraucht — neu holen. */
+const MIN_UPCOMING = 5;
+
+/**
+ * Was von einer gespeicherten Tafel noch kommt: Abfahrten, deren Ist- bzw. Planzeit über eine
+ * Minute zurückliegt, fliegen raus (die App zeigt sie ohnehin nicht). Ist danach kaum noch
+ * etwas übrig, gilt die Tafel als verbraucht, egal wie jung der Eintrag ist.
+ */
+function stillUpcoming(data: StopBoardResponse, now: number): { data: StopBoardResponse; usedUp: boolean } {
+  const results = data.results.filter((r) => {
+    const t = Date.parse(r.actualTime ?? r.plannedTime);
+    return !Number.isFinite(t) || t >= now - 60_000;
+  });
+  const usedUp = results.length < Math.min(MIN_UPCOMING, data.results.length);
+  return { data: results.length === data.results.length ? data : { ...data, results }, usedUp };
+}
 
 // Throttle + Background-Queue leben jetzt in dbVendoQueue.ts — shared zwischen
 // allen db-vendo-Consumern (Stop-Boards, Train-Searches, Pre-Cache). Damit
@@ -266,6 +289,53 @@ function dedupeStopItems(items: StopBoardItem[]): StopBoardItem[] {
   return out;
 }
 
+/** Mappt ein HAFAS-Product (z.B. „regional", „tram", „bus", „suburban") auf
+ *  unsere Frontend-Kind-Kategorie. Wenn das Product nicht erkannt wird (z.B.
+ *  ""/null/unbekannter String): null → wir lassen's durch, lieber zu inklusiv
+ *  als verloren. */
+export function productToKind(product: string): string | null {
+  const p = product.toLowerCase();
+  if (p === "tram") return "tram";
+  if (p === "subway" || p === "metro" || p === "underground") return "subway";
+  if (p === "bus") return "bus";
+  if (p === "ferry") return "ferry";
+  if (
+    p === "nationalexpress" ||
+    p === "national" ||
+    p === "regionalexpress" ||
+    p === "regional" ||
+    p === "regionalbahn" ||
+    p === "suburban" ||
+    p === "express"
+  )
+    return "train";
+  return null;
+}
+
+/**
+ * HAFAS-Produktfilter zu den Verkehrsarten eines Halts: nur, was dort hält.
+ * Gefiltert wurde bisher erst NACH der Abfrage — von 25 Abfahrten am Wiener
+ * Hauptbahnhof blieben für die Bahn-Tafel 8 (die nächsten 9 Minuten), am
+ * Westbahnhof 2: U-Bahn, Tram und Bus füllten den Rest. Unbekannte Produkte
+ * (`interregional`, `onCall`) bleiben an, wie in `filterToStopKinds`.
+ */
+function productsForKinds(
+  profile: MultiHafasProfileKey,
+  kinds: readonly string[] | null | undefined,
+): Record<string, boolean> | undefined {
+  if (!kinds?.length) return undefined;
+  const filter: Record<string, boolean> = {};
+  let off = 0;
+  for (const id of productIdsOf(profile)) {
+    const kind = productToKind(id);
+    filter[id] = kind === null || kinds.includes(kind);
+    if (!filter[id]) off++;
+  }
+  // Nichts aus (alles passt) oder alles aus (Art kennt das Profil nicht) → ohne Filter.
+  const ids = Object.keys(filter);
+  return off === 0 || off === ids.length ? undefined : filter;
+}
+
 /** Multi-Hafas-Pfad für AT/PL/LU/DK. Nutzt hafas-client npm in-process
  *  (kein extra Docker-Container). Kein Budget-Throttling — die Backends haben
  *  eigene Rate-Limits, die wir per Profil monitoring könnten falls's wichtig
@@ -274,11 +344,12 @@ async function fetchFromMultiHafas(
   hafasId: string,
   board: StopBoard,
   profile: MultiHafasProfileKey,
+  products?: Record<string, boolean>,
 ): Promise<StopBoardResponse> {
   const fetchFn = board === "departures" ? multiFetchDepartures : multiFetchArrivals;
   let raw: Awaited<ReturnType<typeof fetchFn>> = [];
   try {
-    raw = await fetchFn(profile, hafasId, { results: 25, duration: 180 });
+    raw = await fetchFn(profile, hafasId, { results: 25, duration: 180, products });
   } catch {
     // Profil-Fehler / Timeout / unbekannter Stop — leere Liste statt 500.
     raw = [];
@@ -367,9 +438,11 @@ export async function getStopBoard(
   hafasId: string,
   board: StopBoard,
   profile: HafasProfileKey = "db",
-  opts: { internal?: boolean } = {},
+  /** `kinds`: Verkehrsarten des Halts — die Multi-HAFAS-Profile fragen dann nur sie ab. */
+  opts: { internal?: boolean; kinds?: readonly string[] | null } = {},
 ): Promise<StopBoardResponse> {
-  const key = cacheKey(hafasId, board, profile);
+  const products = profile === "db" ? undefined : productsForKinds(profile, opts.kinds);
+  const key = cacheKey(hafasId, board, profile) + (products ? `:${[...opts.kinds!].sort().join(",")}` : "");
   if (!opts.internal) trackAccess(key);
 
   const cached = cache.get(key);
@@ -378,19 +451,20 @@ export async function getStopBoard(
   if (cached) {
     const age = now - cached.cachedAt;
     const ttl = isHot(key) ? HOT_TTL_MS : COLD_TTL_MS;
-    if (age < ttl) {
+    const live = stillUpcoming(cached.data, now);
+    if (age < ttl && !live.usedUp) {
       // Fresh enough. Trigger Background-Refresh wenn wir über SWR-Schwelle.
       if (age >= SWR_REFRESH_AT_MS && !cached.refreshing) {
         triggerBackgroundRefresh(hafasId, board, profile, key);
       }
-      return cached.data;
+      return live.data;
     }
     // Stale aber unter Hard-Limit → SWR fires synchronously below if no inflight
     if (age < HARD_MAX_AGE_MS) {
       const existing = inflight.get(key);
       if (existing) {
         // Refresh läuft schon → wir liefern den stale Cache aus.
-        return cached.data;
+        return live.data;
       }
       // Wir feuern jetzt synchron — Caller wartet auf frisches Ergebnis.
     }
@@ -405,7 +479,7 @@ export async function getStopBoard(
   // dort nur on-demand, der dbVendoQueue ist DB-spezifisch.
   // Der Vorlauf (`internal`) holt im Hintergrund — er darf der Tafel, die
   // gerade jemand ansieht, und der Suche keinen Platz nehmen.
-  const promise = fetchBoard(hafasId, board, profile, opts.internal ? "background" : "user")
+  const promise = fetchBoard(hafasId, board, profile, opts.internal ? "background" : "user", products)
     .then((data) => {
       cache.set(key, { data, cachedAt: Date.now(), ttlMs: HOT_TTL_MS, refreshing: false });
       return data;
@@ -414,7 +488,7 @@ export async function getStopBoard(
       // Keine frische Antwort (etwa kein Platz im Bahn-Kontingent): Eine noch
       // brauchbare gespeicherte Tafel ist besser als keine.
       const stale = cache.get(key);
-      if (stale && Date.now() - stale.cachedAt < HARD_MAX_AGE_MS) return stale.data;
+      if (stale && Date.now() - stale.cachedAt < HARD_MAX_AGE_MS) return stillUpcoming(stale.data, Date.now()).data;
       throw err;
     })
     .finally(() => {
@@ -433,11 +507,12 @@ async function fetchBoard(
   board: StopBoard,
   profile: HafasProfileKey,
   priority: "user" | "background",
+  products?: Record<string, boolean>,
 ): Promise<StopBoardResponse> {
   if (profile === "db") {
     return fetchFromDbRest(hafasId, board, priority);
   }
-  return fetchFromMultiHafas(hafasId, board, profile);
+  return fetchFromMultiHafas(hafasId, board, profile, products);
 }
 
 /** Stellt einen Background-Refresh in die geteilte db-vendo-Queue. Der

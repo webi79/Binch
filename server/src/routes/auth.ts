@@ -2,7 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { and, eq, lt, sql } from "drizzle-orm";
 import { db } from "../db/client.js";
-import { users, sessions, userIdentities } from "../db/schema.js";
+import { users, sessions, userIdentities, pushTokens } from "../db/schema.js";
 import { hashPassword, verifyPassword } from "../util/password.js";
 import { randomToken } from "../util/hash.js";
 import { bearerToken, resolveSession, hashSessionToken } from "../services/authSession.js";
@@ -411,6 +411,19 @@ export async function authRoutes(app: FastifyInstance) {
   app.post("/api/auth/logout", async (req, reply) => {
     const token = bearerToken(req);
     if (token) {
+      /**
+       * Das Gerät vom Konto lösen: Was der Server einem KONTO schickt (Bos
+       * geplante Aufgaben), soll nach dem Abmelden nicht mehr auf diesem Handy
+       * erscheinen. Preis-Alarme hängen am Gerät, nicht am Konto, und bleiben.
+       */
+      const pushToken = (req.body as { pushToken?: unknown } | null | undefined)?.pushToken;
+      const me = typeof pushToken === "string" && pushToken ? await resolveSession(token) : null;
+      if (me) {
+        await db
+          .update(pushTokens)
+          .set({ userId: null, updatedAt: new Date() })
+          .where(and(eq(pushTokens.token, pushToken as string), eq(pushTokens.userId, me.id)));
+      }
       await db.delete(sessions).where(eq(sessions.token, hashSessionToken(token)));
     }
     return reply.code(204).send();

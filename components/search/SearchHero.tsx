@@ -47,7 +47,7 @@ import { de as deLocale, enUS, fr as frLocale, es as esLocale, type Locale as Da
 import { Location, TravelMode } from "@/types/search";
 import { useT } from "@/lib/i18n/useT";
 import { useAppBg, usePalette } from "@/lib/theme/appBg";
-import { FIELD_H, GUTTER, SPACE } from "@/lib/theme/spacing";
+import { FIELD_H, GUTTER, SPACE, ITEM_GAP, GROUP_GAP } from "@/lib/theme/spacing";
 import { beginSearchHandoff, endSearchHandoff, isSearchHandoff, prepareHandoffLayer, releaseHandoffLayer } from "@/lib/nav/searchHandoff";
 
 /** Notbremse, falls die Ergebnis-Slide nie zustande kommt. */
@@ -102,6 +102,7 @@ import { useAccent } from "@/lib/theme/accent";
 import { scaledStyles } from "@/lib/ui/compact";
 import { isTransitionBusy } from "@/lib/nav/transitionBusy";
 import { PICKER_OUT } from "@/lib/nav/overlayCover";
+import { classOptionsFor } from "@/lib/search/recentSearch";
 
 const C = {
   bg: "#0D0D0D",
@@ -227,17 +228,24 @@ function tripTypesFor(mode: TravelMode): { id: TripType; key: string }[] {
   return base;
 }
 
+/**
+ * Womit eine NEUE Suche beginnt: Reisende und Zug-Klasse aus Profil →
+ * Einstellungen → Reisen. Eine Vorbelegung aus einer bestehenden Suche
+ * (`initial`) geht weiterhin vor — die hat der Nutzer ja gewählt.
+ */
+function startPax(): PaxCounts {
+  return { ...DEFAULT_PAX, adults: useSearchStore.getState().defaultPassengers };
+}
+
+function startClassIndex(mode: TravelMode): number {
+  if (mode !== "TRAIN") return 0;
+  const idx = extraOptionsFor(mode).indexOf(useSearchStore.getState().defaultTrainClass);
+  return idx >= 0 ? idx : 0;
+}
+
+/** Die Klassen je Verkehrsmittel — EINE Quelle, auch für den Verlauf (lib/search/recentSearch.ts). */
 export function extraOptionsFor(mode: TravelMode): string[] {
-  switch (mode) {
-    case "FLIGHT":
-      return ["search.class.economy", "search.class.business", "search.class.first"];
-    case "TRAIN":
-      return ["search.class.second", "search.class.first", "search.class.sparpreis"];
-    case "BUS":
-      return ["search.seat.standard", "search.seat.comfort", "search.seat.premium"];
-    case "CRUISE":
-      return ["search.cabin.inside", "search.cabin.outside", "search.cabin.balcony", "search.cabin.suite"];
-  }
+  return classOptionsFor(mode);
 }
 
 interface Props {
@@ -393,8 +401,11 @@ function SearchHeroComponent({
   const [destination, setDestination] = useState<Location | null>(null);
   const [departDate, setDepartDate] = useState<Date | null>(null);
   const [returnDate, setReturnDate] = useState<Date | null>(null);
-  const [pax, setPax] = useState<PaxCounts>(DEFAULT_PAX);
-  const [extraOpt, setExtraOpt] = useState(0);
+  const [pax, setPax] = useState<PaxCounts>(() => startPax());
+  const [extraOpt, setExtraOpt] = useState(() => startClassIndex(mode));
+  /** Das aktuelle Verkehrsmittel für den Rücksetz-Effekt, der nur an `resetTrigger` hängt. */
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
   /** Welches der beiden Options-Blätter offen ist — keines, Reisende, Klasse. */
   const [sheet, setSheet] = useState<"pax" | "class" | null>(null);
   // LocationPicker läuft jetzt am Root-Level via LocationPickerHost.
@@ -444,8 +455,9 @@ function SearchHeroComponent({
     setDestination(null);
     setDepartDate(null);
     setReturnDate(null);
-    setPax(DEFAULT_PAX);
-    setExtraOpt(0);
+    // Mit den Reise-Vorlieben aus den Einstellungen, nicht mit festen Werten.
+    setPax(startPax());
+    setExtraOpt(startClassIndex(modeRef.current));
     // Sicherheitsnetz: Der Bildschirm bleibt dauerhaft gemountet, ein offen
     // gebliebenes Blatt stünde beim nächsten Öffnen wieder da.
     setSheet(null);
@@ -504,7 +516,8 @@ function SearchHeroComponent({
     const rawIdx = initial.travelClassKey
       ? extraOptionsFor(mode).indexOf(initial.travelClassKey)
       : -1;
-    const nextIdx = rawIdx >= 0 ? rawIdx : 0;
+    // Ohne Klasse in der Vorbelegung: die aus den Einstellungen, nicht stur die erste.
+    const nextIdx = rawIdx >= 0 ? rawIdx : startClassIndex(mode);
 
     /**
      * Steht dasselbe schon da? Dann NICHTS anfassen.
@@ -1294,7 +1307,7 @@ function SearchHeroComponent({
         {/* Erste Zeile im Sheet — dieselbe Stelle, an der im Auth-Screen der
             Fortschrittsbalken sitzt, und mit dessen Maßen (`navRow`: minHeight
             38, 20 Abstand nach unten). Die 20 setzen sich hier aus dem
-            `gap: 10` des Inhalts und den 10 hier zusammen. */}
+            `gap` des Inhalts (8) und den 12 hier zusammen. */}
         {tripTypes.length > 1 ? (
           <Reveal index={0}>
             <View style={styles.navRow}>
@@ -1505,7 +1518,14 @@ function SearchHeroComponent({
             rippleColor="rgba(0,0,0,0.32)"
             style={[styles.cta, { backgroundColor: accent.solid }]}
           >
-            <Icon size={20} color="rgba(0,0,0,0.6)" style={styles.ctaIcon} />
+            {/* Zeichen und Schrift in EINER Stärke (Nutzer 06.11.2026: das Zeichen
+                war dünner als „Preise vergleichen"). Vorher 60 % Schwarz bei
+                Strich 2 — am Gerät gemessen 1,7 Punkte Strich gegen 2,0 Punkte
+                Grundstrich der fetten 17er-Schrift, und blasser. Jetzt dieselbe
+                Farbe und Strich 2,4 (= 2,0 Punkte bei 20er Zeichen), wie die
+                übrigen Zeichen neben fetten Beschriftungen auf Akzentflächen
+                (Anmelden, Geplant, Aufgaben-Blatt). */}
+            <Icon size={20} color="#000" strokeWidth={2.4} style={styles.ctaIcon} />
             <Text style={styles.ctaText}>{t("search.cta.compare")}</Text>
           </RippleTouch>
           </Animated.View>
@@ -1658,9 +1678,9 @@ const styles = scaledStyles({
   // 20 statt 26 — GUTTER, dasselbe Maß wie im Landingscreen. Die 26 kamen aus
   // dem Anmelde-Screen; dort passen sie zu einem Blatt, das nur Formularfelder
   // trägt. Neben dem Landingscreen gelesen fiel der breitere Rand auf.
-  formContent: { paddingHorizontal: GUTTER, paddingTop: 18, gap: 10 },
+  formContent: { paddingHorizontal: GUTTER, paddingTop: GROUP_GAP, gap: ITEM_GAP },
   /** Platz des Fortschrittsbalkens aus dem Auth-Screen (dort `navRow`). */
-  navRow: { minHeight: 38, justifyContent: "center", marginBottom: 10 },
+  navRow: { minHeight: 38, justifyContent: "center", marginBottom: 12 },
 
   toggleRow: {
     flexDirection: "row",
@@ -1669,7 +1689,7 @@ const styles = scaledStyles({
     padding: 4,
     gap: 4,
   },
-  toggleBtn: { flex: 1, paddingVertical: 9, borderRadius: 11, alignItems: "center" },
+  toggleBtn: { flex: 1, paddingVertical: 8, borderRadius: 11, alignItems: "center" },
   toggleBtnActive: {},
   toggleText: { fontSize: 13, fontWeight: "600", color: C.gray2 },
   toggleTextActive: { color: "#000" },
@@ -1680,12 +1700,12 @@ const styles = scaledStyles({
   routeField: {
     height: FIELD_H,
     borderRadius: 16,
-    paddingLeft: 18,
+    paddingLeft: 16,
     // Platz für den Tausch-Knopf, der rechts über der Fuge liegt.
-    paddingRight: 62,
+    paddingRight: 64,
     flexDirection: "row",
     alignItems: "center",
-    gap: 14,
+    gap: 16,
     minWidth: 0,
     // Unsichtbar, aber reserviert — der rote Fehler-Zustand darf die Höhe nicht
     // verändern, sonst springt das Layout.
@@ -1716,7 +1736,7 @@ const styles = scaledStyles({
   dateRow: { flexDirection: "row", gap: 8 },
   /** Nebeneinander → kein Platz für den Tausch-Knopf, also weniger Rand rechts
    *  und engerer Abstand zum Symbol. */
-  dateField: { flex: 1, paddingLeft: 14, paddingRight: 12, gap: 10 },
+  dateField: { flex: 1, paddingLeft: 16, paddingRight: 12, gap: 8 },
   dateText: { fontSize: 15 },
 
   /**
@@ -1734,7 +1754,7 @@ const styles = scaledStyles({
     flex: 1,
     height: 42,
     borderRadius: 9999,
-    paddingHorizontal: 14,
+    paddingHorizontal: 16,
     flexDirection: "row",
     alignItems: "center",
     gap: 8,

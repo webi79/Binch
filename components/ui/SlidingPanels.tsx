@@ -21,6 +21,7 @@ import Animated, {
 } from "react-native-reanimated";
 import type { ReactNode } from "react";
 import { scaledStyles } from "@/lib/ui/compact";
+import { slideTiming } from "@/lib/nav/slideMotion";
 
 interface Props {
   /** Welches Panel ist aktiv (0-indexed). */
@@ -100,7 +101,7 @@ export function SlidingPanels({ activeIndex, children, rasterize: rasterizeWante
         // Gehörte vorher keiner Familie an: 280ms mit der Kurve der
         // Seitwärts-Slides. Das hier ist ein Blatt-artiger Wechsel innerhalb einer
         // Fläche, also die Blatt-Vorgabe.
-        SHEET_OUT,
+        slideTiming(SHEET_OUT),
         (finished) => {
           // `finished` prüfen ist hier RICHTIG, ich hatte es fälschlich entfernt:
           // Bei einem Wechsel während einer laufenden Slide bricht die neue die alte

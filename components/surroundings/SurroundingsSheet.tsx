@@ -5,9 +5,11 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
+  useState,
   type ReactNode,
 } from "react";
-import { SHEET_IN } from "@/lib/nav/overlayCover";
+import { softSheetMotion } from "@/lib/nav/overlayCover";
 import { haptic } from "@/lib/haptics";
 import {
   View,
@@ -37,7 +39,6 @@ import {
   TramFront,
   Plane,
   Ship,
-  ChevronRight,
   SlidersHorizontal,
   type LucideIcon,
 } from "lucide-react-native";
@@ -47,15 +48,16 @@ import { useT } from "@/lib/i18n/useT";
 import { MarkerKind, SheetMode, StopListItem } from "@/lib/surroundings/mockData";
 import { useAccent } from "@/lib/theme/accent";
 import { ms, scaledStyles } from "@/lib/ui/compact";
-import { SPACE } from "@/lib/theme/spacing";
+import { SPACE, TITLE_GAP, GROUP_GAP, GUTTER, ITEM_GAP } from "@/lib/theme/spacing";
 import {
   dragHealOffset,
   snapToPixel,
+  settleHeal,
   startDragHeal,
-  stopDragHeal,
   useSheetScrollGate,
 } from "@/lib/ui/sheetSwipe";
-import { SheetTabs } from "@/components/surroundings/SheetTabs";
+import { SHEET_TABS_HEIGHT, SheetTabs } from "@/components/surroundings/SheetTabs";
+import { SHEET_HEAD_TOP, SheetHandle } from "@/components/ui/SheetModal";
 import { chromeShift, travelBottom } from "@/lib/surroundings/mapChrome";
 import {
   stopSheetHeal,
@@ -64,6 +66,7 @@ import {
 } from "@/components/surroundings/stopSheetAnimation";
 import { reportSurroundingsTarget } from "@/lib/surroundings/mapViewport";
 import { TRANSIT_COLOR, tint } from "@/lib/theme/transitColors";
+import { slideTiming } from "@/lib/nav/slideMotion";
 
 const LIME = "#7FEA4D";
 const LIME_SUB = "rgba(127,234,77,0.18)";
@@ -92,6 +95,28 @@ const C = {
   s4: "#2D2D31",
 };
 
+/**
+ * Fläche des Blattes: die Hintergrundfarbe wie im Rest der App (`s1`), Karten
+ * und Chips eine Stufe darüber (`s2`) — wie unter „Geplant". Auf "s2" gestellt
+ * hebt sich das Blatt von Karte und Tab-Leiste ab; Karten und Chips rücken dann
+ * von selbst auf `s3`. (03.11.2026: erst s2 probiert, Nutzer wollte zurück.)
+ */
+const SURFACE = "s1" as "s1" | "s2";
+type Palette = ReturnType<typeof usePalette>;
+const sheetTone = (p: Palette) => p[SURFACE];
+const cardTone = (p: Palette) => (SURFACE === "s2" ? p.s3 : p.s2);
+
+/** Der Kasten vorn in der Karte — dieselben Farben wie die Kästen auf der Karte (assets/marker-icons/box-*.png). */
+const LEAD_COLOR: Record<MarkerKind, string | null> = {
+  train: TRANSIT_COLOR.regional,
+  subway: TRANSIT_COLOR.subway,
+  bus: TRANSIT_COLOR.bus,
+  tram: TRANSIT_COLOR.tram,
+  cruise: TRANSIT_COLOR.ferry,
+  // Akzent — kommt zur Laufzeit aus `useAccent`.
+  airport: null,
+};
+
 const KIND_ICON: Record<MarkerKind, LucideIcon> = {
   train: Train,
   subway: SubwayIcon, // „U" wie auf der Karte
@@ -100,6 +125,18 @@ const KIND_ICON: Record<MarkerKind, LucideIcon> = {
   airport: Plane,
   cruise: Ship,
 };
+
+/**
+ * Die neue Liste kommt, wenn die Kamera angekommen ist. Der Flug beim Wechsel
+ * dauert 0,9 s (`cameraMove` in MapSurface.tsx, acht Stufen Zoom) und startet
+ * zwei Bilder nach der Wahl.
+ */
+const LIST_SETTLE_MS = 1100;
+
+/** Ob das Blatt schon einmal stand — siehe `firstMount`. */
+let sheetMountedOnce = false;
+const LIST_FADE_OUT = { duration: 90, easing: Easing.out(Easing.quad) };
+const LIST_FADE_IN = { duration: 220, easing: Easing.out(Easing.cubic) };
 
 const MODE_TABS: { mode: SheetMode; tKey: string; Icon: LucideIcon }[] = [
   { mode: "transit", tKey: "surroundings.mode.transit", Icon: Train },
@@ -146,6 +183,29 @@ const ACCESSORY_GAP = SPACE.md;
  */
 const ACCESSORY_FADE = 120;
 
+/** Nachlauf nach dem Loslassen — wie beim Haltestellen-Blatt (`settleStopSheet`). */
+const SETTLE_TAIL_MS = 900;
+
+/**
+ * So weit taucht das Blatt beim Ausweichen ÜBER seine sichtbare Höhe hinaus
+ * ab — sein Schatten reicht rund 40 Punkte über die Oberkante.
+ */
+const YIELD_SHADOW = 48;
+
+/**
+ * Wie weit dieses Blatt gerade dem Haltestellen- bzw. Stadt-Blatt ausweicht
+ * (siehe unten im Blatt). Auf MODULEBENE und mit allen Größen als Argument:
+ * Eine Funktion im Bauteil wäre bei jedem Durchgang eine neue — und weil die
+ * Lage-Stile sie mitnehmen, legte Reanimated beide Stile bei jedem Rendern
+ * neu an, samt neuem Startwert aus dem JS-Strang. Mehr Durchgänge, die eine
+ * Lage zurückschreiben können, war genau das Falsche.
+ */
+function stopYield(own: number, stopClosed: number, sheetHeight: number): number {
+  "worklet";
+  const rise = Math.max(0, stopClosed - stopSheetY.value);
+  return Math.min(rise, Math.max(0, sheetHeight - own) + YIELD_SHADOW);
+}
+
 /**
  * `memo`: Der Karten-Tab rendert oft (Ortung, Kamera in Ruhe, jedes Paket
  * Gleisverläufe der Stadt) — ohne Schranke lief dieses Blatt samt Liste jedes
@@ -160,7 +220,6 @@ export const SurroundingsSheet = memo(function SurroundingsSheet({
 }: Props) {
   const palette = usePalette();
   const t = useT();
-  const accent = useAccent();
   const insets = useSafeAreaInsets();
   const { height: screenHeight } = useWindowDimensions();
 
@@ -171,37 +230,29 @@ export const SurroundingsSheet = memo(function SurroundingsSheet({
   const snap = useMemo(() => {
     const fullTop = Math.max(60, insets.top + 12);
     const sheetHeight = screenHeight - fullTop;
-    // Platz für die Tab-Leiste. Der Wert stand fest auf 80 und stammte noch von
-    // der früheren, freischwebenden Leiste; er kommt jetzt aus der Leiste selbst
-    // — sonst laufen die zwei Zahlen bei der nächsten Höhenänderung auseinander.
-    const tabBarSpace = TAB_BAR_H + insets.bottom;
+    // Platz für die Tab-Leiste — skaliert wie die Leiste selbst (`ms`, siehe
+    // `TAB_BAR_H`). Hier stand der Rohwert: Auf Geräten mit Faktor < 1 lag das
+    // Blatt um die Differenz zu hoch, auf großen saßen die Chips 3 Punkte über
+    // der Leiste („scheiß Spacing", 04.11.2026).
+    const tabBarSpace = ms(TAB_BAR_H) + insets.bottom;
     /**
-     * Was im Ruhezustand ÜBER der Tab-Leiste stehen bleibt.
+     * Was im Ruhezustand ÜBER der Tab-Leiste steht: Griffzone, Reiter-Reihe und
+     * darunter Luft bis zur Leiste — `GROUP_GAP`, denn dort beginnt die nächste
+     * Gruppe (die Leiste ist eine Stufe heller als das Blatt, die Chips haben
+     * ihre Farbe: ohne Abstand verschmolzen sie mit ihr).
      *
-     * Hier stand 51 mit dem Vermerk, die 1-Punkt-Trennlinie werde abgeschnitten.
-     * Abgeschnitten wurden in Wahrheit 15 Punkte — und darin lag die
-     * Unterstreichung des aktiven Reiters, also genau das Element, das anzeigt,
-     * wo man gerade ist. Nachgerechnet aus den Stilen darunter:
-     *
-     *   Griffzone      10 (oben) +  5 (Griff) + 4 (unten)   = 19
-     *   Reiter-Zeile    4 (oben) + 42 (Reiter) + 1 (Linie)  = 47
-     *   Reiter selbst  12 + 18 (Symbol/Schrift) + 12        = 42
-     *                                                        ----
-     *                                                          66
-     *
-     * Die Unterstreichung sitzt am unteren Rand des Reiters, also bei 65 — und
-     * lag damit vollständig hinter der Leiste. Mit der vollen Höhe sitzt sie
-     * genau auf deren Oberkante, so wie gewünscht.
+     * Alles mit dem Faktor der Stilblätter (`ms` je Maß, wie `scaledStyles`):
+     * Vorher standen hier Rohwerte der alten Reiter (12 + 18 + 12 + Linie), die
+     * mit der Pillen-Reihe nichts mehr zu tun hatten.
      */
-    const HANDLE_ZONE = 10 + 5 + 4;
-    const TAB_H = 12 + 18 + 12;
-    const TAB_ROW = 4 + TAB_H + 1;
-    const peekVisible = HANDLE_ZONE + TAB_ROW;
+    const HANDLE_ZONE = ms(SHEET_HEAD_TOP);
+    const peekVisible = HANDLE_ZONE + SHEET_TABS_HEIGHT + ms(GROUP_GAP);
     const midVisible = Math.min(sheetHeight - 80, Math.max(420, screenHeight * 0.5));
     return {
       fullTop,
       sheetHeight,
       tabBarSpace,
+      peekVisible,
       // Vom Sheet aus runter geschoben (positiv = weiter unten):
       full: 0,
       mid: Math.max(0, sheetHeight - midVisible - tabBarSpace),
@@ -210,15 +261,20 @@ export const SurroundingsSheet = memo(function SurroundingsSheet({
   }, [screenHeight, insets.top, insets.bottom]);
 
   /**
-   * Startwert UNTERHALB des Bildrands, nicht auf der Ruhestellung.
+   * Wo das Blatt beim Einhängen steht.
    *
-   * Hier stand `snap.peek` — also genau das Ziel, das der Mount-Effekt gleich
-   * darunter anfährt. Start gleich Ziel heißt: Es bewegt sich nichts. Das Blatt
-   * stand von Anfang an da, die Zeitvorgabe darunter wirkte auf nichts. Vom
-   * unteren Rand aus fährt es jetzt wirklich herein, mit derselben Kurve wie
-   * jedes andere Blatt von unten.
+   * Mit dem Tab (erstes Einhängen): GLEICH in der Ruhestellung. Vorher fuhr es
+   * vom unteren Bildrand herein — die ganze Blatthöhe (rund 750 Punkte) in
+   * 300 ms, genau während die Karte ihren Stil aufbaut: „kommt so nach oben
+   * geschossen … das laggt auch" (04.11.2026). Die Karte, die Leiste, alles
+   * andere steht beim Tab-Wechsel einfach da — das Blatt jetzt auch.
+   *
+   * Später (nach Live-Ansicht oder Route, wenn das Blatt wiederkommt): kurz und
+   * weich hinter der Leiste hervor, nur um das sichtbare Stück
+   * (`softSheetMotion`) — die Karte steht da schon.
    */
-  const translateY = useSharedValue(snap.sheetHeight);
+  const firstMount = useRef(!sheetMountedOnce).current;
+  const translateY = useSharedValue(firstMount ? snap.peek : snap.peek + snap.peekVisible);
   /**
    * Nur-Karte-Modus: Das Blatt steht in der unteren Bildhälfte, fährt also nach
    * UNTEN hinaus — mit derselben Verschiebung wie alle anderen Teile, bis das
@@ -228,11 +284,37 @@ export const SurroundingsSheet = memo(function SurroundingsSheet({
    */
   /** Selbstkorrektur beim Ziehen — siehe `startDragHeal` in lib/ui/sheetSwipe.ts. */
   const heal = useSharedValue(0);
+  /**
+   * AUSWEICHEN, solange das Haltestellen- bzw. Stadt-Blatt offen ist (Nutzer
+   * 05.11.2026: die Auswahl dahinter „soll nicht sichtbar sein" — auch nicht,
+   * wenn jenes eingeklappt unten liegt).
+   *
+   * Gekoppelt an dessen Lage, Punkt für Punkt: Steigt es um d, sinkt dieses um
+   * d, bis es samt Schatten unter dem Rand ist; schließt es, kommt dieses im
+   * selben Maß zurück. Kein Zustand, kein Render — beide Werte leben auf dem
+   * UI-Strang, die Übergabe passiert im selben Bild. Beide Blätter beginnen an
+   * derselben Oberkante (`fullTop`), die Lagen sind direkt vergleichbar.
+   */
+  const stopSnap = useMemo(
+    () => stopSheetSnap(screenHeight, insets.top, insets.bottom),
+    [screenHeight, insets.top, insets.bottom],
+  );
+  const stopClosed = stopSnap.sheetHeight;
+  const stopMid = stopSnap.mid;
+  const sheetH = snap.sheetHeight;
   const sheetAnim = useAnimatedStyle(() => {
-    const y = translateY.value + Math.min(chromeShift.value, snap.sheetHeight - translateY.value);
+    const own = translateY.value + stopYield(translateY.value, stopClosed, sheetH);
+    const y = own + Math.min(chromeShift.value, Math.max(0, sheetH - own));
     // Auf ganze Gerätepixel — sonst zittert die Schrift beim Ziehen gegen ihre
-    // Flächen (siehe `snapToPixel`).
-    return { transform: [{ translateY: snapToPixel(y) + dragHealOffset(heal) }] };
+    // Flächen (siehe `snapToPixel`). Dazu BEIDE Selbstkorrekturen: die eigene
+    // und die des Haltestellen-Blatts — dieses Blatt folgt dessen Lage, also
+    // muss es auch nach dessen Fahrten nachgeschrieben werden
+    // (`settleStopSheet`).
+    return {
+      transform: [
+        { translateY: snapToPixel(y) + dragHealOffset(heal) + dragHealOffset(stopSheetHeal) },
+      ],
+    };
   });
 
   /**
@@ -282,13 +364,10 @@ export const SurroundingsSheet = memo(function SurroundingsSheet({
    * Auf ganze Gerätepixel wie die Blätter selbst, und zwar Kante und Abstand
    * EINZELN: Sonst schwankte der Abstand zur Kante beim Ziehen um ein Pixel.
    */
-  const stopMid = useMemo(
-    () => stopSheetSnap(screenHeight, insets.top, insets.bottom).mid,
-    [screenHeight, insets.top, insets.bottom],
-  );
   const accessoryAnim = useAnimatedStyle(() => {
     const lift = snapToPixel(accessoryH.value + accessoryGap);
-    const own = translateY.value;
+    // Die SICHTBARE Lage dieses Blattes — mit dem Ausweichen von oben.
+    const own = translateY.value + stopYield(translateY.value, stopClosed, sheetH);
     const stop = stopSheetY.value;
     const edge = Math.min(own, stop);
     // Der Knopf fährt mit — und weiter, bis auch er hinter dem Rand ist: Er
@@ -334,12 +413,11 @@ export const SurroundingsSheet = memo(function SurroundingsSheet({
   );
 
   useEffect(() => {
-    // Beim ersten Mount in die Ruhestellung fahren — mit derselben Vorgabe wie
-    // jedes andere Blatt, das von unten hereinkommt (siehe SHEET_IN). Hier stand
-    // eine eigene Feder; sie schwingt über und endet nur asymptotisch, während
-    // alle anderen exakt landen.
-    translateY.value = withTiming(snap.peek, SHEET_IN);
+    sheetMountedOnce = true;
+    if (!firstMount) translateY.value = withTiming(snap.peek, slideTiming(softSheetMotion(snap.peekVisible).in));
     reportSurroundingsTarget(snap.peek);
+    // Nur beim Einhängen.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /**
@@ -457,9 +535,56 @@ export const SurroundingsSheet = memo(function SurroundingsSheet({
      */
     .onFinalize(() => {
       gate.onList.value = false;
-      stopDragHeal(heal);
+      // Nachlauf statt Stopp: über das Einrasten (180 ms) hinaus nachschreiben
+      // — siehe `settleHeal` in lib/ui/sheetSwipe.ts.
+      settleHeal(heal, 180 + SETTLE_TAIL_MS);
     }),
   [snap, startY, base, moved, translateY, gate, heal]);
+
+  /**
+   * Beim Wechsel der Art: Die Liste tritt sofort zurück (Deckkraft, UI-Strang)
+   * und wird erst NACH der Kamerafahrt getauscht, dann weich eingeblendet.
+   *
+   * Mit der Wahl tauschte die Liste ihre Zeilen aus — erst nur die ersten acht,
+   * aber auch die wollen gebaut und eingehängt werden, und das genau, wenn die
+   * Kamera losfährt, deren Kurve auf demselben UI-Strang rechnet: „laggt
+   * manchmal immer noch" (04.11.2026). Jetzt bleiben während der Fahrt die
+   * ALTEN Zeilen hängen (unsichtbar, unverändert — nichts zu bauen), und der
+   * Tausch kommt, wenn die Kamera steht (`LIST_SETTLE_MS`). Die Liste beginnt
+   * dabei oben: Der Stand der alten Liste hat mit der neuen nichts zu tun.
+   */
+  const [calmMode, setCalmMode] = useState(mode);
+  const settling = calmMode !== mode;
+  useEffect(() => {
+    if (!settling) return;
+    const id = setTimeout(() => setCalmMode(mode), LIST_SETTLE_MS);
+    return () => clearTimeout(id);
+  }, [mode, settling]);
+  const calmItemsRef = useRef(items);
+  if (!settling) calmItemsRef.current = items;
+  const listData = settling ? calmItemsRef.current : items;
+  const listRef = useRef<FlatList<StopListItem>>(null);
+  const listFade = useSharedValue(1);
+  const listFadeStyle = useAnimatedStyle(() => ({ opacity: listFade.value }));
+  const shownModeRef = useRef(calmMode);
+  useEffect(() => {
+    if (settling) return;
+    if (shownModeRef.current !== calmMode) {
+      shownModeRef.current = calmMode;
+      gate.scrollY.value = 0;
+      listRef.current?.scrollToOffset({ offset: 0, animated: false });
+    }
+    // Auch beim Hin-und-zurück vor dem Tausch (A → B → A): wieder einblenden.
+    if (listFade.value !== 1) listFade.value = withTiming(1, LIST_FADE_IN);
+  }, [settling, calmMode, gate, listFade]);
+  const pickMode = useCallback(
+    (m: SheetMode) => {
+      // Die alte Liste tritt schon zurück, während der Umbau läuft.
+      if (m !== mode) listFade.value = withTiming(0, LIST_FADE_OUT);
+      setMode(m);
+    },
+    [mode, setMode, listFade],
+  );
 
   const title = t(TITLE_KEY[mode]);
 
@@ -478,16 +603,14 @@ export const SurroundingsSheet = memo(function SurroundingsSheet({
     <Animated.View
       style={[
         styles.sheet,
-        { backgroundColor: palette.s1 },
+        { backgroundColor: sheetTone(palette) },
         { top: Math.max(60, insets.top + 12), height: snap.sheetHeight },
         sheetAnim,
       ]}
     >
       {/* Nur noch Zeichen, nicht mehr Griff: Gezogen wird überall. Der Strich
           bleibt, weil er ansagt, DASS gezogen werden kann. */}
-      <View style={styles.handleZone}>
-        <View style={styles.handle} />
-      </View>
+      <SheetHandle />
 
       {/* Dieselbe Reiter-Reihe wie im Stadt-Blatt — siehe SheetTabs.tsx. */}
       <SheetTabs
@@ -497,14 +620,28 @@ export const SurroundingsSheet = memo(function SurroundingsSheet({
           Icon,
         }))}
         active={mode}
-        onChange={setMode}
+        onChange={pickMode}
+        chipColor={cardTone(palette)}
       />
 
       <View style={styles.titleRow}>
-        <Text style={styles.title}>{title}</Text>
-        <RippleTouch style={styles.filterRow} borderless>
-          <Text style={[styles.filterText, { color: accent.solid }]}>{t("surroundings.filter")}</Text>
-          <SlidersHorizontal color={accent.solid} size={12} strokeWidth={2.2} />
+        <View style={styles.titleLeft}>
+          <Text style={styles.title} numberOfLines={1}>
+            {title}
+          </Text>
+          {items.length > 0 ? (
+            <View style={[styles.count, { backgroundColor: cardTone(palette) }]}>
+              <Text style={styles.countText}>{items.length}</Text>
+            </View>
+          ) : null}
+        </View>
+        <RippleTouch
+          style={[styles.round, { backgroundColor: cardTone(palette) }]}
+          borderless
+          accessibilityRole="button"
+          accessibilityLabel={t("surroundings.filter")}
+        >
+          <SlidersHorizontal color={C.white} size={16} strokeWidth={2.2} />
         </RippleTouch>
       </View>
 
@@ -513,8 +650,9 @@ export const SurroundingsSheet = memo(function SurroundingsSheet({
           Blatt jedes Scrollen ab. */}
       <GestureDetector gesture={gate.native}>
       <Animated.FlatList
-        style={styles.scroll}
-        data={items}
+        ref={listRef as never}
+        style={[styles.scroll, listFadeStyle]}
+        data={listData}
         keyExtractor={keyExtractor}
         renderItem={renderStopRow}
         contentContainerStyle={{ paddingBottom: snap.tabBarSpace + 40 }}
@@ -572,64 +710,66 @@ const renderStopRow = ({ item }: ListRenderItemInfo<StopListItem>) => (
   <StopRow item={item} />
 );
 
+/**
+ * Eine Haltestelle als Karte (Richtung B): vorn der Kasten wie auf der Karte,
+ * daneben Name und Linien, rechts die Entfernung. Keine Auswahl-Markierung —
+ * ausdrücklich nicht gewünscht.
+ */
 const StopRow = memo(function StopRow({ item }: { item: StopListItem }) {
-  const t = useT();
   const accent = useAccent();
   const palette = usePalette();
   const onSelectStop = useContext(SelectStopContext);
+  const [lead, ...more] = item.kinds;
+  const LeadIcon = lead ? KIND_ICON[lead] : null;
+  const leadBg = lead ? (LEAD_COLOR[lead] ?? accent.solid) : null;
+  const leadFg = lead === "airport" ? accent.textOnSolid : "#FFFFFF";
+  const hasMeta = more.length > 0 || !!item.lines?.length || !!item.badge;
   return (
     <RippleTouch
       onPress={() => {
         haptic("button");
         onSelectStop(item.id);
       }}
-      style={[styles.row, item.selected && [styles.rowSelected, { backgroundColor: palette.s2 }]]}
+      rippleColor="rgba(255,255,255,0.08)"
+      accessibilityRole="button"
+      style={[styles.card, { backgroundColor: cardTone(palette) }]}
     >
-      <View style={{ flex: 1 }}>
-        <View style={styles.rowTitleLine}>
-          <Text style={styles.rowTitle}>{item.name}</Text>
-          {item.selected && (
-            <View style={[styles.selectedBadge, { backgroundColor: accent.solid }]}>
-              <Text style={styles.selectedBadgeText}>{t("surroundings.selected")}</Text>
-            </View>
-          )}
+      {LeadIcon && leadBg ? (
+        <View style={[styles.lead, { backgroundColor: leadBg }]}>
+          <LeadIcon color={leadFg} size={18} strokeWidth={2} />
         </View>
-        <View style={styles.kindRow}>
-          {item.kinds.map((k, i) => {
-            const Icon = KIND_ICON[k];
-            // Unbekannte Kinds (z.B. „ferry" aus OSM-Imports, leere Strings
-            // aus partiellen Daten) → Chip einfach skippen statt Render-
-            // Crash mit „Cannot read property displayName of undefined".
-            if (!Icon) return null;
-            // Airport-Chip nutzt den User-Akzent, die übrigen die Farben der
-            // Verkehrsmittel — wie ihre Kästen auf der Karte.
-            const styled = k === "airport"
-              ? { bg: accent.subtle, fg: accent.solid }
-              : KIND_CHIP_STYLE[k];
-            const bg = styled?.bg ?? C.s3;
-            const fg = styled?.fg ?? C.white;
-            return (
-              <View key={i} style={[styles.kindChip, { backgroundColor: bg }]}>
-                <Icon color={fg} size={14} strokeWidth={2} />
+      ) : null}
+      <View style={styles.cardMain}>
+        <Text style={styles.rowTitle} numberOfLines={1}>
+          {item.name}
+        </Text>
+        {hasMeta ? (
+          <View style={styles.kindRow}>
+            {/* Weitere Verkehrsarten am selben Halt — klein, die erste steht schon vorn. */}
+            {more.map((k, i) => {
+              const Icon = KIND_ICON[k];
+              if (!Icon) return null;
+              const styled = k === "airport" ? { bg: accent.subtle, fg: accent.solid } : KIND_CHIP_STYLE[k];
+              return (
+                <View key={i} style={[styles.kindChip, { backgroundColor: styled?.bg ?? C.s3 }]}>
+                  <Icon color={styled?.fg ?? C.white} size={12} strokeWidth={2} />
+                </View>
+              );
+            })}
+            {item.lines?.map((ln, i) => (
+              <View key={`ln${i}`} style={[styles.lineBadge, { backgroundColor: ln.color }]}>
+                <Text style={styles.lineBadgeText}>{ln.id}</Text>
               </View>
-            );
-          })}
-          {item.lines?.map((ln, i) => (
-            <View key={`ln${i}`} style={[styles.lineBadge, { backgroundColor: ln.color }]}>
-              <Text style={styles.lineBadgeText}>{ln.id}</Text>
-            </View>
-          ))}
-          {item.badge && (
-            <View style={[styles.metaBadge, { backgroundColor: palette.s3 }]}>
-              <Text style={styles.metaBadgeText}>{item.badge}</Text>
-            </View>
-          )}
-        </View>
+            ))}
+            {item.badge && (
+              <View style={[styles.metaBadge, { backgroundColor: palette.s3 }]}>
+                <Text style={styles.metaBadgeText}>{item.badge}</Text>
+              </View>
+            )}
+          </View>
+        ) : null}
       </View>
-      <View style={styles.distanceCol}>
-        <Text style={[styles.distance, { color: accent.solid }]}>{item.distance}</Text>
-        <ChevronRight color={C.g3} size={16} strokeWidth={2.4} />
-      </View>
+      <Text style={styles.distance}>{item.distance}</Text>
     </RippleTouch>
   );
 });
@@ -663,26 +803,15 @@ const styles = scaledStyles({
     elevation: 20,
     zIndex: 40,
   },
-  handleZone: {
-    paddingTop: 10,
-    paddingBottom: 4,
-    alignItems: "center",
-  },
-  handle: {
-    width: 44,
-    height: 5,
-    borderRadius: 3,
-    backgroundColor: "#FFFFFF",
-    opacity: 0.85,
-  },
   // Reiter-Reihe: siehe SheetTabs.tsx.
   titleRow: {
     flexDirection: "row",
     justifyContent: "space-between",
-    alignItems: "flex-end",
-    paddingHorizontal: 20,
-    paddingTop: 18,
-    paddingBottom: 10,
+    alignItems: "center",
+    columnGap: SPACE.md,
+    paddingHorizontal: GUTTER,
+    paddingTop: GROUP_GAP,
+    paddingBottom: TITLE_GAP,
   },
   title: {
     fontSize: 19,
@@ -690,70 +819,62 @@ const styles = scaledStyles({
     color: C.white,
     letterSpacing: -0.4,
   },
-  filterRow: {
-    flexDirection: "row",
+  titleLeft: { flexDirection: "row", alignItems: "center", columnGap: ITEM_GAP, flexShrink: 1 },
+  count: {
+    minWidth: 22,
+    height: 22,
+    paddingHorizontal: 8,
+    borderRadius: 11,
     alignItems: "center",
-    columnGap: 4,
-    paddingVertical: 4,
-    paddingHorizontal: 4,
+    justifyContent: "center",
   },
-  filterText: {
-    fontSize: 12,
-
-    fontWeight: "600",
+  countText: { fontSize: 12, fontWeight: "700", color: C.g1 },
+  /** Filter als runder Knopf — dieselbe Fläche wie die Karten. */
+  round: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    overflow: "hidden",
   },
   scroll: { flex: 1 },
-  row: {
-    paddingHorizontal: 20,
-    paddingVertical: 14,
-    borderBottomColor: C.border,
-    borderBottomWidth: 1,
+  /** Haltestelle als Karte. */
+  card: {
     flexDirection: "row",
     alignItems: "center",
-    columnGap: 14,
+    columnGap: 12,
+    marginHorizontal: GUTTER,
+    marginBottom: ITEM_GAP,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderRadius: 16,
+    overflow: "hidden",
   },
-  rowSelected: { backgroundColor: C.s2 },
-  rowTitleLine: {
-    flexDirection: "row",
+  /** Feiner heller Rand: Der Tram-Kasten (#2A2A2C) ginge auf der Karte sonst unter. */
+  lead: {
+    width: 38,
+    height: 38,
+    borderRadius: 11,
     alignItems: "center",
-    columnGap: 8,
-    marginBottom: 8,
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.14)",
   },
-  rowTitle: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: C.white,
-    letterSpacing: -0.2,
-  },
-  selectedBadge: {
-
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 6,
-  },
-  selectedBadgeText: {
-    color: "#000",
-    fontSize: 9,
-    fontWeight: "800",
-    letterSpacing: 0.5,
-  },
+  cardMain: { flex: 1, minWidth: 0, rowGap: 8 },
+  rowTitle: { fontSize: 15, fontWeight: "600", color: C.white, letterSpacing: -0.2 },
+  kindChip: { width: 20, height: 20, borderRadius: 6, alignItems: "center", justifyContent: "center" },
+  distance: { fontSize: 13.5, fontWeight: "600", color: C.white, letterSpacing: -0.2 },
   kindRow: {
     flexDirection: "row",
     alignItems: "center",
     flexWrap: "wrap",
-    columnGap: 6,
-    rowGap: 6,
-  },
-  kindChip: {
-    width: 26,
-    height: 26,
-    borderRadius: 7,
-    alignItems: "center",
-    justifyContent: "center",
+    columnGap: 8,
+    rowGap: 8,
   },
   lineBadge: {
-    paddingHorizontal: 7,
-    paddingVertical: 3,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
     borderRadius: 6,
   },
   lineBadgeText: {
@@ -765,23 +886,13 @@ const styles = scaledStyles({
   metaBadge: {
     backgroundColor: C.s3,
     paddingHorizontal: 8,
-    paddingVertical: 3,
+    paddingVertical: 4,
     borderRadius: 6,
   },
   metaBadgeText: {
     color: C.g1,
     fontSize: 10,
     fontWeight: "600",
-  },
-  distanceCol: {
-    alignItems: "flex-end",
-    rowGap: 4,
-  },
-  distance: {
-    fontSize: 14,
-    fontWeight: "700",
-
-    letterSpacing: -0.2,
   },
   footer: {
     textAlign: "center",

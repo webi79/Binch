@@ -5,10 +5,12 @@ import { setSheetMoving } from "@/lib/nav/searchHandoff";
 import {
   preloadSettingsSub,
   subscribeSettingsPreload,
+  type SettingsCategoryId,
   type SettingsSubId,
 } from "@/lib/nav/settingsPreload";
 import { OnFocusLost } from "@/lib/nav/FocusSentinel";
 import {
+  AppState,
   Platform,
   BackHandler,
   View,
@@ -39,14 +41,14 @@ import {
   UNDERLAY_TRAVEL_FRAC,
   settingsPush,
 } from "@/lib/nav/overlayCover";
-import { GUTTER, SPACE, HEADING_TOP, HEADING_GAP, useNavbarSpace } from "@/lib/theme/spacing";
+import { CLOSE_ICON_SIZE, GUTTER, SPACE, HEADING_TOP, HEADING_GAP, useNavbarSpace, GROUP_GAP, SECTION_GAP, TITLE_GAP } from "@/lib/theme/spacing";
 import { ScreenHeading } from "@/components/ui/ScreenHeading";
 import * as ImagePicker from "expo-image-picker";
+import { requestWithPrimer } from "@/lib/permissions/primer";
 import * as ImageManipulator from "expo-image-manipulator";
-import Svg, { Circle, Defs, Ellipse, G, LinearGradient, Path, Rect, Stop } from "react-native-svg";
+import Svg, { Defs, Ellipse, G, LinearGradient, Path, Rect, Stop } from "react-native-svg";
 import {
   ChevronRight,
-  Check,
   X,
   User,
   Mail,
@@ -57,17 +59,75 @@ import {
   LogOut,
   LogIn,
   Pencil,
+  Brain,
+  Trash2,
+  Palette,
+  Globe,
+  Bell,
+  Tag,
+  Vibrate,
+  BellOff,
+  Download,
+  Train,
+  Users,
+  TicketCheck,
+  Accessibility,
+  Wifi,
+  Route,
+  Bike,
 } from "lucide-react-native";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import * as Notifications from "expo-notifications";
+import { ensurePushToken, knownPushToken, reregisterDevice } from "@/lib/notifications/push";
+import { showStatusToast } from "@/components/ui/StatusToast";
+import { syncPriceAlerts } from "@/lib/notifications/syncAlerts";
+import { ARRIVAL_LEADS, REMINDER_LEADS, type ArrivalLead, type ReminderLead } from "@/lib/notifications/tripReminders";
+import {
+  boMemoryKeyFor,
+  chatThreadsKeyFor,
+  clearBoMemory,
+  deleteBoMemoryEntry,
+  fetchBoMemory,
+  setBoMemoryEnabled,
+  type BoMemoryState,
+} from "@/lib/api/chats";
 import { useSearchStore, Locale } from "@/stores/searchStore";
 import { useAccent, ACCENT_LIST, type AccentId } from "@/lib/theme/accent";
-import { BinchSwitch } from "@/components/ui/BinchSwitch";
 import { useAppBg, usePalette } from "@/lib/theme/appBg";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
-import { authLogout, authUpdateAvatar } from "@/lib/api/client";
+import { authDeleteAccount, authLogout, authUpdateAvatar } from "@/lib/api/client";
+import { exportMyData } from "@/lib/account/exportData";
+import { RAIL_CARDS, RAIL_CARD_LABEL, TRANSFER_MINUTES, type RailCard, type TransferMinutes } from "@/lib/travel/fareProfile";
 import { showAlert } from "@/lib/alert";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import {
+  ChoiceGrid,
+  ChoiceSegment,
+  ControlLabel,
+  DangerButton,
+  Footnote,
+  ListCard,
+  MiniChat,
+  MiniHome,
+  MiniResults,
+  MiniSearch,
+  MiniToast,
+  NoticeRow,
+  Panel,
+  PreviewCard,
+  SectionTitle,
+  StepperRow,
+  PlaceField,
+  SwitchLine,
+  SwitchRow,
+} from "@/components/settings/SettingsBlocks";
+import { DeliveryTest } from "@/components/settings/DeliveryTest";
 import { scaledStyles } from "@/lib/ui/compact";
+import { slideTiming } from "@/lib/nav/slideMotion";
+import { GridLoader } from "@/components/ui/GridLoader";
+import { LoadGate } from "@/components/ui/LoadGate";
+import { StatePanel } from "@/components/ui/StatePanel";
 
 const C = {
   bg: "#0D0D0D",
@@ -92,7 +152,7 @@ function makeInitials(firstName: string, lastName: string): string {
   return out || "?";
 }
 
-type SubScreen = "details" | "settings" | "support" | null;
+type SubScreen = SettingsSubId | null;
 
 export default function SettingsScreen() {
   const t = useT();
@@ -235,7 +295,7 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
           onPress: async () => {
             if (token) {
               try {
-                await authLogout(token);
+                await authLogout(token, knownPushToken());
               } catch {
                 /* server unreachable — local sign-out is still fine */
               }
@@ -247,9 +307,9 @@ function Hub({ onNav }: { onNav: (id: Exclude<SubScreen, null>) => void }) {
           },
         },
       ],
-      // Trauriger Bo statt des roten Ausrufezeichens: Abmelden ist kein
+      // Eine Tür mit Pfeil statt des roten Ausrufezeichens: Abmelden ist kein
       // Unglück, sondern ein Abschied.
-      "bo-sad",
+      "logout",
     );
   };
 
@@ -452,8 +512,74 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
   const user = useSearchStore((s) => s.authUser);
   const token = useSearchStore((s) => s.authToken);
   const setAuthUser = useSearchStore((s) => s.setAuthUser);
+  const clearAuth = useSearchStore((s) => s.clearAuth);
   const openAuth = useSearchStore((s) => s.openAuthOverlay);
+  const queryClient = useQueryClient();
   const [avatarBusy, setAvatarBusy] = useState(false);
+  const [exporting, setExporting] = useState(false);
+
+  /** Server-Auskunft + Gerätedaten als eine Datei, dann das Teilen-Menü (lib/account/exportData.ts). */
+  const onExport = async () => {
+    if (!token || exporting) return;
+    haptic("button");
+    setExporting(true);
+    try {
+      await exportMyData(token, t("settings.privacy.export"));
+    } catch {
+      showAlert(t("settings.privacy.export.error.title"), t("settings.privacy.export.error.body"));
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  /**
+   * Konto löschen — zwei Rückfragen, denn es ist endgültig. Die erste sagt,
+   * was verschwindet und was bleibt; die zweite ist die Entscheidung.
+   */
+  const onDeleteAccount = () => {
+    if (!token || !user) return;
+    haptic("button");
+    showAlert(t("settings.account.delete.title"), t("settings.account.delete.body"), [
+      { text: t("settings.signout.confirm.cancel"), style: "cancel" },
+      {
+        text: t("settings.account.delete.next"),
+        style: "destructive",
+        onPress: () =>
+          showAlert(
+            t("settings.account.delete.confirm.title"),
+            t("settings.account.delete.confirm.body"),
+            [
+              { text: t("settings.signout.confirm.cancel"), style: "cancel" },
+              { text: t("settings.account.delete.confirm.ok"), style: "destructive", onPress: () => void deleteAccount() },
+            ],
+            "delete",
+          ),
+      },
+    ]);
+  };
+
+  const deleteAccount = async () => {
+    if (!token || !user) return;
+    const uid = user.id;
+    try {
+      await authDeleteAccount(token);
+    } catch {
+      // Lokal NICHT abmelden: Sonst stünde der Nutzer abgemeldet da, mit einem
+      // Konto, das es noch gibt — und hielte es für gelöscht.
+      showAlert(t("settings.account.delete.error.title"), t("settings.account.delete.error.body"));
+      return;
+    }
+    queryClient.removeQueries({ queryKey: chatThreadsKeyFor(uid) });
+    queryClient.removeQueries({ queryKey: boMemoryKeyFor(uid) });
+    clearAuth();
+    void forgetSocialSession();
+    // Mit dem Konto sind auf dem Server auch dessen Geräte und Alarme weg. Die
+    // Alarme auf DIESEM Gerät bleiben (so steht es im Dialog) — also das Gerät
+    // anonym neu anmelden und sie gleich wieder hinterlegen.
+    void reregisterDevice().then(() => syncPriceAlerts());
+    useSearchStore.getState().showStationToast(t("settings.account.deleted.title"), t("settings.account.deleted.body"));
+    onBack();
+  };
 
   const fullName = user ? `${user.firstName} ${user.lastName}` : t("auth.guest.name");
   const initials = user ? makeInitials(user.firstName, user.lastName) : "?";
@@ -461,7 +587,12 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
   const onPickPhoto = async () => {
     if (!user || !token || avatarBusy) return;
     haptic("button");
-    const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    const perm = await requestWithPrimer(
+      "photos",
+      ImagePicker.getMediaLibraryPermissionsAsync,
+      ImagePicker.requestMediaLibraryPermissionsAsync,
+    );
+    if (!perm) return;
     if (!perm.granted) {
       showAlert(t("settings.avatar.permission.title"), t("settings.avatar.permission.body"));
       return;
@@ -552,7 +683,7 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
           ) : null}
         </Pressable>
         {user ? (
-          <View style={{ flexDirection: "row", gap: 14, alignItems: "center" }}>
+          <View style={{ flexDirection: "row", gap: 16, alignItems: "center" }}>
             <Pressable onPress={onPickPhoto} disabled={avatarBusy} hitSlop={6}>
               <Text style={[styles.editPhotoText, { color: accent.solid }]}>{t("settings.detail.editphoto")}</Text>
             </Pressable>
@@ -604,6 +735,28 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
           isLast
         />
       </Group>
+
+      {user && token ? (
+        <>
+          <SLabel text={t("settings.privacy")} />
+          <Group>
+            <Row
+              icon={<Download size={16} color={C.white} strokeWidth={2} />}
+              label={t("settings.privacy.export")}
+              sub={t("settings.privacy.export.desc")}
+              onPress={() => void onExport()}
+              rightEl={exporting ? <ActivityIndicator size="small" color={C.g2} /> : undefined}
+            />
+            <Row
+              icon={<Trash2 size={16} color={C.red} strokeWidth={2} />}
+              label={t("settings.account.delete")}
+              danger
+              onPress={onDeleteAccount}
+              isLast
+            />
+          </Group>
+        </>
+      ) : null}
       </BelowFold>
 
     </View>
@@ -611,202 +764,445 @@ function DetailsScreen({ onBack }: { onBack: () => void }) {
 }
 
 /* ─────────────────────── SETTINGS SUB ─────────────────────── */
-const THEMES: { id: "dark" | "light" | "gray"; bg: string; surface: string }[] = [
-  { id: "dark", bg: "#000000", surface: "#171719" },
-  { id: "light", bg: "#F2F2F5", surface: "#FFFFFF" },
-  // Die Tupfer zeigen, was das Theme WIRKLICH setzt (lib/theme/appBg.ts).
-  // Für Grau standen hier #1C1C1E/#2C2C2E — beides Werte, die es in der App
-  // nirgends gab; der Tupfer war heller als der Bildschirm, den er ankündigt.
-  { id: "gray", bg: "#0D0D0D", surface: "#171719" },
+/**
+ * Design zur Wahl: Grau (Vorgabe) und Schwarz.
+ *
+ * „Hell" steht noch im Speicher, ist aber nicht ausgearbeitet:
+ * `PALETTES.light` in lib/theme/appBg.ts zeichnet wie Grau. Deshalb wird es
+ * nicht angeboten. Wer es noch gespeichert hat, sieht Grau gewählt, denn
+ * genau das sieht er auch.
+ */
+const THEME_CHOICES = ["gray", "dark"] as const;
+
+/** Sprachen in ihrer eigenen Schreibung, wie in jeder Sprachauswahl üblich. */
+const LANGS: { id: Locale; label: string }[] = [
+  { id: "de", label: "Deutsch" },
+  { id: "en", label: "English" },
+  { id: "fr", label: "Français" },
+  { id: "es", label: "Español" },
 ];
 
-const LANGS: { id: Locale; label: string; flag: string }[] = [
-  { id: "de", label: "Deutsch", flag: "DE" },
-  { id: "en", label: "English", flag: "EN" },
-  { id: "fr", label: "Français", flag: "FR" },
-  { id: "es", label: "Español", flag: "ES" },
+/** Als Kürzel, genau so, wie die Ergebniskarten die Währung hinter den Preis schreiben. */
+const CURRENCIES = ["EUR", "USD", "GBP", "JPY", "CHF", "SEK"].map((c) => ({ id: c, label: c }));
+
+/*
+ * DIE EINSTELLUNGEN — zwei Ebenen.
+ *
+ * Bis zum 28.10.2026 stand alles auf EINER Seite „Einstellungen" (Design, Farbe,
+ * Sprache, Währung, Schalter, Bo, Hinweis-Lage) — mehrere Bildschirme hoch und
+ * nach Aussage des Nutzers „zu voll". Jetzt zeigt die Einstellungs-Slide nur
+ * eine Auswahl der Kategorien (`SettingsMenuScreen`, schlichte Liste ohne
+ * Bo-Bilder — so gewünscht), und jede fährt als ZWEITE Slide darüber herein
+ * (siehe `SettingsSubOverlay`). Jede Kategorie-Seite beginnt mit einer
+ * Vorschau-Karte (`components/settings/SettingsBlocks.tsx`).
+ */
+
+/** Reihenfolge und Symbole der Auswahl; Titel und Zeile darunter aus `settings.tile.<id>`. */
+const SETTINGS_CATEGORIES: { id: SettingsCategoryId; Icon: typeof Palette }[] = [
+  // Reisen zuerst — das ist, wofür man die App hat.
+  { id: "travel", Icon: Train },
+  { id: "appearance", Icon: Palette },
+  { id: "language", Icon: Globe },
+  { id: "notifications", Icon: Bell },
+  { id: "bo", Icon: Brain },
 ];
 
-const CURRENCIES = ["EUR", "USD", "GBP", "JPY", "CHF", "SEK"];
-
-function SettingsSubScreen({ onBack }: { onBack: () => void }) {
+/* ─────────────────────── EINSTELLUNGEN (Auswahl) ─────────────────────── */
+function SettingsMenuScreen({
+  onBack,
+  onOpen,
+  onPreload,
+}: {
+  onBack: () => void;
+  onOpen: (id: SettingsCategoryId) => void;
+  onPreload: (id: SettingsCategoryId) => void;
+}) {
+  const t = useT();
   const palette = usePalette();
+  return (
+    <View>
+      <BackHeader title={t("settings.title")} onBack={onBack} />
+      <View style={{ height: 8 }} />
+      <Group>
+        {SETTINGS_CATEGORIES.map(({ id, Icon }, i) => (
+          <Row
+            key={id}
+            icon={<Icon size={16} color={C.white} strokeWidth={2} />}
+            iconBg={palette.s3}
+            label={t(`settings.tile.${id}`)}
+            sub={t(`settings.tile.${id}.desc`)}
+            onTouchStart={() => onPreload(id)}
+            onPress={() => onOpen(id)}
+            isLast={i === SETTINGS_CATEGORIES.length - 1}
+          />
+        ))}
+      </Group>
+    </View>
+  );
+}
+
+/* ─────────────────────── REISEN ─────────────────────── */
+/** Die Karten in der Reihenfolge der Auswahl; „keine" zuerst. */
+const CARD_CHOICES: (RailCard | "none")[] = ["none", ...RAIL_CARDS];
+
+/**
+ * Womit eine neue Suche beginnt (Zuhause, Reisende, Klasse) und womit die Bahn
+ * rechnet (Ermäßigungskarte, Deutschlandticket). Siehe lib/travel/fareProfile.ts.
+ */
+function TravelScreen({ onBack }: { onBack: () => void }) {
+  const t = useT();
+  const trainClass = useSearchStore((s) => s.defaultTrainClass);
+  const setTrainClass = useSearchStore((s) => s.setDefaultTrainClass);
+  const pax = useSearchStore((s) => s.defaultPassengers);
+  const setPax = useSearchStore((s) => s.setDefaultPassengers);
+  const card = useSearchStore((s) => s.railCard);
+  const setCard = useSearchStore((s) => s.setRailCard);
+  const dTicket = useSearchStore((s) => s.dTicket);
+  const setDTicket = useSearchStore((s) => s.setDTicket);
+  const dTicketOnly = useSearchStore((s) => s.dTicketOnly);
+  const setDTicketOnly = useSearchStore((s) => s.setDTicketOnly);
+  const transfer = useSearchStore((s) => s.transferMinutes);
+  const setTransfer = useSearchStore((s) => s.setTransferMinutes);
+  const bike = useSearchStore((s) => s.bikeCarriage);
+  const setBike = useSearchStore((s) => s.setBikeCarriage);
+
+  return (
+    <View>
+      <BackHeader title={t("settings.tile.travel")} onBack={onBack} />
+      <View style={styles.pageTop} />
+      <PreviewCard phone={<MiniSearch />} title={t("settings.travel.preview")} desc={t("settings.travel.preview.desc")}>
+        <ChoiceSegment
+          items={[
+            { id: "search.class.second", label: t("search.class.second") },
+            { id: "search.class.first", label: t("search.class.first") },
+          ]}
+          value={trainClass}
+          onChange={setTrainClass}
+        />
+      </PreviewCard>
+
+      <SectionTitle text={t("settings.travel.places")} />
+      <PlaceField
+        which="home"
+        emptyLabel={t("settings.travel.home.none")}
+        hint={t("settings.travel.home.desc")}
+        placeholder={t("settings.travel.home.search")}
+        changeLabel={t("settings.travel.home.change")}
+        removeLabel={t("settings.travel.home.remove")}
+        cancelLabel={t("settings.signout.confirm.cancel")}
+      />
+      <View style={styles.cardGap} />
+      <PlaceField
+        which="work"
+        emptyLabel={t("settings.travel.work.none")}
+        hint={t("settings.travel.work.desc")}
+        placeholder={t("settings.travel.home.search")}
+        changeLabel={t("settings.travel.home.change")}
+        removeLabel={t("settings.travel.work.remove")}
+        cancelLabel={t("settings.signout.confirm.cancel")}
+      />
+
+      <SectionTitle text={t("search.pax.title")} />
+      <ListCard>
+        <StepperRow
+          Icon={Users}
+          label={t("search.pax.adults")}
+          desc={t("settings.travel.pax.desc")}
+          value={pax}
+          min={1}
+          max={9}
+          onChange={setPax}
+          lessLabel={t("settings.travel.pax.less")}
+          moreLabel={t("settings.travel.pax.more")}
+        />
+      </ListCard>
+
+      <SectionTitle text={t("settings.travel.card")} />
+      <Panel>
+        <ChoiceGrid
+          columns={2}
+          items={CARD_CHOICES.map((id) => ({
+            id,
+            label: id === "none" ? t("settings.travel.card.none") : RAIL_CARD_LABEL[id].name,
+          }))}
+          value={card ?? "none"}
+          onChange={(id) => setCard(id === "none" ? null : id)}
+        />
+      </Panel>
+      <View style={styles.cardGap} />
+      <ListCard>
+        <SwitchRow
+          Icon={TicketCheck}
+          label="Deutschlandticket"
+          desc={t("settings.travel.dticket.desc")}
+          value={dTicket}
+          onChange={(v) => {
+            haptic("button");
+            setDTicket(v);
+          }}
+        />
+        <SwitchRow
+          Icon={Route}
+          label={t("settings.travel.dticketonly.label")}
+          desc={t("settings.travel.dticketonly.desc")}
+          value={dTicket && dTicketOnly}
+          disabled={!dTicket}
+          onChange={(v) => {
+            haptic("button");
+            setDTicketOnly(v);
+          }}
+          isLast
+        />
+      </ListCard>
+      <Footnote text={t("settings.travel.card.note")} />
+
+      <SectionTitle text={t("settings.travel.transfer.section")} />
+      <Panel title={t("settings.travel.transfer.label")} desc={t("settings.travel.transfer.desc")}>
+        <ChoiceSegment
+          items={TRANSFER_MINUTES.map((m) => ({
+            id: String(m),
+            label: m === 0 ? t("settings.travel.transfer.normal") : t("settings.reminder.min").replace("{n}", String(m)),
+          }))}
+          value={String(transfer)}
+          onChange={(id) => setTransfer(Number(id) as TransferMinutes)}
+        />
+      </Panel>
+      <View style={styles.cardGap} />
+      <ListCard>
+        <SwitchRow
+          Icon={Bike}
+          label={t("settings.travel.bike.label")}
+          desc={t("settings.travel.bike.desc")}
+          value={bike}
+          onChange={(v) => {
+            haptic("button");
+            setBike(v);
+          }}
+          isLast
+        />
+      </ListCard>
+    </View>
+  );
+}
+
+/* ─────────────────────── DARSTELLUNG ─────────────────────── */
+function AppearanceScreen({ onBack }: { onBack: () => void }) {
   const t = useT();
   const theme = useSearchStore((s) => s.theme);
   const setTheme = useSearchStore((s) => s.setTheme);
   const accentId = useSearchStore((s) => s.accent);
   const setAccent = useSearchStore((s) => s.setAccent);
-  const accent = useAccent();
+  const reduceMotion = useSearchStore((s) => s.reduceMotion);
+  const setReduceMotion = useSearchStore((s) => s.setReduceMotion);
+  const dataSaver = useSearchStore((s) => s.dataSaver);
+  const setDataSaver = useSearchStore((s) => s.setDataSaver);
+
+  return (
+    <View>
+      <BackHeader title={t("settings.tile.appearance")} onBack={onBack} />
+      <View style={styles.pageTop} />
+      <PreviewCard phone={<MiniHome />} title={t("settings.theme")} desc={t("settings.theme.pitch")}>
+        <ChoiceSegment
+          items={THEME_CHOICES.map((id) => ({ id, label: t(`theme.label.${id}`) }))}
+          value={theme === "dark" ? "dark" : "gray"}
+          onChange={setTheme}
+          commitAfterSlide
+        />
+        <ControlLabel text={t("settings.accent")} />
+        <ChoiceSegment
+          items={ACCENT_LIST.map((a) => ({ id: a.id, label: t(`color.label.${a.id}`), dot: a.solid }))}
+          value={accentId}
+          onChange={setAccent}
+          commitAfterSlide
+        />
+      </PreviewCard>
+      <Footnote text={t("settings.accent.note")} />
+
+      <SectionTitle text={t("settings.motion.section")} />
+      <ListCard>
+        <SwitchRow
+          Icon={Accessibility}
+          label={t("settings.motion.label")}
+          desc={t("settings.motion.desc")}
+          value={reduceMotion}
+          onChange={(v) => {
+            haptic("button");
+            setReduceMotion(v);
+          }}
+        />
+        <SwitchRow
+          Icon={Wifi}
+          label={t("settings.datasaver.label")}
+          desc={t("settings.datasaver.desc")}
+          value={dataSaver}
+          onChange={(v) => {
+            haptic("button");
+            setDataSaver(v);
+          }}
+          isLast
+        />
+      </ListCard>
+    </View>
+  );
+}
+
+/* ─────────────────────── SPRACHE & WÄHRUNG ─────────────────────── */
+function LanguageScreen({ onBack }: { onBack: () => void }) {
+  const t = useT();
   const locale = useSearchStore((s) => s.locale);
   const setLocale = useSearchStore((s) => s.setLocale);
   const currency = useSearchStore((s) => s.currency);
   const setCurrency = useSearchStore((s) => s.setCurrency);
+
+  return (
+    <View>
+      <BackHeader title={t("settings.tile.language")} onBack={onBack} />
+      <View style={styles.pageTop} />
+      <PreviewCard phone={<MiniHome />} title={t("settings.language")} desc={t("settings.language.pitch")}>
+        <ChoiceGrid columns={2} items={LANGS} value={locale} onChange={setLocale} />
+      </PreviewCard>
+      <View style={styles.cardGap} />
+      <PreviewCard phone={<MiniResults />} title={t("settings.currency")} desc={t("settings.currency.pitch")}>
+        <ChoiceGrid columns={3} items={CURRENCIES} value={currency} onChange={setCurrency} />
+      </PreviewCard>
+      <Footnote text={t("settings.currency.note")} />
+    </View>
+  );
+}
+
+/* ─────────────────────── MITTEILUNGEN ─────────────────────── */
+/**
+ * Hat jemand Mitteilungen für Binch am HANDY abgeschaltet?
+ *
+ * Dann nützen die Schalter hier nichts, und das soll die Seite sagen, statt
+ * Wirkung vorzutäuschen. Gelesen beim Öffnen und jedes Mal, wenn die App wieder
+ * in den Vordergrund kommt — meist aus genau den Systemeinstellungen, in die
+ * der Hinweis führt. „Noch nie gefragt" zählt nicht als abgeschaltet: Dann
+ * fragt das Einschalten selbst.
+ */
+function useSystemNotificationsBlocked(): [boolean, () => void] {
+  const [blocked, setBlocked] = useState(false);
+  const aliveRef = useRef(true);
+  const check = useCallback(() => {
+    Notifications.getPermissionsAsync()
+      .then((p) => {
+        if (aliveRef.current) setBlocked(p.status === "denied");
+      })
+      .catch(() => {});
+  }, []);
+  useEffect(() => {
+    aliveRef.current = true;
+    check();
+    const sub = AppState.addEventListener("change", (st) => {
+      if (st === "active") check();
+    });
+    return () => {
+      aliveRef.current = false;
+      sub.remove();
+    };
+  }, [check]);
+  return [blocked, check];
+}
+
+function NotificationsScreen({ onBack }: { onBack: () => void }) {
+  const t = useT();
+  const [systemBlocked, recheckSystem] = useSystemNotificationsBlocked();
   const hapticsEnabled = useSearchStore((s) => s.hapticsEnabled);
   const setHapticsEnabled = useSearchStore((s) => s.setHapticsEnabled);
   const notificationsEnabled = useSearchStore((s) => s.notificationsEnabled);
   const setNotificationsEnabled = useSearchStore((s) => s.setNotificationsEnabled);
   const priceAlertsEnabled = useSearchStore((s) => s.priceAlertsEnabled);
   const setPriceAlertsEnabled = useSearchStore((s) => s.setPriceAlertsEnabled);
+  const boUpdatesEnabled = useSearchStore((s) => s.boUpdatesEnabled);
+  const setBoUpdatesEnabled = useSearchStore((s) => s.setBoUpdatesEnabled);
   const savedToastPosition = useSearchStore((s) => s.savedToastPosition);
   const setSavedToastPosition = useSearchStore((s) => s.setSavedToastPosition);
+  const reminder = useSearchStore((s) => s.tripReminderMinutes);
+  const setReminder = useSearchStore((s) => s.setTripReminderMinutes);
+  const arrival = useSearchStore((s) => s.arrivalReminderMinutes);
+  const setArrival = useSearchStore((s) => s.setArrivalReminderMinutes);
+  /** Wer eine Erinnerung will, wird JETZT nach der Erlaubnis gefragt — nicht erst, wenn sie fällig wäre und still bliebe. */
+  const askIfNeeded = () => {
+    void requestWithPrimer("notifications", Notifications.getPermissionsAsync, Notifications.requestPermissionsAsync)
+      .catch(() => null)
+      .finally(recheckSystem);
+  };
+  const minutesLabel = (m: number) =>
+    m === 0 ? t("settings.reminder.off") : m === 60 ? t("settings.reminder.hour") : t("settings.reminder.min").replace("{n}", String(m));
 
   return (
     <View>
-      <BackHeader title={t("settings.title")} onBack={onBack} />
-
-      {/* APPEARANCE — Theme-Karten mit Mock-UI im Preview, Footer wird bei
-          Active accent-solid mit schwarzem Text + Check-Icon. */}
-      <StripeLabel text={t("settings.appearance")} firstSection />
-      <View style={styles.themeRow}>
-        {THEMES.map((th) => {
-          const active = theme === th.id;
-          return (
-            <Pressable
-              key={th.id}
-              onPress={() => {
-                haptic("button");
-                setTheme(th.id);
-              }}
-              style={[styles.themeCardOuter, { backgroundColor: active ? accent.solid : "transparent" }]}
-            >
-              <View style={[styles.themeCardInner, { borderColor: active ? "transparent" : C.border }]}>
-                <View style={[styles.themePreview, { backgroundColor: th.bg, alignItems: th.id === "light" ? "center" : "stretch" }]}>
-                  <View style={[styles.themePreviewBar, { backgroundColor: th.surface, width: th.id === "light" ? "78%" : "52%" }]} />
-                  <View style={[styles.themePreviewBlock, { backgroundColor: th.surface, width: th.id === "light" ? "88%" : "100%" }]} />
-                </View>
-                <View style={[styles.themeFooter, { backgroundColor: active ? accent.solid : C.s2 }]}>
-                  <Text style={[styles.themeFooterText, { color: active ? accent.textOnSolid : C.white }]}>
-                    {t(`theme.label.${th.id}`)}
-                  </Text>
-                  {active && <Check size={16} color={accent.textOnSolid} strokeWidth={2.6} />}
-                </View>
-              </View>
-            </Pressable>
-          );
-        })}
-      </View>
-
-      {/* COLOR — Akzent-Paletten zur Auswahl. Swatch = flache Akzentfarbe
-          (a.solid). Selected: schwarzer Kreis mit Check-Icon + solid Footer. */}
-      <StripeLabel text={t("settings.color")} />
-      <View style={styles.themeRow}>
-        {ACCENT_LIST.map((a) => {
-          const active = accentId === a.id;
-          return (
-            <Pressable
-              key={a.id}
-              onPress={() => {
-                haptic("button");
-                setAccent(a.id);
-              }}
-              style={[styles.themeCardOuter, { backgroundColor: active ? a.solid : "transparent" }]}
-            >
-              <View style={[styles.themeCardInner, { borderColor: active ? "transparent" : C.border }]}>
-                {/* Flache Swatch statt Verlauf — konsistent mit der flachen
-                    Akzent-Darstellung in der restlichen App (GradientFill). */}
-                <View style={[styles.colorSwatch, { backgroundColor: a.solid }]}>
-                  {active && (
-                    <View style={styles.colorCheck}>
-                      <Check size={14} color={a.solid} strokeWidth={3} />
-                    </View>
-                  )}
-                </View>
-                <View style={[styles.themeFooter, { backgroundColor: active ? a.solid : C.s2, justifyContent: "center" }]}>
-                  <Text style={[styles.themeFooterText, { color: active ? a.textOnSolid : C.white }]}>
-                    {t(`color.label.${a.id}`)}
-                  </Text>
-                </View>
-              </View>
-            </Pressable>
-          );
-        })}
-      </View>
-
-      {/* LANGUAGE — Liste mit 44px Code-Badge links, Active-Highlight via
-          accent.subtle. Code+Name fett wenn aktiv, Check rechts. */}
-      <BelowFold>
-      <StripeLabel text={t("settings.language")} />
-      <Group>
-        {LANGS.map((l, i) => {
-          const active = locale === l.id;
-          return (
-            <Pressable
-              key={l.id}
-              onPress={() => {
-                haptic("button");
-                setLocale(l.id);
-              }}
-              style={[
-                styles.row,
-                i < LANGS.length - 1 && styles.rowDivider,
-                active && { backgroundColor: accent.subtle },
-              ]}
-            >
-              <View style={[styles.langBadge, { backgroundColor: active ? accent.subtle : C.s2 }]}>
-                <Text style={[styles.langBadgeText, { color: active ? accent.solid : C.g2 }]}>
-                  {l.flag}
-                </Text>
-              </View>
-              <Text
-                style={[
-                  styles.rowLabel,
-                  {
-                    flex: 1,
-                    color: active ? C.white : C.g1,
-                    fontWeight: active ? "700" : "500",
-                  },
-                ]}
-              >
-                {l.label}
-              </Text>
-              {active && <Check size={16} color={accent.solid} strokeWidth={2.6} />}
-            </Pressable>
-          );
-        })}
-      </Group>
-
-      {/* CURRENCY */}
-      <StripeLabel text={t("settings.currency")} />
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={styles.currencyRow}
+      <BackHeader title={t("settings.tile.notifications")} onBack={onBack} />
+      <View style={styles.pageTop} />
+      <PreviewCard
+        phone={<MiniToast position={savedToastPosition} />}
+        title={t("settings.toast.title")}
+        desc={t("settings.toast.pitch")}
       >
-        {CURRENCIES.map((c) => {
-          const active = currency === c;
-          return (
-            <Pressable
-              key={c}
-              onPress={() => {
-                haptic("button");
-                setCurrency(c);
-              }}
-              style={[
-                styles.currencyPill,
-                {
-                  backgroundColor: active ? accent.solid : "transparent",
-                  borderColor: active ? accent.solid : C.border,
-                },
-              ]}
-            >
-              <Text
-                style={[
-                  styles.currencyPillText,
-                  { color: active ? accent.textOnSolid : C.g1, fontWeight: "700" },
-                ]}
-              >
-                {c}
-              </Text>
-            </Pressable>
-          );
-        })}
-      </ScrollView>
+        <ChoiceSegment
+          items={[
+            { id: "top", label: t("settings.toast.top") },
+            { id: "bottom", label: t("settings.toast.bottom") },
+          ]}
+          value={savedToastPosition}
+          onChange={setSavedToastPosition}
+        />
+      </PreviewCard>
 
-      {/* HAPTICS & NOTIFICATIONS */}
-      <StripeLabel text={t("settings.notifs.section")} />
-      <Group>
-        <ToggleRow
-          icon={<IconHaptic />}
+      <SectionTitle text={t("settings.notifs.section")} />
+      {notificationsEnabled && systemBlocked ? (
+        <NoticeRow
+          Icon={BellOff}
+          title={t("settings.notifs.systemOff")}
+          action={t("settings.notifs.openSystem")}
+          onPress={() => void Linking.openSettings()}
+        />
+      ) : null}
+      <ListCard>
+        <SwitchRow
+          Icon={Bell}
+          label={t("settings.notifs.label")}
+          desc={t("settings.notifs.desc")}
+          value={notificationsEnabled}
+          onChange={(v) => {
+            haptic("button");
+            setNotificationsEnabled(v);
+            // Einschalten ist der Anlass, nach der Erlaubnis zu fragen (falls
+            // noch nie gefragt) — und die Anmeldung trägt den neuen Stand mit.
+            // Bestätigt wird erst, wenn es wirklich geht.
+            if (v) {
+              void ensurePushToken()
+                .then((r) => {
+                  if (r.ok) showStatusToast("notifyOn");
+                })
+                .finally(recheckSystem);
+            } else showStatusToast("notifyOff");
+          }}
+        />
+        <SwitchRow
+          Icon={Tag}
+          label={t("settings.pricealerts.label")}
+          desc={t("settings.pricealerts.desc")}
+          value={priceAlertsEnabled}
+          disabled={!notificationsEnabled}
+          onChange={(v) => {
+            haptic("button");
+            setPriceAlertsEnabled(v);
+          }}
+        />
+        <SwitchRow
+          Icon={Brain}
+          label={t("settings.boUpdates.label")}
+          desc={t("settings.boUpdates.desc")}
+          value={boUpdatesEnabled}
+          disabled={!notificationsEnabled}
+          onChange={(v) => {
+            haptic("button");
+            setBoUpdatesEnabled(v);
+          }}
+        />
+        <SwitchRow
+          Icon={Vibrate}
           label={t("settings.haptics.label")}
           desc={t("settings.haptics.desc")}
           value={hapticsEnabled}
@@ -814,70 +1210,73 @@ function SettingsSubScreen({ onBack }: { onBack: () => void }) {
             setHapticsEnabled(v);
             if (v) haptic("button");
           }}
-        />
-        <ToggleRow
-          icon={<IconBell />}
-          label={t("settings.notifs.label")}
-          desc={t("settings.notifs.desc")}
-          value={notificationsEnabled}
-          onChange={(v) => {
-            haptic("button");
-            setNotificationsEnabled(v);
-          }}
-        />
-        <ToggleRow
-          icon={<IconAlert />}
-          label={t("settings.pricealerts.label")}
-          desc={t("settings.pricealerts.desc")}
-          value={priceAlertsEnabled}
-          onChange={(v) => {
-            haptic("button");
-            setPriceAlertsEnabled(v);
-          }}
           isLast
         />
-      </Group>
+      </ListCard>
 
-      {/* SAVED TOAST POSITION */}
-      <StripeLabel text={t("settings.toast.section")} />
-      <View style={{ paddingHorizontal: GUTTER }}>
-        <Text style={styles.toastDesc}>{t("settings.toast.desc")}</Text>
-        <View style={[styles.toastSegment, { backgroundColor: palette.s2 }]}>
-          {(["top", "bottom"] as const).map((pos) => {
-            const active = savedToastPosition === pos;
-            return (
-              <Pressable
-                key={pos}
-                onPress={() => {
-                  haptic("button");
-                  setSavedToastPosition(pos);
-                }}
-                style={[
-                  styles.toastSegmentItem,
-                  active && { backgroundColor: accent.solid },
-                ]}
-              >
-                <Text
-                  style={[
-                    styles.toastSegmentText,
-                    { color: active ? accent.textOnSolid : C.g1, fontWeight: active ? "700" : "500" },
-                  ]}
-                >
-                  {t(`settings.toast.${pos}`)}
-                </Text>
-              </Pressable>
-            );
-          })}
-        </View>
-      </View>
+      <SectionTitle text={t("settings.reminder.section")} />
+      <Panel title={t("settings.reminder.label")} desc={t("settings.reminder.desc")} disabled={!notificationsEnabled}>
+        <ChoiceSegment
+          items={REMINDER_LEADS.map((m) => ({ id: String(m), label: minutesLabel(m) }))}
+          value={String(reminder)}
+          onChange={(id) => {
+            const m = Number(id) as ReminderLead;
+            setReminder(m);
+            if (m > 0) askIfNeeded();
+          }}
+        />
+      </Panel>
+      <View style={styles.cardGap} />
+      <Panel title={t("settings.reminder.arrival.label")} desc={t("settings.reminder.arrival.desc")} disabled={!notificationsEnabled}>
+        <ChoiceSegment
+          items={ARRIVAL_LEADS.map((m) => ({ id: String(m), label: minutesLabel(m) }))}
+          value={String(arrival)}
+          onChange={(id) => {
+            const m = Number(id) as ArrivalLead;
+            setArrival(m);
+            if (m > 0) askIfNeeded();
+          }}
+        />
+      </Panel>
+      <Footnote text={t("settings.reminder.note")} />
 
-      <View style={{ height: 16 }} />
-      </BelowFold>
+      <DeliveryTest disabled={!notificationsEnabled} />
+    </View>
+  );
+}
+
+/* ─────────────────────── BO ─────────────────────── */
+function BoScreen({ onBack }: { onBack: () => void }) {
+  const t = useT();
+  return (
+    <View>
+      <BackHeader title={t("settings.tile.bo")} onBack={onBack} />
+      <View style={styles.pageTop} />
+      <BoMemorySection />
     </View>
   );
 }
 
 /* ─────────────────────── SUPPORT ─────────────────────── */
+/**
+ * Herkunft der Fahrplan- und Haltestellen-Daten — die Lizenzen verlangen eine Nennung „an
+ * geeigneter Stelle". Für Österreich steht der Wortlaut im Lizenztext fest (Mobilitätsverbünde
+ * Österreich OG, Abschnitt 3a), für Wien ebenso (Stadt Wien) — deshalb unübersetzt. Hinweis auf
+ * die Bearbeitung und Haftungsausschluss darunter (`settings.sources.note`).
+ */
+const SOURCES = [
+  { label: "settings.sources.at", attribution: "Datenquelle: Mobilitätsverbünde Österreich OG – data.mobilitaetsverbuende.at", url: "https://data.mobilitaetsverbuende.at" },
+  { label: "settings.sources.vienna", attribution: "Datenquelle: Stadt Wien – data.wien.gv.at", url: "https://data.wien.gv.at" },
+  { label: "settings.sources.de", attribution: "gtfs.de – DELFI e.V.", url: "https://gtfs.de" },
+  { label: "settings.sources.osm", attribution: "© OpenStreetMap-Mitwirkende (ODbL)", url: "https://www.openstreetmap.org/copyright" },
+  { label: "settings.sources.transitous", attribution: "Transitous – transitous.org", url: "https://transitous.org" },
+  {
+    label: "settings.sources.more",
+    attribution: "opentransportdata.swiss · OVapi · Bus Open Data Service/NaPTAN (OGL v3.0) · Île-de-France Mobilités · PID · ZTM Warszawa · SNCB",
+    url: null,
+  },
+] as const;
+
 function SupportSubScreen({ onBack }: { onBack: () => void }) {
   const palette = usePalette();
   const t = useT();
@@ -941,6 +1340,27 @@ function SupportSubScreen({ onBack }: { onBack: () => void }) {
           );
         })}
       </View>
+
+      <SLabel text={t("settings.sources")} />
+      <Group>
+        {SOURCES.map((s, i) => (
+          <Row
+            key={s.label}
+            label={t(s.label)}
+            sub={s.attribution}
+            onPress={
+              s.url
+                ? () => {
+                    haptic("button");
+                    Linking.openURL(s.url);
+                  }
+                : undefined
+            }
+            isLast={i === SOURCES.length - 1}
+          />
+        ))}
+      </Group>
+      <Text style={styles.sourcesNote}>{t("settings.sources.note")}</Text>
       </BelowFold>
     </View>
   );
@@ -981,28 +1401,152 @@ function BackHeader({ title, onBack }: { title: string; onBack: () => void }) {
         }
       <Pressable
         onPress={onBack}
-        /* ARRAY statt Funktion — siehe `SearchBar.tsx`. Sonst verliert der
-           Schließ-Knopf sein rundes Feld. */
+        hitSlop={10}
+        accessibilityRole="button"
+        accessibilityLabel="Close"
         style={styles.backHeaderBtn}
       >
-        <X size={16} color={C.white} strokeWidth={2.5} />
+        <X size={CLOSE_ICON_SIZE} color="#E5E7EB" strokeWidth={2} />
       </Pressable>
     </View>
   );
 }
 
-function SLabel({ text }: { text: string }) {
-  return <Text style={styles.sLabel}>{text.toUpperCase()}</Text>;
+/**
+ * BOS GEDÄCHTNIS — an/aus, die Einträge einzeln löschen, alles vergessen.
+ *
+ * Kontogebunden: Ohne Anmeldung steht in der Karte nur der Hinweis, und die
+ * Liste fehlt. Die Liste kommt vom Server (`/api/chat/memory`) und wird erst
+ * geladen, wenn dieser Bereich gerendert wird. Änderungen schreiben den
+ * Zwischenspeicher fort statt neu zu laden — was gelöscht wurde, weiß diese
+ * Stelle ja schon.
+ */
+function BoMemorySection() {
+  const t = useT();
+  const palette = usePalette();
+  const queryClient = useQueryClient();
+  const token = useSearchStore((s) => s.authToken);
+  const userId = useSearchStore((s) => s.authUser?.id ?? null);
+  const key = boMemoryKeyFor(userId);
+  const query = useQuery({
+    queryKey: key,
+    queryFn: fetchBoMemory,
+    enabled: !!token,
+    staleTime: 30_000,
+    retry: 1,
+  });
+  const write = (fn: (prev: BoMemoryState) => BoMemoryState) =>
+    queryClient.setQueryData<BoMemoryState>(key, (prev) => (prev ? fn(prev) : prev));
+  /** Fehlgeschlagen → den echten Stand vom Server holen statt einen falschen stehen zu lassen. */
+  const resync = () => void queryClient.invalidateQueries({ queryKey: key });
+
+  const data = query.data;
+  const enabled = data?.enabled ?? true;
+  const items = data?.items ?? [];
+
+  return (
+    <>
+      <PreviewCard phone={<MiniChat />} title={t("settings.bo.memory.label")} desc={t("settings.bo.memory.pitch")}>
+        {token ? (
+          <SwitchLine
+            label={t("settings.bo.memory.allow")}
+            value={enabled}
+            onChange={(v) => {
+              haptic("button");
+              write((prev) => ({ ...prev, enabled: v }));
+              setBoMemoryEnabled(v).catch(resync);
+            }}
+          />
+        ) : (
+          <Text style={styles.cardHint}>{t("settings.bo.memory.login")}</Text>
+        )}
+      </PreviewCard>
+
+      {token ? (
+        <>
+          <SectionTitle text={t("settings.bo.memory.list")} />
+          <ListCard>
+            {/* Lader nach der einen Regel (`LoadGate`): erst nach 2 s, dann mindestens zwei Durchläufe. */}
+            <LoadGate
+              loading={query.isLoading}
+              style={styles.boMemLoading}
+              loader={<GridLoader size={44} />}
+            >
+            {() => query.isError ? (
+              // Wie jeder Fehler der App: Zeichnung, Satz, EIN Pillen-Knopf.
+              <StatePanel
+                compact
+                art="offline"
+                surface={palette.s2}
+                body={t("settings.bo.memory.error")}
+                action={t("state.retry")}
+                busy={query.isFetching}
+                onAction={() => {
+                  haptic("button");
+                  void query.refetch();
+                }}
+              />
+            ) : items.length === 0 ? (
+              <View style={styles.boMemState}>
+                <Text style={styles.boMemEmpty}>{t("settings.bo.memory.empty")}</Text>
+              </View>
+            ) : (
+              items.map((item, i) => (
+                <View key={item.id} style={styles.boMemItem}>
+                  <View
+                    style={[
+                      styles.boMemBody,
+                      i < items.length - 1 && { borderBottomWidth: 1, borderBottomColor: palette.border },
+                    ]}
+                  >
+                    <Text style={styles.boMemText}>{item.content}</Text>
+                    <RippleTouch
+                      style={styles.boMemDelete}
+                      accessibilityRole="button"
+                      accessibilityLabel={`${t("settings.bo.memory.delete")}: ${item.content}`}
+                      onPress={() => {
+                        haptic("button");
+                        write((prev) => ({ ...prev, items: prev.items.filter((x) => x.id !== item.id) }));
+                        deleteBoMemoryEntry(item.id).catch(resync);
+                      }}
+                    >
+                      <Trash2 size={16} color={C.g2} strokeWidth={2} />
+                    </RippleTouch>
+                  </View>
+                </View>
+              ))
+            )}
+            </LoadGate>
+          </ListCard>
+          <Footnote text={t("settings.bo.memory.privacy")} />
+          {items.length > 0 ? (
+            <DangerButton
+              label={t("settings.bo.memory.clear")}
+              Icon={Trash2}
+              onPress={() => {
+                haptic("button");
+                showAlert(t("settings.bo.memory.clear.title"), t("settings.bo.memory.clear.body"), [
+                  { text: t("settings.signout.confirm.cancel"), style: "cancel" },
+                  {
+                    text: t("settings.bo.memory.clear.ok"),
+                    style: "destructive",
+                    onPress: () => {
+                      write((prev) => ({ ...prev, items: [] }));
+                      clearBoMemory().catch(resync);
+                    },
+                  },
+                ]);
+              }}
+            />
+          ) : null}
+        </>
+      ) : null}
+    </>
+  );
 }
 
-function StripeLabel({ text, firstSection }: { text: string; firstSection?: boolean }) {
-  const accent = useAccent();
-  return (
-    <View style={[styles.stripeLabel, firstSection && { paddingTop: 16 }]}>
-      <View style={[styles.stripeBar, { backgroundColor: accent.solid }]} />
-      <Text style={styles.stripeLabelText}>{text.toUpperCase()}</Text>
-    </View>
-  );
+function SLabel({ text }: { text: string }) {
+  return <Text style={styles.sLabel}>{text.toUpperCase()}</Text>;
 }
 
 function Group({ children }: { children: ReactNode }) {
@@ -1017,15 +1561,18 @@ interface RowProps {
   value?: string;
   sub?: string;
   onPress?: () => void;
+  /** Beim Aufsetzen des Fingers — zum Vorbauen der Seite dahinter. */
+  onTouchStart?: () => void;
   isLast?: boolean;
   danger?: boolean;
   rightEl?: ReactNode;
 }
 
-function Row({ icon, iconBg, label, value, sub, onPress, isLast, danger, rightEl }: RowProps) {
+function Row({ icon, iconBg, label, value, sub, onPress, onTouchStart, isLast, danger, rightEl }: RowProps) {
   return (
     <RippleTouch
       onPress={onPress}
+      onTouchStart={onTouchStart}
       disabled={!onPress}
       style={({ pressed }) => [
         styles.row,
@@ -1047,65 +1594,6 @@ function Row({ icon, iconBg, label, value, sub, onPress, isLast, danger, rightEl
         ? <ChevronRight size={16} color={C.g3} strokeWidth={2} />
         : null}
     </RippleTouch>
-  );
-}
-
-function ToggleRow({
-  icon,
-  label,
-  desc,
-  value,
-  onChange,
-  isLast,
-}: {
-  icon: ReactNode;
-  label: string;
-  desc?: string;
-  value: boolean;
-  onChange: (v: boolean) => void;
-  isLast?: boolean;
-}) {
-  const palette = usePalette();
-  const accent = useAccent();
-  return (
-    <View style={[styles.row, !isLast && styles.rowDivider]}>
-      <View style={[styles.rowIcon, { backgroundColor: palette.s3 }]}>{icon}</View>
-      <View style={{ flex: 1 }}>
-        <Text style={[styles.rowLabel, { fontWeight: "500" }]}>{label}</Text>
-        {desc ? <Text style={styles.rowSub}>{desc}</Text> : null}
-      </View>
-      <BinchSwitch value={value} onValueChange={onChange} accessibilityLabel={label} />
-    </View>
-  );
-}
-
-/* ─── ToggleRow icons ─── */
-function IconHaptic() {
-  const accent = useAccent();
-  return (
-    <Svg width={16} height={16} viewBox="0 0 24 24">
-      <Path d="M8 6.5C6.2 7.8 5 9.8 5 12s1.2 4.2 3 5.5" stroke={C.white} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" fill="none" />
-      <Path d="M16 6.5c1.8 1.3 3 3.3 3 5.5s-1.2 4.2-3 5.5" stroke={C.white} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" fill="none" />
-      <Circle cx={12} cy={12} r={2} stroke={C.white} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" fill="none" />
-    </Svg>
-  );
-}
-function IconBell() {
-  const accent = useAccent();
-  return (
-    <Svg width={16} height={16} viewBox="0 0 24 24">
-      <Path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" stroke={C.white} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" fill="none" />
-      <Path d="M13.73 21a2 2 0 0 1-3.46 0" stroke={C.white} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" fill="none" />
-    </Svg>
-  );
-}
-function IconAlert() {
-  const accent = useAccent();
-  return (
-    <Svg width={16} height={16} viewBox="0 0 24 24">
-      <Circle cx={12} cy={12} r={4} stroke={C.white} strokeWidth={2} fill="none" />
-      <Path d="M12 1v3M12 20v3M4 12H1M23 12h-3M5.6 5.6 7.7 7.7M16.3 16.3l2.1 2.1M5.6 18.4 7.7 16.3M16.3 7.7l2.1-2.1" stroke={C.white} strokeWidth={2} strokeLinecap="round" fill="none" />
-    </Svg>
   );
 }
 
@@ -1316,7 +1804,7 @@ const styles = scaledStyles({
     fontWeight: "600",
     color: C.g3,
     letterSpacing: 0.88,
-    marginBottom: 6,
+    marginBottom: 8,
   },
 
   /* — profile card — */
@@ -1332,7 +1820,7 @@ const styles = scaledStyles({
   profileTopRow: {
     paddingHorizontal: SPACE.lg,
     paddingTop: 16,
-    paddingBottom: 18,
+    paddingBottom: 16,
     flexDirection: "row",
     alignItems: "center",
   },
@@ -1381,10 +1869,10 @@ const styles = scaledStyles({
     borderTopWidth: 1,
     borderTopColor: C.border,
   },
-  statCol: { flex: 1, paddingVertical: 10, alignItems: "center" },
+  statCol: { flex: 1, paddingVertical: 8, alignItems: "center" },
   statColDivider: { borderRightWidth: 1, borderRightColor: C.border },
   statVal: { fontSize: 13, fontWeight: "700", color: C.white },
-  statLbl: { fontSize: 10, color: C.g3, marginTop: 2, letterSpacing: 0.3 },
+  statLbl: { fontSize: 10, color: C.g3, marginTop: 4, letterSpacing: 0.3 },
 
   /* — section card — */
   sectionCard: {
@@ -1414,12 +1902,14 @@ const styles = scaledStyles({
     letterSpacing: -0.5,
     lineHeight: 23,
   },
-  sectionCardDesc: { fontSize: 12, color: C.g2, marginTop: 5, lineHeight: 17 },
+  sectionCardDesc: { fontSize: 12, color: C.g2, marginTop: 4, lineHeight: 17 },
 
   /* — divider, sign-out, version — */
   divider: { height: 1, backgroundColor: C.border, marginHorizontal: GUTTER, marginTop: 16 },
   stack: { flex: 1 },
   layer: { ...StyleSheet.absoluteFillObject },
+  /** Die Auswahl-Ebene in der Einstellungs-Slide — füllt sie, damit sie als Ganzes ausweichen kann. */
+  subLayer: { flex: 1 },
   subSheet: {
     // Gerundete Ecken beim Hereinfahren, passend zum Geräte-Display — wie bei
     // allen anderen Slides der App.
@@ -1432,7 +1922,7 @@ const styles = scaledStyles({
     backgroundColor: "rgba(255,69,58,0.05)",
     borderRadius: 16,
     paddingHorizontal: 16,
-    paddingVertical: 14,
+    paddingVertical: 16,
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
@@ -1444,7 +1934,7 @@ const styles = scaledStyles({
     backgroundColor: "rgba(127,234,77,0.05)",
     borderRadius: 16,
     paddingHorizontal: 16,
-    paddingVertical: 14,
+    paddingVertical: 16,
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
@@ -1469,11 +1959,14 @@ const styles = scaledStyles({
     paddingTop: HEADING_TOP,
     paddingBottom: 0,
   },
+  /**
+   * Das X steht FREI, ohne Kreis — genau wie in Bos Kopfzeile (Größe, Farbe,
+   * Strich). Innenabstand plus negativer Außenabstand ergibt eine echte
+   * 44er-Fläche, ohne dass die Zeile höher wird oder das Zeichen wandert.
+   */
   backHeaderBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: C.s2,
+    padding: (44 - CLOSE_ICON_SIZE) / 2,
+    margin: -(44 - CLOSE_ICON_SIZE) / 2,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -1485,23 +1978,8 @@ const styles = scaledStyles({
     color: C.g3,
     letterSpacing: 0.88,
     paddingHorizontal: GUTTER,
-    paddingTop: 18,
-    paddingBottom: 8,
-  },
-  stripeLabel: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    paddingHorizontal: GUTTER,
-    paddingTop: 20,
-    paddingBottom: 8,
-  },
-  stripeBar: { width: 3, height: 14, borderRadius: 9999, backgroundColor: C.green },
-  stripeLabelText: {
-    fontSize: 11,
-    fontWeight: "600",
-    color: C.g3,
-    letterSpacing: 0.88,
+    paddingTop: SECTION_GAP,
+    paddingBottom: TITLE_GAP,
   },
 
   /* — group / row — */
@@ -1514,9 +1992,9 @@ const styles = scaledStyles({
   row: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 13,
+    gap: 12,
     paddingHorizontal: 16,
-    paddingVertical: 13,
+    paddingVertical: 12,
   },
   rowDivider: { borderBottomWidth: 1, borderBottomColor: C.border },
   rowIcon: {
@@ -1527,57 +2005,38 @@ const styles = scaledStyles({
     justifyContent: "center",
   },
   rowLabel: { fontSize: 15, color: C.white },
-  rowSub: { fontSize: 12, color: C.g2, marginTop: 2 },
+  rowSub: { fontSize: 12, color: C.g2, marginTop: 4 },
   rowValue: { fontSize: 14, color: C.g2 },
 
-  /* — theme cards — */
-  themeRow: { flexDirection: "row", paddingHorizontal: 16, gap: 10 },
-  // Two-Layer-Card: Outer-Ring wird beim Active mit accent-solid eingefärbt
-  // (4px Padding) und Inner-Card hat eigenen Border der dann transparent
-  // wird damit der Outer-Ring durchscheint. Look matched die Designvorlage
-  // (Lime-Glow um die ausgewählte Card).
-  themeCardOuter: { flex: 1, borderRadius: 18, padding: 4 },
-  themeCardInner: { borderRadius: 14, overflow: "hidden", borderWidth: 1 },
-  themeFooter: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: SPACE.md, paddingVertical: 10 },
-  themeFooterText: { fontSize: 14, fontWeight: "700" },
-  // Color-Swatch im Color-Picker: 54px hoher Gradient-Block mit Check-Badge.
-  colorSwatch: { height: 54, alignItems: "center", justifyContent: "center" },
-  colorCheck: { width: 26, height: 26, borderRadius: 13, backgroundColor: "rgba(0,0,0,0.82)", alignItems: "center", justifyContent: "center" },
-  // Language-Badge: 44×44, rounded 13, code-Text 13pt 800 — replaces den
-  // alten rowIcon-Look damit die Settings konsistent zur Design-Vorlage sind.
-  langBadge: { width: 44, height: 44, borderRadius: 13, alignItems: "center", justifyContent: "center" },
-  langBadgeText: { fontSize: 13, fontWeight: "800" },
-  themeCard: { flex: 1, borderRadius: 16, borderWidth: 2, overflow: "hidden" },
-  themePreview: {
-    height: 72,
-    paddingHorizontal: 8,
-    paddingTop: 10,
-    paddingBottom: 8,
-  },
-  themePreviewBar: { width: "60%", height: 5, borderRadius: 3, marginBottom: 6 },
-  themePreviewBlock: { width: "90%", height: 24, borderRadius: 6 },
-  themeLabelRow: {
-    backgroundColor: C.s1,
-    paddingHorizontal: SPACE.sm,
-    paddingVertical: 8,
+  /* — Kategorie-Seiten — */
+  /** Zwischen Überschrift und erster Karte: derselbe Abstand wie die Profil-Karte im Hub. */
+  pageTop: { height: HEADING_GAP },
+  cardGap: { height: GROUP_GAP },
+  /** Hinweis an der Stelle der Bedienung, wenn sie ohne Anmeldung nicht geht. */
+  cardHint: { fontSize: 12.5, lineHeight: 17, color: C.white, fontWeight: "500" },
+
+  /* — Bos Gedächtnis — */
+  boMemState: { paddingHorizontal: 16, paddingVertical: 16 },
+  /** Fläche für Warten und Lader — so hoch wie der Lader mit Rand, damit beim Erscheinen nichts springt. */
+  boMemLoading: { minHeight: 68, paddingVertical: 16 },
+  boMemEmpty: { fontSize: 13, lineHeight: 19, color: C.g2 },
+  boMemItem: { paddingLeft: 16 },
+  boMemBody: {
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
+    gap: 8,
+    paddingRight: 8,
+    paddingVertical: 8,
   },
-  themeLabel: { fontSize: 12, fontWeight: "600" },
-
-  /* — language flag inside the row icon container — */
-  langFlagText: { fontSize: 11, fontWeight: "700" },
-
-  /* — currency pills — */
-  currencyRow: { paddingHorizontal: 16, gap: 8 },
-  currencyPill: {
-    paddingHorizontal: SPACE.lg,
-    paddingVertical: 10,
-    borderRadius: 9999,
-    borderWidth: 1.5,
+  boMemText: { flex: 1, fontSize: 14.5, lineHeight: 20, color: C.white },
+  boMemDelete: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    overflow: "hidden",
   },
-  currencyPillText: { fontSize: 13 },
 
   /* — details large avatar — */
   avatarLargeOuter: {
@@ -1612,34 +2071,17 @@ const styles = scaledStyles({
     color: C.green,
   },
 
-  /* — saved-toast position segment — */
-  toastDesc: { fontSize: 12, color: C.g2, lineHeight: 17, marginBottom: 10, paddingHorizontal: 4 },
-  toastSegment: {
-    flexDirection: "row",
-    backgroundColor: C.s1,
-    borderRadius: 14,
-    padding: 4,
-    gap: 4,
-  },
-  toastSegmentItem: {
-    flex: 1,
-    paddingVertical: 10,
-    borderRadius: 10,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  toastSegmentText: { fontSize: 13, letterSpacing: -0.1 },
-
   /* — FAQ — */
   faqRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: 16,
-    paddingVertical: 14,
+    paddingVertical: 16,
   },
   faqQ: { flex: 1, fontSize: 14, fontWeight: "500", color: C.white, paddingRight: 12 },
-  faqA: { paddingHorizontal: 16, paddingBottom: 14, fontSize: 13, color: C.g2, lineHeight: 19 },
+  faqA: { paddingHorizontal: 16, paddingBottom: 16, fontSize: 13, color: C.g2, lineHeight: 19 },
+  sourcesNote: { paddingHorizontal: GUTTER, paddingTop: 8, fontSize: 12, color: C.g3, lineHeight: 17 },
 });
 
 /* ─────────────────────── UNTERSCHIRM-ÜBERLAGERUNG ─────────────────────── */
@@ -1666,11 +2108,11 @@ const SubSettledContext = createContext(true);
 /**
  * Alles, was beim Hereinfahren noch nicht zu sehen ist, entsteht erst danach.
  *
- * Der Bildschirm „Einstellungen" ist mehrere Bildschirme hoch: drei Themen-
- * Karten mit eigener Vorschau-Oberfläche, die Farbreihe, vier Sprachen, sechs
- * Währungen, dazu die Schalter. Das sind ein paar hundert Ansichten, und Fabric
- * baut sie auf DEMSELBEN Strang auf, auf dem die Bewegung läuft. Sie lief also
- * gegen den Aufbau an.
+ * Gebaut für die frühere Sammel-Seite „Einstellungen", die mehrere Bildschirme
+ * hoch war (Themen-Karten, Farbreihe, Sprachen, Währungen, Schalter) — ein paar
+ * hundert Ansichten, die Fabric auf DEMSELBEN Strang aufbaut, auf dem die
+ * Bewegung läuft. Seit sie in kurze Kategorie-Seiten zerlegt ist (28.10.2026),
+ * nutzen es noch „Deine Daten" und „Support".
  *
  * Der Aufbau war schon um ein Bild nach hinten geschoben, aber das verschiebt
  * die Kosten nur, es senkt sie nicht — sie landen dann eben in den ersten
@@ -1720,6 +2162,59 @@ export function SettingsSubOverlay() {
    * danach wahr, bis der Unterschirm ganz abgeräumt ist.
    */
   const [settled, setSettled] = useState(false);
+
+  /**
+   * ZWEITE EBENE — Einstellungen → Kategorie.
+   *
+   * Fährt wie die erste von rechts herein, aber INNERHALB der Einstellungs-Slide,
+   * und die Auswahl darunter weicht um denselben Anteil nach links aus wie der
+   * Hub unter der ersten Ebene. `id` bleibt stehen, solange die Seite hinausfährt;
+   * `open` fällt dafür schon mit dem Start der Rückfahrt (keine Berührung mehr).
+   * Lokaler Zustand statt Speicher: Er gehört nur dieser Fläche, und ein
+   * Speicher-Schreibvorgang weckte alle Abonnenten der App.
+   */
+  const [cat, setCat] = useState<{ id: SettingsCategoryId | null; open: boolean; moving: boolean }>({
+    id: null,
+    open: false,
+    moving: false,
+  });
+  const categoryPush = useSharedValue(0);
+  const catRef = useRef(cat);
+  catRef.current = cat;
+  /** Beim Berühren der Zeile vorbauen (wie die Kacheln im Hub) — nie über eine offene Seite hinweg. */
+  const preloadCategory = useCallback((id: SettingsCategoryId) => {
+    setCat((c) => (c.open || c.moving || c.id === id ? c : { ...c, id }));
+  }, []);
+  const endCategoryOpen = useCallback(() => setCat((c) => ({ ...c, moving: false })), []);
+  const endCategoryClose = useCallback(() => setCat({ id: null, open: false, moving: false }), []);
+  const openCategory = useCallback(
+    (id: SettingsCategoryId) => {
+      if (catRef.current.open) return;
+      haptic("button");
+      // Erst aufbauen (dieser Durchgang), DANN fahren — ein Bild später, wie die erste Ebene.
+      setCat({ id, open: true, moving: true });
+      requestAnimationFrame(() => {
+        markTransitionBusy(PUSH_SPRING.duration);
+        categoryPush.value = withTiming(1, slideTiming(PUSH_SPRING), (finished?: boolean) => {
+          "worklet";
+          if (finished) runOnJS(endCategoryOpen)();
+        });
+      });
+    },
+    [categoryPush, endCategoryOpen],
+  );
+  const closeCategory = useCallback(() => {
+    if (!catRef.current.open) return;
+    haptic("button");
+    setCat((c) => ({ ...c, open: false, moving: true }));
+    markTransitionBusy(POP_SPRING.duration);
+    requestAnimationFrame(() => {
+      categoryPush.value = withTiming(0, slideTiming(POP_SPRING), (finished?: boolean) => {
+        "worklet";
+        if (finished) runOnJS(endCategoryClose)();
+      });
+    });
+  }, [categoryPush, endCategoryClose]);
 
   /**
    * ERST aufbauen, DANN bewegen.
@@ -1772,7 +2267,7 @@ export function SettingsSubOverlay() {
         // 1,4 Sekunden, also lange vor dem Zurückgehen.
         holdLayer("settings");
         settingsPush.value = 0;
-        settingsPush.value = withTiming(1, PUSH_SPRING, (finished?: boolean) => {
+        settingsPush.value = withTiming(1, slideTiming(PUSH_SPRING), (finished?: boolean) => {
           "worklet";
           if (finished) {
             runOnJS(setMoving)(false);
@@ -1802,7 +2297,10 @@ export function SettingsSubOverlay() {
     const id = setTimeout(() => {
       setDisplay(null);
       setMoving(false);
-          /**
+      // Die zweite Ebene gehört zur ersten — beim nächsten Öffnen steht wieder die Auswahl da.
+      setCat({ id: null, open: false, moving: false });
+      categoryPush.value = 0;
+      /**
        * Mit Abstand — siehe Bo. Bildgenau auf das Kurvenende gesetzt, reißt
        * dieser Wecker den Unterschirm-Baum rund ein Bild zu früh ab, und
        * `setTimeout` trifft ohnehin nicht das Bild.
@@ -1848,7 +2346,7 @@ export function SettingsSubOverlay() {
     // Und die Hub-Textur für die Rückfahrt wieder scharf stellen.
     rearmLayer("settings");
     requestAnimationFrame(() => {
-      settingsPush.value = withTiming(0, POP_SPRING, (finished?: boolean) => {
+      settingsPush.value = withTiming(0, slideTiming(POP_SPRING), (finished?: boolean) => {
         "worklet";
         if (!finished) return;
         runOnJS(setSheetMoving)(false, "settingsSub");
@@ -1880,11 +2378,25 @@ export function SettingsSubOverlay() {
   useEffect(() => {
     if (Platform.OS !== "android" || !sub) return;
     const h = BackHandler.addEventListener("hardwareBackPress", () => {
-      back();
+      // Erst die Kategorie zurück zur Auswahl, dann die Einstellungen zum Hub.
+      if (catRef.current.open) closeCategory();
+      else back();
       return true; // verbraucht — sonst schlösse Android die App.
     });
     return () => h.remove();
-  }, [sub, back]);
+  }, [sub, back, closeCategory]);
+
+  /** Die Auswahl weicht nach links aus, während die Kategorie hereinfährt. */
+  const menuShiftStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: categoryPush.value * screenW * UNDERLAY_TRAVEL_FRAC }],
+  }));
+  const categoryStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: (1 - categoryPush.value) * screenW }],
+  }));
+  const categorySheetStyle = useMemo(
+    () => [StyleSheet.absoluteFillObject, styles.subSheet, { backgroundColor: appBg, zIndex: 91 }, categoryStyle],
+    [appBg, categoryStyle],
+  );
 
   /**
    * Beide Ablagen liegen VOR dem Ausstieg unten.
@@ -1924,20 +2436,52 @@ export function SettingsSubOverlay() {
       // sie bei jedem Scrollen darin neu.
       renderToHardwareTextureAndroid={Platform.OS === "android" && moving}
     >
-      <Animated.ScrollView
-        scrollEventThrottle={16}
-        // key an den Unterschirm gebunden: Sonst behielte die Fläche ihren
-        // Scroll-Stand vom vorherigen Unterschirm.
-        key={display}
-        contentContainerStyle={{ paddingTop: insets.top, paddingBottom: insets.bottom + 24 }}
-        showsVerticalScrollIndicator={false}
+      <Animated.View
+        style={[styles.subLayer, menuShiftStyle]}
+        // Weicht die Auswahl aus, wird sie wie der Hub als Ebene geschoben statt Bild für Bild neu gezeichnet.
+        renderToHardwareTextureAndroid={Platform.OS === "android" && cat.moving}
       >
-        <SubSettledContext.Provider value={settled}>
-          {display === "details" && <DetailsScreen onBack={back} />}
-          {display === "settings" && <SettingsSubScreen onBack={back} />}
-          {display === "support" && <SupportSubScreen onBack={back} />}
-        </SubSettledContext.Provider>
-      </Animated.ScrollView>
+        <Animated.ScrollView
+          scrollEventThrottle={16}
+          // key an den Unterschirm gebunden: Sonst behielte die Fläche ihren
+          // Scroll-Stand vom vorherigen Unterschirm.
+          key={display}
+          contentContainerStyle={{ paddingTop: insets.top, paddingBottom: insets.bottom + 24 }}
+          showsVerticalScrollIndicator={false}
+        >
+          <SubSettledContext.Provider value={settled}>
+            {display === "details" && <DetailsScreen onBack={back} />}
+            {display === "settings" && (
+              <SettingsMenuScreen onBack={back} onOpen={openCategory} onPreload={preloadCategory} />
+            )}
+            {display === "support" && <SupportSubScreen onBack={back} />}
+          </SubSettledContext.Provider>
+        </Animated.ScrollView>
+      </Animated.View>
+      {display === "settings" && cat.id ? (
+        <Animated.View
+          // Vorgebaut, aber nicht offen: geparkt rechts außerhalb und nicht anfassbar.
+          pointerEvents={cat.open ? "auto" : "none"}
+          style={categorySheetStyle}
+          renderToHardwareTextureAndroid={Platform.OS === "android" && cat.moving}
+        >
+          <Animated.ScrollView
+            scrollEventThrottle={16}
+            key={cat.id}
+            // „Zuhause" sucht mit offener Tastatur — der erste Tipp auf einen
+            // Treffer soll ihn wählen, nicht nur die Tastatur schließen.
+            keyboardShouldPersistTaps="handled"
+            contentContainerStyle={{ paddingTop: insets.top, paddingBottom: insets.bottom + 24 }}
+            showsVerticalScrollIndicator={false}
+          >
+            {cat.id === "travel" && <TravelScreen onBack={closeCategory} />}
+            {cat.id === "appearance" && <AppearanceScreen onBack={closeCategory} />}
+            {cat.id === "language" && <LanguageScreen onBack={closeCategory} />}
+            {cat.id === "notifications" && <NotificationsScreen onBack={closeCategory} />}
+            {cat.id === "bo" && <BoScreen onBack={closeCategory} />}
+          </Animated.ScrollView>
+        </Animated.View>
+      ) : null}
     </Animated.View>
   );
 }

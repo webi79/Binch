@@ -9,6 +9,7 @@ import {
 import { SHEET_IN, SHEET_OUT, markSheetMoving } from "./overlayCover";
 import { setSheetMoving } from "./searchHandoff";
 import { dragHealOffset, snapToPixel } from "@/lib/ui/sheetSwipe";
+import { slideTiming } from "@/lib/nav/slideMotion";
 
 /**
  * EINE Fahrt für alle Blätter — von unten wie von oben.
@@ -45,7 +46,13 @@ import { dragHealOffset, snapToPixel } from "@/lib/ui/sheetSwipe";
  * Bewegung heraushalten soll. Ein Blatt, das sie vergisst, erzeugt Fehler an
  * ganz anderer Stelle — das ist in dieser Datei mehrfach passiert.
  */
-export function useSheetSlide(key: string, park: number) {
+/** Eigene Kurve und Dauer statt `SHEET_IN`/`SHEET_OUT` — siehe `softSheetMotion`. */
+export interface SheetMotion {
+  in: { duration: number; easing: typeof SHEET_IN.easing };
+  out: { duration: number; easing: typeof SHEET_IN.easing };
+}
+
+export function useSheetSlide(key: string, park: number, motion?: SheetMotion) {
   const y = useSharedValue(park);
   /**
    * Die laufende Fahrt als reine JS-Angabe — siehe `from` unten.
@@ -113,7 +120,7 @@ export function useSheetSlide(key: string, park: number) {
       // anmeldet: Er trüge sonst mitten in ihr denselben Schlüssel wieder aus.
       clearAdopt();
       cancelAnimation(y);
-      const cfg = show ? SHEET_IN : SHEET_OUT;
+      const cfg = show ? (motion?.in ?? SHEET_IN) : (motion?.out ?? SHEET_OUT);
       /**
        * Beim Wiedereintritt aus der Rückfahrt: von der aktuellen Stelle weiter,
        * mit ANTEILIGER Dauer.
@@ -187,7 +194,7 @@ export function useSheetSlide(key: string, park: number) {
       rafRef.current = requestAnimationFrame(() => {
         rafRef.current = null;
         onFrame?.(show);
-        y.value = withTiming(show ? 0 : park, cfgScaled, (finished) => {
+        y.value = withTiming(show ? 0 : park, slideTiming(cfgScaled), (finished) => {
           "worklet";
           // Nicht mehr `if (!finished) return` — siehe `gen`: Auch der Abbruch
           // durch eine Berührung muss den Schlüssel zurückgeben.
@@ -196,7 +203,7 @@ export function useSheetSlide(key: string, park: number) {
         });
       });
     },
-    [clearAdopt, gen, key, park, y],
+    [clearAdopt, gen, key, park, y, motion],
   );
 
   /**
@@ -214,7 +221,7 @@ export function useSheetSlide(key: string, park: number) {
    */
   const warm = useCallback(() => {
     y.value = park;
-    y.value = withTiming(park - 0.002, SHEET_IN, (finished) => {
+    y.value = withTiming(park - 0.002, slideTiming(SHEET_IN), (finished) => {
       "worklet";
       if (finished) y.value = park;
     });

@@ -101,6 +101,7 @@ interface Row {
   city: string | null;
   type: string;
   subtype: string | null;
+  kinds: string[] | null;
   lat: number | null;
   lng: number | null;
   parent_code: string | null;
@@ -134,6 +135,18 @@ function familyOf(r: Row): Family {
     default:
       return r.type === "TRAIN" ? "rail" : "bus";
   }
+}
+
+/**
+ * Führt der Ersatz alle Verkehrsarten der alten Zeile? Dann ist er dieselbe Art, auch wenn die
+ * Hauptart abweicht: Ein geteilter Tram-/Busmast steht in OSM als Bushalt, im Fahrplan als
+ * Tramhalt („Dommayergasse", Wien) — beide führen Tram UND Bus. Ein reiner Tramhalt ersetzt
+ * dagegen nie einen Bushalt.
+ */
+function coversKinds(repl: Row, old: Row): boolean {
+  const have = new Set(repl.kinds ?? []);
+  const need = old.kinds ?? [];
+  return need.length > 0 && need.every((k) => have.has(k));
 }
 
 function meters(a: Row, b: Row): number {
@@ -261,7 +274,7 @@ function coversAll(a: string, b: string): boolean {
 const csv = (cells: Array<string | number>) =>
   cells.map((c) => (/[",\n]/.test(String(c)) ? `"${String(c).replace(/"/g, '""')}"` : String(c))).join(",");
 
-const ROW_COLUMNS = `l.code, coalesce(l.display_name, l.label) AS name, l.city, l.type, l.subtype,
+const ROW_COLUMNS = `l.code, coalesce(l.display_name, l.label) AS name, l.city, l.type, l.subtype, l.kinds,
   l.latitude::float8 AS lat, l.longitude::float8 AS lng, l.parent_code, l.hafas_id`;
 
 async function loadRows(codes: string[]): Promise<Map<string, Row>> {
@@ -343,6 +356,7 @@ async function recheck(file: string): Promise<void> {
       city: (r.city as string | null) ?? null,
       type: String(r.type),
       subtype: (r.subtype as string | null) ?? null,
+      kinds: (r.kinds as string[] | null) ?? null,
       lat: r.latitude == null ? null : Number(r.latitude),
       lng: r.longitude == null ? null : Number(r.longitude),
       parent_code: null,
@@ -446,7 +460,7 @@ async function main() {
           ? "Ersatz fehlt"
           : twin(code)
             ? null
-            : familyOf(repl) !== familyOf(old)
+            : familyOf(repl) !== familyOf(old) && !coversKinds(repl, old)
             ? "Ersatz andere Art"
             : meters(old, repl) > (plan.get(code)!.kind === "B6" ? B6_MAX_M : MAX_M)[familyOf(old)]
               ? "Ersatz zu weit"

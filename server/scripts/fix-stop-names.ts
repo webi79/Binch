@@ -69,13 +69,14 @@ function readSourceNames(file: string): Map<string, string> {
 }
 const STAMP = new Date().toISOString().replace(/[:.]/g, "-");
 
-type SectionId = "source" | "gbtwin" | "gbclean" | "nltwin" | "fahrplan" | "steig" | "clean" | "detail" | "reset";
+type SectionId = "source" | "gbtwin" | "gbclean" | "nltwin" | "fahrplan" | "wien" | "steig" | "clean" | "detail" | "reset";
 const SECTIONS: Array<{ id: SectionId; title: string; column: "display_name" | "display_detail" | "source_name" }> = [
   { id: "source", title: "Fahrplan-Namen in source_name übernehmen", column: "source_name" },
   { id: "gbtwin", title: "GB: Name des Fahrplan-Zwillings (NaPTAN)", column: "display_name" },
   { id: "gbclean", title: "GB: Quellname ohne Ort-Vorsatz, Seite, Richtung, Halt-Buchstabe", column: "display_name" },
   { id: "nltwin", title: "NL: Name des Fahrplan-Zwillings („Ort, Halt“)", column: "display_name" },
   { id: "fahrplan", title: "Name aus dem aktuellen Fahrplan statt aus label", column: "display_name" },
+  { id: "wien", title: "Wien: Name wie bei den Wiener Linien (ohne Bezirksteil, ohne „Wien“)", column: "display_name" },
   { id: "steig", title: "Steige tragen den Namen ihrer Station", column: "display_name" },
   { id: "clean", title: "Übrige Länder: ohne Fahrtrichtung, Steig, Mastnummer, Bedarfshalt", column: "display_name" },
   { id: "reset", title: "Anzeigenamen, die nicht mehr gelten (→ NULL)", column: "display_name" },

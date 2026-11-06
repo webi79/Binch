@@ -87,11 +87,15 @@ export interface AlertCheckInput {
    */
   passengers: number;
   travelClass: string;
+  /** Tarifprofil der Suche (kanonisch, util/fareProfile.ts) — leer = ohne Karte. */
+  fareProfile?: string;
 }
 
-interface PushMessage {
+export interface PushMessage {
   /** Die FCM-Kennung des Geräts. */
   to: string;
+  /** Wie lange Firebase zustellen darf; fehlt = die Entprellzeit der Alarme. */
+  ttlMs?: number;
   title: string;
   body: string;
   /**
@@ -530,9 +534,19 @@ function fcm(): admin.messaging.Messaging | null {
  * Dort hat ein Versuch stattgefunden, und tote Kennungen werden dabei
  * aufgeräumt.
  */
-async function sendPush(messages: PushMessage[]): Promise<boolean> {
+export async function sendPush(messages: PushMessage[]): Promise<boolean> {
+  return (await sendPushCounted(messages)) !== null;
+}
+
+/**
+ * Wie `sendPush`, nennt aber, wie viele Nachrichten Firebase ANGENOMMEN hat —
+ * `null`, wenn es keine Zugangsdaten gibt. Für alles, was festhält, ob etwas
+ * hinausging (Bos geplante Aufgaben).
+ */
+export async function sendPushCounted(messages: PushMessage[]): Promise<number | null> {
   const messaging = fcm();
-  if (!messaging) return false;
+  if (!messaging) return null;
+  let accepted = 0;
   for (let i = 0; i < messages.length; i += FCM_BATCH) {
     const batch = messages.slice(i, i + FCM_BATCH);
     try {
@@ -567,7 +581,8 @@ async function sendPush(messages: PushMessage[]): Promise<boolean> {
              * in dem sie ersetzt werden könnte. Ein längerer Wert ließe beides
              * gleichzeitig zu, ein kürzerer ließe eine Lücke.
              */
-            ttl: NOTIFY_COOLDOWN_MS,
+            // Erinnerungen tragen ihre eigene Frist: nach der Abfahrt wertlos.
+            ttl: m.ttlMs ?? NOTIFY_COOLDOWN_MS,
             /**
              * HOHE Priorität — ausdrücklich, nicht auf die Vorgabe vertrauend.
              *
@@ -588,6 +603,7 @@ async function sendPush(messages: PushMessage[]): Promise<boolean> {
           },
         })),
       );
+      accepted += res.successCount;
       const dead: string[] = [];
       res.responses.forEach((r, idx) => {
         if (r.success) return;
@@ -617,6 +633,23 @@ async function sendPush(messages: PushMessage[]): Promise<boolean> {
           console.warn("[priceAlerts] push error:", code, r.error?.message);
         }
       });
+      /**
+       * JEDE Sendung belegen — auch die gelungenen.
+       *
+       * Ohne diese Zeile war „auf dem Handy kam nichts an" nicht zu trennen von
+       * „es ging nie etwas raus": Erinnerungen werden beim Versand gelöscht,
+       * und ein Erfolg hinterließ keine Spur. Kennungen nur gekürzt.
+       */
+      // eslint-disable-next-line no-console
+      console.log(
+        `[push] ${batch
+          .map((m, idx) => {
+            const r = res.responses[idx];
+            const state = r?.success ? "ok" : (r?.error?.code ?? "?").replace("messaging/", "");
+            return `${m.channelId}→${m.to.slice(0, 8)}…:${state}`;
+          })
+          .join(" ")}`,
+      );
       if (dead.length > 0) {
         await db.delete(pushTokens).where(inArray(pushTokens.token, dead));
       }
@@ -625,7 +658,7 @@ async function sendPush(messages: PushMessage[]): Promise<boolean> {
       console.warn("[priceAlerts] push failed:", e);
     }
   }
-  return true;
+  return accepted;
 }
 
 /**
@@ -740,6 +773,8 @@ export async function evaluateAlerts(
         departDate: priceAlerts.departDate,
         locale: pushTokens.locale,
         timezone: pushTokens.timezone,
+        notificationsEnabled: pushTokens.notificationsEnabled,
+        priceAlertsEnabled: pushTokens.priceAlertsEnabled,
         // Für die Anrede — steht nur da, wenn der Alarm einem Konto gehört.
         firstName: users.firstName,
       })
@@ -768,6 +803,8 @@ export async function evaluateAlerts(
           eq(priceAlerts.currency, input.currency.toUpperCase()),
           eq(priceAlerts.passengers, input.passengers),
           eq(priceAlerts.travelClass, input.travelClass),
+          // Nur Preise desselben Tarifs (BahnCard, Deutschlandticket) — siehe Schema.
+          eq(priceAlerts.fareProfile, input.fareProfile ?? ""),
         ),
       );
 
@@ -785,6 +822,15 @@ export async function evaluateAlerts(
       const dropped = price <= desired;
       const rose = a.notifyOnRise && price > base;
       if (!dropped && !rose) continue;
+
+      /**
+       * In der App abgeschaltet: Meldungen überhaupt oder Preisalarme.
+       *
+       * ÜBERSPRUNGEN, nicht verworfen — wie bei der Ruhezeit unten:
+       * `lastNotifiedAt` bleibt, der Alarm bleibt fällig. Schaltet der Nutzer
+       * wieder ein, meldet die nächste Prüfung den Preis, der dann gilt.
+       */
+      if (!a.notificationsEnabled || !a.priceAlertsEnabled) continue;
 
       // Entprellung — siehe NOTIFY_COOLDOWN_MS.
       const last = a.lastNotifiedAt ? new Date(a.lastNotifiedAt).getTime() : 0;

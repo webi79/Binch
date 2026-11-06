@@ -29,6 +29,8 @@ export interface SearchAlertRequest {
   returnDate: string;
   passengers: number;
   travelClass: string;
+  /** Tarifprofil der Suche (lib/travel/fareProfile.ts) — leer = ohne Karte. */
+  fareProfile: string;
   currency: string;
   /** Der günstigste Preis der Suche, UNGERUNDET — gerundet wird hier. */
   cheapestPrice: number;
@@ -50,6 +52,18 @@ export function createSearchAlert(
    * Versprechen ohne Deckung.
    */
   void (async () => {
+    /**
+     * Wer einen Alarm anlegt, will ihn bekommen.
+     *
+     * Stehen „Benachrichtigungen" oder „Preisalarme" in den Einstellungen auf
+     * AUS, bliebe der neue Alarm sonst stumm — und niemand verstünde, warum.
+     * Die Anfrage nach einem Alarm ist der deutlichste Wunsch, den es dazu
+     * gibt. Den Server erreicht der neue Stand über die Anmeldung gleich
+     * darunter bzw. das Abonnement in `PriceAlertRouter`.
+     */
+    const st = useSearchStore.getState();
+    if (!st.notificationsEnabled) st.setNotificationsEnabled(true);
+    if (!st.priceAlertsEnabled) st.setPriceAlertsEnabled(true);
     const push = await ensurePushToken();
     if (!push.ok) {
       /**
@@ -61,6 +75,8 @@ export function createSearchAlert(
        * Meldung, die auf die falsche Ursache zeigt, ist schlimmer als gar
        * keine; genau das war hier der Fall.
        */
+      // „Nicht jetzt" im Blatt vor der Abfrage: still bleiben — der Nutzer hat gerade selbst entschieden.
+      if (push.reason === "later") return;
       if (push.reason === "denied") {
         showAlert(t("alert.nopush.title"), t("alert.nopush.body"));
       } else {
@@ -104,9 +120,10 @@ export function createSearchAlert(
            * gab.
            */
           returnDate: req.returnDate || undefined,
-          // Reisende und Klasse gehören zum Preis — siehe `PriceAlert`.
+          // Reisende, Klasse und Tarif gehören zum Preis — siehe `PriceAlert`.
           passengers: req.passengers,
           travelClass: req.travelClass,
+          fareProfile: req.fareProfile,
           currency: req.currency,
           basePrice,
           desiredPrice: req.desiredPrice,
@@ -141,6 +158,7 @@ export function createSearchAlert(
           returnDate: req.returnDate,
           passengers: req.passengers,
           travelClass: req.travelClass,
+          fareProfile: req.fareProfile,
           currency: req.currency,
           // Dieselbe gerundete Zahl wie beim Server — die Anzeige darf
           // nicht behaupten, der Alarm hänge an einem anderen Preis.

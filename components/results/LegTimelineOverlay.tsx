@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { GROUP_GAP, SECTION_GAP } from "@/lib/theme/spacing";
 import { SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import {
   StyleSheet,
@@ -29,6 +30,7 @@ import { dragHealOffset, snapToPixel, useSheetScrollGate, useSheetSwipe } from "
 import { fetchTripPolylines } from "@/lib/api/client";
 import { haptic } from "@/lib/haptics";
 import { RippleTouch } from "@/components/ui/RippleTouch";
+import { SheetHandle } from "@/components/ui/SheetModal";
 import {
   JOURNEY_WARNING_COLORS,
   JourneyWarningBadge,
@@ -37,6 +39,7 @@ import {
 import { useAccent } from "@/lib/theme/accent";
 import { scaledStyles } from "@/lib/ui/compact";
 import { LinePill, productLabel } from "@/components/results/LinePill";
+import { slideTiming } from "@/lib/nav/slideMotion";
 
 // Farbpalette aus dem App-Theme — die hellere Lime aus dem Mockup ist bewusst
 // auf unsere Brand-Lime gedimmt (#7FEA4D), Card/Surface-Stufen matchen
@@ -337,7 +340,7 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
         // asymptotisch, während die Kurve des Such-Blattes exakt endet. Neben
         // einem anderen Blatt fällt genau dieser Auslauf auf.
         markSheetMoving();
-        translateY.value = withTiming(0, SHEET_IN);
+        translateY.value = withTiming(0, slideTiming(SHEET_IN));
       });
       return () => cancelAnimationFrame(id);
     }
@@ -365,7 +368,7 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
       return undefined;
     }
     markSheetMoving(SHEET_OUT.duration);
-    translateY.value = withTiming(sheetHeight, SHEET_OUT);
+    translateY.value = withTiming(sheetHeight, slideTiming(SHEET_OUT));
     return undefined;
   }, [open, sheetHeight, translateY]);
 
@@ -455,9 +458,7 @@ const LegTimelineSheet = memo(function LegTimelineSheet({
         style={[styles.sheet, { backgroundColor: palette.s1 }, sheetAnim, { top: sheetTop }]}
       >
         {/* Nur noch Zeichen, nicht mehr Griff — gezogen wird überall. */}
-        <View style={styles.handleWrap}>
-          <View style={styles.handle} />
-        </View>
+        <SheetHandle />
 
         {/* Stat-Box (Date | Departure | Stops). Symmetrische Anordnung:
             Date linksbündig, Uhrzeit zentriert, Stops rechtsbündig — gleicher
@@ -897,8 +898,6 @@ const styles = scaledStyles({
    * minimal anders sitzt als das andere. Genau daraus entsteht der Eindruck,
    * eine App sei „nicht ganz sauber", ohne dass man sagen könnte woran.
    */
-  handleWrap: { alignItems: "center", paddingTop: 12, paddingBottom: 16 },
-  handle: { width: 40, height: 4, borderRadius: 9999, backgroundColor: C.text },
 
   /* Stat-Box: Date | Departure | Stops */
   summaryBox: {
@@ -908,22 +907,22 @@ const styles = scaledStyles({
     borderRadius: 18,
     paddingHorizontal: 16,
     paddingVertical: 12,
-    marginHorizontal: 14,
-    marginBottom: 16,
+    marginHorizontal: 16,
+    marginBottom: GROUP_GAP,
   },
-  summaryStat: { flex: 1, flexDirection: "column", gap: 2, minWidth: 0 },
+  summaryStat: { flex: 1, flexDirection: "column", gap: 4, minWidth: 0 },
   // Ortszeit-Hinweis unter dem Kasten — klein und grau, rückt mit dem
   // eigenen Abstand an den Kasten heran (der hat unten 16).
   zoneHint: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 5,
+    gap: 4,
     marginHorizontal: SIDE_PAD,
     marginTop: -8,
     marginBottom: 12,
   },
   zoneHintText: { fontSize: 11, color: C.sub, fontWeight: "500", letterSpacing: 0.1 },
-  summaryValueRow: { flexDirection: "row", alignItems: "center", gap: 5 },
+  summaryValueRow: { flexDirection: "row", alignItems: "center", gap: 4 },
   summaryValue: { fontSize: 14, fontWeight: "700", color: C.text, letterSpacing: -0.15 },
   summaryLabel: {
     fontSize: 10,
@@ -933,7 +932,7 @@ const styles = scaledStyles({
     letterSpacing: 0.8,
   },
 
-  scrollContent: { paddingBottom: 32 },
+  scrollContent: { paddingBottom: SECTION_GAP },
   notice: {
     flexDirection: "row",
     alignItems: "flex-start",
@@ -942,7 +941,7 @@ const styles = scaledStyles({
     marginTop: 4,
     marginBottom: 8,
     paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingVertical: 8,
     borderRadius: 14,
   },
   noticeText: { flex: 1, fontSize: 12, lineHeight: 17, color: C.sub, fontWeight: "500" },
@@ -965,7 +964,7 @@ const styles = scaledStyles({
     alignItems: "center",
     gap: GAP,
     paddingHorizontal: SIDE_PAD,
-    paddingVertical: 14,
+    paddingVertical: 16,
     minHeight: 44,
   },
   timeLabel: {
@@ -1004,7 +1003,7 @@ const styles = scaledStyles({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    gap: 10,
+    gap: 8,
   },
   stationName: {
     flex: 1,
@@ -1014,8 +1013,8 @@ const styles = scaledStyles({
     letterSpacing: -0.3,
   },
   platformChip: {
-    paddingHorizontal: 10,
-    paddingVertical: 5,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
 
     borderRadius: 9999,
     borderWidth: 1,
@@ -1042,31 +1041,31 @@ const styles = scaledStyles({
     borderWidth: 1,
     borderColor: C.border,
     borderRadius: 20,
-    padding: 14,
-    gap: 10,
+    padding: 16,
+    gap: 8,
   },
-  transportHeader: { flexDirection: "row", alignItems: "center", gap: 10 },
+  transportHeader: { flexDirection: "row", alignItems: "center", gap: 8 },
   codeText: { fontSize: 13, color: C.sub, fontWeight: "600" },
   destinationText: { fontSize: 13, color: C.text, fontWeight: "500" },
   stopsToggle: {
     alignSelf: "flex-start",
     flexDirection: "row",
     alignItems: "center",
-    gap: 6,
+    gap: 8,
     paddingHorizontal: 12,
-    paddingVertical: 7,
+    paddingVertical: 8,
     backgroundColor: C.cardSoft,
     borderRadius: 9999,
   },
   stopsToggleText: { fontSize: 12, fontWeight: "700" },
   stopList: {
-    marginTop: 2,
-    paddingTop: 10,
+    marginTop: 4,
+    paddingTop: 8,
     borderTopWidth: 1,
     borderTopColor: C.border,
-    gap: 7,
+    gap: 8,
   },
-  stopItem: { flexDirection: "row", alignItems: "center", gap: 9 },
+  stopItem: { flexDirection: "row", alignItems: "center", gap: 8 },
   stopBullet: { width: 5, height: 5, borderRadius: 5, backgroundColor: C.subDim },
   stopItemText: { fontSize: 13, color: C.sub, flex: 1 },
 
@@ -1074,9 +1073,9 @@ const styles = scaledStyles({
   transferCard: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
+    gap: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
     borderWidth: 1,
     borderStyle: "dashed",
     borderColor: C.border,
@@ -1092,7 +1091,7 @@ const styles = scaledStyles({
   },
   transferTitle: { fontSize: 13, fontWeight: "700", color: C.text },
   transferMeta: { fontSize: 11, color: C.sub, fontWeight: "500" },
-  transferRisk: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 4 },
+  transferRisk: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 4 },
   transferRiskText: { fontSize: 12, fontWeight: "700", flexShrink: 1 },
 
   /* Dotted spacer line zwischen Transfer-Stationen */
@@ -1119,7 +1118,7 @@ const styles = scaledStyles({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    gap: 6,
+    gap: 8,
   },
   mapBtnLabel: {
 

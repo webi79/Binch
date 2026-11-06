@@ -1,7 +1,9 @@
 import * as Notifications from "expo-notifications";
+import { requestWithPrimer } from "@/lib/permissions/primer";
 import { Platform } from "react-native";
 import { API_BASE_URL } from "@/lib/api/client";
 import { useSearchStore } from "@/stores/searchStore";
+import { dictionaries } from "@/lib/i18n/dict";
 
 /**
  * Der Weg vom Gerät zur Meldung — und wann er beschritten wird.
@@ -29,12 +31,28 @@ import { useSearchStore } from "@/stores/searchStore";
  * wert, wenn man die App offen hat.
  */
 Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowBanner: true,
-    shouldShowList: true,
-    shouldPlaySound: false,
-    shouldSetBadge: false,
-  }),
+  handleNotification: async (n) => {
+    /**
+     * Die Schalter aus den Einstellungen gelten auch HIER.
+     *
+     * Der Server schickt nichts mehr, sobald er sie kennt. Bis die Meldung
+     * dort angekommen ist (kein Netz, ältere Server-Fassung), kann noch etwas
+     * unterwegs sein — und im Vordergrund entscheidet allein diese Stelle, ob
+     * es zu sehen ist.
+     */
+    const st = useSearchStore.getState();
+    const type = (n.request.content.data as { type?: unknown } | null)?.type;
+    const show =
+      st.notificationsEnabled &&
+      (type !== "priceAlert" || st.priceAlertsEnabled) &&
+      (type !== "boTask" || st.boUpdatesEnabled);
+    return {
+      shouldShowBanner: show,
+      shouldShowList: show,
+      shouldPlaySound: false,
+      shouldSetBadge: false,
+    };
+  },
 });
 
 
@@ -78,6 +96,49 @@ function deviceTimezone(): string {
   }
 }
 
+/**
+ * Was das Gerät dem Server meldet — an JEDER Stelle derselbe Rumpf.
+ *
+ * Sprache und Zeitzone braucht der Server für den Text und die Ruhezeit, die
+ * beiden Schalter dafür, ob er überhaupt schickt. Stand vorher dreimal einzeln
+ * da; eine vierte Angabe hätte an drei Stellen nachgetragen werden müssen.
+ */
+function deviceBody(token: string): string {
+  const st = useSearchStore.getState();
+  return JSON.stringify({
+    token,
+    platform: Platform.OS,
+    locale: st.locale,
+    timezone: deviceTimezone(),
+    deviceModel: deviceModel(),
+    notificationsEnabled: st.notificationsEnabled,
+    priceAlertsEnabled: st.priceAlertsEnabled,
+    boUpdatesEnabled: st.boUpdatesEnabled,
+  });
+}
+
+/**
+ * Das Gerät beim Server melden — MIT Anmelde-Zeichen, sobald es eines gibt.
+ *
+ * Daran hängt die Verknüpfung Gerät ↔ Konto. Alles, was der Server einem KONTO
+ * schickt (Bos geplante Aufgaben), findet das Gerät nur darüber; ohne Kopfzeile
+ * bleibt die Zeile anonym und die Meldung geht ins Leere, ohne dass irgendwo ein
+ * Fehler steht.
+ *
+ * Bewusst NUR aus dem Speicher. Kommt das Zeichen beim Start erst später aus dem
+ * Schlüsselbund, meldet `PriceAlertRouter` das Gerät in dem Moment neu an. Ein
+ * Griff in den Schlüsselbund von hier aus liefe beim Abmelden dem Löschen davon
+ * und holte das alte Zeichen zurück in den Speicher.
+ */
+function postDevice(token: string): Promise<Response> {
+  const auth = useSearchStore.getState().authToken;
+  return fetch(`${API_BASE_URL}/api/alerts/device`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(auth ? { Authorization: `Bearer ${auth}` } : {}) },
+    body: deviceBody(token),
+  });
+}
+
 /** Einmal geholt und gemerkt — die Kennung ändert sich innerhalb eines Laufs nicht. */
 let cachedToken: string | null = null;
 
@@ -96,6 +157,8 @@ export type PushTokenResult =
   | { ok: true; token: string }
   /** Der Nutzer hat die Erlaubnis nicht erteilt. */
   | { ok: false; reason: "denied" }
+  /** Im Blatt vor der Abfrage „Nicht jetzt" gewählt — kein Hinweis, keine Einstellungen. */
+  | { ok: false; reason: "later" }
   /**
    * Erlaubnis liegt vor, ein Zustellweg kommt trotzdem nicht zustande.
    *
@@ -153,6 +216,12 @@ async function ensureChannel(): Promise<void> {
        */
       importance: Notifications.AndroidImportance.HIGH,
     });
+    // Bos geplante Aufgaben (Server-Kanal „bo-updates", services/boTasks.ts).
+    const dict = dictionaries[useSearchStore.getState().locale] ?? dictionaries.en;
+    await Notifications.setNotificationChannelAsync("bo-updates", {
+      name: dict["bo.channel"] ?? dictionaries.en["bo.channel"] ?? "Bo",
+      importance: Notifications.AndroidImportance.HIGH,
+    });
   } catch {
     // Scheitert das Anlegen, ist das kein Grund abzubrechen — die Meldung käme
     // dann eben im Vorgabe-Kanal an. Ein fehlender Kanal ist besser als eine
@@ -168,13 +237,13 @@ export async function ensurePushToken(): Promise<PushTokenResult> {
   // Die Erlaubnis GETRENNT prüfen, damit „verweigert" nicht im selben Topf
   // landet wie „geht technisch nicht".
   try {
-    const existing = await Notifications.getPermissionsAsync();
-    let status = existing.status;
-    if (status !== "granted") {
-      const asked = await Notifications.requestPermissionsAsync();
-      status = asked.status;
-    }
-    if (status !== "granted") return { ok: false, reason: "denied" };
+    const perm = await requestWithPrimer(
+      "notifications",
+      Notifications.getPermissionsAsync,
+      Notifications.requestPermissionsAsync,
+    );
+    if (!perm) return { ok: false, reason: "later" };
+    if (perm.status !== "granted") return { ok: false, reason: "denied" };
   } catch (e) {
     return { ok: false, reason: "unavailable", detail: describe(e) };
   }
@@ -209,29 +278,18 @@ export async function ensurePushToken(): Promise<PushTokenResult> {
   }
 
   try {
-    // Beim Server hinterlegen — ohne das kennt niemand den Empfänger.
-    const res = await fetch(`${API_BASE_URL}/api/alerts/device`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        token: cachedToken,
-        platform: Platform.OS,
-        /**
-         * Sprache und Zeitzone MIT anmelden.
-         *
-         * Den Text der Meldung schreibt der Server, und zwar zu einem
-         * Zeitpunkt, an dem die App gar nicht beteiligt ist — er hat sonst
-         * keine Möglichkeit, beides zu erfahren. Ohne die Sprache wären alle
-         * Meldungen englisch, egal was in den Einstellungen steht; ohne die
-         * Zeitzone könnte er die Ruhezeit nicht einhalten und schickte
-         * Preis-Alarme nachts um drei, weil am anderen Ende der Welt jemand
-         * dieselbe Strecke gesucht hat.
-         */
-        locale: useSearchStore.getState().locale,
-        timezone: deviceTimezone(),
-        deviceModel: deviceModel(),
-      }),
-    });
+    /**
+     * Beim Server hinterlegen — ohne das kennt niemand den Empfänger.
+     *
+     * Sprache und Zeitzone gehen MIT (`deviceBody`). Den Text der Meldung
+     * schreibt der Server, und zwar zu einem Zeitpunkt, an dem die App gar
+     * nicht beteiligt ist — er hat sonst keine Möglichkeit, beides zu erfahren.
+     * Ohne die Sprache wären alle Meldungen englisch, egal was in den
+     * Einstellungen steht; ohne die Zeitzone könnte er die Ruhezeit nicht
+     * einhalten und schickte Preis-Alarme nachts um drei, weil am anderen Ende
+     * der Welt jemand dieselbe Strecke gesucht hat.
+     */
+    const res = await postDevice(cachedToken);
     if (!res.ok) {
       // Die Kennung ist gültig, nur der Server kennt sie nicht. Beim nächsten
       // Versuch wird sie erneut gemeldet — deshalb den Zwischenspeicher leeren.
@@ -281,28 +339,8 @@ export async function restorePushToken(): Promise<string | null> {
     const res = await Notifications.getDevicePushTokenAsync();
     if (typeof res.data !== "string" || res.data.length === 0) return null;
     cachedToken = res.data;
-    void fetch(`${API_BASE_URL}/api/alerts/device`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        token: cachedToken,
-        platform: Platform.OS,
-        /**
-         * Sprache und Zeitzone MIT anmelden.
-         *
-         * Den Text der Meldung schreibt der Server, und zwar zu einem
-         * Zeitpunkt, an dem die App gar nicht beteiligt ist — er hat sonst
-         * keine Möglichkeit, beides zu erfahren. Ohne die Sprache wären alle
-         * Meldungen englisch, egal was in den Einstellungen steht; ohne die
-         * Zeitzone könnte er die Ruhezeit nicht einhalten und schickte
-         * Preis-Alarme nachts um drei, weil am anderen Ende der Welt jemand
-         * dieselbe Strecke gesucht hat.
-         */
-        locale: useSearchStore.getState().locale,
-        timezone: deviceTimezone(),
-        deviceModel: deviceModel(),
-      }),
-    }).catch(() => {
+    // Sprache, Zeitzone und Schalter MIT anmelden — siehe `ensurePushToken`.
+    void postDevice(cachedToken).catch(() => {
       // Der Server erfährt es beim nächsten Mal. Die Kennung steht trotzdem,
       // und darauf kommt es hier an.
     });
@@ -313,30 +351,27 @@ export async function restorePushToken(): Promise<string | null> {
 }
 
 /**
- * Sprache und Zeitzone am Server nachziehen — nach einem Wechsel im Betrieb.
+ * Sprache und Schalter am Server nachziehen — nach einem Wechsel im Betrieb.
  *
  * `restorePushToken` steigt bei einer schon geholten Kennung sofort aus, meldet
  * also im laufenden Betrieb nichts mehr nach. Wer die Sprache umstellt, bekäme
- * seine Meldungen sonst bis zum nächsten App-Start in der alten — und der Titel
- * ist seit der Umstellung die einzige Stelle, an der die Sprache überhaupt noch
- * sichtbar wird.
+ * seine Meldungen sonst bis zum nächsten App-Start in der alten — und wer
+ * Meldungen abschaltet, bekäme sie bis dahin weiter.
  *
- * Ohne Kennung passiert nichts: Dann ist entweder die Erlaubnis nicht erteilt
- * oder der Start noch nicht durch, und beide Fälle holt der nächste Start ein.
+ * Ohne Kennung im Zwischenspeicher übernimmt `restorePushToken`: Es holt sie
+ * nur mit erteilter Erlaubnis (kein Dialog) und meldet dabei schon den neuen
+ * Stand. Ohne Erlaubnis gibt es nichts zu melden — und dafür eigens ein Gerät
+ * beim Server anzulegen, das nie Meldungen bekommen hat, wäre eine Angabe mehr
+ * über jemanden, ohne Nutzen für ihn.
  */
-export function syncDeviceLocale(): void {
-  if (!cachedToken) return;
-  void fetch(`${API_BASE_URL}/api/alerts/device`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      token: cachedToken,
-      platform: Platform.OS,
-      locale: useSearchStore.getState().locale,
-      timezone: deviceTimezone(),
-      deviceModel: deviceModel(),
-    }),
-  }).catch(() => {
+export function syncDeviceSettings(): void {
+  void (async () => {
+    if (!cachedToken) {
+      await restorePushToken();
+      return;
+    }
+    await postDevice(cachedToken);
+  })().catch(() => {
     // Nicht schlimm — der nächste Start meldet es ohnehin erneut.
   });
 }
@@ -373,8 +408,56 @@ export async function pushTokenForCleanup(): Promise<string | null> {
   }
 }
 
+/**
+ * Die Kennung holen (nur mit erteilter Erlaubnis, ohne Dialog) UND die
+ * Anmeldung beim Server ABWARTEN.
+ *
+ * Für alles, was gleich danach eine Geräte-Zeile auf dem Server braucht (die
+ * Erinnerungen): `restorePushToken` meldet nur nebenbei an, und die nächste
+ * Anfrage käme womöglich vor der Anmeldung an — „Unknown device".
+ */
+export async function registeredPushToken(): Promise<string | null> {
+  const token = cachedToken ?? (await restorePushToken());
+  if (!token) return null;
+  try {
+    const res = await postDevice(token);
+    return res.ok ? token : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Das Gerät NEU anmelden — nach dem Löschen des Kontos.
+ *
+ * Mit dem Konto löscht der Server auch die damit verknüpften Geräte samt deren
+ * Alarmen (`ON DELETE CASCADE`). Die Kennung im Zwischenspeicher zeigte danach
+ * auf eine Zeile, die es nicht mehr gibt, und jeder Alarm-Abgleich scheiterte
+ * mit „Unknown device" — bis zum nächsten Kaltstart. Ohne Dialog, wie
+ * `restorePushToken`, und ohne Anmeldung: Das Gerät ist jetzt anonym.
+ */
+export async function reregisterDevice(): Promise<string | null> {
+  cachedToken = null;
+  return restorePushToken();
+}
+
 export function knownPushToken(): string | null {
   return cachedToken;
+}
+
+/** Wer auf das Eintreffen einer Test-Mitteilung wartet (Einstellungen → Mitteilungen). */
+const testArrivedListeners = new Set<() => void>();
+
+/** Eine Test-Mitteilung ist im Vordergrund eingetroffen. */
+export function announceTestArrived(): void {
+  for (const l of testArrivedListeners) l();
+}
+
+export function onTestArrived(listener: () => void): () => void {
+  testArrivedListeners.add(listener);
+  return () => {
+    testArrivedListeners.delete(listener);
+  };
 }
 
 /**

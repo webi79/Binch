@@ -11,6 +11,7 @@ import { whenMapQuiet } from "@/lib/surroundings/mapViewport";
 import { useT } from "@/lib/i18n/useT";
 import { useSearchStore, type CityQuery, type SelectedCity } from "@/stores/searchStore";
 import type { TravelMode } from "@/types/search";
+import { fareProfileFor } from "@/lib/travel/fareProfile";
 
 /**
  * Die Vorbelegung der Slide aus der Suche des Blattes.
@@ -264,6 +265,8 @@ export function CitySearchPanels() {
           returnDate: cq.returnDate,
           passengers: cq.passengers,
           travelClass: cq.travelClass,
+          // Derselbe Tarif, mit dem `searchByMode` die Stadt-Suche gestellt hat.
+          fareProfile: fareProfileFor(cq.mode, st),
           currency: st.currency,
           cheapestPrice: st.cityCheapest,
           desiredPrice,
@@ -298,8 +301,6 @@ export function CitySearchPanels() {
         onClose={closePanel}
         currentPrice={cheapest}
         currency={currency}
-        fromLabel={q?.originLabel ?? ""}
-        toLabel={q?.destLabel ?? ""}
         onCreate={submitAlert}
       />
     </>

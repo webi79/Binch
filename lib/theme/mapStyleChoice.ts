@@ -1,4 +1,5 @@
 import { useSearchStore } from "@/stores/searchStore";
+import { useDataSaverActive } from "@/lib/net/dataSaver";
 import { mapStyleFor } from "@/components/surroundings/mapStyle";
 import type { Locale } from "@/lib/i18n/dict";
 import type { StyleSpecification } from "@maplibre/maplibre-react-native";
@@ -36,11 +37,18 @@ export function resolveMapStyle(
   return theme === "light" ? "light" : "dark";
 }
 
-/** Reaktiv: Die Karte zeichnet neu, wenn Wahl ODER Thema wechseln. */
+/**
+ * Reaktiv: Die Karte zeichnet neu, wenn Wahl ODER Thema wechseln — oder wenn
+ * Datensparen das Luftbild gerade zurückhält (kein WLAN, lib/net/dataSaver.ts).
+ * Dann gilt, was „automatisch" zeigen würde. Hier und nicht in der Karte, damit
+ * jede Ebene (Strecke, Fußweg, Live-Fahrzeuge) denselben Stil sieht.
+ */
 export function useResolvedMapStyle(): ResolvedMapStyle {
   const choice = useSearchStore((s) => s.mapStyleChoice);
   const theme = useSearchStore((s) => s.theme);
-  return resolveMapStyle(choice, theme);
+  const saving = useDataSaverActive();
+  const resolved = resolveMapStyle(choice, theme);
+  return saving && resolved === "satellite" ? resolveMapStyle("auto", theme) : resolved;
 }
 
 /**

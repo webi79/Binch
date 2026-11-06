@@ -10,6 +10,7 @@ import { useSearchStore } from "@/stores/searchStore";
 import { fetchLocations } from "@/lib/api/client";
 import { useT } from "@/lib/i18n/useT";
 import { useAccent } from "@/lib/theme/accent";
+import { requestWithPrimer } from "@/lib/permissions/primer";
 
 let ExpoSpeechRecognitionModule: any = null;
 let useSpeechRecognitionEvent: (name: string, cb: (e: any) => void) => void = () => {};
@@ -103,7 +104,13 @@ export default function VoiceScreen() {
       showAlert(t("voice.unsupported"));
       return;
     }
-    const perm = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
+    const speech = ExpoSpeechRecognitionModule;
+    const perm = await requestWithPrimer(
+      "microphone",
+      () => speech.getPermissionsAsync(),
+      () => speech.requestPermissionsAsync(),
+    );
+    if (!perm) return;
     if (!perm.granted) {
       showAlert(t("voice.unsupported"));
       return;

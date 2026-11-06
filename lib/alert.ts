@@ -9,7 +9,12 @@ export type AlertButtonStyle = "default" | "cancel" | "destructive";
  * Ohne Angabe entscheidet er: rotes Ausrufezeichen, sobald ein Knopf löscht,
  * sonst das Info-Zeichen im Akzentton.
  */
-export type AlertArt = "bo-sad";
+export type AlertArt = "logout" | "delete";
+/*
+ * Vorher „bo-sad" (ein trauriger Bo über Abmelden und Konto löschen). Seit
+ * 04.11.2026 Strichzeichnungen wie in den Berechtigungs-Blättern: eine Tür mit
+ * Pfeil, ein Eimer — Bo gehört in sein Fenster (siehe StateArt.tsx).
+ */
 
 export interface AlertButton {
   text: string;

@@ -43,6 +43,36 @@ export const SPACE = {
 export const GUTTER = SPACE.xl;
 
 /**
+ * DER VERTIKALE RHYTHMUS — vier Stufen, in jedem Bildschirm dieselben.
+ *
+ * Grundlage ist das 8-Punkt-Raster, wie es Material Design, Apple (HIG) und
+ * IBM Carbon verwenden, und das Gestaltgesetz der Nähe: Was zusammengehört,
+ * steht enger als das, was getrennt ist — und zwar sichtbar enger. Jede Stufe ist
+ * deshalb klar größer als die vorige; zwei Abstände, die sich nur um ein paar
+ * Punkte unterscheiden, liest das Auge als Zufall.
+ *
+ *   ITEM_GAP      8   Elemente EINER Gruppe: Karten einer Liste, Chips, Kacheln.
+ *   TITLE_GAP    12   Überschrift → ihr Inhalt.
+ *   GROUP_GAP    16   Gruppen innerhalb eines Abschnitts (Suchleiste → Reiter →
+ *                     „Zur Arbeit"), Kopfzeile → erstes Element (= HEADING_GAP).
+ *   SECTION_GAP  24   Abschnitt → Abschnitt („Zuletzt gesucht" → „Beliebte
+ *                     Reiseziele") und das Ende einer scrollenden Seite. 24 statt
+ *                     32 auf Wunsch des Nutzers (03.11.2026): ruhiger, nicht luftig.
+ *
+ * Gemessen wird zwischen den SICHTBAREN Kanten. Bringt ein Element eigenen Rand
+ * mit (der Abstand unter der letzten Karte einer Liste), zieht der nächste ihn
+ * ab — sonst addieren sich zwei Stufen zu einer, die es nicht gibt.
+ *
+ * Innerhalb eines Bausteins (Symbol ↔ Text, Titel ↔ Unterzeile, Innenabstand
+ * einer Karte) gelten die kleinen Schritte von `SPACE`; diese vier regeln nur,
+ * wie Bausteine zueinander stehen.
+ */
+export const ITEM_GAP = SPACE.sm;
+export const TITLE_GAP = SPACE.md;
+export const GROUP_GAP = SPACE.lg;
+export const SECTION_GAP = SPACE.xxl;
+
+/**
  * Vertikaler Takt der Tab-Überschrift (Logo, „Saved", „Profil").
  *
  * Gleiches Problem wie beim GUTTER, nur senkrecht: Jeder Screen hatte seinen

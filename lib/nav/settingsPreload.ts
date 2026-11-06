@@ -18,7 +18,14 @@
  * eine Überlagerung, um die es geht — dasselbe Vorgehen wie in
  * `lib/nav/transitionLayer.ts`.
  */
+/** Die Unterschirme des Profil-Tabs (erste Ebene). Auch der Speicher (`settingsSub`) nimmt diesen Typ. */
 export type SettingsSubId = "details" | "settings" | "support";
+/**
+ * Die zweite Ebene: die Kategorien in „Einstellungen" (seit 28.10.2026 — vorher
+ * stand alles auf einer Seite). Sie fahren INNERHALB der Einstellungs-Slide
+ * herein; ihr Zustand lebt dort, nicht im Speicher.
+ */
+export type SettingsCategoryId = "travel" | "appearance" | "language" | "notifications" | "bo";
 
 type Listener = (id: SettingsSubId) => void;
 const listeners = new Set<Listener>();

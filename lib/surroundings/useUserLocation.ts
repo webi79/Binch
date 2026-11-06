@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import * as Location from "expo-location";
+import { requestWithPrimer } from "@/lib/permissions/primer";
 import { type Coord } from "./mockData";
 import { useSearchStore } from "@/stores/searchStore";
 
@@ -92,10 +93,18 @@ export function useUserLocation(enabled = true): UseUserLocation {
     useSearchStore.getState().setLastKnownCoord(c);
   };
 
-  const fetchLocation = async (): Promise<void> => {
+  /** `auto`: beim Öffnen der Karte, nicht per Tipp — dann kommt das Berechtigungs-Blatt erst nach dem Übergang. */
+  const fetchLocation = async (auto = false): Promise<void> => {
     try {
-      const { status: permStatus } = await Location.requestForegroundPermissionsAsync();
-      if (permStatus !== "granted") {
+      // Erst unser Blatt, dann (nach „Weiter") das System — „Nicht jetzt" zählt wie verweigert.
+      const perm = await requestWithPrimer(
+        "location",
+        Location.getForegroundPermissionsAsync,
+        Location.requestForegroundPermissionsAsync,
+        // Nach dem Aufbau der Karte (siehe `settleDown`) nur noch ein Atemzug.
+        auto ? { delayMs: 380 } : undefined,
+      );
+      if (perm?.status !== "granted") {
         setStatus("denied");
         return;
       }
@@ -131,9 +140,9 @@ export function useUserLocation(enabled = true): UseUserLocation {
 
   useEffect(() => {
     if (!enabled) return;
-    void fetchLocation();
+    void fetchLocation(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled]);
 
-  return { coord, status, hasFix, refresh: fetchLocation };
+  return { coord, status, hasFix, refresh: () => fetchLocation(false) };
 }

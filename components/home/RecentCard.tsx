@@ -1,4 +1,5 @@
 import { memo, useEffect, useState, useMemo } from "react";
+import { ITEM_GAP } from "@/lib/theme/spacing";
 import { View, Text, StyleSheet, Pressable } from "react-native";
 import { usePalette } from "@/lib/theme/appBg";
 import Animated, {
@@ -12,46 +13,21 @@ import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { useRouter } from "expo-router";
 import { Plane, Train, Bus, Ship, ChevronRight, Trash2, type LucideIcon } from "lucide-react-native";
 import { format, parseISO } from "date-fns";
+import { recentClassKey, recentDepartTime, recentRelaunchParams } from "@/lib/search/recentSearch";
 import { de as deLocale, enUS, es as esLocale, fr as frLocale, type Locale as DateLocale } from "date-fns/locale";
 import { useT } from "@/lib/i18n/useT";
 import { useSearchStore, RecentSearch } from "@/stores/searchStore";
 import { TravelMode } from "@/types/search";
 import { RippleTouch } from "@/components/ui/RippleTouch";
-import { GradientFill } from "@/components/ui/GradientFill";
 import { haptic } from "@/lib/haptics";
-import { startResultsPush } from "@/lib/nav/overlayCover";
+import { launchResults } from "@/lib/search/launchResults";
 import { scaledStyles } from "@/lib/ui/compact";
 
-/**
- * Die Doppeltipp-Sperre gilt für ALLE Verlaufskarten gemeinsam.
- *
- * Sie lag als `useRef` in der Karte, war also eine Sperre je Exemplar — und
- * schützte damit genau nicht gegen den Fall, den ihr eigener Kommentar
- * beschreibt: Karte A antippen, dann während der Bewegung Karte B. B hat eine
- * eigene, ungesetzte Sperre, der Aufruf geht durch, `startResultsPush()` läuft
- * ein zweites Mal — und der setzt den Fortschritt auf 0 zurück. Die schon halb
- * hereingefahrene Liste springt hart nach rechts aus dem Bild und fährt neu
- * ein, mit den Parametern der zweiten Karte, die mitten in der Bewegung
- * überschrieben wurden.
- *
- * Auf Modulebene gibt es dieses Loch nicht. Der Such-Screen hat dasselbe
- * Problem nicht, weil es dort nur einen Knopf gibt.
- */
-let openLocked_ = false;
-function openLocked(): boolean {
-  return openLocked_;
-}
-function lockOpen(): void {
-  openLocked_ = true;
-}
-function unlockOpen(): void {
-  openLocked_ = false;
-}
+// Die Doppeltipp-Sperre liegt in lib/search/launchResults.ts — gemeinsam mit den Pendel-Knöpfen.
 
 const C = {
   surface1: "#171719",
   surface2: "#171719",
-  // green entfernt — Akzent kommt via useAccent() bzw. GradientFill.
   white: "#F4F4F5",
   gray1: "#C8C8CC",
   gray2: "#8E8E93",
@@ -88,7 +64,7 @@ const CANCEL_THRESHOLD = 30;
 const ANIM_MS = 220;
 const EASING_OUT = Easing.out(Easing.quad);
 
-function RecentCardInner({ search, bordered = false }: { search: RecentSearch; bordered?: boolean }) {
+function RecentCardInner({ search }: { search: RecentSearch }) {
   const palette = usePalette();
   const t = useT();
   const router = useRouter();
@@ -210,18 +186,27 @@ function RecentCardInner({ search, bordered = false }: { search: RecentSearch; b
   [deleteMode, cardH, collapse, translateX, startX, removeRecentSearch, search.id]);
 
   const dateLocale = DATE_LOCALES[locale] ?? enUS;
+  /**
+   * Was gesucht wurde: Tag, gewählte Uhrzeit, bei Hin- und Rückreise beide
+   * Tage — vorher stand hier nur der Hinreisetag.
+   */
   const dateLabel = (() => {
-    try {
-      return format(parseISO(search.departDate), "d. MMM", { locale: dateLocale });
-    } catch {
-      return search.departDate;
-    }
+    const day = (iso: string) => {
+      try {
+        return format(parseISO(iso), "d. MMM", { locale: dateLocale });
+      } catch {
+        return iso;
+      }
+    };
+    const time = recentDepartTime(search);
+    const first = time ? `${day(search.departDate)} ${format(time, "HH:mm")}` : day(search.departDate);
+    return search.returnDate ? `${first} – ${day(search.returnDate)}` : first;
   })();
   const paxLabel = `${search.passengers} ${
     search.passengers === 1 ? t("search.passenger.singular") : t("search.passenger.plural")
   }`;
-  const classLabel =
-    search.mode === "FLIGHT" ? t("search.class.economy") : t("search.class.second");
+  // Die GESUCHTE Klasse — hier stand fest „Economy" bzw. „2. Klasse".
+  const classLabel = t(recentClassKey(search));
   const isCleanCode = (code: string) =>
     code.length > 0 && code.length <= 6 && !code.includes(":");
   const formatEndpoint = (e: { code: string; label: string }) => {
@@ -246,76 +231,16 @@ function RecentCardInner({ search, bordered = false }: { search: RecentSearch; b
   };
 
   function open() {
-    // Doppeltipp-Sperre, wie am Suchen-Knopf: Ein zweiter Tipp riefe
-    // `startResultsPush()` erneut auf, das setzt den Wert auf 0 zurück — die
-    // schon reingefahrene Liste springt hart nach rechts aus dem Bild — und legte
-    // zusätzlich eine zweite Route samt zweiter Suche an.
-    //
-    // 400ms statt 900: Ein echter Doppeltipp liegt darunter. Bei 900 war der
-    // Knopf danach spürbar tot — zurück und sofort dieselbe Karte nochmal tippen
-    // ging nicht, und das liest sich als kaputter Knopf, nicht als Schutz.
-    if (openLocked()) return;
-    lockOpen();
-    setTimeout(unlockOpen, 400);
-
-    // SOFORT navigieren, parallel das Overlay schließen. Vorher
-    // setTimeout 280ms = spürbarer Input-Lag. Die Slide-Out des Overlays
-    // läuft auf der UI-Thread (Reanimated), parallel zur Slide-In des
-    // Results-Screens (auch UI-Thread, via InteractionManager+rAF in
-    // app/search/results.tsx) → kein Konflikt mehr.
+    // Dieselbe Suche wie damals — mit Klasse und Uhrzeit; ein vergangener
+    // Reisetag rückt auf heute (lib/search/recentSearch.ts).
+    const rp = recentRelaunchParams(search);
+    // Sofort öffnen — ohne Router; die Route wird nachgezogen, sobald die
+    // Bewegung durch ist (siehe pendingResultsRoute im Store). Sperre und
+    // Reihenfolge in lib/search/launchResults.ts.
+    if (!launchResults(rp)) return;
     // Nur schließen, wenn wirklich etwas offen ist: Ein ungeschütztes set()
-    // weckt jeden Abonnenten — und das im Berührungs-Frame, direkt bevor die
-    // Navigation startet. Dasselbe Muster wie beim Tab-Tipp in (tabs)/_layout.
+    // weckt jeden Abonnenten — im Berührungs-Frame, direkt vor dem Start.
     if (useSearchStore.getState().recentHistoryOverlayOpen) closeRecentHistoryOverlay();
-    // Sofort öffnen — ohne Router. Die Route wird nachgezogen, sobald die
-    // Bewegung durch ist (siehe pendingResultsRoute im Store).
-    const rp = {
-        mode: search.mode,
-        origin: search.origin.code,
-        destination: search.destination.code,
-        originLabel: search.origin.label,
-        destLabel: search.destination.label,
-        departDate: search.departDate,
-        ...(search.returnDate ? { returnDate: search.returnDate } : {}),
-        ...(search.tripType ? { tripType: search.tripType } : {}),
-        passengers: String(search.passengers),
-        currency: search.currency,
-      } as Record<string, string>;
-    // Ein Bild Abstand zwischen Textur-Flip und Öffnen.
-    //
-    // React fasst sonst beides in EINEN Commit: die Unterlage wird auf eine
-    // Hardware-Ebene gehoben UND der Ergebnis-Baum sichtbar gemacht. Zwei
-    // bildschirmfüllende Aufbauten im selben Bild, direkt bevor die Bewegung
-    // anläuft. Beim Ticket-Übergang liegen genau deshalb zwei Commits
-    // dazwischen — und der gilt als der glatte.
-    /**
-     * Die Bewegung ZUERST — vor allem, was danach kommt.
-     *
-     * Sie startete bisher im Ergebnis-Bildschirm, in einem Effekt. Der läuft
-     * aber erst, NACHDEM die beiden Schreibvorgänge darunter jeden Abonnenten
-     * geweckt und Fabric den ganzen Ergebnis-Baum sichtbar gemacht haben. Genau
-     * diese Strecke lag zwischen Finger und erster Regung, und in ihr steckten
-     * auch die Mikro-Ruckler: Die Bewegung fing an, während der Commit noch
-     * lief.
-     */
-    startResultsPush();
-    /**
-     * Die beiden Schreibvorgänge ein Bild später — wie am Suchen-Knopf.
-     *
-     * `setResultsParams` macht die Ergebnis-Ansicht sichtbar: über 2000 Zeilen,
-     * dauerhaft an der Wurzel. Der Commit dazu läuft bei einem Loslass-Ereignis
-     * SYNCHRON noch in diesem Aufruf zu Ende, während `startResultsPush` seine
-     * Bewegung nur einreiht und sie erst im Microtask danach zugestellt wird.
-     * Die Reihenfolge oben half also nichts: Erst lief der ganze Aufbau, dann
-     * erst fuhr etwas los.
-     *
-     * Der Such-Screen legt dieselben zwei Aufrufe längst in ein Bild Abstand;
-     * dieser Pfad war als einziger nicht nachgezogen.
-     */
-    requestAnimationFrame(() => {
-      useSearchStore.getState().setPendingResultsRoute(rp);
-      useSearchStore.getState().setResultsParams(rp);
-    });
   }
 
   return (
@@ -356,10 +281,10 @@ function RecentCardInner({ search, bordered = false }: { search: RecentSearch; b
             style={[
               styles.recentCard,
               // Eine Karte auf dem Bildschirm ist eine BOX, kein Blatt —
-              // deshalb `s2`. Der Ton bleibt derselbe wie bisher; er ist jetzt
-              // nur an der richtigen Stufe angemeldet und wandert mit ihr.
+              // deshalb `s2`. Im Verlaufs-Blatt genauso: Das Blatt ist `s1`,
+              // die Karte hebt sich ohne Rahmen ab (der Rahmen stammte aus der
+              // Zeit, als das Blatt selbst `s2` war, und war nur noch Unruhe).
               { backgroundColor: palette.s2 },
-              bordered && [styles.recentCardBordered, { borderColor: palette.border }],
             ]}
             onPress={onCardPress}
             onLongPress={enterDeleteMode}
@@ -367,7 +292,7 @@ function RecentCardInner({ search, bordered = false }: { search: RecentSearch; b
             {/* Liegt AUF der Karte, also `s3`. Stand hier auf `s2` — demselben
                 Ton wie die Karte — und war dadurch unsichtbar. */}
             <View style={[styles.recentIconWrap, { backgroundColor: palette.s3 }]}>
-              <Icon size={20} color={C.gray1} />
+              <Icon size={20} color={C.gray1} strokeWidth={2} />
             </View>
             <View style={styles.recentText}>
               <Text style={styles.recentRoute} numberOfLines={1}>
@@ -377,13 +302,18 @@ function RecentCardInner({ search, bordered = false }: { search: RecentSearch; b
                 {dateLabel} · {paxLabel} · {classLabel}
               </Text>
             </View>
-            <View style={styles.recentRight}>
-              <View style={styles.pricePill}>
-                <GradientFill />
-                <Text style={styles.pricePillText}>{search.currency}</Text>
-              </View>
-              <ChevronRight size={14} color={C.gray3} />
-            </View>
+            {/**
+              * Rechts nur noch der Pfeil, mittig zur Zeile — wie in den
+              * Einstellungs-Zeilen (16, `#56565C`).
+              *
+              * Hier stand eine Akzent-Pille mit dem Währungs-Code („EUR"),
+              * darunter der Pfeil. Die Pille sah aus wie ein Preis, sagte aber
+              * keinen; sie nahm dem Streckennamen Platz (er wurde früher
+              * gekürzt) und schob den Pfeil aus der Mitte in die Ecke. Die
+              * Währung gehört zu den Such-Einstellungen und wird beim erneuten
+              * Suchen weiter mitgenommen (`recentRelaunchParams`).
+              */}
+            <ChevronRight size={16} color={C.gray3} strokeWidth={2} />
           </RippleTouch>
         </Animated.View>
       </GestureDetector>
@@ -392,7 +322,7 @@ function RecentCardInner({ search, bordered = false }: { search: RecentSearch; b
 }
 
 /** Abstand zur nächsten Karte — fährt beim Löschen mit auf null. */
-const CARD_GAP = 8;
+const CARD_GAP = ITEM_GAP;
 
 const styles = scaledStyles({
   cardWrap: {
@@ -451,37 +381,27 @@ const styles = scaledStyles({
     backgroundColor: C.surface1,
     borderRadius: 16,
     paddingHorizontal: 16,
-    paddingVertical: 14,
+    paddingVertical: 16,
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
   },
-  recentCardBordered: {
-    borderWidth: 1,
-    borderColor: "#212123",
-  },
+  /** 40er-Kachel mit 12er-Radius — die Stufe der Symbol-Kacheln auf Karten. */
   recentIconWrap: {
-    width: 44,
-    height: 44,
-    borderRadius: 14,
+    width: 40,
+    height: 40,
+    borderRadius: 12,
     backgroundColor: C.surface2,
     alignItems: "center",
     justifyContent: "center",
   },
   recentText: { flex: 1, minWidth: 0 },
-  recentRoute: { fontSize: 14, fontWeight: "600", color: C.white },
-  recentMeta: { fontSize: 12, color: C.gray2, marginTop: 3 },
-  recentRight: { alignItems: "flex-end", gap: 6 },
-  pricePill: {
-    borderRadius: 9999,
-    paddingHorizontal: 9,
-    paddingVertical: 4,
-    overflow: "hidden",
-  },
-  pricePillText: { fontSize: 11, fontWeight: "700", color: "#000" },
+  /** 15/600 über 13 — Name und Angaben klar getrennt, beide gut lesbar. */
+  recentRoute: { fontSize: 15, fontWeight: "600", color: C.white, letterSpacing: -0.1 },
+  recentMeta: { fontSize: 13, color: C.gray2, marginTop: 4 },
 });
 
 // Memo-Wrapper: bei einer Liste von 5+ Recent-Cards verhindert das, dass alle
 // Cards bei jedem Home-Render neu zeichnen. Nur wenn `search` (das Trip-Objekt
-// selbst) oder `bordered` sich ändert, wird die einzelne Card aktualisiert.
+// selbst) sich ändert, wird die einzelne Card aktualisiert.
 export const RecentCard = memo(RecentCardInner);

@@ -156,16 +156,13 @@ export interface MapSurfaceHandle {
    * `rearm` weiter unten.
    */
   rearm: () => void;
-  /**
-   * Das aktuelle Kartenbild für die NÄCHSTE Karte einfrieren — vor einem
-   * Wechsel des Kartentyps. Die neue Karte (neu aufgebaut, siehe `key` am
-   * Aufrufer) legt es sich über, bis sie fertig gezeichnet hat, und blendet es
-   * dann aus; ohne das war sie bis dahin leer und blitzte auf. Nativ in
-   * `MLRNMapView.captureStyleCover` (Patch). Wirft nie.
-   */
-  freezeForStyleSwitch: () => Promise<void>;
   /** Karte wieder nach Norden ausrichten (Drehung und Neigung auf null). */
   resetNorth: () => void;
+  /**
+   * Nur die NEIGUNG weich ändern — Mitte, Zoom und Drehung bleiben. Für
+   * „3D-Gebäude an/aus" im Kartentyp-Blatt.
+   */
+  tiltTo: (pitch: number) => void;
   /**
    * Map auf eine Koordinate (lat/lng) zentrieren mit gewünschtem Zoom.
    *
@@ -802,15 +799,6 @@ const MapSurfaceInner = forwardRef<MapSurfaceHandle, Props>(function MapSurface(
     ref,
     () => ({
       rearm,
-      freezeForStyleSwitch: async () => {
-        try {
-          // „cover" ist eine Binch-Ergänzung im Patch — der Typ kennt nur die beiden
-          // eingebauten Ausgaben.
-          await mapViewRef.current?.createStaticMapImage({ output: "cover" as "file" });
-        } catch {
-          // Karte nicht bereit — dann wechselt sie eben ohne Überblendung.
-        }
-      },
       /**
        * Zurück nach Norden — Drehung UND Neigung auf null.
        *
@@ -855,6 +843,26 @@ const MapSurfaceInner = forwardRef<MapSurfaceHandle, Props>(function MapSurface(
           });
         } catch {
           // Karte noch nicht bereit — dann gibt es auch nichts geradezurücken.
+        }
+      },
+      /**
+       * Kippen ohne Wegfahren — derselbe Weg wie `resetNorth` (`setStop`
+       * überschreibt nur die Neigung, Mitte und Zoom bleiben stehen).
+       *
+       * Für „3D-Gebäude": Anschalten kippt die Karte, damit man die Häuser
+       * sofort stehen sieht; Ausschalten legt sie wieder flach. Das ersetzt den
+       * Satz „mit zwei Fingern kippen" (Nutzer 05.11.2026: zu viel Text). Dauer
+       * wie beim Geraderücken: Sockel plus drei Millisekunden je Grad.
+       */
+      tiltTo: (pitch) => {
+        const from = cameraStateRef.current?.pitch ?? 0;
+        if (Math.abs(from - pitch) < 1) return;
+        const duration = Math.round(Math.min(900, 450 + Math.abs(pitch - from) * 3));
+        beginMove(null, duration);
+        try {
+          void cameraRef.current?.setStop({ pitch, duration, easing: TAP_EASING });
+        } catch {
+          // Karte noch nicht bereit — dann gibt es nichts zu kippen.
         }
       },
       /**

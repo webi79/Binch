@@ -10,8 +10,11 @@
  *     {"type":"conversation","id":"<uuid>"}      (IMMER zuerst, s.u.)
  *     {"type":"mood","mood":"thinking|talking|happy|error|idle"}
  *     {"type":"text","delta":"Hallo"}            (Text-Chunk vom Modell)
- *     {"type":"tool_use","name":"search_journey"}  (Tool wird ausgeführt)
+ *     {"type":"tool_use","name":"search_journey","detail":"Köln → Berlin"}  (Tool wird ausgeführt; web_search wird nach dem Aufruf gemeldet)
  *     {"type":"search_result","result":{...}}     (Top-Trip nach search_journey)
+ *     {"type":"sources","sources":[{url,title}]}  (Quellen einer Websuche, unter dem Text)
+ *     {"type":"memory","action":"saved","text":"…"} (Bo hat sich etwas gemerkt/vergessen)
+ *     {"type":"task_proposal","proposal":{...}}   (Vorschlag einer geplanten Aufgabe — Karte, angelegt erst nach Bestätigung)
  *     {"type":"usage","input":..., "output":..., "cacheRead":..., "cacheWrite":...}
  *     {"type":"error","message":"..."}
  *     {"type":"done"}                             (Turn fertig, Client schließt)
@@ -34,6 +37,7 @@ import { z } from "zod";
 import { and, desc, eq, lt, sql } from "drizzle-orm";
 import {
   isChatAvailable,
+  isProviderOutage,
   runChatTurn,
   type ChatEvent,
   type ChatMessage,
@@ -47,6 +51,14 @@ import {
 } from "../db/schema.js";
 import { requireUser, type SessionUser } from "../services/authSession.js";
 import { rateLimit } from "../util/rateLimit.js";
+import {
+  deleteAllMemories,
+  deleteMemory,
+  listMemories,
+  loadBoProfile,
+  setMemoryEnabled,
+  type BoProfile,
+} from "../services/boMemory.js";
 
 /** Pro Konto: 30 Bo-Turns pro Stunde. Großzügig für echte Unterhaltungen
  *  (jede Nachricht = 1 Turn), stoppt aber Token-Abuse über ein Konto. */
@@ -87,6 +99,15 @@ const bodySchema = z.object({
   /** Optional: in welche Unterhaltung dieser Turn gehört. Fehlt sie, legen
    *  wir eine neue an und nennen ihre ID im ersten SSE-Event. */
   conversationId: z.string().uuid().optional(),
+  /**
+   * Reise-Vorlieben aus der App (Profil → Einstellungen → Reisen): Bos
+   * Zugsuchen rechnen mit derselben Karte und Klasse wie die App, und
+   * „Zuhause" ist sein Start, wenn der Nutzer keinen nennt.
+   */
+  fareProfile: z.string().max(40).optional(),
+  trainClass: z.enum(["search.class.second", "search.class.first"]).optional(),
+  home: z.object({ code: z.string().min(1).max(64), label: z.string().min(1).max(160) }).optional(),
+  work: z.object({ code: z.string().min(1).max(64), label: z.string().min(1).max(160) }).optional(),
 });
 
 const idParamsSchema = z.object({ id: z.string().uuid() });
@@ -112,6 +133,9 @@ const messagesQuerySchema = z.object({
 const createConversationSchema = z.object({
   title: z.string().trim().min(1).max(TITLE_MAX_CHARS).optional(),
 });
+
+const memoryIdParamsSchema = z.object({ id: z.coerce.number().int().positive() });
+const patchMemorySchema = z.object({ enabled: z.boolean() });
 
 /**
  * Alle drei Felder optional, aber mindestens eines verlangt.
@@ -643,6 +667,47 @@ export async function chatRoutes(app: FastifyInstance) {
     return reply.code(204).send();
   });
 
+  /**
+   * BOS GEDÄCHTNIS — ansehen, einzeln löschen, alles löschen, an/aus
+   * (Profil → Einstellungen → Bo). Alles kontogebunden; eine fremde oder ausgedachte
+   * Nummer bekommt dieselbe 404.
+   */
+  app.get("/api/chat/memory", async (req, reply) => {
+    const user = await requireUser(req);
+    if (!user) return reply.code(401).send({ error: "Login required" });
+    return listMemories(user.id);
+  });
+
+  app.patch("/api/chat/memory", async (req, reply) => {
+    const user = await requireUser(req);
+    if (!user) return reply.code(401).send({ error: "Login required" });
+    const parsed = patchMemorySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "Bad request", issues: parsed.error.flatten() });
+    }
+    await setMemoryEnabled(user.id, parsed.data.enabled);
+    return { enabled: parsed.data.enabled };
+  });
+
+  app.delete("/api/chat/memory", async (req, reply) => {
+    const user = await requireUser(req);
+    if (!user) return reply.code(401).send({ error: "Login required" });
+    await deleteAllMemories(user.id);
+    return reply.code(204).send();
+  });
+
+  app.delete<{ Params: { id: string } }>("/api/chat/memory/:id", async (req, reply) => {
+    const user = await requireUser(req);
+    if (!user) return reply.code(401).send({ error: "Login required" });
+    const params = memoryIdParamsSchema.safeParse(req.params);
+    if (!params.success) {
+      return reply.code(400).send({ error: "Bad request", issues: params.error.flatten() });
+    }
+    const removed = await deleteMemory(user.id, params.data.id);
+    if (!removed) return reply.code(404).send({ error: "Memory not found" });
+    return reply.code(204).send();
+  });
+
   app.post("/api/chat/stream", async (req, reply) => {
     if (!isChatAvailable()) {
       return reply
@@ -780,6 +845,16 @@ export async function chatRoutes(app: FastifyInstance) {
 
     const ip = req.ip;
 
+    /**
+     * Was Bo über das Konto weiß (Gedächtnis, Vorname, andere Chats) — einmal
+     * je Turn. Scheitert das Laden, antwortet Bo eben ohne: Ein Lesefehler
+     * soll den Chat nicht verhindern.
+     */
+    const profile: BoProfile | undefined = await loadBoProfile(user.id, conversation.id).catch((err) => {
+      req.log.warn({ err, conversationId: conversation.id }, "Bo-Profil konnte nicht geladen werden");
+      return undefined;
+    });
+
     // Mitschrift dieses Turns. Text sammeln wir in einem Puffer statt pro
     // Token zu schreiben; die Anhänge (Treffer, Tafel, Aktion) merken wir uns
     // in der Reihenfolge ihres Eintreffens.
@@ -795,8 +870,13 @@ export async function chatRoutes(app: FastifyInstance) {
           currency: parsed.data.currency,
           today: parsed.data.today,
           lastSearch: parsed.data.lastSearch,
+          profile,
+          fareProfile: parsed.data.fareProfile,
+          trainClass: parsed.data.trainClass,
+          home: parsed.data.home,
+          work: parsed.data.work,
         },
-        { ip },
+        { ip, userId: user.id, conversationId: conversation.id },
         (event) => {
           // Mitgeschrieben wird IMMER, auch wenn der Client schon weg ist —
           // sonst fehlte im Verlauf ausgerechnet die Antwort, die der Nutzer
@@ -838,6 +918,30 @@ export async function chatRoutes(app: FastifyInstance) {
                 payload: { action: event.action, payload: event.payload },
               });
               break;
+            case "sources":
+              attachments.push({
+                role: "assistant",
+                kind: "sources",
+                content: null,
+                payload: { sources: event.sources },
+              });
+              break;
+            case "memory":
+              attachments.push({
+                role: "assistant",
+                kind: "note",
+                content: null,
+                payload: { action: event.action, text: event.text },
+              });
+              break;
+            case "task_proposal":
+              attachments.push({
+                role: "assistant",
+                kind: "task",
+                content: null,
+                payload: { proposal: event.proposal },
+              });
+              break;
             case "usage":
               // Je API-Aufruf eine Zeile: Damit lassen sich Bos echte Kosten
               // (Modell, Cache-Treffer, Länge) aus dem Log nachrechnen, statt
@@ -851,6 +955,7 @@ export async function chatRoutes(app: FastifyInstance) {
                     cacheRead: event.cacheRead,
                     cacheWrite: event.cacheWrite,
                     ...(event.trimmed ? { trimmed: event.trimmed } : {}),
+                    ...(event.webSearches ? { webSearches: event.webSearches } : {}),
                   },
                 },
                 "bo usage",
@@ -867,7 +972,7 @@ export async function chatRoutes(app: FastifyInstance) {
       // Defensive — runChatTurn fängt schon alles, aber falls doch was leakt:
       if (!clientGone) {
         const message = err instanceof Error ? err.message : String(err);
-        writeSse(reply, { type: "error", message });
+        writeSse(reply, { type: "error", message, ...(isProviderOutage(err) ? { code: "maintenance" } : {}) });
         writeSse(reply, { type: "done" });
       }
     } finally {

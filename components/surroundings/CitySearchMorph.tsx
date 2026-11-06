@@ -16,6 +16,7 @@ import { usePalette } from "@/lib/theme/appBg";
 import { SPACE } from "@/lib/theme/spacing";
 import { ms, scaledStyles } from "@/lib/ui/compact";
 import { useSearchStore, type CityQuery } from "@/stores/searchStore";
+import { slideTiming } from "@/lib/nav/slideMotion";
 
 /**
  * DIE SUCHLEISTE WIRD ZUM KASTEN — sobald eine Stadt angetippt ist.
@@ -146,7 +147,7 @@ export function CitySearchMorph({ children }: { children: ReactNode }) {
    * werden — im Projekt als schwarzer Such-Bildschirm belegt.
    */
   useEffect(() => {
-    p.value = withTiming(active ? 1 : 0, active ? SHEET_IN : SHEET_OUT);
+    p.value = withTiming(active ? 1 : 0, slideTiming(active ? SHEET_IN : SHEET_OUT));
   }, [active, p]);
 
   /** Höhe der Leiste — für den Radius der Pille (halbe Höhe). */

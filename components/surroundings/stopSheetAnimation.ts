@@ -17,6 +17,8 @@
 import { makeMutable, type SharedValue, withTiming } from "react-native-reanimated";
 import { SHEET_IN, SHEET_OUT, markSheetMoving } from "@/lib/nav/overlayCover";
 import { reportStopSheetTarget } from "@/lib/surroundings/mapViewport";
+import { slideTiming } from "@/lib/nav/slideMotion";
+import { settleHeal } from "@/lib/ui/sheetSwipe";
 
 /**
  * Die Lage des Blattes (translateY ab `fullTop`) — als EIN Wert auf
@@ -40,6 +42,35 @@ export const stopSheetY = makeMutable(100000);
  * der Kante dieses Blattes und braucht sie genauso.
  */
 export const stopSheetHeal = makeMutable(0);
+
+/**
+ * Liegt das Blatt EINGEKLAPPT (oder fährt darunter hinaus)? Dann ist seine
+ * Tafel unsichtbar, aber eingehängt — und was dort läuft, läuft für niemanden:
+ * der Sekundentakt der ersten Abfahrt (`NextHero`, zeichnet samt SVG-Ring neu)
+ * und die pulsierenden Live-Knöpfe (`useLiveClock`). Beide fragen diesen Wert
+ * und setzen aus. Gesetzt auf dem UI-Strang (StopDetailSheet) — kein
+ * React-Durchgang beim Ein- und Ausklappen, also keiner mitten in einer Fahrt.
+ */
+export const stopSheetCollapsed = makeMutable(false);
+
+/**
+ * Nachlauf nach jeder Fahrt dieses Blattes — so lange wird nach ihrem Ende noch
+ * Bild für Bild nachgeschrieben (siehe `settleHeal` in lib/ui/sheetSwipe.ts).
+ * Reicht für einen schweren Durchgang beim Schließen (Tafeln abbauen).
+ */
+const SETTLE_TAIL_MS = 900;
+
+/**
+ * Jede Fahrt des Blattes meldet sich hier an: Dann werden das Blatt, das
+ * Auswahlfenster dahinter (es weicht diesem Blatt aus) und der Standort-Knopf
+ * darüber noch eine Weile nachgeschrieben — alle drei rechnen `stopSheetHeal`
+ * in ihre Lage ein. Ohne das blieb nach dem Herunterwischen das Auswahlfenster
+ * unter dem Rand hängen (Gerät, 06.11.2026).
+ */
+export function settleStopSheet(motionMs: number): void {
+  "worklet";
+  settleHeal(stopSheetHeal, motionMs + SETTLE_TAIL_MS);
+}
 
 /**
  * Was das Blatt zeigt: eine Haltestelle (Abfahrten) oder eine Stadt (Zug, Bus
@@ -104,7 +135,8 @@ export function openStopSheet(): void {
   // Als Fahrt anmelden: Wer auf „nichts fährt gerade" wartet (Vorbau der
   // Such-Slide, Kegel, Sekundentakt), wartet damit auch auf diese Einfahrt.
   markSheetMoving(SHEET_IN.duration);
-  controller.translateY.value = withTiming(controller.getMid(), SHEET_IN);
+  controller.translateY.value = withTiming(controller.getMid(), slideTiming(SHEET_IN));
+  settleStopSheet(SHEET_IN.duration);
   reportStopSheetTarget(controller.getMid());
 }
 
@@ -120,6 +152,7 @@ export function stopSheetOpenTarget(): number | null {
 /** Ohne Aufrufer — bleibt als Gegenstück stehen, benutzt aber dieselbe Vorgabe. */
 export function closeStopSheet(): void {
   if (!controller) return;
-  controller.translateY.value = withTiming(controller.getSheetHeight(), SHEET_OUT);
+  controller.translateY.value = withTiming(controller.getSheetHeight(), slideTiming(SHEET_OUT));
+  settleStopSheet(SHEET_OUT.duration);
   reportStopSheetTarget(null);
 }

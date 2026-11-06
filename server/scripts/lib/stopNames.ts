@@ -196,9 +196,10 @@ export interface StopRow {
 /**
  * fahrplan = Name aus dem aktuellen Fahrplan statt aus `label` („Hbf Nord" →
  * „Hauptbahnhof Nord"); steig = Name der Station (übernommene Masten wie MVG
- * „Hbf Süd" unter „Hauptbahnhof Süd").
+ * „Hbf Süd" unter „Hauptbahnhof Süd"); wien = Wiener Halt im Stil der Wiener
+ * Linien (`viennaName`).
  */
-export type NameRule = "gbtwin" | "gbclean" | "nltwin" | "clean" | "fahrplan" | "steig";
+export type NameRule = "gbtwin" | "gbclean" | "nltwin" | "clean" | "fahrplan" | "steig" | "wien";
 
 export interface NameDecision {
   /** Der offizielle Name — gleich `label`, wenn nichts zu ändern ist. */
@@ -216,11 +217,35 @@ const RAIL_SUBTYPES = new Set(["LONG_DISTANCE", "REGIONAL", "SUBURBAN"]);
  * schon nach Verkehrsart vorgefiltert (siehe `loadTwins`).
  */
 export function decideName(row: StopRow, twins: TwinIndex | null): NameDecision {
+  const vienna = viennaName(row);
+  if (vienna) {
+    const d = decideNameInner({ ...row, label: vienna }, twins);
+    return { ...d, rule: d.name === row.label ? null : "wien" };
+  }
   const fromLabel = withoutCityPrefix(decideNameInner(row, twins), row);
   const ws = (v: string) => v.replace(/\s+/g, " ").trim();
   if (!row.sourceName || ws(row.sourceName) === ws(row.label)) return fromLabel;
   const fromFeed = withoutCityPrefix(decideNameInner({ ...row, label: row.sourceName }, twins), row);
   return feedNameAdds(fromLabel.name, fromFeed.name) ? { ...fromFeed, rule: "fahrplan" } : fromLabel;
+}
+
+/**
+ * Wien (Okt. 2026, Wunsch des Nutzers): Bus, Tram und U-Bahn heißen wie bei den Wiener Linien —
+ * „Hauptbahnhof", „Rennweg". Das alte Präfix-Skript hatte 1 878 Wiener Halten einen Bezirksteil
+ * aus der früheren, länderblinden Gemeinde-Regel vorangestellt („Matzleinsdorf Hbf", „Landstraße
+ * Rennweg"); der österreichweite Fahrplan setzt „Wien" davor. Beides fällt weg, der Name kommt aus
+ * dem Fahrplan (Kennung at:49:… = Wien). Mit dem Bezirksteil verschwand auch der Grund, warum der
+ * Abgleich die OSM-Dubletten daneben nicht erkannte („Kolschitzkygasse").
+ *
+ * Bahnhöfe behalten den ÖBB-Namen: Ohne Ort hieße „Wien Mitte" nur „Mitte" — darum bleibt
+ * auch „Wien Mitte-Landstraße". Gilt für Masten (`at:49:…`) wie Stationen (`Pat:49:…`, seit
+ * dem österreichweiten Fahrplan); Steige folgen ihrer Station (Regel „steig").
+ */
+function viennaName(row: StopRow): string | null {
+  // „n" davor: belegte Kennung, neu vergeben (`freeCode` im Import, add-missing-poles.ts).
+  if (!/^gtfs:at:[nP]?at:49:/.test(row.code) || !row.sourceName || RAIL_SUBTYPES.has(row.subtype ?? "")) return null;
+  const name = row.sourceName.replace(/^Wien[\s,]+/, "").replace(/\s+/g, " ").trim();
+  return name.length >= 2 && !/^Mitte\b/.test(name) ? name : null;
 }
 
 function withoutCityPrefix(d: NameDecision, row: StopRow): NameDecision {
@@ -245,7 +270,7 @@ function nameTokens(v: string): string[] {
 /**
  * Taugt der Fahrplan-Name als Anzeigename? Nur, wenn er nichts verliert und
  * etwas hinzufügt. Die alten Labels tragen oft den Ort vorn (Präfix-Skript:
- * „Hof Joensuustr.", Wien „Meidling Lichtensterngasse"); der Fahrplan nennt
+ * „Hof Joensuustr."; Wien regelt seit 27.10. `viennaName`); der Fahrplan nennt
  * dort nur die Straße — 110 000 Halte hätten ihren Ort verloren. Übernommen
  * wird also nur, wenn jedes bisherige Wort im Fahrplan-Namen steht (auch
  * ausgeschrieben: „Str." → „Straße", „Hbf" → „Hauptbahnhof") UND er ein neues

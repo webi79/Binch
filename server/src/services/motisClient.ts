@@ -233,6 +233,30 @@ interface GeocodeHit {
   /** MOTIS' eigenes Wichtigkeits-Maß. München Hbf = 0.377, München Ost = 0.017 —
    *  damit trifft man den Hauptbahnhof statt irgendeines Halts der Stadt. */
   importance?: number;
+  /** Verkehrsarten am Halt. Leer = dort fährt nichts (Spiegel ohne Fahrten). */
+  modes?: string[];
+}
+
+/**
+ * Halt aus dem Fahrplan eines ANDEREN Landes: ein Spiegel für dessen
+ * grenzüberschreitende Züge („Köln Hbf" im belgischen, „Innsbruck Hbf" im
+ * niederländischen Feed). Der Geocoder liefert gern ihn als Vertreter des
+ * Bahnhofs, seine Tafel zeigt aber nur diese paar Züge — oder gar keine, wenn
+ * er anders heißt als der echte Halt (Frankfurt Hbf: „Frankfurt Main (DE)",
+ * 0 Abfahrten). Erkannt am Länderkürzel vor dem Feed-Namen (`be-sncb`,
+ * `nl-OpenOV`; `eu-` = europaweit, etwa Flixbus) gegen das Land des Halts.
+ */
+function isForeignMirror(hit: GeocodeHit): boolean {
+  const m = /^([a-z]{2})-/i.exec(hit.id ?? "");
+  if (!m || !hit.country) return false;
+  const feed = m[1]!.toUpperCase() === "UK" ? "GB" : m[1]!.toUpperCase();
+  return feed !== hit.country.toUpperCase();
+}
+
+/** Rang eines STOP-Treffers: 0 eigener Fahrplan, 1 Referenz-Knoten, 2 Spiegel bzw. ohne Fahrten. */
+function feedRank(hit: GeocodeHit): number {
+  if ((Array.isArray(hit.modes) && hit.modes.length === 0) || isForeignMirror(hit)) return 2;
+  return isReferenceFeedId(hit.id ?? "") ? 1 : 0;
 }
 
 async function geocodeRaw(label: string, signal?: AbortSignal): Promise<GeocodeHit[]> {
@@ -308,6 +332,8 @@ export async function motisReverseGeocodeStop(
   lng: number,
   maxMeters = SAME_SPOT_M,
   signal?: AbortSignal,
+  /** Unser Name des Halts — ein gleichnamiger Treffer geht jedem anderen vor. */
+  name?: string,
 ): Promise<MotisPlace | null> {
   // Transport-Fehler wirft (siehe motisGeocodeStopNear) — kein Negativ-Cache
   // bei transientem MOTIS-Ausfall.
@@ -316,26 +342,70 @@ export async function motisReverseGeocodeStop(
     signal,
   )) as GeocodeHit[];
   if (!Array.isArray(raw)) return null;
-  // Operative Feeds bevorzugen: Referenz-Knoten liefern Tafeln (ihre
-  // stopTimes tragen den bedienten Halt), aber ohne saubere Gleisangaben.
-  // Nur wenn im Radius NICHTS Operatives liegt, den Referenz-Knoten nehmen.
-  let bestOp: MotisPlace | null = null;
-  let bestOpM = Infinity;
-  let bestRef: MotisPlace | null = null;
-  let bestRefM = Infinity;
+  // Reihenfolge: gleichnamig vor anders benannt, dann eigener Fahrplan vor
+  // Referenz-Knoten vor Spiegel (`feedRank`), dann Abstand. Referenz-Knoten
+  // liefern Tafeln (ihre stopTimes tragen den bedienten Halt), aber ohne
+  // saubere Gleisangaben. Ohne den Namen nahm das bloß den nächsten operativen
+  // Halt — an Frankfurt Hbf den belgischen Spiegel ohne eine einzige Abfahrt;
+  // der nächste deutsche wäre „Platz der Republik" gewesen, ein anderer Halt.
+  const want = name ? normName(name) : null;
+  let best: MotisPlace | null = null;
+  let bestKey: number[] | null = null;
   for (const r of raw) {
     if (r.type !== "STOP" || !r.id || r.lat == null || r.lon == null) continue;
     const d = approxMeters(lat, lng, r.lat, r.lon);
     if (d > maxMeters) continue;
-    const place: MotisPlace = { id: r.id, name: r.name ?? "", lat: r.lat, lon: r.lon, tz: r.tz, type: r.type };
-    if (isReferenceFeedId(r.id)) {
-      if (d < bestRefM) { bestRefM = d; bestRef = place; }
-    } else if (d < bestOpM) {
-      bestOpM = d;
-      bestOp = place;
+    const key = [want && normName(r.name ?? "") === want ? 0 : 1, feedRank(r), d];
+    if (!bestKey || isBefore(key, bestKey)) {
+      bestKey = key;
+      best = { id: r.id, name: r.name ?? "", lat: r.lat, lon: r.lon, tz: r.tz, type: r.type };
     }
   }
-  return bestOp ?? bestRef;
+  return best;
+}
+
+/** Lexikografischer Vergleich zweier Rang-Tupel. */
+function isBefore(a: readonly number[], b: readonly number[]): boolean {
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i]! < b[i]!;
+  return false;
+}
+
+/**
+ * Alle STOPs mit UNSEREM Namen an unserer Koordinate, beste zuerst (eigener
+ * Fahrplan, Referenz-Knoten, Spiegel; dann Abstand) — Rückfall der Tafel, wenn
+ * der aufgelöste Halt keine Abfahrt liefert. Der Geocoder fasst gleichnamige
+ * Halte zu EINEM Vertreter zusammen, der aus irgendeinem Feed stammen kann; die
+ * stopTimes eines Halts umfassen aber alle gleichnamigen samt ihren Steigen.
+ * Ein gleichnamiger Knoten aus einem anderen Feed bringt darum die ganze Tafel
+ * (Berlin Hbf über den Referenz-Knoten: 20 Abfahrten statt eines 404).
+ */
+export async function motisSameNameStops(
+  name: string,
+  lat: number,
+  lng: number,
+  maxMeters = 400,
+  signal?: AbortSignal,
+): Promise<MotisPlace[]> {
+  const want = normName(name);
+  if (!want) return [];
+  const [near, named] = await Promise.all([
+    motisFetch(`/v1/reverse-geocode?place=${lat},${lng}&type=STOP`, signal).catch(() => []) as Promise<GeocodeHit[]>,
+    geocodeRaw(name, signal).catch(() => [] as GeocodeHit[]),
+  ]);
+  const seen = new Set<string>();
+  const hits: Array<{ place: MotisPlace; key: number[] }> = [];
+  for (const r of [...(Array.isArray(near) ? near : []), ...named]) {
+    if (r.type !== "STOP" || !r.id || r.lat == null || r.lon == null || seen.has(r.id)) continue;
+    seen.add(r.id);
+    if (normName(r.name ?? "") !== want) continue;
+    const d = approxMeters(lat, lng, r.lat, r.lon);
+    if (d > maxMeters) continue;
+    hits.push({
+      place: { id: r.id, name: r.name ?? name, lat: r.lat, lon: r.lon, tz: r.tz, type: r.type },
+      key: [feedRank(r), d],
+    });
+  }
+  return hits.sort((a, b) => (isBefore(a.key, b.key) ? -1 : isBefore(b.key, a.key) ? 1 : 0)).map((h) => h.place);
 }
 
 /**
@@ -370,9 +440,18 @@ const normName = normStationName;
  * MOTIS als eigener Knoten behandelt. Routet man dorthin, baut MOTIS einen
  * absurden Fußweg zwischen zwei gleichnamigen Knoten ein („München Hauptbahnhof
  * → 8 min zu Fuß → München Hbf"). Also nie als Routing-Endpunkt verwenden.
+ *
+ * Ausnahme: die ÖSTERREICHISCHEN Halte des Feeds (`…_at:…`, `…_Pat:…`). Für
+ * Österreich ist er kein Abbild, sondern der Bahnfahrplan selbst — Transitous
+ * führt Österreichs Züge nur dort (Innsbruck Hbf: Regionalzug und S-Bahn
+ * ausschließlich an `…_at:47:1187:0:*`). Als Referenz verworfen blieb für
+ * Innsbruck Hbf nur der Nachtzug-Spiegel aus dem niederländischen Feed, für
+ * Wien Westbahnhof der Flixbus-Halt — Tafeln leer bzw. nur Fernbusse.
  */
 export function isReferenceFeedId(id: string): boolean {
-  return /reference-data/i.test(id.split("_")[0] ?? "");
+  const sep = id.indexOf("_");
+  if (!/reference-data/i.test(sep < 0 ? id : id.slice(0, sep))) return false;
+  return !/^P?at:/.test(id.slice(sep + 1));
 }
 
 /**
@@ -396,12 +475,12 @@ export async function motisGeocodeNearestStop(
   signal?: AbortSignal,
 ): Promise<MotisPlace | null> {
   if (!label.trim()) return null;
-  let raw: Array<{ type?: string; id?: string; name?: string; lat?: number; lon?: number; tz?: string }>;
+  let raw: GeocodeHit[];
   try {
     raw = (await motisFetch(
       `/v1/geocode?text=${encodeURIComponent(label)}`,
       signal,
-    )) as typeof raw;
+    )) as GeocodeHit[];
   } catch {
     return null;
   }
@@ -410,7 +489,7 @@ export async function motisGeocodeNearestStop(
   const want = normName(label);
   const cos = Math.cos((refLat * Math.PI) / 180);
   let best: MotisPlace | null = null;
-  let bestM = Infinity;
+  let bestKey: number[] | null = null;
 
   for (const r of raw) {
     if (r.type !== "STOP" || !r.id || !r.name || r.lat == null || r.lon == null) continue;
@@ -427,10 +506,14 @@ export async function motisGeocodeNearestStop(
     const dy = (r.lat - refLat) * 111_000;
     const dx = (r.lon - refLng) * 111_000 * cos;
     const m = Math.sqrt(dx * dx + dy * dy);
-    if (m < bestM) {
-      bestM = m;
+    if (m > maxMeters) continue;
+    // Spiegel eines fremden Feeds nur, wenn sonst keiner passt (`feedRank`):
+    // Innsbruck Hbf lag als niederländischer Nachtzug-Halt keine 200 m daneben.
+    const key = [feedRank(r), m];
+    if (!bestKey || isBefore(key, bestKey)) {
+      bestKey = key;
       best = { id: r.id, name: r.name, lat: r.lat, lon: r.lon, tz: r.tz };
     }
   }
-  return bestM <= maxMeters ? best : null;
+  return best;
 }

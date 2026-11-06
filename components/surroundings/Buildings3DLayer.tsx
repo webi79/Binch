@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { Layer } from "@maplibre/maplibre-react-native";
 import { DARK_PALETTE, LIGHT_PALETTE } from "@/components/surroundings/mapStyle";
 import type { ResolvedMapStyle } from "@/lib/theme/mapStyleChoice";
@@ -39,6 +40,31 @@ export function Buildings3DLayer({
   visible: boolean;
 }) {
   /**
+   * WEICH EIN- UND AUSBLENDEN statt hart an und aus (06.11.2026, „die
+   * Übergänge flackern"). Die Häuser kommen jetzt mit der Kamera, die beim
+   * Anschalten in die Schräge fährt (`tiltTo`), statt im ersten Bild dazustehen.
+   *
+   * MapLibre blendet eine Deckkraft über `…-transition` — aber nur bei einer
+   * ÄNDERUNG an einer sichtbaren Ebene. Darum zwei Schritte:
+   *  - an: erst sichtbar mit Deckkraft 0, einen Augenblick später 0,8 → blendet ein;
+   *  - aus: erst Deckkraft 0 → blendet aus, danach unsichtbar. Unsichtbar heißt:
+   *    MapLibre rechnet die Körper gar nicht mehr (eine Ebene auf 0 kostete weiter).
+   * Beim Aufbau einer neuen Karte (Kartentyp-Wechsel) steht sie gleich auf dem
+   * Endwert — dort liegt das eingefrorene Bild der alten darüber.
+   */
+  const [shown, setShown] = useState(visible);
+  const [opaque, setOpaque] = useState(visible);
+  useEffect(() => {
+    if (visible) {
+      setShown(true);
+      const id = setTimeout(() => setOpaque(true), APPEAR_DELAY_MS);
+      return () => clearTimeout(id);
+    }
+    setOpaque(false);
+    const id = setTimeout(() => setShown(false), FADE_MS + 60);
+    return () => clearTimeout(id);
+  }, [visible]);
+  /**
    * Die Farbe kommt aus derselben Palette wie die flache Gebäude-Fläche, damit
    * beide zusammengehören. Im Luftbild-Modus gibt es keine Palette dafür —
    * dort nimmt ein neutrales, leicht durchsichtiges Grau die Häuser aus dem
@@ -75,7 +101,7 @@ export function Buildings3DLayer({
       source-layer="building"
       minzoom={14}
       filter={["!=", ["get", "hide_3d"], true]}
-      layout={{ visibility: visible ? "visible" : "none" }}
+      layout={{ visibility: shown ? "visible" : "none" }}
       paint={{
         "fill-extrusion-color": color,
         "fill-extrusion-height": ["get", "render_height"],
@@ -86,8 +112,16 @@ export function Buildings3DLayer({
          * die Straßennamen dahinter, und die Karte wird als Karte schlechter,
          * während sie als Bild besser aussieht.
          */
-        "fill-extrusion-opacity": 0.8,
+        "fill-extrusion-opacity": opaque ? OPACITY : 0,
+        "fill-extrusion-opacity-transition": { duration: FADE_MS, delay: 0 },
       }}
     />
   );
 }
+
+/** Deckkraft der Häuser — leicht durchscheinend, die Straßen bleiben lesbar. */
+const OPACITY = 0.8;
+/** Ein- und Ausblenden; etwa so lang wie die Kamera in die Schräge fährt. */
+const FADE_MS = 420;
+/** Ein Durchgang Abstand zwischen „sichtbar" und „deckend" — siehe oben. */
+const APPEAR_DELAY_MS = 40;

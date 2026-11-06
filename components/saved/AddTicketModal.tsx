@@ -6,7 +6,6 @@ import {
   Modal,
   Pressable,
   StyleSheet,
-  ActivityIndicator,
   type LayoutChangeEvent,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -20,10 +19,10 @@ import Animated, {
 } from "react-native-reanimated";
 import { GestureDetector, GestureHandlerRootView } from "react-native-gesture-handler";
 import { showAlert } from "@/lib/alert";
-import { SHEET_SUBTITLE, SHEET_TITLE } from "@/components/ui/SheetModal";
+import { SheetHandle, SHEET_SUBTITLE, SHEET_TITLE } from "@/components/ui/SheetModal";
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
-import { Plane, TrainFront, Bus, Ship } from "lucide-react-native";
+import { Plane, Train, Bus, Ship } from "lucide-react-native";
 import { TravelMode } from "@/types/search";
 import { Ticket } from "@/types/saved";
 import { useT } from "@/lib/i18n/useT";
@@ -34,6 +33,9 @@ import { RippleTouch } from "@/components/ui/RippleTouch";
 import { useAccent } from "@/lib/theme/accent";
 import { scaledStyles } from "@/lib/ui/compact";
 import { dragHealOffset, snapToPixel, useSheetScrollGate, useSheetSwipe } from "@/lib/ui/sheetSwipe";
+import { slideTiming } from "@/lib/nav/slideMotion";
+import { GridLoader } from "@/components/ui/GridLoader";
+import { GateLoader, useLoadGate } from "@/components/ui/LoadGate";
 
 interface Props {
   visible: boolean;
@@ -43,7 +45,7 @@ interface Props {
 
 const MODES: { id: TravelMode; icon: typeof Plane; labelKey: string }[] = [
   { id: "FLIGHT", icon: Plane, labelKey: "saved.modal.type.flight" },
-  { id: "TRAIN", icon: TrainFront, labelKey: "saved.modal.type.train" },
+  { id: "TRAIN", icon: Train, labelKey: "saved.modal.type.train" },
   { id: "BUS", icon: Bus, labelKey: "saved.modal.type.bus" },
   { id: "CRUISE", icon: Ship, labelKey: "saved.modal.type.cruise" },
 ];
@@ -118,6 +120,8 @@ function AddTicketSheet({
   const t = useT();
   const accent = useAccent();
   const [busy, setBusy] = useState(false);
+  /** Der Lader beim Lesen steht sofort, läuft aber mindestens einen vollen Durchlauf und blendet aus (`LoadGate`). */
+  const loadGate = useLoadGate(busy, { delayMs: 0, minCycles: 1 });
   /** Synchrone Sperre für den Auswahl-Dialog — greift schon im selben Frame. */
   const pickingRef = useRef(false);
 
@@ -177,7 +181,7 @@ function AddTicketSheet({
     translateY.value = h;
     requestAnimationFrame(() => {
       markSheetMoving();
-      translateY.value = withTiming(0, SHEET_IN);
+      translateY.value = withTiming(0, slideTiming(SHEET_IN));
     });
   }, [translateY, sheetH]);
 
@@ -248,7 +252,7 @@ function AddTicketSheet({
     // Auch hier: die Ausfahrt war nicht angemeldet, siehe LegTimelineOverlay.
     markSheetMoving(SHEET_OUT.duration);
     closingSv.value = true;
-    translateY.value = withTiming(sheetH.value || 900, SHEET_OUT);
+    translateY.value = withTiming(sheetH.value || 900, slideTiming(SHEET_OUT));
     scheduleClose(SHEET_OUT.duration);
   }, [scheduleClose, translateY, sheetH]);
   useEffect(() => registerClose(requestClose), [registerClose, requestClose]);
@@ -415,18 +419,16 @@ function AddTicketSheet({
             ]}
           >
             {/* Nur noch Zeichen, nicht mehr Griff — gezogen wird überall. */}
-            <View style={styles.handleWrap}>
-              <View style={styles.handle} />
-            </View>
+            <SheetHandle />
 
             <Text style={styles.title}>{t("saved.modal.title")}</Text>
             <Text style={styles.subtitle}>{t("saved.modal.subtitle")}</Text>
 
-            {busy ? (
-              <View style={styles.busyWrap}>
-                <ActivityIndicator size="large" color={accent.solid} />
+            {loadGate.phase !== "content" ? (
+              <GateLoader phase={loadGate.phase} onLeft={loadGate.onLeft} style={styles.busyWrap}>
+                <GridLoader size={64} />
                 <Text style={styles.busyText}>{t("saved.modal.parsing")}</Text>
-              </View>
+              </GateLoader>
             ) : (
               /* Eigener nativer Erkenner um die Liste, damit das Ziehen am Blatt
                  sie nicht abwürgt — siehe `useSheetScrollGate`. */
@@ -487,20 +489,18 @@ const styles = scaledStyles({
     minHeight: 320,
   },
   root: { flex: 1 },
-  handleWrap: { alignItems: "center", paddingTop: 12, paddingBottom: 16 },
-  handle: { width: 40, height: 4, borderRadius: 9999, backgroundColor: "#FFFFFF" },
   title: { ...SHEET_TITLE, marginBottom: 8 },
   subtitle: { ...SHEET_SUBTITLE, marginBottom: 16 },
   tilesRow: {
     flexDirection: "row",
     flexWrap: "wrap",
-    gap: 10,
-    marginBottom: 14,
+    gap: 8,
+    marginBottom: 16,
   },
   tile: {
     flexBasis: "47%",
     flexGrow: 1,
-    paddingVertical: 18,
+    paddingVertical: 16,
     borderRadius: 14,
     backgroundColor: "#171719",
     borderWidth: 1,
@@ -509,7 +509,7 @@ const styles = scaledStyles({
     gap: 8,
   },
   tileLabel: { fontSize: 13, fontWeight: "600", color: "#F4F4F5" },
-  hint: { fontSize: 12, color: "#56565C", textAlign: "center", lineHeight: 18, paddingHorizontal: 6, marginTop: 6 },
-  busyWrap: { alignItems: "center", justifyContent: "center", paddingVertical: 50, gap: 14 },
+  hint: { fontSize: 12, color: "#56565C", textAlign: "center", lineHeight: 18, paddingHorizontal: 8, marginTop: 8 },
+  busyWrap: { alignItems: "center", justifyContent: "center", paddingVertical: 48, gap: 16 },
   busyText: { fontSize: 14, color: "#C8C8CC" },
 });

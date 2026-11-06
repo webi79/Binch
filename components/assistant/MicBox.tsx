@@ -14,14 +14,15 @@ import Animated, {
   useSharedValue,
   type SharedValue,
 } from "react-native-reanimated";
-import { Mic, Pause, Send, Trash2 } from "lucide-react-native";
+import { Mic, Pause, Trash2 } from "lucide-react-native";
+import { SendGlyph } from "@/components/ui/SendGlyph";
 import { Waveform } from "@/components/assistant/VoiceRecordBar";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { usePalette } from "@/lib/theme/appBg";
 import { useAccent } from "@/lib/theme/accent";
 import { useT } from "@/lib/i18n/useT";
 import { haptic } from "@/lib/haptics";
-import { scaledStyles } from "@/lib/ui/compact";
+import { ms, scaledStyles } from "@/lib/ui/compact";
 
 /**
  * Der Mikrofon-Kasten in Bos Chat.
@@ -33,7 +34,7 @@ import { scaledStyles } from "@/lib/ui/compact";
 
 const DELETE_INK = "#E5484D";
 /** Getönter Grund des Verwerfen-Knopfes — derselbe Rotton, stark verdünnt. */
-const DELETE_TINT = "rgba(229,72,77,0.16)";
+export const DELETE_TINT = "rgba(229,72,77,0.16)";
 
 /** `#RRGGBB` mischen. `t` = 0 gibt `a`, 1 gibt `b`. */
 function mix(a: string, b: string, t: number): string {
@@ -64,7 +65,7 @@ const AnimatedTextInput = Animated.createAnimatedComponent(TextInput);
  * Reanimated fortgeschrieben werden kann. Nicht bedienbar, nicht fokussierbar:
  * Er ist hier reine Anzeige.
  */
-function RecordTime({ recording, paused }: { recording: boolean; paused: boolean }) {
+export function RecordTime({ recording, paused }: { recording: boolean; paused: boolean }) {
   const elapsedMs = useSharedValue(0);
   /** Zeitstempel des letzten Bildes — 0 heißt „gerade angehalten". */
   const lastTs = useSharedValue(0);
@@ -123,6 +124,8 @@ interface Props {
   micVolumeSV: SharedValue<number>;
   /** Lage und Maße kommen vom Bildschirm — dort steht die Geometrie. */
   style?: StyleProp<ViewStyle>;
+  /** Im Aufnahme-Blatt: ohne eigene Fläche, Kante und Innenabstand — das Blatt ist die Fläche. */
+  bare?: boolean;
 }
 
 export function MicBox({
@@ -133,6 +136,7 @@ export function MicBox({
   onSend,
   micVolumeSV,
   style,
+  bare = false,
 }: Props) {
   const t = useT();
   const palette = usePalette();
@@ -153,7 +157,7 @@ export function MicBox({
   const fill = useMemo(() => mix(palette.bg, palette.s2, 0.5), [palette.bg, palette.s2]);
 
   return (
-    <View style={[styles.box, { backgroundColor: fill, borderColor: palette.border }, style]}>
+    <View style={[styles.box, bare ? styles.bare : { backgroundColor: fill, borderColor: palette.border }, style]}>
       <View style={styles.topRow}>
         <Waveform recording={recording} paused={paused} micVolumeSV={micVolumeSV} />
         <RecordTime recording={recording} paused={paused} />
@@ -201,7 +205,7 @@ export function MicBox({
           accessibilityLabel={t("assistant.voice.send")}
           style={[styles.round, { backgroundColor: accent.solid }]}
         >
-          <Send size={21} color={accent.textOnSolid} strokeWidth={2.2} />
+          <SendGlyph size={ms(22)} color={accent.textOnSolid} cutColor={accent.solid} />
         </RippleTouch>
       </View>
     </View>
@@ -213,7 +217,7 @@ const styles = scaledStyles({
     borderRadius: 24,
     borderWidth: 1,
     paddingHorizontal: 16,
-    paddingVertical: 14,
+    paddingVertical: 16,
     justifyContent: "space-between",
   },
   /**
@@ -224,7 +228,8 @@ const styles = scaledStyles({
    * zwischen Oberkante des Kastens und Oberkante der Knöpfe — genau die ergibt
    * sich, wenn die Zeile den Raum füllt und ihren Inhalt zentriert.
    */
-  topRow: { flex: 1, flexDirection: "row", alignItems: "center", gap: 14 },
+  bare: { borderWidth: 0, borderRadius: 0, paddingHorizontal: 0, paddingVertical: 0, backgroundColor: "transparent" },
+  topRow: { flex: 1, flexDirection: "row", alignItems: "center", gap: 16 },
   /** Feste Breite mit Ziffern gleicher Laufweite: Die Uhr darf die Tonspur
    *  nicht bei jedem Sekundenwechsel um einen Punkt verschieben. */
   /**
@@ -259,7 +264,7 @@ const styles = scaledStyles({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    gap: 10,
+    gap: 8,
   },
   toggleText: { fontSize: 15, fontWeight: "700" },
 });

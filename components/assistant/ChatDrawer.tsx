@@ -31,6 +31,7 @@ import {
   User,
   X,
 } from "lucide-react-native";
+import { useBoView } from "@/lib/assistant/boView";
 import { ClearSearchHistoryAlert } from "@/components/ui/ClearSearchHistoryAlert";
 import { RippleTouch } from "@/components/ui/RippleTouch";
 import { RenameThreadDialog } from "@/components/assistant/RenameThreadDialog";
@@ -53,9 +54,12 @@ import { haptic } from "@/lib/haptics";
 import { useT } from "@/lib/i18n/useT";
 import { useAccent } from "@/lib/theme/accent";
 import { usePalette } from "@/lib/theme/appBg";
-import { CLOSE_ICON_SIZE, GUTTER, SPACE, TOPBAR_TOP } from "@/lib/theme/spacing";
+import { CLOSE_ICON_SIZE, GUTTER, SPACE, TOPBAR_TOP, TITLE_GAP } from "@/lib/theme/spacing";
 import { ms, scaledStyles } from "@/lib/ui/compact";
 import { useSearchStore } from "@/stores/searchStore";
+import { StatePanel } from "@/components/ui/StatePanel";
+import { GridLoader } from "@/components/ui/GridLoader";
+import { GateLoader, useLoadGate } from "@/components/ui/LoadGate";
 
 /**
  * Die Schublade hinter dem Bo-Screen: „Neuer Chat" und die früheren
@@ -103,6 +107,9 @@ const C = {
   /** Papierkorb-Rot — derselbe Wert wie im Benachrichtigungs-Blatt. */
   danger: "#FF3B5C",
 };
+
+/** So viele Chats passen beim Öffnen sichtbar in die Schublade. */
+const DRAWER_FIRST_ROWS = 9;
 
 /** Was `fetchChatThreads` in den Zwischenspeicher legt. */
 type ThreadPage = { items: ChatThreadSummary[]; nextCursor: string | null };
@@ -222,6 +229,8 @@ const DELETE_WIDTH = 80;
 const CANCEL_THRESHOLD = 30;
 const SWIPE_MS = 220;
 const SWIPE_EASE = Easing.out(Easing.quad);
+/** Leere Liste, solange das Tor lädt — fest, damit die Liste nicht bei jedem Durchgang neue Daten sieht. */
+const NO_THREADS: readonly never[] = [];
 
 const ChatRow = memo(function ChatRow({
   item,
@@ -423,6 +432,8 @@ interface Props {
   onClose: () => void;
   /** Tipp auf die Profil-Karte: Bo schließen und in den Profil-Tab wechseln. */
   onOpenProfile: () => void;
+  /** Bereich „Geplant" im Fenster zeigen. */
+  onOpenScheduled: () => void;
 }
 
 export function ChatDrawer({
@@ -432,6 +443,7 @@ export function ChatDrawer({
   onNewChat,
   onClose,
   onOpenProfile,
+  onOpenScheduled,
 }: Props) {
   const t = useT();
   const palette = usePalette();
@@ -474,7 +486,7 @@ export function ChatDrawer({
    */
   const bottomGap = Math.round((height * (1 - SCALE)) / 2);
 
-  const { data, isLoading, isError, error, refetch } = useQuery({
+  const { data, isLoading, isError, isFetching, error, refetch } = useQuery({
     /**
      * Der Schlüssel trägt das KONTO.
      *
@@ -515,7 +527,20 @@ export function ChatDrawer({
     retry: (count, err) => !(err instanceof ChatAuthError) && count < 1,
   });
 
-  const threads = data?.items ?? [];
+  /**
+   * Erstes Laden nach der einen Regel (`LoadGate`): Lader erst nach 2 s, dann
+   * mindestens zwei volle Durchläufe; die Chats erscheinen erst danach und
+   * blenden ein. Bis dahin hält die Liste ihre Zeilen zurück.
+   */
+  const gate = useLoadGate(isLoading);
+  const listFade = useSharedValue(1);
+  useEffect(() => {
+    if (gate.phase !== "content" || !gate.fresh) return;
+    listFade.value = 0;
+    listFade.value = withTiming(1, { duration: 280, easing: Easing.out(Easing.quad) });
+  }, [gate.phase, gate.fresh, listFade]);
+  const listFadeStyle = useAnimatedStyle(() => ({ opacity: listFade.value }));
+  const threads = gate.phase === "content" ? (data?.items ?? []) : NO_THREADS;
   const signedOut = error instanceof ChatAuthError;
 
   /* ------------------------------------------------------------ Nachladen */
@@ -556,7 +581,9 @@ export function ChatDrawer({
         // gescheiterte ZWEITE Seite verdeckte eine funktionierende Liste.
       })
       .finally(() => setLoadingMore(false));
-  }, [open, loadingMore, queryClient]);
+    // `userId` mit: Nach einem Kontowechsel liefe das Nachladen sonst gegen den
+    // Zwischenspeicher des vorigen Kontos.
+  }, [open, loadingMore, queryClient, userId]);
 
   /* -------------------------------------------------------------- Löschen */
 
@@ -609,14 +636,9 @@ export function ChatDrawer({
    * am Ende nur ein Punkt. Den liefert das Ereignis selbst mit — und zwar
    * genau dort, wo der Finger war.
    */
-  /**
-   * Welcher Abschnitt unten steht.
-   *
-   * „Geplant" ist bewusst ein UMSCHALTER und kein eigener Bildschirm: Die
-   * Schublade hat keinen Platz für eine zweite Ebene, und ein zweites Mal auf
-   * dieselbe Zeile tippen ist der kürzeste Weg zurück.
-   */
-  const [section, setSection] = useState<"chats" | "scheduled">("chats");
+  /** Steht „Geplant" im Fenster, ist das die aktuelle Zeile und keine Unterhaltung. */
+  const scheduledShown = useBoView() === "scheduled";
+  const highlightId = scheduledShown ? null : activeId;
   /**
    * Die Höhe der unteren Leiste — GEMESSEN, nicht gerechnet.
    *
@@ -714,10 +736,10 @@ export function ChatDrawer({
     ({ item }: { item: ChatThreadSummary }) => (
       <ChatRow
         item={item}
-        active={item.id === activeId}
+        active={item.id === highlightId}
         swiped={item.id === swipeId}
-        bg={item.id === activeId ? accent.subtle : palette.s2}
-        titleColor={item.id === activeId ? accent.solid : C.white}
+        bg={item.id === highlightId ? accent.subtle : palette.s2}
+        titleColor={item.id === highlightId ? accent.solid : C.white}
         label={item.title ?? t("assistant.threads.untitled")}
         moreLabel={t("assistant.threads.more")}
         deleteLabel={t("assistant.threads.delete.confirm")}
@@ -749,7 +771,7 @@ export function ChatDrawer({
         }}
       />
     ),
-    [accent.solid, accent.subtle, activeId, onSelect, palette.s2, removeThread, swipeId, t],
+    [accent.solid, accent.subtle, highlightId, onSelect, palette.s2, removeThread, swipeId, t],
   );
 
   /**
@@ -761,22 +783,47 @@ export function ChatDrawer({
    * wirklich leer.
    */
   const renderEmpty = () => {
-    if (signedOut) return <Text style={styles.hint}>{t("assistant.threads.signedOut")}</Text>;
+    /**
+     * Alle Zustände der Liste wie überall in der App: Zeichnung, Titel, Satz und
+     * EIN Pillen-Knopf (`StatePanel`), mittig im freien Teil der Schublade.
+     * Vorher standen hier nackte Zeilen mit einem Text-Link („einfach dahin
+     * geklatscht", 04.11.2026). Gezeichnet wird erst, wenn die Schublade aufgeht.
+     */
+    if (signedOut) {
+      return (
+        <StatePanel
+          compact
+          art="chat"
+          active={open}
+          surface={palette.s3}
+          title={t("assistant.threads.signedOutTitle")}
+          body={t("assistant.threads.signedOut")}
+          action={t("state.signIn")}
+          onAction={() => {
+            haptic("button");
+            useSearchStore.getState().openAuthOverlay();
+          }}
+          style={styles.emptyCenter}
+        />
+      );
+    }
     if (isError) {
       return (
-        <View style={styles.stateBlock}>
-          <Text style={styles.hint}>{t("assistant.threads.error")}</Text>
-          <Pressable
-            onPress={() => void refetch()}
-            hitSlop={12}
-            accessibilityRole="button"
-            style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
-          >
-            <Text style={[styles.retry, { color: accent.solid }]}>
-              {t("assistant.threads.retry")}
-            </Text>
-          </Pressable>
-        </View>
+        <StatePanel
+          compact
+          art="offline"
+          active={open}
+          surface={palette.s3}
+          title={t("state.error.title")}
+          body={t("assistant.threads.error")}
+          action={t("state.retry")}
+          busy={isFetching}
+          onAction={() => {
+            haptic("button");
+            void refetch();
+          }}
+          style={styles.emptyCenter}
+        />
       );
     }
     /**
@@ -786,8 +833,26 @@ export function ChatDrawer({
      * ein großes Skelett wäre dann ein Aufblitzen für nichts. Sichtbar wird das
      * hier nur beim allerersten Mal.
      */
-    if (isLoading) return <ActivityIndicator size="small" color={C.gray} style={styles.spinner} />;
-    return <Text style={styles.hint}>{t("assistant.threads.empty")}</Text>;
+    if (gate.phase !== "content") {
+      return (
+        <View style={styles.loaderArea}>
+          <GateLoader phase={gate.phase} onLeft={gate.onLeft}>
+            <GridLoader size={44} active={open} />
+          </GateLoader>
+        </View>
+      );
+    }
+    // Die Schublade hängt im vorgebauten Bo-Fenster dauerhaft — gezeichnet wird erst, wenn sie aufgeht.
+    return (
+      <StatePanel
+        compact
+        art="chat"
+        active={open}
+        surface={palette.s3}
+        body={t("assistant.threads.empty")}
+        style={styles.emptyCenter}
+      />
+    );
   };
 
   return (
@@ -888,7 +953,6 @@ export function ChatDrawer({
             bg={palette.s2}
             onPress={() => {
               haptic("button");
-              setSection("chats");
               onNewChat();
             }}
           />
@@ -899,10 +963,10 @@ export function ChatDrawer({
             bg={palette.s2}
             // Gewählt = die Fläche trägt den Akzent, dezent (16%). Über eine
             // Kante ginge es nicht mehr, seit die Karten keine tragen.
-            activeBg={section === "scheduled" ? accent.subtle : undefined}
+            activeBg={scheduledShown ? accent.subtle : undefined}
             onPress={() => {
               haptic("button");
-              setSection((prev) => (prev === "scheduled" ? "chats" : "scheduled"));
+              onOpenScheduled();
             }}
           />
         </View>
@@ -915,7 +979,7 @@ export function ChatDrawer({
           zu sehen. Hier beschriftet sie den Abschnitt, und ein Abschnitt
           verschiebt sich nicht, weil man in ihm blättert.
         */}
-        {section === "chats" && threads.length > 0 ? (
+        {threads.length > 0 ? (
           /**
            * Der Rand kommt von einer HÜLLE, nicht vom Text.
            *
@@ -929,12 +993,7 @@ export function ChatDrawer({
             <Text style={styles.sectionLabel}>{t("assistant.threads.recent")}</Text>
           </View>
         ) : null}
-        {section === "scheduled" ? (
-          <View style={styles.list}>
-            <Text style={styles.hint}>{t("assistant.threads.scheduledEmpty")}</Text>
-          </View>
-        ) : (
-        <FlatList
+        <Animated.FlatList
           data={threads}
           keyExtractor={(item) => item.id}
           renderItem={renderItem}
@@ -949,6 +1008,18 @@ export function ChatDrawer({
           /** Nachgeladen wird nur bei offener Schublade — siehe `loadMore`. */
           onEndReached={loadMore}
           onEndReachedThreshold={0.4}
+          /**
+           * Nur bauen, was man sieht — und während die Schublade fährt gar nichts
+           * dazu. Mit den Vorgaben der Liste (21 Bildschirmhöhen Fenster, alle
+           * 50 ms ein Schub) baute sie bei vielen geladenen Chats Zeile um Zeile
+           * nach, jede mit eigener Wisch-Geste, mitten in der Fahrt. Das war das
+           * Ruckeln. `open` kommt erst, wenn die Kurve steht; danach füllt sie in
+           * Ruhe auf.
+           */
+          initialNumToRender={DRAWER_FIRST_ROWS}
+          maxToRenderPerBatch={4}
+          windowSize={5}
+          updateCellsBatchingPeriod={open ? 50 : 10_000}
           ListFooterComponent={
             loadingMore ? (
               <ActivityIndicator size="small" color={C.gray} style={styles.spinner} />
@@ -961,12 +1032,11 @@ export function ChatDrawer({
            * schiebt alles Nachfolgende aus dem Bild — die Konto-Zeile wäre bei
            * langen Listen einfach weg.
            */
-          style={styles.list}
-          contentContainerStyle={styles.listContent}
+          style={[styles.list, listFadeStyle]}
+          contentContainerStyle={threads.length > 0 ? styles.listContent : styles.listContentEmpty}
           showsVerticalScrollIndicator={false}
           keyboardShouldPersistTaps="handled"
         />
-        )}
       </View>
 
       {/*
@@ -1172,6 +1242,13 @@ export function ChatDrawer({
   );
 }
 
+/**
+ * Wo die Schrift von „Profil" unter der Oberkante der unteren Leiste beginnt:
+ * ihr Abstand nach oben (`sectionLabel.paddingTop`) plus der Weißraum über den
+ * Großbuchstaben (bei 13 Punkt rund 4). Roh — das Stilblatt skaliert.
+ */
+const PROFILE_INK_TOP = SPACE.lg + 4;
+
 const styles = scaledStyles({
   /** `width` kommt zur Laufzeit dazu — sie hängt an der Bildschirmbreite. */
   column: { flex: 1 },
@@ -1220,7 +1297,7 @@ const styles = scaledStyles({
     alignItems: "center",
     gap: SPACE.md,
     paddingHorizontal: SPACE.lg,
-    paddingVertical: 14,
+    paddingVertical: 16,
     borderRadius: 16,
   },
   /**
@@ -1234,6 +1311,12 @@ const styles = scaledStyles({
 
   list: { flex: 1 },
   listContent: {
+    /**
+     * Wächst auf die volle Höhe der Liste: Ohne Zeilen steht der leere Zustand
+     * bzw. der Lader damit mittig im freien Teil der Schublade statt oben
+     * („Ladeanimationen immer mittig", 04.11.2026). Mit Zeilen ändert es nichts.
+     */
+    flexGrow: 1,
     /** Die Überschrift steht jetzt außerhalb und bringt ihren Abstand mit. */
     paddingTop: 0,
     paddingHorizontal: GUTTER,
@@ -1270,27 +1353,39 @@ const styles = scaledStyles({
     alignItems: "center",
     gap: SPACE.md,
     paddingHorizontal: SPACE.lg,
-    paddingVertical: 14,
+    paddingVertical: 16,
     borderRadius: 16,
   },
-  rowText: { flex: 1, gap: 2 },
+  rowText: { flex: 1, gap: 4 },
   rowTitleLine: { flexDirection: "row", alignItems: "center", gap: SPACE.xs },
   /** `flexShrink`, damit das Anheft-Zeichen nicht vom langen Titel
    *  hinausgedrängt wird. */
   rowTitle: { flexShrink: 1, fontSize: 15, fontWeight: "600", color: C.white },
 
-  /** Maße der Leerzustände aus Saved-Tab und Ergebnisliste. */
-  stateBlock: { alignItems: "center", gap: SPACE.md, paddingHorizontal: SPACE.md },
-  hint: {
-    fontSize: 13,
-    lineHeight: 20,
-    color: C.gray,
-    textAlign: "center",
-    paddingHorizontal: SPACE.md,
-    paddingTop: SPACE.lg,
-  },
-  retry: { fontSize: 14, fontWeight: "600" },
   spinner: { paddingTop: SPACE.xl },
+  /**
+   * Ohne Chats (laden, leer, Fehler, abgemeldet): Die Liste wächst auf volle
+   * Höhe, OHNE den unteren Rand der Zeilen — sonst stünde alles um dessen
+   * Hälfte zu hoch.
+   */
+  listContentEmpty: { flexGrow: 1, paddingHorizontal: GUTTER },
+  /**
+   * Mittig zwischen den SICHTBAREN Kanten: der Unterkante von „Geplant" und
+   * der Schrift von „Profil" (05.11.2026: der Lader stand gut 40 Punkte zu
+   * hoch). Die Liste endet an der Oberkante der unteren Leiste; deren
+   * Beschriftung beginnt erst `PROFILE_INK_TOP` tiefer. Um genau so viel
+   * reicht die Fläche nach unten über die Liste hinaus — beschnitten wird
+   * dort nichts, der Inhalt steht ja in der Mitte.
+   */
+  loaderArea: {
+    flex: 1,
+    minHeight: 240,
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: -PROFILE_INK_TOP,
+  },
+  /** Der leere Zustand ebenso. */
+  emptyCenter: { flex: 1, justifyContent: "center", marginBottom: -PROFILE_INK_TOP },
 
   /** Abschnitts-Beschriftung — dieselbe zweite Textebene wie überall (13/grau),
    *  nur fett. Eine eigene Schriftgröße dafür gibt es in der App nicht. */
@@ -1303,7 +1398,7 @@ const styles = scaledStyles({
     /** Luft nach OBEN trennt den Abschnitt vom Block darüber — nach unten
      *  reicht wenig, die Überschrift gehört zu den Zeilen darunter. */
     paddingTop: SPACE.lg,
-    paddingBottom: SPACE.sm,
+    paddingBottom: TITLE_GAP,
   },
 
   /** `left`/`top` kommen zur Laufzeit — sie hängen am Berührungspunkt. */
@@ -1357,7 +1452,7 @@ const styles = scaledStyles({
     alignItems: "center",
     gap: SPACE.md,
     paddingHorizontal: SPACE.lg,
-    paddingVertical: 14,
+    paddingVertical: 16,
     borderRadius: 16,
   },
   claim: {
@@ -1365,14 +1460,15 @@ const styles = scaledStyles({
     alignItems: "center",
     gap: SPACE.md,
     paddingHorizontal: SPACE.lg,
-    paddingVertical: 14,
+    paddingVertical: 16,
     borderRadius: 16,
   },
   claimLabel: { flexShrink: 1, fontSize: 15, fontWeight: "600", color: C.white },
   avatar: { width: 36, height: 36, borderRadius: 18 },
   avatarFallback: { alignItems: "center", justifyContent: "center" },
   avatarInitials: { fontSize: 14, fontWeight: "700" },
-  accountText: { flexShrink: 1, gap: 1 },
+  /** Wie `rowText` der Chat-Zeilen darüber — gleiche Zeile, gleicher Abstand. */
+  accountText: { flexShrink: 1, gap: SPACE.xs },
   accountName: { fontSize: 14, fontWeight: "600", color: C.white },
   accountMail: { fontSize: 12, color: C.gray },
 });

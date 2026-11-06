@@ -18,7 +18,8 @@
  *     Steig als eigener Halt mit eigener Tafel (scripts/lib/gtfsStands.ts) —
  *     OSM-Masten genau dort werden zum Steig statt daneben gedoppelt;
  *   • Art aus den tatsächlich verkehrenden Linien (Bus/Reisebus → BUS,
- *     Tram/U-Bahn/DLR → TRAIN), Fähren werden ausgelassen;
+ *     Tram/U-Bahn/DLR → TRAIN), Fähren werden ausgelassen (mit `GB_FERRIES=1`
+ *     kommen reine Fähranleger als BUS/FERRY dazu);
  *   • Name = NaPTAN-Name; nichtssagende („Bus Station", „Rail Station")
  *     bekommen den nächsten Ort (≤ 8 km) davor;
  *   • Kennung `gtfs:gb:<stop_id>` — die Tafel findet den Halt damit direkt.
@@ -155,8 +156,18 @@ async function main() {
     } else standalone.push(s);
   }
 
+  /**
+   * Fähranleger hängen im Feed meist an einer Fähr-„Station" (930G…), oft mit einem einzigen
+   * Anleger („Place Ferry Landing") — als Steig fielen sie aus der Liste heraus. Mit Liste und
+   * `GB_FERRIES=1` zählt deshalb auch der Anleger unter einer Station, aber nur EINER je Station:
+   * Die zwei Anleger von „Blackfriars Pier" stünden sonst als gleichnamige Marker nebeneinander.
+   */
+  const ferryPiers =
+    ONLY && process.env.GB_FERRIES === "1"
+      ? [...childrenOf.values()].map((kids) => kids.find((k) => ONLY.has(k.stop_id))).filter((k): k is FeedStop => !!k)
+      : [];
   // Kandidaten: alleinstehende Masten ohne Zeile; Stationen werden unten getrennt behandelt.
-  const poleCands = standalone.filter(
+  const poleCands = [...standalone, ...ferryPiers].filter(
     (s) =>
       !byCode.has(PREFIX + s.stop_id) &&
       !NOT_A_STOP.test(s.name) &&
@@ -217,7 +228,12 @@ async function main() {
     }
     return label;
   };
-  /** Art aus den Linienarten (wie bisher); null = nichts erkennbar oder nur Fähre. */
+  /**
+   * Art aus den Linienarten (wie bisher); null = nichts erkennbar. Reine Fähranleger nur mit
+   * `GB_FERRIES=1` — wie die Schweizer Anleger als BUS/FERRY. Bis Okt. 2026 blieben sie ganz
+   * draußen: Ein Drittel der Anleger mit Fahrplan fehlte auf der Karte (Prüfung gegen den
+   * Fahrplan), über 100 davon ohne jede Zeile in der Nähe.
+   */
   const classify = (modes: number[]) => {
     if (modes.length === 0) return null;
     const kinds = new Set<string>();
@@ -225,7 +241,11 @@ async function main() {
       const sub = subtypeOfRouteType(m);
       kinds.add(sub === "TRAM" ? "tram" : sub === "SUBWAY" ? "subway" : sub === "REGIONAL" || sub === "SUBURBAN" ? "train" : sub === "FERRY" ? "ferry" : "bus");
     }
-    if (kinds.size === 1 && kinds.has("ferry")) return null;
+    if (kinds.size === 1 && kinds.has("ferry")) {
+      return process.env.GB_FERRIES === "1"
+        ? { type: "BUS" as const, subtype: "FERRY", kinds: ["ferry"] }
+        : null;
+    }
     kinds.delete("ferry");
     const isBus = kinds.has("bus") && kinds.size === 1;
     const subtype = isBus

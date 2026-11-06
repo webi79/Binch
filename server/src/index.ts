@@ -7,17 +7,22 @@ import { locationsRoutes } from "./routes/locations.js";
 import { redirectRoutes } from "./routes/redirect.js";
 import { ticketsRoutes } from "./routes/tickets.js";
 import { authRoutes } from "./routes/auth.js";
+import { accountRoutes } from "./routes/account.js";
 import { surroundingsRoutes } from "./routes/surroundings.js";
 import { tilesRoutes } from "./routes/tiles.js";
 import { stopsRoutes } from "./routes/stops.js";
 import { tripsRoutes } from "./routes/trips.js";
 import { flightBookingOptionsRoutes } from "./routes/flightBookingOptions.js";
 import { chatRoutes } from "./routes/chat.js";
+import { debugProbeRoutes } from "./routes/debugProbe.js";
 import { tripPlanRoutes } from "./routes/tripPlan.js";
 import { walkRoutes } from "./routes/walk.js";
 import { alertsRoutes } from "./routes/alerts.js";
 import { flushEsriUsage, imageryRoutes } from "./routes/imagery.js";
 import { deactivateExpiredAlerts, startAlertExpiry, stopAlertExpiry } from "./services/priceAlerts.js";
+import { startReminderLoop, stopReminderLoop } from "./services/tripReminders.js";
+import { startBoTaskLoop, stopBoTaskLoop } from "./services/boTasks.js";
+import { boTasksRoutes } from "./routes/boTasks.js";
 import { pool } from "./db/client.js";
 import { startStopBoardPreCache, stopStopBoardPreCache } from "./services/stopBoardPreCache.js";
 import { startDbVendoQueue, stopDbVendoQueue } from "./services/dbVendoQueue.js";
@@ -41,6 +46,25 @@ const app = Fastify({
   trustProxy: config.TRUST_PROXY ? 1 : false,
 });
 
+/**
+ * Interne Fehler nie im Wortlaut nach außen.
+ *
+ * Fastifys Vorgabe gibt bei einer 500 die Fehlermeldung zurück — bei einem
+ * Datenbankfehler also deren rohen Text samt Spalten und Werten (gefunden im
+ * Rauchtest: ein kaputtes Suchdatum kam als „invalid input syntax for type
+ * date" beim Aufrufer an). Ins Protokoll kommt alles; der Aufrufer bekommt bei
+ * 5xx nur den Status. 4xx (Eingabe, Größe, Format) bleiben, wie sie sind — die
+ * sind für den Absender gedacht.
+ */
+app.setErrorHandler((err: Error & { statusCode?: number }, req, reply) => {
+  const status = err.statusCode && err.statusCode >= 400 ? err.statusCode : 500;
+  if (status >= 500) {
+    req.log.error({ err }, "Unbehandelter Fehler");
+    return reply.code(status).send({ error: "Internal Server Error" });
+  }
+  return reply.code(status).send({ error: err.message });
+});
+
 // CORS: mit CORS_ORIGINS (Prod) nur die gelisteten Origins, ungesetzt (Dev)
 // wird jeder Origin reflektiert. Native App-Clients senden keinen Origin-
 // Header — das hier betrifft nur Browser-Clients.
@@ -58,6 +82,7 @@ await app.register(locationsRoutes);
 await app.register(redirectRoutes);
 await app.register(ticketsRoutes);
 await app.register(authRoutes);
+await app.register(accountRoutes);
 await app.register(surroundingsRoutes);
 await app.register(tilesRoutes);
 await app.register(stopsRoutes);
@@ -65,6 +90,9 @@ await app.register(tripsRoutes);
 await app.register(alertsRoutes);
 await app.register(flightBookingOptionsRoutes);
 await app.register(chatRoutes);
+await app.register(boTasksRoutes);
+// Messsonde (vorübergehend) — siehe routes/debugProbe.ts.
+await app.register(debugProbeRoutes);
 await app.register(tripPlanRoutes);
 await app.register(walkRoutes);
 await app.register(imageryRoutes);
@@ -83,6 +111,8 @@ const shutdown = async (signal: string) => {
   stopStopBoardPreCache();
   stopDbVendoQueue();
   stopAlertExpiry();
+  stopReminderLoop();
+  stopBoTaskLoop();
   stopRetention();
   // Gezählte Esri-Kacheln nicht verlieren (sonst fehlen bis zu 10 s im Kontingent).
   await flushEsriUsage().catch(() => {});
@@ -111,6 +141,10 @@ try {
    */
   void deactivateExpiredAlerts();
   startAlertExpiry();
+  // Abfahrts- und Ausstiegs-Erinnerungen verschicken (services/tripReminders.ts).
+  startReminderLoop();
+  // Bos geplante Aufgaben ausführen (services/boTasks.ts).
+  startBoTaskLoop();
   // Alte Suchdaten, abgelaufene Tokens und Sitzungen abräumen (services/retention.ts).
   startRetention();
 } catch (err) {
